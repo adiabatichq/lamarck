@@ -32,7 +32,7 @@ export type ContentBlobRef = {
   version: 1;
   digest: string;
   variant: "redacted-text";
-  mediaType: "text/plain; charset=utf-8";
+  mediaType: "text/plain; charset=utf-8" | "application/json";
   encoding: "gzip";
 };
 
