@@ -1,0 +1,15 @@
+{
+  "manifestVersion": 1,
+  "id": "hello-world",
+  "name": "Hello World",
+  "runtime": {
+    "ui": {
+      "command": ["npm", "run", "start"],
+      "port": 3000
+    }
+  },
+  "permissions": {
+    "docs": [],
+    "tables": ["greetings"]
+  }
+}

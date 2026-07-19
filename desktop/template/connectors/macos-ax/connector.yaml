@@ -1,0 +1,27 @@
+manifestVersion: 1
+id: macos-ax
+name: macOS AX Watcher
+entry: ./index.mjs
+runtime:
+  mode: watch
+integrations:
+  mode: multiple
+platforms:
+  darwin:
+    requirements:
+      - macos-accessibility
+auth:
+  type: none
+config:
+  idle-threshold-seconds:
+    type: number
+    label: Idle threshold seconds
+    default: 15
+  afk-threshold-seconds:
+    type: number
+    label: AFK threshold seconds
+    default: 60
+configPanels:
+  privacy-controls:
+    label: Privacy Controls
+    description: Configure app-level desktop capture policy

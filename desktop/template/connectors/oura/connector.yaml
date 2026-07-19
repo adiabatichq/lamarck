@@ -1,0 +1,32 @@
+manifestVersion: 1
+id: oura
+name: Oura
+entry: ./index.mjs
+runtime:
+  mode: poll
+  defaultSchedule: "0 */6 * * *"
+integrations:
+  mode: multiple
+platforms:
+  darwin: {}
+  linux: {}
+  windows: {}
+  ios: {}
+  android: {}
+  cloud: {}
+auth:
+  type: managedProvider
+  providerId: oura
+config:
+  lookback-days:
+    type: number
+    label: Lookback days
+    default: 3
+  backfill-years:
+    type: number
+    label: Backfill years
+    default: 1
+  include-heartrate:
+    type: boolean
+    label: Include heart rate
+    default: true

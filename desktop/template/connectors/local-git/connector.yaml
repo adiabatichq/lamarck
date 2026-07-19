@@ -1,0 +1,18 @@
+manifestVersion: 1
+id: local-git
+name: Local Git
+entry: ./index.mjs
+runtime:
+  mode: watch
+integrations:
+  mode: multiple
+platforms:
+  darwin: {}
+  linux: {}
+  windows: {}
+auth:
+  type: none
+configPanels:
+  setup:
+    label: Setup
+    description: Configure code roots, commit identity, and capture policy

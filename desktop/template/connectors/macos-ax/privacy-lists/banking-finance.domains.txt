@@ -1,0 +1,23 @@
+# Lamarck curated seed. High-signal finance and payments domains.
+americanexpress.com
+amex.com
+bankofamerica.com
+capitalone.com
+chase.com
+citi.com
+citibank.com
+coinbase.com
+etrade.com
+fidelity.com
+interactivebrokers.com
+jpmorgan.com
+kraken.com
+paypal.com
+robinhood.com
+schwab.com
+stripe.com
+tdameritrade.com
+venmo.com
+vanguard.com
+wellsfargo.com
+wise.com

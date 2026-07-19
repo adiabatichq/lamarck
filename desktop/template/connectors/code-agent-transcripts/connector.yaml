@@ -1,0 +1,43 @@
+manifestVersion: 1
+id: code-agent-transcripts
+name: Code Agent Transcripts
+entry: ./index.mjs
+runtime:
+  mode: watch
+integrations:
+  mode: multiple
+platforms:
+  darwin: {}
+  linux: {}
+  windows: {}
+auth:
+  type: none
+config:
+  include-codex:
+    type: boolean
+    label: Include Codex
+    default: true
+  include-claude:
+    type: boolean
+    label: Include Claude
+    default: true
+  include-reasoning:
+    type: boolean
+    label: Include reasoning blocks
+    default: false
+  codex-root:
+    type: string
+    label: Codex sessions root
+    default: ~/.codex/sessions
+  claude-root:
+    type: string
+    label: Claude projects root
+    default: ~/.claude/projects
+  lookback-days:
+    type: number
+    label: Lookback days
+    default: 30
+  max-inline-bytes:
+    type: number
+    label: Max inline bytes
+    default: 8192

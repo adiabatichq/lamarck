@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "provider": "telegram",
+  "api": "Bot API",
+  "transport": "cloud",
+  "compatibility": {
+    "minimumVersion": "10.0",
+    "testedAgainstVersion": "10.1",
+    "testedAgainstReleaseDate": "2026-06-11",
+    "versionPolicy": "Telegram Cloud Bot API is a rolling service; these versions record the minimum required and last reviewed contracts, not a pinned runtime."
+  },
+  "references": {
+    "documentation": "https://core.telegram.org/bots/api",
+    "changelog": "https://core.telegram.org/bots/api-changelog",
+    "testedAgainstRelease": "https://core.telegram.org/bots/api-changelog#june-11-2026"
+  },
+  "methods": [
+    "deleteWebhook",
+    "getMe",
+    "getUpdates"
+  ],
+  "updateTypes": [
+    "message",
+    "edited_message",
+    "channel_post",
+    "edited_channel_post",
+    "business_message",
+    "edited_business_message",
+    "guest_message"
+  ]
+}

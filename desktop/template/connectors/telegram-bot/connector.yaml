@@ -1,0 +1,29 @@
+manifestVersion: 1
+id: telegram-bot
+name: Telegram Bot
+entry: ./index.mjs
+runtime:
+  mode: watch
+integrations:
+  mode: multiple
+platforms:
+  darwin: {}
+  linux: {}
+  windows: {}
+  cloud: {}
+auth:
+  type: apiKey
+  label: Telegram bot token
+config:
+  poll-timeout-sec:
+    type: number
+    label: Poll timeout seconds
+    default: 25
+  clear-webhook-on-start:
+    type: boolean
+    label: Clear webhook on start
+    default: false
+configPanels:
+  telegram-setup:
+    label: Telegram Setup
+    description: Pair users and configure message capture

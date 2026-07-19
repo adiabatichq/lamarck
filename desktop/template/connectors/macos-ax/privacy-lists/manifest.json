@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "version": "2026-07-06",
+  "description": "Connector-owned domain lists used only for privacy policy classification. User overrides live in integration.config.",
+  "lists": {
+    "adult_content": {
+      "kind": "domain-list",
+      "file": "adult-content.domains.txt",
+      "defaultAction": "metadata_only",
+      "sourceName": "StevenBlack hosts porn-only variant",
+      "sourceUrl": "https://github.com/StevenBlack/hosts/blob/master/alternates/porn-only/readme.md",
+      "rawUrl": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts",
+      "sourceDate": "2026-07-05",
+      "sourceEntryCount": 76749,
+      "generatedEntryCount": 76744,
+      "license": "Mixed source licenses: MIT and CC BY 4.0. Keep attribution when redistributing.",
+      "notes": "Generated from the porn-only hosts variant by extracting hostnames from hosts-file rows. Five upstream entries containing underscores are skipped by the normalized-domain parser."
+    },
+    "banking_finance": {
+      "kind": "domain-list",
+      "file": "banking-finance.domains.txt",
+      "defaultAction": "metadata_only",
+      "sourceName": "Lamarck curated seed",
+      "sourceUrl": null,
+      "sourceDate": "2026-07-06",
+      "license": "Project-owned curated list.",
+      "notes": "Small high-signal seed. Do not treat as comprehensive financial categorization."
+    },
+    "gambling": {
+      "kind": "domain-list",
+      "file": "gambling.domains.txt",
+      "defaultAction": "metadata_only",
+      "sourceName": "StevenBlack hosts gambling-only variant",
+      "sourceUrl": "https://github.com/StevenBlack/hosts/blob/master/alternates/gambling-only/readme.md",
+      "rawUrl": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling-only/hosts",
+      "sourceDate": "2026-07-05",
+      "sourceEntryCount": 6264,
+      "generatedEntryCount": 6264,
+      "license": "MIT upstream sources via StevenBlack aggregator.",
+      "notes": "Generated from the gambling-only hosts variant by extracting hostnames from hosts-file rows."
+    },
+    "secret_management": {
+      "kind": "domain-list",
+      "file": "secret-management.domains.txt",
+      "defaultAction": "metadata_only",
+      "sourceName": "Lamarck curated seed",
+      "sourceUrl": null,
+      "sourceDate": "2026-07-06",
+      "license": "Project-owned curated list.",
+      "notes": "Credential-management and one-time secret sharing surfaces should default to metadata-only."
+    },
+    "social_media": {
+      "kind": "domain-list",
+      "file": "social-media.domains.txt",
+      "defaultAction": "rich",
+      "sourceName": "StevenBlack hosts social-only variant",
+      "sourceUrl": "https://github.com/StevenBlack/hosts/blob/master/alternates/social-only/readme.md",
+      "rawUrl": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/social-only/hosts",
+      "sourceDate": "2026-07-05",
+      "sourceEntryCount": 3244,
+      "generatedEntryCount": 3244,
+      "license": "MIT upstream source via StevenBlack aggregator.",
+      "notes": "Generated from the social-only hosts variant by extracting hostnames from hosts-file rows. Social media is classification evidence, not default-sensitive in v0."
+    }
+  }
+}

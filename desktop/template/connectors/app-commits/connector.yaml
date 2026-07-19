@@ -1,0 +1,14 @@
+manifestVersion: 1
+id: app-commits
+name: App Commits
+entry: ./index.mjs
+runtime:
+  mode: watch
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+  linux: {}
+  windows: {}
+auth:
+  type: none
