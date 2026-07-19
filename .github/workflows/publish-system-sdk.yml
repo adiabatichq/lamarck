@@ -57,3 +57,84 @@ jobs:
 
       - name: Verify published registry bytes
         run: node scripts/check-system-sdk-registry.mjs --wait
+
+  sync-consumers:
+    needs: publish
+    if: github.repository == 'adiabatichq/lamarck'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24.10.0"
+          package-manager-cache: false
+
+      - name: Verify pinned toolchain
+        run: |
+          test "$(node --version)" = "v24.10.0"
+          test "$(npm --version)" = "11.6.1"
+
+      - name: Refresh first-party starter locks
+        id: refresh
+        run: |
+          version="${GITHUB_REF_NAME#system-sdk-v}"
+          node scripts/update-system-sdk-consumers.mjs "$version"
+          npm run verify:system-sdk-consumers
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git diff --quiet -- desktop/template/apps; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --check -- desktop/template/apps
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and open downstream pull request
+        if: steps.refresh.outputs.changed == 'true'
+        id: pull-request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SDK_VERSION: ${{ steps.refresh.outputs.version }}
+        run: |
+          existing_pr="$(gh pr list --state open --base main --search "Update starter Apps for @lamarck/system ${SDK_VERSION} in:title" --json number --jq '.[0].number // empty')"
+          if test -n "$existing_pr"; then
+            echo "A downstream PR already exists: #$existing_pr"
+            exit 0
+          fi
+          branch="automation/system-sdk-v${SDK_VERSION}-consumers-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -- desktop/template/apps
+          git diff --cached --name-only | while IFS= read -r path; do
+            case "$path" in
+              desktop/template/apps/*/package-lock.json) ;;
+              *) echo "Unexpected downstream change: $path" >&2; exit 1 ;;
+            esac
+          done
+          git commit -m "Update starter Apps for @lamarck/system ${SDK_VERSION}"
+          git push --set-upstream origin "$branch"
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "Update starter Apps for @lamarck/system ${SDK_VERSION}" \
+            --body "Updates first-party starter lockfiles from the npm registry bytes verified by the system-sdk-v${SDK_VERSION} publication workflow."
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch CI for the bot pull request
+        if: steps.pull-request.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BRANCH: ${{ steps.pull-request.outputs.branch }}
+        run: gh workflow run ci.yml --ref "$PR_BRANCH"

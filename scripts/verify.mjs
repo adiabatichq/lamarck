@@ -18,6 +18,7 @@ const env = {
 const gates = [
   ["Repository module boundaries", ["run", "verify:module-boundaries"]],
   ["System SDK consumer alignment", ["run", "verify:system-sdk-consumers"]],
+  ["System SDK consumer sync tests", ["run", "test:system-sdk-consumer-sync"]],
   ["Desktop production build", ["run", "build"]],
   ["Core typecheck", ["--workspace", "@lamarck/core", "run", "typecheck"]],
   ["Core tests", ["--workspace", "@lamarck/core", "run", "test"]],

@@ -1,6 +1,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
+import canonicalAppPackageLock from "../../template/apps/hello-world/package-lock.json" with { type: "json" };
 import { createAppPackageJson, createAppPackageLock } from "../src/app-scaffold";
 
 interface PackageDocument {
@@ -17,12 +18,8 @@ interface LockDocument {
   readonly packages: Record<string, Record<string, unknown>>;
 }
 
-const SYSTEM_SDK_LOCK = {
-  version: "0.1.0",
-  resolved: "https://registry.npmjs.org/@lamarck/system/-/system-0.1.0.tgz",
-  integrity: "sha512-rgVeKfXM1z38xl+1BczndOnf8AKfZ8Ak60bm4apd90Q5KJwX9cvrcAttfE6Qt1xzh7KSn3gyfGvtqFhaFPYWkg==",
-  engines: { node: ">=24.10.0" },
-} as const;
+const SYSTEM_SDK_LOCK = (canonicalAppPackageLock as LockDocument)
+  .packages["node_modules/@lamarck/system"];
 
 describe("new App package lock", () => {
   test("renders package.json from the same canonical template", async () => {
