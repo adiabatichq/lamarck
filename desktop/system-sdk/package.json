@@ -1,0 +1,63 @@
+{
+  "name": "@lamarck/system",
+  "version": "0.1.0",
+  "description": "Canonical Lamarck Personal System client SDK and protocol types",
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "lamarckSystemProtocol": 1,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24.10.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adiabatichq/lamarck.git",
+    "directory": "desktop/system-sdk"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "types": "./dist/browser.d.ts",
+  "exports": {
+    ".": {
+      "browser": {
+        "types": "./dist/browser.d.ts",
+        "default": "./dist/browser.js"
+      },
+      "node": {
+        "types": "./dist/node.d.ts",
+        "default": "./dist/node.js"
+      },
+      "types": "./dist/browser.d.ts",
+      "default": "./dist/browser.js"
+    },
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "default": "./dist/browser.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol.d.ts",
+      "default": "./dist/protocol.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.18"
+  }
+}
