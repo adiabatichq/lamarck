@@ -70,11 +70,9 @@ if (first.integrity !== integrity || second.integrity !== integrity) {
 }
 const resolved = `https://registry.npmjs.org/@lamarck/system/-/system-${packageDocument.version}.tgz`;
 
-for (const workspace of ["desktop/core", "desktop/shell"]) {
-  const document = JSON.parse(await readFile(join(root, workspace, "package.json"), "utf8"));
-  if (document.dependencies?.["@lamarck/system"] !== packageDocument.version) {
-    throw new Error(`${workspace} must depend on exact @lamarck/system ${packageDocument.version}`);
-  }
+const corePackage = JSON.parse(await readFile(join(root, "desktop", "core", "package.json"), "utf8"));
+if (corePackage.dependencies?.["@lamarck/system"] !== packageDocument.version) {
+  throw new Error(`desktop/core must depend on exact @lamarck/system ${packageDocument.version}`);
 }
 
 const templateAppsDirectory = join(root, "desktop", "template", "apps");
