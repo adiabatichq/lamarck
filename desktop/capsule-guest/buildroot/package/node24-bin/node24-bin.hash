@@ -1,0 +1,4 @@
+# Official SHASUMS256.txt for Node.js v24.10.0.
+sha256  07f0558316ebb8977dd6fb29b4de8d369a639d3d8cef544293852a6f5eea6af8  node-v24.10.0-linux-arm64.tar.xz
+# Locally calculated from that exact official Node.js binary archive.
+sha256  537308465103a306d0e3eecf42632b4ff1b48aaaec044e9fc10a78c81fd00b34  LICENSE

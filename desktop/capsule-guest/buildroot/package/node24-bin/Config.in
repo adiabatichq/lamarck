@@ -1,0 +1,8 @@
+config BR2_PACKAGE_NODE24_BIN
+	bool "pinned Node.js 24 binary runtime"
+	depends on BR2_aarch64
+	depends on BR2_TOOLCHAIN_USES_GLIBC
+	depends on BR2_INSTALL_LIBSTDCPP
+	help
+	  Installs the official Node.js 24.10.0 linux-arm64 distribution,
+	  including npm and headers required by compatible package tooling.

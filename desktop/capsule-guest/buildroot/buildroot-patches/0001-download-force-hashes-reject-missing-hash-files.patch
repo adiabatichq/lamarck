@@ -1,0 +1,47 @@
+From: Lamarck release build <release@lamarck.local>
+Subject: [PATCH] download: reject a missing hash file when hashes are forced
+
+BR2_DOWNLOAD_FORCE_CHECK_HASHES promises that every download has at least
+one valid hash.  Buildroot 2026.05 clears BR_NO_CHECK_HASH_FOR when the
+option is enabled, but support/download/check-hash still exits successfully
+when it receives no hash files at all.
+
+Pass the configuration value to check-hash and make that missing-file case
+an error only when the force option is enabled.  Keep the default warning
+behaviour unchanged for other Buildroot configurations.
+---
+ package/pkg-download.mk       | 1 +
+ support/download/check-hash   | 6 ++++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/package/pkg-download.mk b/package/pkg-download.mk
+index 18de5bda67..e6d82ef36d 100644
+--- a/package/pkg-download.mk
++++ b/package/pkg-download.mk
+@@ -116,6 +116,7 @@ define DOWNLOAD
+ 	SVN="$(call qstrip,$(BR2_SVN))" \
+ 	WGET="$(call qstrip,$(BR2_WGET))" \
+ 	BR_NO_CHECK_HASH_FOR="$(if $(BR2_DOWNLOAD_FORCE_CHECK_HASHES),,$(BR_NO_CHECK_HASH_FOR))" \
++	BR2_DOWNLOAD_FORCE_CHECK_HASHES="$(BR2_DOWNLOAD_FORCE_CHECK_HASHES)" \
+ 		flock $($(PKG)_DL_DIR)/.lock $(DL_WRAPPER) \
+ 		-c '$($(PKG)_DL_VERSION)' \
+ 		-d '$($(PKG)_DL_DIR)' \
+diff --git a/support/download/check-hash b/support/download/check-hash
+index 6c8e1869c9..9e5ddab4ea 100755
+--- a/support/download/check-hash
++++ b/support/download/check-hash
+@@ -91,6 +91,12 @@ done
+ 
+ # shellcheck disable=SC2086  # nb_h_files is a non-empty int
+ if [ ${nb_h_files} -eq 0 ]; then
++    if [ "${BR2_DOWNLOAD_FORCE_CHECK_HASHES:-}" = "y" ]; then
++        printf "ERROR: no hash file for %s while hash checking is forced\n" \
++               "${base}" >&2
++        # Match the existing no-hash-for-this-file failure below.
++        exit 3
++    fi
+     printf "WARNING: no hash file for %s\n" "${base}" >&2
+     exit 0
+ fi
+-- 
+2.39.5

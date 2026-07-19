@@ -1,0 +1,28 @@
+#!/bin/sh
+
+set -eu
+
+PIDFILE=/run/lamarck-guest-service.pid
+
+start() {
+	mkdir -p /run/lamarck
+	if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+		return 0
+	fi
+	/usr/libexec/lamarck-guest-service >/dev/console 2>&1 &
+	echo "$!" > "$PIDFILE"
+}
+
+stop() {
+	if [ -f "$PIDFILE" ]; then
+		kill "$(cat "$PIDFILE")" 2>/dev/null || true
+		rm -f "$PIDFILE"
+	fi
+}
+
+case "${1:-}" in
+	start) start ;;
+	stop) stop ;;
+	restart) stop; start ;;
+	*) echo "Usage: $0 {start|stop|restart}" >&2; exit 64 ;;
+esac

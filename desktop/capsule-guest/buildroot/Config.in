@@ -1,0 +1,5 @@
+menu "Lamarck Capsule Guest"
+
+source "$BR2_EXTERNAL_LAMARCK_PATH/package/node24-bin/Config.in"
+
+endmenu

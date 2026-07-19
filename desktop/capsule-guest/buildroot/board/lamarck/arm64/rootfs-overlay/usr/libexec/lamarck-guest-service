@@ -1,0 +1,146 @@
+#!/bin/sh
+
+set -eu
+
+mkdir -p /run/lamarck/tmp
+chmod 0700 /run/lamarck /run/lamarck/tmp
+
+/usr/local/bin/node /usr/libexec/lamarck-supervisor.js &
+supervisor_pid=$!
+native_build_root=""
+native_smoke=""
+
+cleanup_native_smoke() {
+	failed=0
+	if [ -n "$native_build_root" ]; then
+		for path in "$native_build_root/tmp" "$native_build_root/home/build" \
+			"$native_build_root/workspace" "$native_build_root/proc"; do
+			if mountpoint -q "$path"; then
+				umount "$path" || failed=1
+			fi
+		done
+		if mountpoint -q "$native_build_root/dev"; then
+			umount -R "$native_build_root/dev" || failed=1
+		fi
+	fi
+	if [ -n "$native_smoke" ]; then
+		rm -rf "$native_smoke" || failed=1
+	fi
+	native_build_root=""
+	native_smoke=""
+	return "$failed"
+}
+
+cleanup() {
+	cleanup_native_smoke || true
+	kill "$relay_pid" 2>/dev/null || true
+	kill "$supervisor_pid" 2>/dev/null || true
+	wait "$relay_pid" 2>/dev/null || true
+	wait "$supervisor_pid" 2>/dev/null || true
+}
+relay_pid=""
+trap cleanup EXIT INT TERM
+
+for _attempt in $(seq 1 200); do
+	[ -S /run/lamarck/supervisor-control.sock ] && break
+	kill -0 "$supervisor_pid" 2>/dev/null || exit 1
+	sleep 0.05
+done
+[ -S /run/lamarck/supervisor-control.sock ] || exit 1
+kill -0 "$supervisor_pid"
+
+# The release-image smoke gate boots these exact production init scripts under
+# QEMU TCG. The Host never supplies this flag during a normal VZ boot. Keep the
+# probe inside the image so it proves the read-only root, disposable state
+# initialization, bundled Node runtime, and real supervisor all reached a
+# usable state before the release is accepted.
+case " $(cat /proc/cmdline) " in
+	*" lamarck.boot_smoke=1 "*)
+		awk '$2 == "/" && $4 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit(found ? 0 : 1) }' /proc/mounts
+		awk '$2 == "/var/lib/lamarck" && $3 == "ext4" && $4 ~ /(^|,)rw(,|$)/ { found = 1 } END { exit(found ? 0 : 1) }' /proc/mounts
+		[ -d /var/lib/lamarck/blobs ]
+		[ -d /var/lib/lamarck/artifacts ]
+		[ -d /var/lib/lamarck/runtime ]
+		[ -d /var/lib/lamarck/builds ]
+		[ -d /var/lib/lamarck/logs ]
+		printf 'state-ok\n' > /var/lib/lamarck/.boot-smoke
+		test "$(cat /var/lib/lamarck/.boot-smoke)" = state-ok
+		rm -f /var/lib/lamarck/.boot-smoke
+		test "$(/usr/local/bin/node --version)" = v24.10.0
+		/usr/local/bin/node -e '
+			const glibc = process.report.getReport().header.glibcVersionRuntime;
+			if (process.arch !== "arm64" || process.versions.modules !== "137" || glibc !== "2.43") {
+				throw new Error(`runtime ABI mismatch: ${process.arch}/${process.versions.modules}/glibc-${glibc}`);
+			}
+		'
+		/usr/bin/runc --version >/dev/null
+		/usr/local/bin/node /usr/libexec/lamarck-release-runc-smoke.js
+
+		# Prove the sealed Build root is more than a Node-only prototype.  This
+		# runs the same npm-ci lifecycle shape used by Build Capsules, compiles a
+		# target-native N-API addon with node-gyp, and loads the resulting ELF in
+		# the bundled Node runtime.  Writable paths mirror the real OCI mounts;
+		# the Build root itself remains the signed read-only image.
+		native_build_root=/opt/lamarck/rootfs/build-node24
+		native_smoke=/var/lib/lamarck/.native-addon-smoke
+		rm -rf "$native_smoke"
+		mkdir -p "$native_smoke/workspace" "$native_smoke/home" "$native_smoke/tmp"
+		cp -a /usr/share/lamarck/native-addon-smoke/. "$native_smoke/workspace/"
+		mount --rbind /dev "$native_build_root/dev"
+		mount --make-rslave "$native_build_root/dev"
+		mount -t proc -o nosuid,noexec,nodev proc "$native_build_root/proc"
+		mount --bind "$native_smoke/workspace" "$native_build_root/workspace"
+		mount --bind "$native_smoke/home" "$native_build_root/home/build"
+		mount --bind "$native_smoke/tmp" "$native_build_root/tmp"
+		native_status=0
+		chroot "$native_build_root" /usr/bin/env -i \
+			AR=/usr/bin/ar \
+			CC=/usr/bin/cc \
+			CXX=/usr/bin/c++ \
+			HOME=/home/build \
+			LANG=C.UTF-8 \
+			LD_LIBRARY_PATH=/opt/lamarck/toolchain/lib \
+			NPM_CONFIG_AUDIT=false \
+			NPM_CONFIG_CACHE=/home/build/.npm \
+			NPM_CONFIG_FUND=false \
+			NPM_CONFIG_UPDATE_NOTIFIER=false \
+			PATH=/usr/local/bin:/usr/bin:/bin \
+			PYTHON=/usr/bin/python3 \
+			TMPDIR=/tmp \
+			npm_config_nodedir=/usr/local \
+			npm_config_python=/usr/bin/python3 \
+			/bin/sh -eu -c '
+				cd /workspace
+				/usr/local/bin/npm --version >/dev/null
+				/usr/local/bin/npm ci --offline --audit=false --fund=false --update-notifier=false
+				/usr/local/bin/node -e '\''
+					const addon = require("./build/Release/lamarck_native_smoke.node");
+					if (addon.answer() !== 42) throw new Error("native addon returned the wrong value");
+				'\''
+			' || native_status=$?
+		native_cleanup_status=0
+		cleanup_native_smoke || native_cleanup_status=$?
+		[ "$native_status" -eq 0 ]
+		[ "$native_cleanup_status" -eq 0 ]
+		printf '%s\n' LAMARCK_GUEST_BOOT_SMOKE_OK > /dev/console
+		cleanup
+		trap - EXIT INT TERM
+		sync
+		poweroff -f
+		exit 0
+		;;
+esac
+
+/usr/libexec/lamarck-vsock-relay control &
+relay_pid=$!
+
+while kill -0 "$supervisor_pid" 2>/dev/null && kill -0 "$relay_pid" 2>/dev/null; do
+	sleep 0.1
+done
+
+# CONTROL loss invalidates the complete image-bound VM session. Force a clean
+# VM restart instead of silently reconnecting a new control principal.
+cleanup
+trap - EXIT INT TERM
+sync
+reboot -f

@@ -1,0 +1,72 @@
+#!/bin/sh
+
+set -eu
+
+start() {
+	awk '$2 == "/" && $4 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit(found ? 0 : 1) }' /proc/mounts || {
+		echo "Lamarck Guest root filesystem is not read-only" >&2
+		return 1
+	}
+
+	device="$(findfs LABEL=LAMARCK_STATE 2>/dev/null || true)"
+	[ -n "$device" ] || device=/dev/vdb
+	for _attempt in $(seq 1 100); do
+		[ -b "$device" ] && break
+		sleep 0.05
+	done
+	[ -b "$device" ] || {
+		echo "Lamarck disposable state block is unavailable" >&2
+		return 1
+	}
+
+	type="$(blkid -s TYPE -o value "$device" 2>/dev/null || true)"
+	if [ -z "$type" ]; then
+		# The Host physically reserves every byte of state.raw before VZ
+		# attachment. Never issue whole-device discard while formatting: a
+		# virtio discard may punch those reserved Host blocks back into holes.
+		mkfs.ext4 -F -m 0 -E nodiscard -L LAMARCK_STATE "$device"
+		type=ext4
+	fi
+	[ "$type" = ext4 ] || {
+		echo "Lamarck state block has unsupported filesystem $type" >&2
+		return 1
+	}
+	label="$(blkid -s LABEL -o value "$device" 2>/dev/null || true)"
+	[ "$label" = LAMARCK_STATE ] || {
+		echo "Lamarck state block label mismatch" >&2
+		return 1
+	}
+
+	[ -d /var/lib/lamarck ] && [ ! -L /var/lib/lamarck ] || {
+		echo "Lamarck state mountpoint is missing from the read-only Guest image" >&2
+		return 1
+	}
+	# ext4 defaults to no online discard, but keep that invariant explicit:
+	# normal file deletion must never become a Host sparse-file hole punch.
+	mount -t ext4 -o rw,nodev,nosuid,noatime,nodiscard "$device" /var/lib/lamarck
+	chmod 0700 /var/lib/lamarck
+	mkdir -p /var/lib/lamarck/blobs /var/lib/lamarck/artifacts \
+		/var/lib/lamarck/runtime /var/lib/lamarck/builds /var/lib/lamarck/logs
+
+	mkdir -p /sys/fs/cgroup/lamarck/apps /sys/fs/cgroup/lamarck/builds
+	for path in /sys/fs/cgroup /sys/fs/cgroup/lamarck \
+		/sys/fs/cgroup/lamarck/apps /sys/fs/cgroup/lamarck/builds; do
+		controllers=""
+		for controller in cpu memory pids; do
+			grep -qw "$controller" "$path/cgroup.controllers" && controllers="$controllers +$controller"
+		done
+		[ -z "$controllers" ] || printf '%s\n' "$controllers" > "$path/cgroup.subtree_control"
+	done
+}
+
+stop() {
+	sync
+	umount /var/lib/lamarck 2>/dev/null || true
+}
+
+case "${1:-}" in
+	start) start ;;
+	stop) stop ;;
+	restart) stop; start ;;
+	*) echo "Usage: $0 {start|stop|restart}" >&2; exit 64 ;;
+esac

@@ -1,0 +1,12 @@
+# Root is attached read-only by the Host. The disposable state block is
+# validated/formatted/mounted by S00lamarck-state and intentionally may execute.
+/dev/root  /                  ext4     ro,noauto                         0  1
+proc       /proc              proc     nosuid,noexec,nodev               0  0
+sysfs      /sys               sysfs    nosuid,noexec,nodev               0  0
+devpts     /dev/pts           devpts   nosuid,noexec,gid=5,mode=620,ptmxmode=0666  0  0
+tmpfs      /dev/shm           tmpfs    nosuid,nodev,noexec,mode=1777     0  0
+tmpfs      /tmp               tmpfs    nosuid,nodev,mode=1777,size=512M  0  0
+tmpfs      /run               tmpfs    nosuid,nodev,mode=0755,size=64M   0  0
+tmpfs      /var/log           tmpfs    nosuid,nodev,noexec,mode=0755,size=32M  0  0
+tmpfs      /var/tmp           tmpfs    nosuid,nodev,noexec,mode=1777,size=64M  0  0
+cgroup2    /sys/fs/cgroup     cgroup2  nosuid,nodev,noexec               0  0

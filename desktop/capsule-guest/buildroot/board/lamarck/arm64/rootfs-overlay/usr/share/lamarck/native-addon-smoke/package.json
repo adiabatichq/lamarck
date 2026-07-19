@@ -1,0 +1,8 @@
+{
+  "name": "lamarck-native-addon-smoke",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install": "node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild --nodedir=/usr/local"
+  }
+}
