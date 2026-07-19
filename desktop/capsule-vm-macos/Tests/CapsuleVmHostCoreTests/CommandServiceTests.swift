@@ -69,6 +69,49 @@ import Testing
     #expect(session.stopCount == 1)
 }
 
+@Test func commandServiceAcceptsExactResourceIntegerBounds() throws {
+    let emitter = RecordingCapsuleVmFrameEmitter()
+    let session = FakeCapsuleVmSession()
+    let service = CapsuleVmCommandService(session: session, emitter: emitter)
+    var params = validStartParams()
+    params["cpuCount"] = Int.max
+    params["memorySizeBytes"] = UInt64.max
+
+    try service.accept(requestFrame(
+        streamID: 6,
+        object: ["method": "start", "params": params]
+    ))
+
+    let descriptor = try #require(session.startDescriptors.first)
+    #expect(descriptor.cpuCount == Int.max)
+    #expect(descriptor.memorySize == UInt64.max)
+}
+
+@Test func commandServiceRejectsResourceIntegersOutsideMachineBounds() throws {
+    let emitter = RecordingCapsuleVmFrameEmitter()
+    let session = FakeCapsuleVmSession()
+    let service = CapsuleVmCommandService(session: session, emitter: emitter)
+    let cases: [(field: String, value: NSDecimalNumber)] = [
+        ("cpuCount", NSDecimalNumber(string: "9223372036854775808")),
+        ("cpuCount", NSDecimalNumber(string: "-9223372036854775809")),
+        ("memorySizeBytes", NSDecimalNumber(string: "18446744073709551616")),
+    ]
+
+    for (offset, testCase) in cases.enumerated() {
+        var params = validStartParams()
+        params[testCase.field] = testCase.value
+        try service.accept(requestFrame(
+            streamID: UInt32(7 + offset),
+            object: ["method": "start", "params": params]
+        ))
+
+        let error = try responseError(try #require(emitter.frames.last))
+        #expect(error["code"] as? String == "guest_image_required")
+    }
+
+    #expect(session.startDescriptors.isEmpty)
+}
+
 @Test func commandServiceRejectsDuplicatePendingRequestAndSuppressesAfterShutdown() throws {
     let emitter = RecordingCapsuleVmFrameEmitter()
     let session = FakeCapsuleVmSession()

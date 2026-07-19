@@ -370,16 +370,25 @@ private func isLowercaseSHA256(_ value: String) -> Bool {
 
 private func exactInt(_ value: Any?) -> Int? {
     guard !(value is Bool), let number = value as? NSNumber else { return nil }
-    let double = number.doubleValue
-    guard double.isFinite, double.rounded(.towardZero) == double,
-          double >= Double(Int.min), double <= Double(Int.max) else { return nil }
-    return Int(double)
+    guard let decimal = exactDecimalInteger(number),
+          decimal >= Decimal(Int.min), decimal <= Decimal(Int.max) else { return nil }
+    return NSDecimalNumber(decimal: decimal).intValue
 }
 
 private func exactUInt64(_ value: Any?) -> UInt64? {
     guard !(value is Bool), let number = value as? NSNumber else { return nil }
-    let double = number.doubleValue
-    guard double.isFinite, double.rounded(.towardZero) == double,
-          double >= 0, double <= Double(UInt64.max) else { return nil }
-    return UInt64(double)
+    guard let decimal = exactDecimalInteger(number),
+          decimal >= 0, decimal <= Decimal(UInt64.max) else { return nil }
+    return NSDecimalNumber(decimal: decimal).uint64Value
+}
+
+private func exactDecimalInteger(_ number: NSNumber) -> Decimal? {
+    let decimal = number.decimalValue
+    guard !decimal.isNaN else { return nil }
+
+    var source = decimal
+    var rounded = Decimal()
+    NSDecimalRound(&rounded, &source, 0, .down)
+    guard rounded == decimal else { return nil }
+    return decimal
 }
