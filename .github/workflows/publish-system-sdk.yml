@@ -1,9 +1,8 @@
 name: Publish System SDK
 
 on:
-  push:
-    tags:
-      - "system-sdk-v*"
+  release:
+    types: [published]
 
 permissions: {}
 
@@ -13,7 +12,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'adiabatichq/lamarck'
+    if: github.repository == 'adiabatichq/lamarck' && startsWith(github.event.release.tag_name, 'system-sdk-v')
     runs-on: ubuntu-latest
     environment: npm-publish
     permissions:
@@ -60,11 +59,10 @@ jobs:
 
   sync-consumers:
     needs: publish
-    if: github.repository == 'adiabatichq/lamarck'
+    if: github.repository == 'adiabatichq/lamarck' && startsWith(github.event.release.tag_name, 'system-sdk-v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      actions: write
       contents: write
       pull-requests: write
 
@@ -131,10 +129,3 @@ jobs:
             --title "Update starter Apps for @lamarck/system ${SDK_VERSION}" \
             --body "Updates first-party starter lockfiles from the npm registry bytes verified by the system-sdk-v${SDK_VERSION} publication workflow."
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
-
-      - name: Dispatch CI for the bot pull request
-        if: steps.pull-request.outputs.branch != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_BRANCH: ${{ steps.pull-request.outputs.branch }}
-        run: gh workflow run ci.yml --ref "$PR_BRANCH"
