@@ -1,0 +1,62 @@
+name: Publish System SDK
+
+on:
+  push:
+    tags:
+      - "system-sdk-v*"
+
+permissions: {}
+
+concurrency:
+  group: publish-system-sdk
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'adiabatichq/lamarck'
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24.10.0"
+          package-manager-cache: false
+
+      - name: Verify pinned toolchain
+        run: |
+          test "$(node --version)" = "v24.10.0"
+          test "$(npm --version)" = "11.6.1"
+
+      - name: Install dependencies
+        run: npm ci --workspace @lamarck/system --workspace @lamarck/core --include-workspace-root=false --ignore-scripts --audit=false --fund=false
+
+      - name: Verify SDK
+        run: |
+          npm --workspace @lamarck/system run typecheck
+          npm --workspace @lamarck/system test
+
+      - name: Verify generated App package and lock stay paired
+        run: npm --workspace @lamarck/core exec -- vitest run test/app-scaffold.test.ts
+
+      - name: Build and verify release tarball
+        run: node scripts/pack-system-sdk.mjs --verify-release
+
+      - name: Check immutable registry version
+        id: registry
+        run: node scripts/check-system-sdk-registry.mjs
+
+      - name: Publish with npm trusted publishing
+        if: steps.registry.outputs.published != 'true'
+        run: npm publish .lamarck/build/system-sdk/lamarck-system.tgz --access public --tag latest
+
+      - name: Verify published registry bytes
+        run: node scripts/check-system-sdk-registry.mjs --wait
