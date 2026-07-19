@@ -1,0 +1,42 @@
+{
+  "name": "lamarck",
+  "version": "0.1.0",
+  "description": "Local-first personal state substrate and desktop runtime",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adiabatichq/lamarck.git"
+  },
+  "engines": {
+    "node": ">=24.10.0"
+  },
+  "packageManager": "npm@11.6.1",
+  "scripts": {
+    "build": "node scripts/build-desktop.mjs",
+    "start": "node scripts/start-desktop.mjs",
+    "dev": "npm --workspace @lamarck/shell run dev",
+    "verify": "node scripts/verify.mjs",
+    "capsule:test": "node scripts/test-capsule.mjs",
+    "capsule-guest:image": "desktop/capsule-guest/scripts/build-guest-image.sh",
+    "capsule-guest:verify": "node desktop/capsule-guest/scripts/verify-guest-release.mjs .lamarck/build/capsule-guest/release",
+    "capsule-guest:boot-smoke": "node desktop/capsule-guest/scripts/test-guest-image-boot.mjs .lamarck/build/capsule-guest/release",
+    "capsule-guest:stage": "node scripts/stage-capsule-native.mjs",
+    "capsule-guest:e2e:linux": "desktop/capsule-guest/scripts/test-linux-runtime.sh",
+    "capsule-vm:build:macos": "node scripts/build-capsule-vm-macos.mjs",
+    "package:macos": "node scripts/package-macos-release.mjs",
+    "package:macos:dry-run": "node scripts/package-macos-release.mjs --dry-run",
+    "package:macos:test": "node --test scripts/package-macos-release.test.mjs",
+    "package:patch": "node scripts/package-os-patch.mjs"
+  },
+  "workspaces": [
+    "desktop/capsule",
+    "desktop/capsule-guest",
+    "desktop/core",
+    "desktop/shell",
+    "desktop/system-sdk"
+  ],
+  "devDependencies": {
+    "@electron/osx-sign": "^2.4.0"
+  }
+}

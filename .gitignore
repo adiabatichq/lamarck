@@ -1,0 +1,17 @@
+.DS_Store
+node_modules/
+.wrangler/
+dist/
+dist-electron/
+/desktop/capsule-vm-macos/.build/
+cdk.out/
+/.lamarck/
+**/.lamarck/*
+!**/.lamarck/.gitkeep
+# Ignore stale pre-alpha developer state without treating it as a runtime alias.
+/.adiabatic/
+**/.adiabatic/*
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
