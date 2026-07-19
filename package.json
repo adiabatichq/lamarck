@@ -17,6 +17,8 @@
     "start": "node scripts/start-desktop.mjs",
     "dev": "npm --workspace @lamarck/shell run dev",
     "verify": "node scripts/verify.mjs",
+    "verify:module-boundaries": "node scripts/verify-module-boundaries.mjs",
+    "verify:system-sdk-consumers": "node scripts/verify-system-sdk-consumers.mjs",
     "capsule:test": "node scripts/test-capsule.mjs",
     "capsule-guest:image": "desktop/capsule-guest/scripts/build-guest-image.sh",
     "capsule-guest:verify": "node desktop/capsule-guest/scripts/verify-guest-release.mjs .lamarck/build/capsule-guest/release",
