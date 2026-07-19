@@ -1,0 +1,6529 @@
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { dirname, join } from "path";
+import { gunzipSync, gzipSync } from "node:zlib";
+import { ContentBlobStore } from "../src/blob-store";
+import { openTestDatabases as openDatabases } from "./support/test-databases";
+import { TestGuard as Guard } from "./support/test-guard";
+import {
+  ConnectorScheduler,
+  ConnectorSupervisor,
+  ConnectorAuthManager,
+  hashConnectorPackage,
+  installConnector,
+  listInstalledConnectorDirs,
+  installConnectorFromSource,
+  isPlatformSupported,
+  listAvailableBuiltIns,
+  loadConnectorManifest,
+  materializeBuiltInConnector,
+  registerWorkspaceConnectors,
+  removeConnectorFromWorkspace,
+  removeInstalledConnector,
+  resolveConnectorEntry,
+  sourceForConnector,
+  updateConnectorFromSource,
+  validateConnectorManifest,
+  nextCronRunAt,
+  type ConnectorDefinition,
+  type ConnectorManifest,
+} from "../src/connectors";
+import { MemorySecretStore } from "../src/credentials";
+
+const telegramBotApiReference = JSON.parse(readFileSync(
+  new URL("../../template/connectors/telegram-bot/api-reference.json", import.meta.url),
+  "utf8",
+)) as {
+  schemaVersion: number;
+  provider: string;
+  api: string;
+  transport: string;
+  compatibility: {
+    minimumVersion: string;
+    testedAgainstVersion: string;
+    testedAgainstReleaseDate: string;
+    versionPolicy: string;
+  };
+  references: {
+    documentation: string;
+    changelog: string;
+    testedAgainstRelease: string;
+  };
+  methods: string[];
+  updateTypes: string[];
+};
+
+async function waitWithTestTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function contentBlobPath(workspace: string, digestHex: string): string {
+  return join(
+    workspace,
+    ".lamarck",
+    "blobs",
+    "content",
+    "v1",
+    "sha256",
+    digestHex.slice(0, 2),
+    digestHex.slice(2, 4),
+    `${digestHex}.gz`,
+  );
+}
+
+function writeSyntheticContentBlob(workspace: string, digestHex: string, bytes: Buffer): void {
+  const path = contentBlobPath(workspace, digestHex);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, bytes);
+}
+
+describe("Connector system", () => {
+  let workspace: string;
+  let dataDb: ReturnType<typeof openDatabases>["dataDb"];
+  let systemDb: ReturnType<typeof openDatabases>["systemDb"];
+  let close: () => void;
+  let supervisor: ConnectorSupervisor;
+  let secrets: MemorySecretStore;
+
+  beforeEach(() => {
+    workspace = mkdtempSync(join(tmpdir(), "lamarck-connector-test-"));
+    mkdirSync(join(workspace, ".lamarck"), { recursive: true });
+    const result = openDatabases(workspace);
+    dataDb = result.dataDb;
+    systemDb = result.systemDb;
+    close = result.close;
+    secrets = new MemorySecretStore();
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace, lamarckApiOrigin: "https://dev-api.example.test" },
+      platform: "darwin",
+      authManager: new ConnectorAuthManager(secrets),
+    });
+  });
+
+  afterEach(() => {
+    close();
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("loads and validates a connector manifest from YAML", async () => {
+    const dir = join(workspace, "connectors", "calendar");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: calendar
+name: Calendar
+entry: ./index.mjs
+runtime:
+  mode: poll
+  defaultSchedule: "*/15 * * * *"
+integrations:
+  mode: multiple
+configPanels:
+  privacy-controls:
+    label: Privacy Controls
+    description: Configure privacy policy
+platforms:
+  darwin:
+    requirements:
+      - macos-accessibility
+  cloud: {}
+auth:
+  type: oauth2-public
+  authorizationEndpoint: https://accounts.google.com/o/oauth2/v2/auth
+  tokenEndpoint: https://oauth2.googleapis.com/token
+  clientId: calendar-client-id
+  scope:
+    - https://www.googleapis.com/auth/calendar.readonly
+`,
+    );
+
+    const manifest = await loadConnectorManifest(dir);
+    expect(manifest).toMatchObject({
+      manifestVersion: 1,
+      id: "calendar",
+      name: "Calendar",
+      entry: "./index.mjs",
+	      runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
+	      integrations: { mode: "multiple" },
+	      configPanels: {
+	        "privacy-controls": {
+	          label: "Privacy Controls",
+	          description: "Configure privacy policy",
+	        },
+	      },
+	      platforms: {
+        darwin: { requirements: ["macos-accessibility"] },
+        cloud: { requirements: [] },
+      },
+      auth: {
+        type: "oauth2-public",
+        authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+        tokenEndpoint: "https://oauth2.googleapis.com/token",
+        clientId: "calendar-client-id",
+        scope: ["https://www.googleapis.com/auth/calendar.readonly"],
+      },
+    });
+  });
+
+  test("rejects invalid manifest ids, modes, schedules, auth, and platforms", () => {
+    const base: ConnectorManifest = {
+      manifestVersion: 1,
+      id: "demo",
+      name: "Demo",
+      entry: "./index.ts",
+      runtime: { mode: "poll" },
+      integrations: { mode: "singleton" },
+    };
+
+    expect(() => validateConnectorManifest({ ...base, id: "../demo" })).toThrow("Invalid connector id");
+    expect(() =>
+      validateConnectorManifest({ ...base, integrations: undefined as any })
+    ).toThrow("requires an explicit integrations.mode");
+    expect(() =>
+      validateConnectorManifest({ ...base, runtime: { mode: "stream" as any } })
+    ).toThrow("invalid runtime mode");
+    expect(() =>
+      validateConnectorManifest({ ...base, runtime: { mode: "watch", defaultSchedule: "every 1m" } })
+    ).toThrow("defaultSchedule is only valid");
+    expect(() =>
+      validateConnectorManifest({ ...base, runtime: { mode: "poll", defaultSchedule: "every 1m" } })
+    ).toThrow("Unsupported connector schedule");
+    expect(() =>
+      validateConnectorManifest({ ...base, runtime: { mode: "poll", schedule: "every 1m" } as any })
+    ).toThrow("unknown field: schedule");
+    expect(() =>
+      validateConnectorManifest({ ...base, platforms: ["darwin" as any] as any })
+    ).toThrow("structured object");
+    expect(() =>
+      validateConnectorManifest({ ...base, platforms: { haiku: {} } as any })
+    ).toThrow("invalid platform");
+	    expect(() =>
+	      validateConnectorManifest({ ...base, integrations: { mode: "many" as any } })
+	    ).toThrow("invalid integrations mode");
+	    expect(() =>
+	      validateConnectorManifest({ ...base, configPanels: [] as any })
+	    ).toThrow("configPanels must be a map");
+	    expect(() =>
+	      validateConnectorManifest({ ...base, configPanels: { "../panel": { label: "Panel" } } as any })
+	    ).toThrow("invalid id");
+	    expect(() =>
+	      validateConnectorManifest({ ...base, configPanels: { panel: { label: "" } } as any })
+	    ).toThrow("requires a label");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: {
+          type: "oauth2",
+          authorizationEndpoint: "https://x/auth",
+          tokenEndpoint: "https://x/token",
+          clientId: "cid",
+        } as any,
+      })
+    ).toThrow("invalid auth type");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: { type: "oauth2-public", tokenEndpoint: "https://x/token", clientId: "cid" } as any,
+      })
+    ).toThrow("requires authorizationEndpoint");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: { type: "oauth2-public", authorizationEndpoint: {}, tokenEndpoint: "https://x/token", clientId: "cid" } as any,
+      })
+    ).toThrow("requires authorizationEndpoint");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: { type: "oauth2-public", authorizationEndpoint: "http://x/auth", tokenEndpoint: "https://x/token", clientId: "cid" } as any,
+      })
+    ).toThrow("must be https");
+    expect(
+      validateConnectorManifest({
+        ...base,
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://x/auth",
+          tokenEndpoint: "https://x/token",
+          clientId: "cid",
+        },
+      }).auth,
+    ).toMatchObject({ type: "oauth2-public", clientId: "cid" });
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: { type: "oauth2-public", authorizationEndpoint: "https://x/auth", tokenEndpoint: "https://x/token", clientId: "" } as any,
+      })
+    ).toThrow("requires clientId");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://x/auth",
+          tokenEndpoint: "https://x/token",
+          clientId: "cid",
+          tokenEndpointAuthMethod: "client_secret_post",
+        } as any,
+      })
+    ).toThrow("unknown field: tokenEndpointAuthMethod");
+    expect(
+      validateConnectorManifest({
+        ...base,
+        auth: {
+          type: "managedProvider",
+          providerId: "oura",
+        },
+      }).auth,
+    ).toMatchObject({ type: "managedProvider", providerId: "oura" });
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: {
+          type: "managedProvider",
+          providerId: "",
+        } as any,
+      })
+    ).toThrow("requires a valid providerId");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: {
+          type: "managedProvider",
+          providerId: "oura",
+          connectEndpoint: "https://app.lamarck.ai/providers/oura/connect",
+        } as any,
+      })
+    ).toThrow("unknown field: connectEndpoint");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: {
+          type: "managedProvider",
+          providerId: "oura",
+          scope: ["daily"],
+        } as any,
+      })
+    ).toThrow("unknown field: scope");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: {
+          type: "managedProvider",
+          providerId: "oura",
+          authorizationEndpoint: "https://x/auth",
+        } as any,
+      })
+    ).toThrow("unknown field: authorizationEndpoint");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: {
+          type: "managedProvider",
+          providerId: "oura",
+          tokenEndpointAuthMethod: "client_secret_post",
+        } as any,
+      })
+    ).toThrow("unknown field: tokenEndpointAuthMethod");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://x/auth",
+          tokenEndpoint: "https://x/token",
+          clientId: "cid",
+          scope: "read" as any,
+        },
+      })
+    ).toThrow("scope must be an array of strings");
+    expect(() =>
+      validateConnectorManifest({ ...base, auth: { type: "localPermission" } as any })
+    ).toThrow("invalid auth type");
+
+    // Config schema: a valid map of fields is accepted and normalized.
+    expect(
+      validateConnectorManifest({
+        ...base,
+        config: { interval: { type: "number", label: "Interval (ms)", default: 5000 } },
+      }).config,
+    ).toEqual({ interval: { type: "number", label: "Interval (ms)", default: 5000, required: true } });
+    expect(
+      validateConnectorManifest({
+        ...base,
+        config: { note: { type: "string", label: "Note", required: false } },
+      }).config,
+    ).toEqual({ note: { type: "string", label: "Note", required: false } });
+    expect(
+      validateConnectorManifest({
+        ...base,
+        config: {
+          region: {
+            type: "string",
+            label: "Region",
+            default: "TW",
+            required: true,
+            options: { TW: "Taiwan", KR: "Korea" } as any,
+          },
+        },
+      }).config,
+    ).toEqual({
+      region: {
+        type: "string",
+        label: "Region",
+        default: "TW",
+        required: true,
+        options: [
+          { value: "TW", label: "Taiwan" },
+          { value: "KR", label: "Korea" },
+        ],
+      },
+    });
+    expect(() =>
+      validateConnectorManifest({ ...base, config: [] as any })
+    ).toThrow("must be a map of fields");
+    expect(() =>
+      validateConnectorManifest({ ...base, config: { x: { type: "json" as any, label: "X" } } })
+    ).toThrow("invalid type");
+    expect(() =>
+      validateConnectorManifest({ ...base, config: { x: { type: "number" } as any } })
+    ).toThrow("requires a label");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        config: { x: { type: "number", label: "X", default: "five" as any } },
+      })
+    ).toThrow("default must be a number");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        config: { x: { type: "number", label: "X", options: { five: "Five" } as any } },
+      })
+    ).toThrow("option value must be a number");
+    expect(() =>
+      validateConnectorManifest({
+        ...base,
+        config: { x: { type: "string", label: "X", required: "yes" as any } },
+      })
+    ).toThrow("required must be a boolean");
+  });
+
+  test("requires manifest v1 and rejects unknown fields at every fixed-shape layer", () => {
+    const base: ConnectorManifest = {
+      manifestVersion: 1,
+      id: "strict-demo",
+      name: "Strict Demo",
+      entry: "./index.mjs",
+      runtime: { mode: "manual" },
+      integrations: { mode: "singleton" },
+      auth: { type: "none" },
+    };
+
+    const missingVersion = { ...base } as Record<string, unknown>;
+    delete missingVersion.manifestVersion;
+    expect(() => validateConnectorManifest(missingVersion)).toThrow("manifestVersion must be 1");
+    expect(() => validateConnectorManifest({ ...base, manifestVersion: 2 })).toThrow(
+      "manifestVersion must be 1",
+    );
+    expect(() => validateConnectorManifest([])).toThrow("manifest must be a plain object");
+    expect(() => validateConnectorManifest({ ...base, unexpected: true })).toThrow(
+      "Connector manifest has unknown field: unexpected",
+    );
+    expect(() => validateConnectorManifest({
+      ...base,
+      runtime: { mode: "manual", unexpected: true },
+    })).toThrow("runtime has unknown field: unexpected");
+    expect(() => validateConnectorManifest({
+      ...base,
+      integrations: { mode: "singleton", unexpected: true },
+    })).toThrow("integrations has unknown field: unexpected");
+    expect(() => validateConnectorManifest({
+      ...base,
+      platforms: { darwin: { requirements: [], unexpected: true } },
+    })).toThrow("platform darwin has unknown field: unexpected");
+    expect(() => validateConnectorManifest({
+      ...base,
+      auth: { type: "none", unexpected: true },
+    })).toThrow("none auth has unknown field: unexpected");
+    expect(() => validateConnectorManifest({
+      ...base,
+      auth: { type: "apiKey", unexpected: true },
+    })).toThrow("apiKey auth has unknown field: unexpected");
+    expect(() => validateConnectorManifest({
+      ...base,
+      auth: {
+        type: "oauth2-public",
+        authorizationEndpoint: "https://example.test/authorize",
+        tokenEndpoint: "https://example.test/token",
+        clientId: "client",
+        unexpected: true,
+      },
+    })).toThrow("oauth2-public auth has unknown field: unexpected");
+    expect(() => validateConnectorManifest({
+      ...base,
+      auth: { type: "managedProvider", providerId: "provider", unexpected: true },
+    })).toThrow("managedProvider auth has unknown field: unexpected");
+    expect(() => validateConnectorManifest({
+      ...base,
+      config: {
+        region: { type: "string", label: "Region", unexpected: true },
+      },
+    })).toThrow('config field "region" has unknown field: unexpected');
+    expect(() => validateConnectorManifest({
+      ...base,
+      config: {
+        region: {
+          type: "string",
+          label: "Region",
+          options: [{ value: "tw", label: "Taiwan", unexpected: true }],
+        },
+      },
+    })).toThrow('option 0 has unknown field: unexpected');
+    expect(() => validateConnectorManifest({
+      ...base,
+      configPanels: {
+        setup: { label: "Setup", unexpected: true },
+      },
+    })).toThrow('config panel "setup" has unknown field: unexpected');
+
+    expect(validateConnectorManifest(base)).toEqual({
+      manifestVersion: 1,
+      id: "strict-demo",
+      name: "Strict Demo",
+      entry: "./index.mjs",
+      runtime: { mode: "manual" },
+      integrations: { mode: "singleton" },
+      platforms: {},
+      auth: { type: "none" },
+    });
+  });
+
+  test("runs a connector with bound guard, config, and persistent state", async () => {
+    const definition: ConnectorDefinition<{ label: string; extra?: boolean }, { cursor: string }> = {
+      async run({ guard, state, config, host }) {
+        expect(await state.get()).toBeUndefined();
+        expect(config).toEqual({ label: "override", extra: true });
+        expect(host.workspacePath).toBe(workspace);
+        expect(host.lamarckApiOrigin).toBe("https://dev-api.example.test");
+        await guard.writeEvent({
+          type: "app.commit",
+          externalId: "abc123",
+          startedAt: 1000,
+          payload: { sha: "abc123", label: config.label },
+        });
+        await state.set({ cursor: "abc123" });
+      },
+    };
+
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "app-commits",
+        name: "App Commits",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      definition,
+    );
+    const integration = supervisor.ensureIntegration({
+      connectorId: "app-commits",
+      config: { label: "integration", extra: true },
+    });
+
+    expect(integration.id).not.toBe("app-commits");
+    await supervisor.run(integration.id, { config: { label: "override" } });
+
+    const event = dataDb.prepare("SELECT * FROM events WHERE type = ?").get("app.commit") as any;
+    expect(event.source).toBe("connector:app-commits");
+    expect(event.external_id).toBe("abc123");
+    expect(JSON.parse(event.payload)).toEqual({ sha: "abc123", label: "override" });
+
+    const stored = supervisor.getIntegration<unknown, { cursor: string }>(integration.id);
+    expect(stored?.status).toBe("idle");
+    expect(stored?.syncState).toEqual({ cursor: "abc123" });
+    expect(stored?.lastRunAt).toBeGreaterThan(0);
+    const listed = (await supervisor.list()).find((row) => row.id === integration.id)!;
+    expect(listed.recentRuns).toHaveLength(1);
+    expect(listed.recentRuns[0]).toMatchObject({
+      integrationId: integration.id,
+      connectorId: "app-commits",
+      trigger: "manual",
+      status: "success",
+      error: undefined,
+    });
+    expect(listed.recentRuns[0].endedAt).toBeGreaterThanOrEqual(listed.recentRuns[0].startedAt);
+    expect(listed.recentRuns[0].durationMs).toBeGreaterThanOrEqual(0);
+
+    expect(() => dataDb.prepare("SELECT * FROM connector_integrations").all()).toThrow("no such table");
+    const storedState = systemDb
+      .prepare("SELECT status, sync_state FROM connector_integrations WHERE id = ?")
+      .get(integration.id) as { status: string; sync_state: string };
+    expect(storedState.status).toBe("idle");
+    expect(JSON.parse(storedState.sync_state)).toEqual({ cursor: "abc123" });
+  });
+
+  test("recovers stale running observations after a core restart", () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "restart-recovery",
+        name: "Restart Recovery",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      { async run() {} },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "restart-recovery" });
+    systemDb.prepare("UPDATE connector_integrations SET status = 'running' WHERE id = ?").run(source.id);
+    systemDb.prepare(
+      `INSERT INTO connector_runs
+       (id, integration_id, connector_id, trigger, status, started_at)
+       VALUES ('stale-run', ?, 'restart-recovery', 'schedule', 'running', 1)`,
+    ).run(source.id);
+
+    const restarted = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+    });
+    expect(restarted.getIntegration(source.id)?.status).toBe("idle");
+    expect(systemDb.prepare(
+      "SELECT status, ended_at, error FROM connector_runs WHERE id = 'stale-run'",
+    ).get()).toEqual(expect.objectContaining({
+      status: "aborted",
+      error: "Core restarted before the run completed",
+    }));
+  });
+
+  test("connectors can write logical text blob refs without exposing storage paths", async () => {
+    const blobText = "large redacted transcript payload";
+    let writtenRef: any;
+    const definition: ConnectorDefinition = {
+      async run({ guard }) {
+        if (!guard.writeTextBlob) throw new Error("missing writeTextBlob capability");
+        const result = await guard.writeTextBlob({
+          text: blobText,
+          variant: "redacted-text",
+          mediaType: "text/plain; charset=utf-8",
+        });
+        writtenRef = result.ref;
+        await guard.writeEvent({
+          type: "blob.ref",
+          externalId: "blob-ref-1",
+          startedAt: 1000,
+          payload: {
+            contentRef: result.ref,
+            bytes: result.bytes,
+            compressedBytes: result.compressedBytes,
+          },
+        });
+      },
+    };
+
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "blob-writer",
+        name: "Blob Writer",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      definition,
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "blob-writer" });
+
+    await supervisor.run(integration.id);
+
+    const digestHex = createHash("sha256").update(blobText).digest("hex");
+    expect(writtenRef).toEqual({
+      kind: "content-blob",
+      version: 1,
+      digest: `sha256:${digestHex}`,
+      variant: "redacted-text",
+      mediaType: "text/plain; charset=utf-8",
+      encoding: "gzip",
+    });
+    expect(JSON.stringify(writtenRef)).not.toContain(".lamarck");
+    const blobPath = join(
+      workspace,
+      ".lamarck",
+      "blobs",
+      "content",
+      "v1",
+      "sha256",
+      digestHex.slice(0, 2),
+      digestHex.slice(2, 4),
+      `${digestHex}.gz`,
+    );
+    expect(gunzipSync(readFileSync(blobPath)).toString("utf8")).toBe(blobText);
+
+    const event = dataDb.prepare("SELECT * FROM events WHERE type = ?").get("blob.ref") as any;
+    const payload = JSON.parse(event.payload);
+    expect(payload.contentRef).toEqual(writtenRef);
+    expect(JSON.stringify(payload.contentRef)).not.toContain(blobPath);
+  });
+
+  test("content blob resolver returns text and explicit failure states", () => {
+    const store = new ContentBlobStore(workspace);
+    const text = "full redacted transcript text";
+    const written = store.writeText({ text });
+
+    expect(store.resolve(written.ref)).toEqual({
+      status: "resolved",
+      kind: "text",
+      text,
+      bytes: Buffer.byteLength(text),
+      digest: written.ref.digest,
+      mediaType: "text/plain; charset=utf-8",
+      variant: "redacted-text",
+    });
+
+    const missingDigest = `sha256:${"1".repeat(64)}`;
+    expect(store.resolve({ ...written.ref, digest: missingDigest })).toEqual({
+      status: "missing",
+      digest: missingDigest,
+    });
+
+    const mismatchDigestHex = "2".repeat(64);
+    const mismatchBytes = Buffer.from("different redacted text", "utf8");
+    writeSyntheticContentBlob(workspace, mismatchDigestHex, gzipSync(mismatchBytes));
+    expect(store.resolve({ ...written.ref, digest: `sha256:${mismatchDigestHex}` })).toEqual({
+      status: "digest_mismatch",
+      expected: `sha256:${mismatchDigestHex}`,
+      actual: `sha256:${createHash("sha256").update(mismatchBytes).digest("hex")}`,
+    });
+
+    expect(store.resolve({ ...written.ref, mediaType: "application/pdf" })).toEqual({
+      status: "unsupported",
+      reason: "unsupported contentRef mediaType",
+    });
+
+    const decodeErrorDigestHex = "3".repeat(64);
+    writeSyntheticContentBlob(workspace, decodeErrorDigestHex, Buffer.from("not gzip"));
+    expect(store.resolve({ ...written.ref, digest: `sha256:${decodeErrorDigestHex}` })).toMatchObject({
+      status: "decode_error",
+    });
+  });
+
+	  test("merges config-schema defaults under integration and run overrides", async () => {
+    let received: unknown;
+    const definition: ConnectorDefinition = {
+      async run({ config }) {
+        received = config;
+      },
+    };
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "cfg-merge",
+        name: "Cfg Merge",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+        config: {
+          interval: { type: "number", label: "Interval", default: 5000 },
+          label: { type: "string", label: "Label", default: "base" },
+          extra: { type: "boolean", label: "Extra", default: false },
+        },
+      },
+      definition,
+    );
+    const integration = supervisor.ensureIntegration({
+      connectorId: "cfg-merge",
+      config: { label: "integration" },
+    });
+    await supervisor.run(integration.id, { config: { extra: true } });
+
+    // interval = schema default, label = integration override, extra = run override
+	    expect(received).toEqual({ interval: 5000, label: "integration", extra: true });
+	  });
+
+	  test("starts connector-owned config UI and preserves opaque config payload", async () => {
+	    const definition: ConnectorDefinition = {
+	      async run({ state }) {
+	        await state.set({ pendingUsers: { "123": { username: "alice" } } });
+	      },
+	      async configUi({ panelId, config, configStore, state }) {
+	        expect(panelId).toBe("privacy-controls");
+	        expect(config).toEqual({
+	          mode: "rich-local",
+	          opaque: { keep: true },
+	        });
+	        expect(await state.get()).toEqual({
+	          pendingUsers: { "123": { username: "alice" } },
+	        });
+	        await configStore.patch({
+	          set: {
+	            privacyPolicy: {
+	              version: 1,
+	              apps: {
+	                "com.apple.finder": { action: "metadata_only" },
+	              },
+	            },
+	          },
+	        });
+	        await state.set({
+	          pendingUsers: {},
+	          approvedUsers: { "123": { username: "alice" } },
+	        });
+	        return { url: "http://127.0.0.1:49321/panel?token=abcdefghijklmnop" };
+	      },
+	    };
+	    supervisor.register(
+	      {
+	        manifestVersion: 1,
+	        id: "cfg-ui",
+	        name: "Config UI",
+	        entry: "./index.ts",
+	        runtime: { mode: "manual" },
+	        integrations: { mode: "singleton" },
+	        auth: { type: "none" },
+	        config: {
+	          mode: { type: "string", label: "Mode", default: "rich-local" },
+	        },
+	        configPanels: {
+	          "privacy-controls": { label: "Privacy Controls" },
+	        },
+	      },
+	      definition,
+	    );
+	    const integration = supervisor.ensureIntegration({
+	      connectorId: "cfg-ui",
+	      config: { opaque: { keep: true } },
+	    });
+
+	    await supervisor.run(integration.id);
+	    const started = await supervisor.startConfigUi(integration.id, "privacy-controls");
+	    expect(started.url).toContain("token=abcdefghijklmnop");
+	    expect(supervisor.getIntegration(integration.id)?.config).toEqual({
+	      opaque: { keep: true },
+	      privacyPolicy: {
+	        version: 1,
+	        apps: {
+	          "com.apple.finder": { action: "metadata_only" },
+	        },
+	      },
+	    });
+	    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({
+	      pendingUsers: {},
+	      approvedUsers: { "123": { username: "alice" } },
+	    });
+	    expect(await supervisor.stopConfigUiSession(started.sessionId)).toBe(true);
+	    expect(await supervisor.stopConfigUiSession(started.sessionId)).toBe(false);
+	    expect(systemDb.prepare("SELECT COUNT(*) AS count FROM connector_runs").get()).toEqual({ count: 1 });
+	  });
+
+	  test("required config fields keep integrations in setup until configured", async () => {
+    let runs = 0;
+    const definition: ConnectorDefinition = {
+      async run({ guard, config }) {
+        runs += 1;
+        await guard.writeEvent({
+          type: "configured.sample",
+          externalId: `run-${runs}`,
+          startedAt: 1,
+          payload: { name: (config as { name: string }).name },
+        });
+      },
+    };
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "configured-feed",
+        name: "Configured Feed",
+        entry: "./index.ts",
+        runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+        config: {
+          region: {
+            type: "string",
+            label: "Region",
+            default: "TW",
+            options: [{ value: "TW", label: "Taiwan" }],
+          },
+          name: { type: "string", label: "Name", required: true },
+        },
+      },
+      definition,
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "configured-feed" });
+    expect(integration.setupStatus).toBe("setup");
+    expect((await supervisor.list())[0].setupPending).toContain("config");
+    await expect(supervisor.run(integration.id)).rejects.toThrow("not set up");
+
+    const scheduler = new ConnectorScheduler({ supervisor });
+    await scheduler.tick();
+    expect(runs).toBe(0);
+    expect(supervisor.getIntegration(integration.id)?.nextRunAt).toBeUndefined();
+
+    supervisor.updateIntegration(integration.id, { config: { name: "" } });
+    expect((await supervisor.refreshIntegrationSetup(integration.id)).setupStatus).toBe("setup");
+
+    supervisor.updateIntegration(integration.id, { config: { name: "ready" } });
+    expect((await supervisor.refreshIntegrationSetup(integration.id)).setupStatus).toBe("ready");
+    await scheduler.tick();
+
+    expect(runs).toBe(1);
+    const event = dataDb.prepare("SELECT type, payload FROM events WHERE type = ?").get("configured.sample") as any;
+    expect(event.type).toBe("configured.sample");
+    expect(JSON.parse(event.payload)).toEqual({ name: "ready" });
+  });
+
+  test("supports multiple connector instances with separate sources and state", async () => {
+    const definition: ConnectorDefinition<{ externalId: string }, { seen: string }> = {
+      async run({ guard, state, config }) {
+        await guard.writeEvent({
+          type: "calendar.event",
+          externalId: config.externalId,
+          startedAt: 2000,
+          payload: { id: config.externalId },
+        });
+        await state.set({ seen: config.externalId });
+      },
+    };
+
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "calendar",
+        name: "Calendar",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "multiple" },
+        auth: { type: "none" },
+      },
+      definition,
+    );
+    const personal = supervisor.ensureIntegration({ connectorId: "calendar", integrationKey: "personal", config: { externalId: "same" } });
+    const work = supervisor.ensureIntegration({ connectorId: "calendar", integrationKey: "work", config: { externalId: "same" } });
+
+    expect(personal.id).not.toBe("calendar:personal");
+    expect(work.id).not.toBe("calendar:work");
+    await supervisor.run(personal.id);
+    await supervisor.run(work.id);
+
+    const rows = dataDb.prepare("SELECT source, external_id FROM events ORDER BY source").all() as any[];
+    expect(rows).toEqual([
+      { source: "connector:calendar:personal", external_id: "same" },
+      { source: "connector:calendar:work", external_id: "same" },
+    ]);
+    expect(supervisor.getIntegration(personal.id)?.syncState).toEqual({ seen: "same" });
+    expect(supervisor.getIntegration(work.id)?.syncState).toEqual({ seen: "same" });
+  });
+
+  test("Add Source is create-only and installed Connectors remain visible with zero Sources", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "singleton-source",
+        name: "Singleton Source",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      { async run() {} },
+    );
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "many-sources",
+        name: "Many Sources",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        integrations: { mode: "multiple" },
+        auth: { type: "none" },
+      },
+      { async run() {} },
+    );
+
+    expect(supervisor.listInstalledConnectors()).toEqual([
+      expect.objectContaining({ connectorId: "many-sources", integrationsMode: "multiple" }),
+      expect.objectContaining({ connectorId: "singleton-source", integrationsMode: "singleton" }),
+    ]);
+    expect(await supervisor.list()).toEqual([]);
+
+    const singleton = supervisor.addIntegration({ connectorId: "singleton-source" });
+    expect(singleton.connectorId).toBe("singleton-source");
+    expect(() => supervisor.addIntegration({ connectorId: "singleton-source" }))
+      .toThrow("already has its singleton Source");
+
+    const draftOne = supervisor.addIntegration({ connectorId: "many-sources" });
+    const draftTwo = supervisor.addIntegration({ connectorId: "many-sources" });
+    expect(draftTwo.id).not.toBe(draftOne.id);
+    const work = supervisor.addIntegration({ connectorId: "many-sources", integrationKey: "work" });
+    expect(work.integrationKey).toBe("work");
+    expect(() => supervisor.addIntegration({ connectorId: "many-sources", integrationKey: "work" }))
+      .toThrow("already has Source work");
+  });
+
+  test("edits a multi-integration setup row into a keyed integration", async () => {
+    const definition: ConnectorDefinition<{ externalId: string }, { seen: string }> = {
+      async run({ guard, state, config }) {
+        await guard.writeEvent({
+          type: "calendar.event",
+          externalId: config.externalId,
+          startedAt: 2100,
+          payload: { id: config.externalId },
+        });
+        await state.set({ seen: config.externalId });
+      },
+    };
+
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "calendar",
+        name: "Calendar",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "multiple" },
+        auth: { type: "none" },
+      },
+      definition,
+    );
+
+    const setup = supervisor.ensureIntegration({ connectorId: "calendar" });
+    expect(setup.integrationKey).toBeUndefined();
+    expect(setup.setupStatus).toBe("setup");
+    expect((await supervisor.list())[0].source).toBeUndefined();
+    expect(() =>
+      supervisor.ensureIntegration({ connectorId: "calendar", setupStatus: "ready" })
+    ).toThrow("requires an integration_key");
+    expect(() =>
+      supervisor.updateIntegration(setup.id, { setupStatus: "ready" })
+    ).toThrow("requires an integration_key");
+
+    const ready = supervisor.updateIntegration<{ externalId: string }, { seen: string }>(setup.id, {
+      integrationKey: "work",
+      setupStatus: "ready",
+      config: { externalId: "event-1" },
+    });
+    expect(ready.id).toBe(setup.id);
+    expect(ready.integrationKey).toBe("work");
+    expect(ready.setupStatus).toBe("ready");
+    expect((await supervisor.list())[0].source).toBe("connector:calendar:work");
+
+    await supervisor.run(ready.id);
+
+    const event = dataDb.prepare("SELECT source, external_id FROM events").get() as any;
+    expect(event).toEqual({ source: "connector:calendar:work", external_id: "event-1" });
+    expect(supervisor.getIntegration(ready.id)?.syncState).toEqual({ seen: "event-1" });
+    expect(() =>
+      supervisor.updateIntegration(ready.id, { integrationKey: "personal" })
+    ).toThrow("rename requires an explicit migration");
+  });
+
+  test("provides auth as a capability handle", async () => {
+    let tokenSeen = "";
+    const definition: ConnectorDefinition = {
+      async run({ auth, guard }) {
+        if (auth.type === "none") throw new Error("expected auth");
+        tokenSeen = await auth.getToken();
+        await guard.writeEvent({
+          type: "oura.sample",
+          externalId: "sample-1",
+          startedAt: 3000,
+          payload: { ok: true },
+        });
+      },
+    };
+
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oura",
+        name: "Oura",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: { type: "apiKey", label: "Oura Token" },
+      },
+      definition,
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "oura" });
+    expect(integration.setupStatus).toBe("setup");
+    await expect(supervisor.connectIntegration(integration.id)).rejects.toThrow("requires credentials");
+    expect(() =>
+      supervisor.updateIntegration(integration.id, { setupStatus: "ready" })
+    ).toThrow("requires credentials");
+    await supervisor.getAuthManager().setToken(integration.authRef!, "secret-token");
+    const ready = await supervisor.connectIntegration(integration.id);
+    expect(
+      supervisor.updateIntegration(ready.id, { config: { sample: true } }).setupStatus
+    ).toBe("ready");
+    expect(() =>
+      supervisor.updateIntegration(ready.id, { authRef: "missing-token-ref" })
+    ).toThrow("authRef changes must use connectIntegration");
+
+    await supervisor.getAuthManager().setToken("rotated-ref", "rotated-token");
+    const rotated = await supervisor.connectIntegration(ready.id, { authRef: "rotated-ref" });
+    expect(rotated.setupStatus).toBe("ready");
+    expect(rotated.authRef).toBe("rotated-ref");
+
+    await supervisor.run(rotated.id);
+
+    expect(tokenSeen).toBe("rotated-token");
+    const event = dataDb.prepare("SELECT source, type FROM events").get() as any;
+    expect(event).toEqual({ source: "connector:oura", type: "oura.sample" });
+  });
+
+  test("connector guard accepts non-object JSON payloads and rejects non-JSON payloads", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "json-feed",
+        name: "JSON Feed",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ guard }) {
+          await guard.writeEvent({
+            type: "json.string",
+            externalId: "json-string",
+            startedAt: 3100,
+            payload: "hello",
+          });
+          await expect(guard.writeEvent({
+            type: "json.bad",
+            externalId: "json-bad",
+            startedAt: 3101,
+            payload: (() => undefined) as any,
+          })).rejects.toThrow("JSON-serializable");
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "json-feed" });
+
+    await supervisor.run(integration.id);
+
+    const event = dataDb.prepare("SELECT payload FROM events WHERE type = ?").get("json.string") as any;
+    expect(JSON.parse(event.payload)).toBe("hello");
+  });
+
+  test("connector guard requires externalId", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "id-feed",
+        name: "ID Feed",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ guard }) {
+          await expect(guard.writeEvent({
+            type: "id-feed.event",
+            startedAt: 3110,
+            payload: { ok: true },
+          } as any)).rejects.toThrow("externalId");
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "id-feed" });
+
+    await supervisor.run(integration.id);
+  });
+
+  test("connector guard treats duplicate externalId writes as idempotent", async () => {
+    const ids: string[] = [];
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "retry-feed",
+        name: "Retry Feed",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ guard }) {
+          const first = await guard.writeEvent({
+            type: "retry.sample",
+            externalId: "same-event",
+            startedAt: 3500,
+            payload: { attempt: 1 },
+          });
+          const second = await guard.writeEvent({
+            type: "retry.sample",
+            externalId: "same-event",
+            startedAt: 3500,
+            payload: { attempt: 2 },
+          });
+          ids.push(first.id, second.id);
+        },
+      },
+    );
+
+    const integration = supervisor.ensureIntegration({ connectorId: "retry-feed" });
+    await supervisor.run(integration.id);
+
+    expect(ids[0]).toBe(ids[1]);
+    const rows = dataDb.prepare("SELECT source, external_id, payload FROM events").all() as any[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].source).toBe("connector:retry-feed");
+    expect(rows[0].external_id).toBe("same-event");
+    expect(JSON.parse(rows[0].payload)).toEqual({ attempt: 1 });
+  });
+
+  test("connector warnings are keyed non-fatal integration metadata", async () => {
+    let shouldClear = false;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "warning-feed",
+        name: "Warning Feed",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ warnings }) {
+          if (shouldClear) {
+            await warnings.clear("missing");
+            await warnings.clear("backfill");
+            return;
+          }
+          await warnings.set({
+            key: "backfill",
+            message: "Backfill paused",
+            details: { stream: "sleep" },
+          });
+          await warnings.set({
+            key: "backfill",
+            message: "Backfill still paused",
+          });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "warning-feed" });
+
+    await supervisor.run(integration.id);
+    const warned = supervisor.getIntegration(integration.id);
+    expect(warned?.status).toBe("idle");
+    expect(warned?.lastError).toBeUndefined();
+    expect(warned?.warnings).toHaveLength(1);
+    expect(warned?.warnings?.[0]).toMatchObject({
+      key: "backfill",
+      message: "Backfill still paused",
+    });
+    expect(warned?.warnings?.[0].details).toBeUndefined();
+    expect(warned?.warnings?.[0].firstSeenAt).toBeLessThanOrEqual(warned?.warnings?.[0].lastSeenAt ?? 0);
+
+    shouldClear = true;
+    await supervisor.run(integration.id);
+    expect(supervisor.getIntegration(integration.id)?.warnings).toBeUndefined();
+  });
+
+  test("blocks runs up front when credentials disappear after ready", async () => {
+    let connectorSawAuth = false;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "revoked-feed",
+        name: "Revoked Feed",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: { type: "apiKey" },
+      },
+      {
+        async run({ auth }) {
+          connectorSawAuth = true;
+          if (auth.type === "none") throw new Error("expected auth");
+          await auth.getToken();
+        },
+      },
+    );
+
+    const integration = supervisor.ensureIntegration({ connectorId: "revoked-feed" });
+    await supervisor.getAuthManager().setToken(integration.authRef!, "token");
+    const ready = await supervisor.connectIntegration(integration.id);
+    expect(ready.setupStatus).toBe("ready");
+
+    // Token revoked after ready: the run must fail before connector code
+    // executes, and the integration drops back to setup.
+    await supervisor.getAuthManager().deleteToken(integration.authRef!);
+    await expect(supervisor.run(integration.id)).rejects.toThrow("credentials are missing");
+    expect(connectorSawAuth).toBe(false);
+    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("setup");
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
+  });
+
+  test("watch scheduler restarts integrations after setup recovery", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "auth-watch",
+        name: "Auth Watch",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "apiKey" },
+      },
+      {
+        async run({ signal }) {
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) {
+              resolve();
+            } else {
+              signal.addEventListener("abort", () => resolve(), { once: true });
+            }
+          });
+        },
+      },
+    );
+
+    const integration = supervisor.ensureIntegration({ connectorId: "auth-watch" });
+    await supervisor.getAuthManager().setToken(integration.authRef!, "token");
+    await supervisor.connectIntegration(integration.id);
+
+    // Credentials revoked: the run-gate failure leaves a setup-blocked error.
+    await supervisor.getAuthManager().deleteToken(integration.authRef!);
+    await expect(supervisor.run(integration.id)).rejects.toThrow("credentials are missing");
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
+    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("setup");
+
+    // Reconnect promotes back to ready and resets the setup-blocked error to
+    // idle, so the watch scheduler picks the integration up again.
+    await supervisor.getAuthManager().setToken(integration.authRef!, "token-2");
+    const recovered = await supervisor.connectIntegration(integration.id);
+    expect(recovered.setupStatus).toBe("ready");
+    expect(recovered.status).toBe("idle");
+    expect(recovered.lastError).toBeUndefined();
+
+    const scheduler = new ConnectorScheduler({ supervisor });
+    await scheduler.tick();
+    expect((await supervisor.list())[0].running).toBe(true);
+    await scheduler.stop();
+    expect((await supervisor.list())[0].running).toBe(false);
+  });
+
+  test("crashed watch runs need explicit restart before the scheduler picks them up", async () => {
+    let crash = true;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "crashy-watch",
+        name: "Crashy Watch",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ signal }) {
+          if (crash) throw new Error("connector bug");
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) {
+              resolve();
+            } else {
+              signal.addEventListener("abort", () => resolve(), { once: true });
+            }
+          });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "crashy-watch" });
+    const scheduler = new ConnectorScheduler({ supervisor, onError() {} });
+
+    // Crash leaves a needs-attention error that further ticks do not retry.
+    await scheduler.tick();
+    await Promise.resolve();
+    while ((await supervisor.list())[0].running) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
+    expect(supervisor.getIntegration(integration.id)?.lastError).toContain("connector bug");
+
+    crash = false;
+    await scheduler.tick();
+    expect((await supervisor.list())[0].running).toBe(false);
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
+
+    // Explicit restart resets to idle and the scheduler picks it up again.
+    const restarted = supervisor.restartIntegration(integration.id);
+    expect(restarted.status).toBe("idle");
+    expect(restarted.lastError).toBeUndefined();
+
+    await scheduler.tick();
+    expect((await supervisor.list())[0].running).toBe(true);
+    expect(() => supervisor.restartIntegration(integration.id)).toThrow("already running");
+    await scheduler.stop();
+  });
+
+  test("restart guards Sources that still need setup", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "guarded-feed",
+        name: "Guarded Feed",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: { type: "apiKey" },
+      },
+      { async run() {} },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "guarded-feed" });
+    expect(integration.setupStatus).toBe("setup");
+    expect(() => supervisor.restartIntegration(integration.id)).toThrow("not set up");
+    expect(() => supervisor.restartIntegration("missing-id")).toThrow("not found");
+  });
+
+  test("fails auth connectors without credentials and records integration error", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oura",
+        name: "Oura",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: { type: "apiKey" },
+      },
+      {
+        async run({ auth }) {
+          if (auth.type === "none") throw new Error("expected auth");
+          await auth.getToken();
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "oura" });
+
+    expect(integration.setupStatus).toBe("setup");
+    await expect(supervisor.run(integration.id)).rejects.toThrow("not set up");
+    const stored = supervisor.getIntegration(integration.id);
+    expect(stored?.status).toBe("idle");
+    expect(stored?.lastError).toBeUndefined();
+  });
+
+  test("gates integrations by platform", async () => {
+    const linuxSupervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "linux",
+    });
+    linuxSupervisor.register(
+      {
+        manifestVersion: 1,
+        id: "macos-ax",
+        name: "macOS Accessibility",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "multiple" },
+        platforms: {
+          darwin: {
+            requirements: ["macos-accessibility"],
+          },
+        },
+        auth: { type: "none" },
+      },
+      { async run() {} },
+    );
+
+    expect(() =>
+      linuxSupervisor.ensureIntegration({ connectorId: "macos-ax" })
+    ).toThrow("not supported on linux");
+
+    // Installing a connector never creates an unsupported placeholder Source.
+    expect(linuxSupervisor.getIntegration("macos-ax")).toBeUndefined();
+    expect(await linuxSupervisor.list()).toEqual([]);
+  });
+
+  test("gates no-auth integrations behind platform requirement lifecycle", async () => {
+    let granted = false;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "ax-watch",
+        name: "AX Watch",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        platforms: {
+          darwin: { requirements: ["macos-accessibility"] },
+        },
+        auth: { type: "none" },
+      },
+      {
+        async run({ guard }) {
+          await guard.writeEvent({
+            type: "ax.sample",
+            externalId: "ax-1",
+            startedAt: 6000,
+            payload: { ok: true },
+          });
+        },
+        requirements: {
+          "macos-accessibility": {
+            label: "Accessibility",
+            async check() {
+              return granted
+                ? { status: "satisfied" }
+                : { status: "missing", message: "Accessibility access is not granted." };
+            },
+            async request() {
+              granted = true;
+              return { status: "pending", message: "Granting..." };
+            },
+          },
+        },
+      },
+    );
+
+    // First integration must not be ready while requirements are unchecked.
+    const integration = supervisor.ensureIntegration({ connectorId: "ax-watch" });
+    expect(integration.setupStatus).toBe("setup");
+    await expect(supervisor.run(integration.id)).rejects.toThrow("not set up");
+
+    // setupStatus cannot bypass the requirement gate.
+    expect(() =>
+      supervisor.updateIntegration(integration.id, { setupStatus: "ready" })
+    ).toThrow("requires platform requirements");
+
+    // check() persists status and keeps the integration in setup.
+    const missing = await supervisor.checkIntegrationRequirements(integration.id);
+    expect(missing["macos-accessibility"].status).toBe("missing");
+    expect(missing["macos-accessibility"].message).toContain("not granted");
+    const listed = (await supervisor.list())[0];
+    expect(listed.requirements).toEqual([
+      expect.objectContaining({ id: "macos-accessibility", status: "missing" }),
+    ]);
+    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("setup");
+
+    // request() resolves the requirement and the evaluator promotes to ready.
+    const requested = await supervisor.requestIntegrationRequirement(
+      integration.id,
+      "macos-accessibility",
+    );
+    expect(requested.status).toBe("satisfied");
+    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("ready");
+
+    await supervisor.run(integration.id);
+    const event = dataDb.prepare("SELECT source, type FROM events").get() as any;
+    expect(event).toEqual({ source: "connector:ax-watch", type: "ax.sample" });
+
+    // Requirement regression blocks the next run and demotes back to setup.
+    granted = false;
+    await expect(supervisor.run(integration.id)).rejects.toThrow("requirements not satisfied");
+    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("setup");
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
+  });
+
+  test("allows connecting auth before requirements are granted", async () => {
+    let granted = false;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "auth-ax",
+        name: "Auth AX",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        platforms: {
+          darwin: { requirements: ["macos-accessibility"] },
+        },
+        auth: { type: "apiKey" },
+      },
+      {
+        async run() {},
+        requirements: {
+          "macos-accessibility": {
+            label: "Accessibility",
+            async check() {
+              return granted
+                ? { status: "satisfied" }
+                : { status: "missing", message: "Not granted." };
+            },
+            async request() {
+              return { status: "pending", message: "Grant access in System Settings." };
+            },
+          },
+        },
+      },
+    );
+
+    const integration = supervisor.ensureIntegration({ connectorId: "auth-ax" });
+    expect(integration.setupStatus).toBe("setup");
+
+    // Auth connects first: credentials bind, but the integration stays in
+    // setup because the platform requirement is still missing.
+    await supervisor.getAuthManager().setToken(integration.authRef!, "token");
+    const connected = await supervisor.connectIntegration(integration.id);
+    expect(connected.setupStatus).toBe("setup");
+    expect(connected.authRef).toBe(integration.authRef);
+
+    // request() reports pending and the immediate re-check still says missing:
+    // the pending record must stay visible for the UI.
+    const pending = await supervisor.requestIntegrationRequirement(
+      integration.id,
+      "macos-accessibility",
+    );
+    expect(pending.status).toBe("pending");
+    expect(pending.message).toContain("System Settings");
+    expect((await supervisor.list())[0].requirements).toEqual([
+      expect.objectContaining({ id: "macos-accessibility", status: "pending" }),
+    ]);
+
+    // Once the requirement is granted, a check promotes to ready without
+    // reconnecting auth.
+    granted = true;
+    const records = await supervisor.checkIntegrationRequirements(integration.id);
+    expect(records["macos-accessibility"].status).toBe("satisfied");
+    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("ready");
+
+    await supervisor.run(integration.id);
+  });
+
+  test("records an error when a declared requirement has no handler", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "no-handler",
+        name: "No Handler",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        platforms: {
+          darwin: { requirements: ["macos-accessibility"] },
+        },
+        auth: { type: "none" },
+      },
+      { async run() {} },
+    );
+
+    const integration = supervisor.ensureIntegration({ connectorId: "no-handler" });
+    expect(integration.setupStatus).toBe("setup");
+
+    const records = await supervisor.checkIntegrationRequirements(integration.id);
+    expect(records["macos-accessibility"].status).toBe("error");
+    expect(records["macos-accessibility"].message).toContain("does not implement requirement handler");
+    await expect(
+      supervisor.requestIntegrationRequirement(integration.id, "macos-accessibility")
+    ).rejects.toThrow("does not implement requirement handler");
+    await expect(supervisor.run(integration.id)).rejects.toThrow("not set up");
+  });
+
+  test("requirement checks pass the trust gate before importing connector code", async () => {
+    const sourceDir = join(workspace, "connectors", "untrusted-ax");
+    mkdirSync(sourceDir, { recursive: true });
+    writeFileSync(
+      join(sourceDir, "connector.yaml"),
+      `manifestVersion: 1
+id: untrusted-ax
+name: Untrusted AX
+entry: ./index.mjs
+runtime:
+  mode: poll
+integrations:
+  mode: singleton
+platforms:
+  darwin:
+    requirements:
+      - macos-accessibility
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(sourceDir, "index.mjs"),
+      `export default {
+  async run() {},
+  requirements: {
+    "macos-accessibility": {
+      label: "Accessibility",
+      async check() {
+        return { status: "satisfied" };
+      },
+    },
+  },
+};
+`,
+    );
+
+    await registerWorkspaceConnectors(supervisor, workspace);
+    supervisor.ensureIntegration({ connectorId: "untrusted-ax" });
+    const integration = (await supervisor.list())[0];
+    expect(integration.packageTrust).toBe("untrusted");
+    expect(integration.requirements).toEqual([
+      expect.objectContaining({ id: "macos-accessibility", status: "unknown" }),
+    ]);
+
+    await expect(supervisor.checkIntegrationRequirements(integration.id)).rejects.toThrow("not trusted");
+
+    await supervisor.approveCurrentPackage("untrusted-ax");
+    const records = await supervisor.checkIntegrationRequirements(integration.id);
+    expect(records["macos-accessibility"].status).toBe("satisfied");
+    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("ready");
+  });
+
+  test("starts and aborts watch connector runs", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "terminal",
+        name: "Terminal",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ signal, state, guard }) {
+          await guard.writeEvent({
+            type: "terminal.session.started",
+            externalId: "s1",
+            startedAt: 4000,
+            payload: { session: "s1" },
+          });
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) {
+              resolve();
+            } else {
+              signal.addEventListener("abort", () => resolve(), { once: true });
+            }
+          });
+          await state.set({ stopped: true });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "terminal" });
+
+    const handle = supervisor.start(integration.id);
+    expect((await supervisor.list())[0].running).toBe(true);
+    handle.abort();
+    await handle.promise;
+
+    expect((await supervisor.list())[0].running).toBe(false);
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
+    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ stopped: true });
+  });
+
+  test("scheduler starts watch connectors and stops them on shutdown", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "watch-feed",
+        name: "Watch Feed",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ signal, state }) {
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) {
+              resolve();
+            } else {
+              signal.addEventListener("abort", () => resolve(), { once: true });
+            }
+          });
+          await state.set({ stopped: true });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "watch-feed" });
+    const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
+
+    await scheduler.start();
+    expect((await supervisor.list())[0].running).toBe(true);
+
+    await scheduler.stop();
+    expect((await supervisor.list())[0].running).toBe(false);
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
+    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ stopped: true });
+  });
+
+  test("Pause stops an active watch and Resume lets the scheduler start it again", async () => {
+    let starts = 0;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "pausable-watch",
+        name: "Pausable Watch",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ signal, state }) {
+          starts += 1;
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          await state.set({ stoppedAtStart: starts });
+        },
+      },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "pausable-watch" });
+    const scheduler = new ConnectorScheduler({ supervisor });
+
+    await scheduler.tick();
+    expect((await supervisor.list())[0].running).toBe(true);
+    expect(starts).toBe(1);
+
+    const paused = await supervisor.pauseIntegration(source.id);
+    expect(paused.pausedAt).toBeGreaterThan(0);
+    expect((await supervisor.list())[0].running).toBe(false);
+    await scheduler.tick();
+    expect(starts).toBe(1);
+
+    supervisor.resumeIntegration(source.id);
+    await scheduler.tick();
+    expect(starts).toBe(2);
+    expect((await supervisor.list())[0].running).toBe(true);
+    await scheduler.stop();
+  });
+
+  test("scheduler stop aborts in-flight poll runs", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "slow-poll",
+        name: "Slow Poll",
+        entry: "./index.ts",
+        runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ signal, state }) {
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) {
+              resolve();
+            } else {
+              signal.addEventListener("abort", () => resolve(), { once: true });
+            }
+          });
+          await state.set({ aborted: true });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "slow-poll" });
+    const scheduler = new ConnectorScheduler({ supervisor });
+
+    const tick = scheduler.tick();
+    while (!(await supervisor.list())[0].running) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    await scheduler.stop();
+    await tick;
+
+    expect((await supervisor.list())[0].running).toBe(false);
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
+    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ aborted: true });
+    expect(supervisor.getIntegration(integration.id)?.nextRunAt).toBeGreaterThan(0);
+  });
+
+  test("scheduler stop does not hang when a run ignores the abort signal", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "stubborn-watch",
+        name: "Stubborn Watch",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run() {
+          await new Promise(() => {});
+        },
+      },
+    );
+    supervisor.ensureIntegration({ connectorId: "stubborn-watch" });
+    const scheduler = new ConnectorScheduler({ supervisor, stopTimeoutMs: 50 });
+
+    await scheduler.start();
+    expect((await supervisor.list())[0].running).toBe(true);
+
+    const stopped = await waitWithTestTimeout(scheduler.stop(), 2_000);
+    expect(stopped).toBe(true);
+  });
+
+  test("scheduler runs due poll connectors and stores the next run time", async () => {
+    let now = new Date("2026-01-01T00:00:00Z").getTime();
+    let runs = 0;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "poll-feed",
+        name: "Poll Feed",
+        entry: "./index.ts",
+        runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ guard }) {
+          runs += 1;
+          await guard.writeEvent({
+            type: "poll.sample",
+            externalId: `run-${runs}`,
+            startedAt: now,
+            payload: { runs },
+          });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "poll-feed" });
+    expect(() =>
+      supervisor.updateIntegration(integration.id, { scheduleCron: "every 1m" })
+    ).toThrow("Unsupported connector schedule");
+    const scheduler = new ConnectorScheduler({ supervisor, now: () => now });
+
+    await scheduler.tick();
+    expect(runs).toBe(1);
+    const afterFirstRun = supervisor.getIntegration(integration.id);
+    expect(afterFirstRun?.nextRunAt).toBe(nextCronRunAt("*/15 * * * *", now));
+
+    await scheduler.tick();
+    expect(runs).toBe(1);
+
+    now = afterFirstRun!.nextRunAt!;
+    await scheduler.tick();
+    expect(runs).toBe(2);
+    expect(supervisor.getIntegration(integration.id)?.nextRunAt).toBe(nextCronRunAt("*/15 * * * *", now));
+  });
+
+  test("timed Pause suppresses poll runs until the scheduler expires it", async () => {
+    let runs = 0;
+    let now = Date.now();
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "timed-poll",
+        name: "Timed Poll",
+        entry: "./index.ts",
+        runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      { async run() { runs += 1; } },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "timed-poll" });
+    const paused = await supervisor.pauseIntegration(source.id, 60_000);
+    const scheduler = new ConnectorScheduler({ supervisor, now: () => now });
+
+    now = paused.resumeAt! - 1;
+    await scheduler.tick();
+    expect(runs).toBe(0);
+    expect(supervisor.getIntegration(source.id)?.pausedAt).toBeDefined();
+
+    now = paused.resumeAt!;
+    await scheduler.tick();
+    expect(runs).toBe(1);
+    expect(supervisor.getIntegration(source.id)?.pausedAt).toBeUndefined();
+    expect(supervisor.getIntegration(source.id)?.resumeAt).toBeUndefined();
+  });
+
+  test("Run now is an explicit one-off while a Source remains paused", async () => {
+    let runs = 0;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "paused-manual",
+        name: "Paused Manual",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      { async run() { runs += 1; } },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "paused-manual" });
+    await supervisor.pauseIntegration(source.id);
+
+    await supervisor.run(source.id, { trigger: "manual" });
+    expect(runs).toBe(1);
+    expect(supervisor.getIntegration(source.id)?.pausedAt).toBeDefined();
+  });
+
+  test("Pause changes automatic policy without aborting an active manual run", async () => {
+    let finish!: () => void;
+    let aborted = false;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "manual-in-flight",
+        name: "Manual In Flight",
+        entry: "./index.ts",
+        runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ signal }) {
+          signal.addEventListener("abort", () => { aborted = true; }, { once: true });
+          await new Promise<void>((resolve) => { finish = resolve; });
+        },
+      },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "manual-in-flight" });
+    const handle = supervisor.start(source.id, { trigger: "manual" });
+    while (!finish) await new Promise((resolve) => setTimeout(resolve, 1));
+
+    await supervisor.pauseIntegration(source.id);
+    expect(aborted).toBe(false);
+    expect((await supervisor.list())[0].running).toBe(true);
+    expect(supervisor.getIntegration(source.id)?.pausedAt).toBeDefined();
+
+    finish();
+    await handle.promise;
+    expect(supervisor.getIntegration(source.id)?.status).toBe("idle");
+    expect(supervisor.getIntegration(source.id)?.pausedAt).toBeDefined();
+  });
+
+  test("scheduler validates poll schedules before running", async () => {
+    let runs = 0;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "invalid-schedule-feed",
+        name: "Invalid Schedule Feed",
+        entry: "./index.ts",
+        runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ guard }) {
+          runs += 1;
+          await guard.writeEvent({
+            type: "invalid-schedule.sample",
+            externalId: `run-${runs}`,
+            startedAt: 1,
+            payload: { runs },
+          });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "invalid-schedule-feed" });
+    systemDb.prepare("UPDATE connector_integrations SET schedule_cron = ?, next_run_at = NULL WHERE id = ?")
+      .run("every 1m", integration.id);
+    const errors: unknown[] = [];
+    const scheduler = new ConnectorScheduler({
+      supervisor,
+      onError(err) {
+        errors.push(err);
+      },
+    });
+
+    await scheduler.tick();
+    await scheduler.tick();
+
+    expect(runs).toBe(0);
+    expect(errors).toHaveLength(2);
+    const event = dataDb.prepare("SELECT * FROM events WHERE type = ?").get("invalid-schedule.sample");
+    expect(event).toBeFalsy();
+  });
+
+  test("scheduler does not run untrusted workspace connector packages", async () => {
+    const sourceDir = join(workspace, "connectors", "untrusted-feed");
+    mkdirSync(sourceDir, { recursive: true });
+    writeFileSync(
+      join(sourceDir, "connector.yaml"),
+      `manifestVersion: 1
+id: untrusted-feed
+name: Untrusted Feed
+entry: ./index.mjs
+runtime:
+  mode: poll
+  defaultSchedule: "*/15 * * * *"
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(sourceDir, "index.mjs"),
+      `export default {
+  async run({ guard }) {
+    await guard.writeEvent({
+      type: "untrusted.sample",
+      externalId: "sample",
+      startedAt: 1,
+      payload: { ok: true },
+    });
+  },
+};
+`,
+    );
+
+    await registerWorkspaceConnectors(supervisor, workspace);
+    supervisor.ensureIntegration({ connectorId: "untrusted-feed" });
+    expect((await supervisor.list())[0].packageTrust).toBe("untrusted");
+
+    const scheduler = new ConnectorScheduler({ supervisor });
+    await scheduler.tick();
+
+    const event = dataDb.prepare("SELECT * FROM events WHERE type = ?").get("untrusted.sample");
+    expect(event).toBeFalsy();
+  });
+
+  test("app-commits syncs app git repos with per-app cursors", async () => {
+    const appCommitsUrl = new URL("../../template/connectors/app-commits/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(appCommitsUrl) as {
+      syncOnce(context: unknown): Promise<void>;
+    };
+    const appDir = join(workspace, "apps", "hello-world");
+    mkdirSync(appDir, { recursive: true });
+    execFileSync("git", ["-C", appDir, "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", appDir, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", appDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+
+    writeFileSync(join(appDir, "index.tsx"), "export default function App() { return null; }\n");
+    execFileSync("git", ["-C", appDir, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", appDir, "commit", "-m", "Initial app"], { stdio: "ignore" });
+    const firstSha = execFileSync("git", ["-C", appDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+    let syncState: unknown;
+    const events: any[] = [];
+	    const context = {
+      guard: {
+        async writeEvent(event: any) {
+          events.push(event);
+          return { id: `event-${events.length}` };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      host: { workspacePath: workspace },
+      signal: new AbortController().signal,
+    };
+
+    await syncOnce(context);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "app.commit",
+      externalId: `hello-world:${firstSha}`,
+      payload: {
+        appId: "hello-world",
+        commitSha: firstSha,
+        authorName: "Test User",
+        authorEmail: "test@example.com",
+        message: "Initial app",
+      },
+    });
+
+    writeFileSync(join(appDir, "index.tsx"), "export default function App() { return 'updated'; }\n");
+    execFileSync("git", ["-C", appDir, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", appDir, "commit", "-m", "Update app", "-m", "Refine the render path."], { stdio: "ignore" });
+    const secondSha = execFileSync("git", ["-C", appDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+    await syncOnce(context);
+    expect(events).toHaveLength(2);
+    expect(events[1].externalId).toBe(`hello-world:${secondSha}`);
+    // Full multi-line message (subject + body) is captured, not just the subject.
+    expect(events[1].payload.message).toBe("Update app\n\nRefine the render path.");
+    expect(syncState).toEqual({
+      apps: {
+        "hello-world": { lastSha: secondSha },
+      },
+    });
+
+    syncState = {
+      apps: {
+        "hello-world": { lastSha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
+      },
+    };
+    const fallbackStart = events.length;
+    await syncOnce(context);
+    expect(events).toHaveLength(fallbackStart + 2);
+    expect(events[fallbackStart].payload.message).toBe("Initial app");
+    expect(events[fallbackStart + 1].payload.message).toBe("Update app\n\nRefine the render path.");
+    expect(syncState).toEqual({
+      apps: {
+        "hello-world": { lastSha: secondSha },
+      },
+    });
+  });
+
+  test("local-git syncs matching commits from code roots", async () => {
+    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(localGitUrl) as {
+      syncOnce(context: unknown): Promise<void>;
+    };
+    const rootDir = join(workspace, "Projects");
+    const repoDir = join(rootDir, "sample-repo");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["-C", repoDir, "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+
+    writeFileSync(join(repoDir, "index.ts"), "export const value = 1;\n");
+    execFileSync("git", ["-C", repoDir, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "commit", "-m", "Initial local work", "-m", "Capture the full commit message."], { stdio: "ignore" });
+    const firstSha = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const objectFormat = execFileSync(
+      "git",
+      ["-C", repoDir, "rev-parse", "--show-object-format=storage"],
+      { encoding: "utf8" },
+    ).trim();
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const context = {
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${events.length + index}`) };
+        },
+      },
+      warnings: {
+        async set() {},
+        async clear() {},
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        localGit: {
+          global: {
+            capture: {
+              commitMessage: "full",
+              diffstat: "aggregate",
+              codeDiff: false,
+              emailInEvents: "raw_and_hash",
+            },
+          },
+          roots: [{ path: rootDir }],
+          identities: [{ email: "test@example.com", label: "test" }],
+        },
+      },
+      signal: new AbortController().signal,
+    };
+
+    await syncOnce(context);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "local_git.commit",
+      externalId: `commit:${objectFormat}:${firstSha}`,
+      payload: {
+        schema: "local_git.commit.v1",
+        objectFormat,
+        commitSha: firstSha,
+        authoredByUser: true,
+        committedByUser: true,
+        author: {
+          name: "Test User",
+          email: "test@example.com",
+        },
+        committer: {
+          name: "Test User",
+          email: "test@example.com",
+        },
+        message: {
+          mode: "full",
+          subject: "Initial local work",
+          body: "Initial local work\n\nCapture the full commit message.",
+        },
+        diffstat: {
+          mode: "aggregate",
+          filesChanged: 1,
+          additions: 1,
+          deletions: 0,
+        },
+        codeDiff: {
+          mode: "none",
+        },
+      },
+    });
+    expect(events[0].payload.author.emailHash).toMatch(/^sha256:/);
+
+    await syncOnce(context);
+    expect(events).toHaveLength(1);
+    expect(Object.keys((syncState as any).repos)).toHaveLength(1);
+  });
+
+  test("local-git applies explicit repo capture overrides", async () => {
+    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(localGitUrl) as {
+      syncOnce(context: unknown): Promise<void>;
+    };
+    const rootDir = join(workspace, "Projects");
+    const repoDir = join(rootDir, "override-repo");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["-C", repoDir, "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+
+    writeFileSync(join(repoDir, "a.ts"), "export const a = 1;\n");
+    writeFileSync(join(repoDir, "b.ts"), "export const b = 2;\n");
+    execFileSync("git", ["-C", repoDir, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "commit", "-m", "Add files"], { stdio: "ignore" });
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const context = {
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${events.length + index}`) };
+        },
+        async writeTextBlob(input: any) {
+          return {
+            ref: { kind: "test", digest: "sha256:test" },
+            bytes: input.text.length,
+            compressedBytes: input.text.length,
+          };
+        },
+      },
+      warnings: {
+        async set() {},
+        async clear() {},
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        localGit: {
+          global: {
+            capture: {
+              commitMessage: "full",
+              diffstat: "aggregate",
+              codeDiff: false,
+              emailInEvents: "raw_and_hash",
+            },
+          },
+          roots: [{ path: rootDir }],
+          repositories: [{
+            path: repoDir,
+            capture: {
+              commitMessage: "subject",
+              diffstat: "files",
+              codeDiff: true,
+              emailInEvents: "raw",
+            },
+          }],
+          identities: [{ email: "test@example.com", label: "test" }],
+        },
+      },
+      signal: new AbortController().signal,
+    };
+
+    await syncOnce(context);
+    expect(events).toHaveLength(1);
+    expect(events[0].payload.message).toEqual({
+      mode: "subject",
+      subject: "Add files",
+    });
+    expect(events[0].payload.diffstat).toMatchObject({
+      mode: "files",
+      filesChanged: 2,
+      additions: 2,
+      deletions: 0,
+    });
+    expect(events[0].payload.diffstat.files.map((file: any) => file.path).sort()).toEqual(["a.ts", "b.ts"]);
+    expect(events[0].payload.codeDiff).toMatchObject({
+      mode: "patch",
+      contentRef: { kind: "test", digest: "sha256:test" },
+    });
+    expect(events[0].payload.author.email).toBe("test@example.com");
+    expect(events[0].payload.author.emailHash).toBeUndefined();
+  });
+
+  test("local-git does not treat repo overrides as data sources", async () => {
+    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(localGitUrl) as {
+      syncOnce(context: unknown): Promise<void>;
+    };
+    const repoDir = join(workspace, "outside-root-repo");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["-C", repoDir, "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+    writeFileSync(join(repoDir, "work.ts"), "export const work = true;\n");
+    execFileSync("git", ["-C", repoDir, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "commit", "-m", "Outside root"], { stdio: "ignore" });
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const context = {
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${index}`) };
+        },
+      },
+      warnings: {
+        async set() {},
+        async clear() {},
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        localGit: {
+          global: {
+            capture: {
+              commitMessage: "full",
+              diffstat: "aggregate",
+              codeDiff: false,
+              emailInEvents: "raw_and_hash",
+            },
+          },
+          roots: [],
+          repositories: [{
+            path: repoDir,
+            capture: {
+              commitMessage: "full",
+              diffstat: "files",
+              codeDiff: false,
+              emailInEvents: "raw_and_hash",
+            },
+          }],
+          identities: [{ email: "test@example.com", label: "test" }],
+        },
+      },
+      signal: new AbortController().signal,
+    };
+
+    await syncOnce(context);
+    expect(events).toHaveLength(0);
+    expect(syncState).toBeUndefined();
+  });
+
+  test("local-git aborts git scans without advancing repo state", async () => {
+    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(localGitUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const rootDir = join(workspace, "Projects");
+    const repoDir = join(rootDir, "abort-repo");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["-C", repoDir, "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+    writeFileSync(join(repoDir, "work.ts"), "export const work = true;\n");
+    execFileSync("git", ["-C", repoDir, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "commit", "-m", "Abort work"], { stdio: "ignore" });
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const context = {
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${index}`) };
+        },
+      },
+      warnings: {
+        async set() {},
+        async clear() {},
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        localGit: {
+          global: {
+            capture: {
+              commitMessage: "full",
+              diffstat: "aggregate",
+              codeDiff: false,
+              emailInEvents: "raw_and_hash",
+            },
+          },
+          roots: [{ path: rootDir }],
+          identities: [{ email: "test@example.com", label: "test" }],
+        },
+      },
+      signal: new AbortController().signal,
+    };
+
+    const execFileImpl = async (command: string, args: string[]) => {
+      if (args.includes("log")) {
+        const err = new Error("The operation was aborted");
+        (err as any).name = "AbortError";
+        throw err;
+      }
+      return {
+        stdout: execFileSync(command, args, { encoding: "utf8" }),
+        stderr: "",
+      };
+    };
+
+    await expect(syncOnce(context, { execFileImpl })).rejects.toMatchObject({ name: "AbortError" });
+    expect(events).toHaveLength(0);
+    expect(syncState).toBeUndefined();
+  });
+
+  test("local-git rescans history when identity emails change", async () => {
+    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(localGitUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const rootDir = join(workspace, "Projects");
+    const repoDir = join(rootDir, "identity-repo");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["-C", repoDir, "init"], { stdio: "ignore" });
+
+    const commitAs = (email: string, message: string, date: string) => {
+      execFileSync("git", ["-C", repoDir, "commit", "--allow-empty", "-m", message], {
+        stdio: "ignore",
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "Test User",
+          GIT_AUTHOR_EMAIL: email,
+          GIT_AUTHOR_DATE: date,
+          GIT_COMMITTER_NAME: "Test User",
+          GIT_COMMITTER_EMAIL: email,
+          GIT_COMMITTER_DATE: date,
+        },
+      });
+      return execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    };
+    const oldSha = commitAs("old@example.com", "Old identity work", "2020-01-01T00:00:00Z");
+    const newSha = commitAs("new@example.com", "New identity work", "2020-01-02T00:00:00Z");
+
+    let syncState: any;
+    const events: any[] = [];
+    const context: any = {
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${index}`) };
+        },
+      },
+      warnings: {
+        async set() {},
+        async clear() {},
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        localGit: {
+          global: {
+            capture: {
+              commitMessage: "full",
+              diffstat: "aggregate",
+              codeDiff: false,
+              emailInEvents: "raw_and_hash",
+            },
+          },
+          roots: [{ path: rootDir }],
+          identities: [{ email: "old@example.com", label: "old" }],
+        },
+      },
+      signal: new AbortController().signal,
+    };
+
+    await syncOnce(context, { now: () => Date.UTC(2026, 6, 9) });
+    expect(events.map((event) => event.payload.commitSha)).toEqual([oldSha]);
+    const oldRepoState = Object.values(syncState.repos)[0] as any;
+    expect(oldRepoState.identityFingerprint).toMatch(/^sha256:/);
+
+    context.config.localGit.identities.push({ email: "new@example.com", label: "new" });
+    await syncOnce(context, { now: () => Date.UTC(2026, 6, 9, 1) });
+
+    expect(events.map((event) => event.payload.commitSha)).toEqual([oldSha, newSha]);
+    const newRepoState = Object.values(syncState.repos)[0] as any;
+    expect(newRepoState.identityFingerprint).toMatch(/^sha256:/);
+    expect(newRepoState.identityFingerprint).not.toBe(oldRepoState.identityFingerprint);
+  });
+
+  test("local-git commit ids do not depend on origin", async () => {
+    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(localGitUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const rootDir = join(workspace, "Projects");
+    const repoDir = join(rootDir, "origin-repo");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["-C", repoDir, "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+
+    writeFileSync(join(repoDir, "one.ts"), "export const one = 1;\n");
+    execFileSync("git", ["-C", repoDir, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "commit", "-m", "Before origin"], { stdio: "ignore" });
+    const firstSha = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const objectFormat = execFileSync(
+      "git",
+      ["-C", repoDir, "rev-parse", "--show-object-format=storage"],
+      { encoding: "utf8" },
+    ).trim();
+
+    let syncState: any;
+    const events: any[] = [];
+    const context = {
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${index}`) };
+        },
+      },
+      warnings: {
+        async set() {},
+        async clear() {},
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        localGit: {
+          global: {
+            capture: {
+              commitMessage: "full",
+              diffstat: "aggregate",
+              codeDiff: false,
+              emailInEvents: "raw_and_hash",
+            },
+          },
+          roots: [{ path: rootDir }],
+          identities: [{ email: "test@example.com", label: "test" }],
+        },
+      },
+      signal: new AbortController().signal,
+    };
+
+    await syncOnce(context);
+    expect(events).toHaveLength(1);
+    expect(events[0].externalId).toBe(`commit:${objectFormat}:${firstSha}`);
+    expect(events[0].payload.repo.normalizedOriginUrl).toBeUndefined();
+
+    execFileSync(
+      "git",
+      ["-C", repoDir, "remote", "add", "origin", "https://token@example.com/ExampleOrg/Origin-Repo.git"],
+      { stdio: "ignore" },
+    );
+    writeFileSync(join(repoDir, "two.ts"), "export const two = 2;\n");
+    execFileSync("git", ["-C", repoDir, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "commit", "-m", "After origin"], { stdio: "ignore" });
+    const secondSha = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+    await syncOnce(context);
+    expect(events).toHaveLength(2);
+    expect(events[1].externalId).toBe(`commit:${objectFormat}:${secondSha}`);
+    expect(events[1].payload.repo.normalizedOriginUrl).toBe("https://example.com/exampleorg/origin-repo");
+    expect(JSON.stringify(events[1].payload.repo)).not.toContain("token");
+
+    const repoState = Object.values(syncState.repos)[0] as any;
+    expect(repoState.normalizedOriginUrl).toBe("https://example.com/exampleorg/origin-repo");
+    expect(Object.keys(syncState.repos)).toHaveLength(1);
+  });
+
+  test("local-git commit ids survive moving a repo", async () => {
+    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(localGitUrl) as {
+      syncOnce(context: unknown): Promise<void>;
+    };
+    const rootDir = join(workspace, "Projects");
+    const repoDir = join(rootDir, "before-move");
+    const movedRepoDir = join(rootDir, "after-move");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["-C", repoDir, "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "commit", "--allow-empty", "-m", "Move-safe commit"], { stdio: "ignore" });
+
+    let syncState: unknown;
+    const attempts: any[] = [];
+    const materialized = new Map<string, any>();
+    const context = {
+      guard: {
+        async writeEvents(batch: any[]) {
+          attempts.push(...batch);
+          for (const event of batch) {
+            if (!materialized.has(event.externalId)) materialized.set(event.externalId, event);
+          }
+          return { ids: batch.map((event) => event.externalId) };
+        },
+      },
+      warnings: {
+        async set() {},
+        async clear() {},
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        localGit: {
+          global: {
+            capture: {
+              commitMessage: "none",
+              diffstat: "none",
+              codeDiff: false,
+              emailInEvents: "hash",
+            },
+          },
+          roots: [{ path: rootDir }],
+          identities: [{ email: "test@example.com", label: "test" }],
+        },
+      },
+      signal: new AbortController().signal,
+    };
+
+    await syncOnce(context);
+    renameSync(repoDir, movedRepoDir);
+    await syncOnce(context);
+
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1].externalId).toBe(attempts[0].externalId);
+    expect(materialized.size).toBe(1);
+    expect(attempts[0].payload.repo.key).toBeUndefined();
+    expect(attempts[1].payload.repo.path).not.toBe(attempts[0].payload.repo.path);
+  });
+
+  test("local-git namespaces commit ids by Git object format", async () => {
+    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(localGitUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const rootDir = join(workspace, "Projects");
+    const repoDir = join(rootDir, "sha256-format-repo");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["-C", repoDir, "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoDir, "commit", "--allow-empty", "-m", "Format-aware commit"], { stdio: "ignore" });
+    const commitSha = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const context = {
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((event) => event.externalId) };
+        },
+      },
+      warnings: {
+        async set() {},
+        async clear() {},
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        localGit: {
+          global: {
+            capture: {
+              commitMessage: "none",
+              diffstat: "none",
+              codeDiff: false,
+              emailInEvents: "hash",
+            },
+          },
+          roots: [{ path: rootDir }],
+          identities: [{ email: "test@example.com", label: "test" }],
+        },
+      },
+      signal: new AbortController().signal,
+    };
+    const execFileImpl = async (command: string, args: string[]) => {
+      if (args.includes("--show-object-format=storage")) {
+        return { stdout: "sha256\n", stderr: "" };
+      }
+      return {
+        stdout: execFileSync(command, args, { encoding: "utf8" }),
+        stderr: "",
+      };
+    };
+
+    await syncOnce(context, { execFileImpl });
+
+    expect(events).toHaveLength(1);
+    expect(events[0].externalId).toBe(`commit:sha256:${commitSha}`);
+    expect(events[0].payload.objectFormat).toBe("sha256");
+  });
+
+  test("local-git opens code roots through the connector-owned macOS picker", async () => {
+    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const { chooseCodeRoot } = await import(localGitUrl) as {
+      chooseCodeRoot(deps?: unknown): Promise<{ paths: string[] }>;
+    };
+    const calls: any[] = [];
+
+    const selected = await chooseCodeRoot({
+      platform: "darwin",
+      async execFileImpl(command: string, args: string[]) {
+        calls.push({ command, args });
+        return { stdout: "/tmp/local-git-root/\n", stderr: "" };
+      },
+    });
+
+    expect(calls[0].command).toBe("osascript");
+    expect(calls[0].args.join(" ")).toContain("choose folder");
+    expect(selected).toEqual({ paths: ["/tmp/local-git-root"] });
+
+    const canceled = await chooseCodeRoot({
+      platform: "darwin",
+      async execFileImpl() {
+        const err = new Error("User canceled.");
+        (err as any).code = 1;
+        (err as any).stderr = "execution error: User canceled. (-128)";
+        throw err;
+      },
+    });
+
+    expect(canceled).toEqual({ paths: [] });
+  });
+
+  function makeCodeAgentContext(config: Record<string, unknown>) {
+    let syncState: unknown;
+    const events: any[] = [];
+    const blobWrites: any[] = [];
+    const context = {
+      guard: {
+        async writeTextBlob(input: any) {
+          blobWrites.push(input);
+          const digest = createHash("sha256").update(input.text).digest("hex");
+          return {
+            ref: {
+              kind: "content-blob",
+              version: 1,
+              digest: "sha256:" + digest,
+              variant: input.variant,
+              mediaType: input.mediaType,
+              encoding: "gzip",
+            },
+            bytes: Buffer.byteLength(input.text),
+            compressedBytes: gzipSync(input.text).byteLength,
+          };
+        },
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => "event-" + index) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config,
+      signal: new AbortController().signal,
+    };
+    return { context, events, blobWrites, getState: () => syncState };
+  }
+
+  test("code-agent-transcripts packs one Codex interaction into human and agent events", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-turn-sessions");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const transcriptPath = join(dayDir, "rollout.jsonl");
+    const turnId = "turn-1";
+    writeFileSync(
+      transcriptPath,
+      [
+        {
+          timestamp: "2026-07-01T02:00:00.000Z",
+          type: "session_meta",
+          payload: { id: "codex-session-1", cwd: "/Users/alice/project", model: "gpt-5-codex" },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.000Z",
+          type: "event_msg",
+          payload: { type: "task_started", turn_id: turnId },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.100Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Run the focused tests." }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.100Z",
+          type: "event_msg",
+          payload: { type: "user_message", client_id: "client-1", message: "Run the focused tests." },
+        },
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            id: "commentary-1",
+            role: "assistant",
+            phase: "commentary",
+            content: [{ type: "output_text", text: "Running tests." }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:03.000Z",
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            call_id: "call-1",
+            name: "shell",
+            arguments: "{\"cmd\":\"npm test\"}",
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:03.500Z",
+          type: "response_item",
+          payload: {
+            type: "function_call_output",
+            call_id: "call-1",
+            output: "passed",
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:04.000Z",
+          type: "response_item",
+          payload: {
+            type: "reasoning",
+            summary: [{ type: "summary_text", text: "Private reasoning." }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:05.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            id: "final-1",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: "Focused tests passed." }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:05.100Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: turnId, last_agent_message: "Focused tests passed." },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+      "max-inline-bytes": 8192,
+    });
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    expect(run.events[0]).toMatchObject({
+      startedAt: Date.parse("2026-07-01T02:00:01.100Z"),
+      payload: {
+        provider: "codex",
+        content: { text: "Run the focused tests.", truncated: false },
+        raw: {
+          format: "codex-records",
+          recordCount: 1,
+          firstSourceLineIndex: 4,
+          lastSourceLineIndex: 4,
+          ids: { sessionId: "codex-session-1", turnId, clientId: "client-1" },
+        },
+      },
+    });
+    expect(run.events[0].payload.raw.contentRef).toBeUndefined();
+    expect(run.events[1]).toMatchObject({
+      startedAt: Date.parse("2026-07-01T02:00:02.000Z"),
+      endedAt: Date.parse("2026-07-01T02:00:05.100Z"),
+      payload: {
+        provider: "codex",
+        interactionId: run.events[0].payload.interactionId,
+        status: "completed",
+        content: { text: "Focused tests passed.", truncated: false },
+        raw: {
+          format: "codex-jsonl",
+          recordCount: 6,
+          firstSourceLineIndex: 2,
+          lastSourceLineIndex: 10,
+          ids: { sessionId: "codex-session-1", turnId },
+          contentRef: { kind: "content-blob", encoding: "gzip" },
+        },
+      },
+    });
+    expect(run.blobWrites).toHaveLength(1);
+    expect(run.blobWrites[0].text).toContain('"type":"function_call_output"');
+    expect(run.blobWrites[0].text).toContain('"phase":"final_answer"');
+    expect(run.blobWrites[0].text).not.toContain("Private reasoning.");
+    expect(run.blobWrites[0].text).not.toContain('"type":"user_message"');
+  });
+
+  test("code-agent-transcripts keeps only bounded anchors while a Codex turn is open", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-open-turn");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const transcriptPath = join(dayDir, "rollout.jsonl");
+    const turnId = "turn-open";
+    writeFileSync(
+      transcriptPath,
+      [
+        { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "session-open" } },
+        { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "client-open", message: "Start." } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    expect(run.events.map((event) => event.type)).toEqual(["code_agent.human_message"]);
+    expect(run.blobWrites).toHaveLength(0);
+    const firstState = run.getState() as any;
+    expect(firstState.version).toBe(1);
+    expect(Object.values(firstState.files)[0]).toMatchObject({
+      activeInteractionId: turnId,
+      openInteractions: {
+        [turnId]: {
+          providerInteractionId: turnId,
+          startLineIndex: 2,
+        },
+      },
+    });
+    expect(JSON.stringify(firstState)).not.toContain("Start.");
+
+    appendFileSync(
+      transcriptPath,
+      [
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: "Done." }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:02.100Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: turnId, last_agent_message: "Done." },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    expect(run.blobWrites).toHaveLength(1);
+    expect(run.blobWrites[0].text).toContain('"type":"task_started"');
+    expect((run.getState() as any).files[Object.keys((run.getState() as any).files)[0]].openInteractions).toEqual({});
+  });
+
+  test("code-agent-transcripts leaves a complete JSON record pending until its newline arrives", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-partial-turn");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const transcriptPath = join(dayDir, "rollout.jsonl");
+    const turnId = "turn-partial";
+    const completePrefix = [
+      { timestamp: "2026-07-01T02:00:00.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+      { timestamp: "2026-07-01T02:00:00.100Z", type: "event_msg", payload: { type: "user_message", client_id: "client-partial", message: "Wait for closure." } },
+      {
+        timestamp: "2026-07-01T02:00:01.000Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          phase: "final_answer",
+          content: [{ type: "output_text", text: "Closed." }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        },
+      },
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n";
+    const closure = JSON.stringify({
+      timestamp: "2026-07-01T02:00:01.100Z",
+      type: "event_msg",
+      payload: { type: "task_complete", turn_id: turnId, last_agent_message: "Closed." },
+    });
+    writeFileSync(transcriptPath, completePrefix + closure);
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    expect(run.events.map((event) => event.type)).toEqual(["code_agent.human_message"]);
+    const firstCursor = Object.values((run.getState() as any).files)[0] as any;
+    expect(firstCursor.lineCount).toBe(3);
+    expect(firstCursor.byteOffset).toBe(Buffer.byteLength(completePrefix));
+
+    appendFileSync(transcriptPath, "\n");
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    expect(run.events[1].payload.content.text).toBe("Closed.");
+  });
+
+  test("code-agent-transcripts does not commit a closed turn cursor when raw materialization is aborted", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-aborted-materialization");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const transcriptPath = join(dayDir, "rollout.jsonl");
+    const turnId = "turn-aborted-materialization";
+    writeFileSync(
+      transcriptPath,
+      [
+        { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "session-aborted-materialization" } },
+        { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "client-aborted-materialization", message: "Finish safely." } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    const stateBeforeClosure = JSON.parse(JSON.stringify(run.getState()));
+    appendFileSync(
+      transcriptPath,
+      [
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: "Safely finished." }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        { timestamp: "2026-07-01T02:00:02.100Z", type: "event_msg", payload: { type: "task_complete", turn_id: turnId, last_agent_message: "Safely finished." } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const controller = new AbortController();
+    (run.context as any).signal = controller.signal;
+    let readPass = 0;
+    async function* abortDuringRawRead(path: string, startOffset: number) {
+      const pass = ++readPass;
+      const text = readFileSync(path).subarray(startOffset).toString("utf8");
+      for (const line of text.split("\n")) {
+        if (!line) continue;
+        yield line;
+        if (pass === 2) controller.abort();
+      }
+    }
+
+    await expect(syncOnce(run.context, {
+      now: Date.UTC(2026, 6, 1, 3),
+      readLinesImpl: abortDuringRawRead,
+    })).rejects.toMatchObject({ name: "AbortError" });
+    expect(run.getState()).toEqual(stateBeforeClosure);
+    expect(run.events.map((event) => event.type)).toEqual(["code_agent.human_message"]);
+
+    (run.context as any).signal = new AbortController().signal;
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    expect(run.events[1].payload.content.text).toBe("Safely finished.");
+  });
+
+  test("code-agent-transcripts applies the 8192-byte content and human raw limits", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-inline-limit");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const longMessage = "界".repeat(3000);
+    writeFileSync(
+      join(dayDir, "rollout.jsonl"),
+      [
+        { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "session-limit" } },
+        { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "turn-limit" } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "client-limit", message: longMessage } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+      "max-inline-bytes": 8192,
+    });
+
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    expect(run.events).toHaveLength(1);
+    const event = run.events[0];
+    expect(event.payload.content).toMatchObject({
+      bytes: 9000,
+      truncated: true,
+      contentRef: { kind: "content-blob", encoding: "gzip" },
+    });
+    expect(Buffer.byteLength(event.payload.content.text)).toBeLessThanOrEqual(8192);
+    expect(event.payload.raw).toMatchObject({
+      format: "codex-jsonl",
+      recordCount: 1,
+      contentRef: { kind: "content-blob", encoding: "gzip" },
+    });
+    expect(event.payload.raw.records).toBeUndefined();
+    expect(run.blobWrites).toHaveLength(2);
+    expect(run.blobWrites.map((write) => write.text)).toContain(longMessage);
+  });
+
+  test("code-agent-transcripts packs Claude Code tool activity and strips reasoning by default", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const claudeRoot = join(workspace, "claude-turns");
+    const projectDir = join(claudeRoot, "Users-alice-project");
+    mkdirSync(projectDir, { recursive: true });
+    const promptId = "prompt-1";
+    writeFileSync(
+      join(projectDir, "session.jsonl"),
+      [
+        {
+          type: "user",
+          uuid: "human-1",
+          promptId,
+          origin: { kind: "human" },
+          sessionId: "claude-session-1",
+          timestamp: "2026-07-01T01:00:00.000Z",
+          message: { role: "user", content: "Inspect the connector." },
+        },
+        {
+          type: "assistant",
+          uuid: "assistant-tool",
+          sessionId: "claude-session-1",
+          timestamp: "2026-07-01T01:00:01.000Z",
+          message: {
+            role: "assistant",
+            stop_reason: "tool_use",
+            content: [
+              { type: "thinking", thinking: "Reasoning notes." },
+              { type: "tool_use", id: "tool-1", name: "Read", input: { file_path: "index.mjs" } },
+            ],
+          },
+        },
+        {
+          type: "user",
+          uuid: "tool-result-1",
+          promptId,
+          sessionId: "claude-session-1",
+          timestamp: "2026-07-01T01:00:02.000Z",
+          message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tool-1", content: "file contents" }] },
+        },
+        {
+          type: "assistant",
+          uuid: "assistant-thinking",
+          sessionId: "claude-session-1",
+          timestamp: "2026-07-01T01:00:03.000Z",
+          message: {
+            role: "assistant",
+            stop_reason: "end_turn",
+            content: [{ type: "thinking", thinking: "Final private reasoning." }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "assistant-final",
+          sessionId: "claude-session-1",
+          timestamp: "2026-07-01T01:00:04.000Z",
+          message: {
+            role: "assistant",
+            stop_reason: "end_turn",
+            content: [{ type: "text", text: "Connector inspected." }],
+          },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    const run = makeCodeAgentContext({
+      "include-codex": false,
+      "include-claude": true,
+      "include-reasoning": false,
+      "claude-root": claudeRoot,
+      "lookback-days": 30,
+    });
+
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 2) });
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    expect(run.events[1]).toMatchObject({
+      startedAt: Date.parse("2026-07-01T01:00:01.000Z"),
+      endedAt: Date.parse("2026-07-01T01:00:04.000Z"),
+      payload: {
+        provider: "claude-code",
+        interactionId: run.events[0].payload.interactionId,
+        status: "completed",
+        content: { text: "Connector inspected." },
+        raw: {
+          format: "claude-code-jsonl",
+          recordCount: 3,
+          ids: { sessionId: "claude-session-1", promptId },
+          contentRef: { kind: "content-blob", encoding: "gzip" },
+        },
+      },
+    });
+    expect(run.blobWrites).toHaveLength(1);
+    expect(run.blobWrites[0].text).toContain('"type":"tool_use"');
+    expect(run.blobWrites[0].text).toContain('"type":"tool_result"');
+    expect(run.blobWrites[0].text).not.toContain("Reasoning notes.");
+    expect(run.blobWrites[0].text).not.toContain("Final private reasoning.");
+  });
+
+  test("code-agent-transcripts accepts Claude prompts without origin and keeps steering in one agent turn", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const claudeRoot = join(workspace, "claude-steered-turn");
+    const projectDir = join(claudeRoot, "Users-alice-project");
+    mkdirSync(projectDir, { recursive: true });
+    const promptId = "prompt-steered";
+    writeFileSync(
+      join(projectDir, "session.jsonl"),
+      [
+        {
+          type: "user",
+          uuid: "task-notification",
+          promptId: "synthetic-task",
+          origin: { kind: "task-notification" },
+          sessionId: "claude-session-steered",
+          timestamp: "2026-07-01T01:00:00.000Z",
+          message: { role: "user", content: "Synthetic task notification." },
+        },
+        {
+          type: "user",
+          uuid: "compact-summary",
+          promptId: "synthetic-summary",
+          isCompactSummary: true,
+          isVisibleInTranscriptOnly: true,
+          sessionId: "claude-session-steered",
+          timestamp: "2026-07-01T01:00:00.050Z",
+          message: { role: "user", content: "Synthetic compact summary." },
+        },
+        {
+          type: "user",
+          uuid: "human-original",
+          promptId,
+          userType: "external",
+          sessionId: "claude-session-steered",
+          timestamp: "2026-07-01T01:00:01.000Z",
+          message: { role: "user", content: "Start the audit." },
+        },
+        {
+          type: "assistant",
+          uuid: "assistant-before-steer",
+          sessionId: "claude-session-steered",
+          timestamp: "2026-07-01T01:00:02.000Z",
+          message: {
+            role: "assistant",
+            stop_reason: "tool_use",
+            content: [{ type: "text", text: "Audit started." }],
+          },
+        },
+        {
+          type: "user",
+          uuid: "human-steer",
+          promptId,
+          userType: "external",
+          sessionId: "claude-session-steered",
+          timestamp: "2026-07-01T01:00:03.000Z",
+          message: { role: "user", content: "Also check the catalog." },
+        },
+        {
+          type: "assistant",
+          uuid: "assistant-after-steer",
+          sessionId: "claude-session-steered",
+          timestamp: "2026-07-01T01:00:04.000Z",
+          message: {
+            role: "assistant",
+            stop_reason: "end_turn",
+            content: [{ type: "text", text: "Audit and catalog checked." }],
+          },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    const run = makeCodeAgentContext({
+      "include-codex": false,
+      "include-claude": true,
+      "claude-root": claudeRoot,
+      "lookback-days": 30,
+    });
+
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 2) });
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    const [original, steer, agent] = run.events;
+    expect(original.externalId).not.toBe(steer.externalId);
+    expect(original.payload.interactionId).toBe(steer.payload.interactionId);
+    expect(agent.payload.interactionId).toBe(original.payload.interactionId);
+    expect(agent).toMatchObject({
+      startedAt: Date.parse("2026-07-01T01:00:02.000Z"),
+      endedAt: Date.parse("2026-07-01T01:00:04.000Z"),
+      payload: {
+        status: "completed",
+        content: { text: "Audit and catalog checked." },
+        raw: { ids: { sessionId: "claude-session-steered", promptId } },
+      },
+    });
+    expect(run.blobWrites).toHaveLength(1);
+    expect(run.blobWrites[0].text).toContain("Audit started.");
+    expect(run.blobWrites[0].text).toContain("Audit and catalog checked.");
+    expect(run.blobWrites[0].text).not.toContain("Also check the catalog.");
+    expect(run.blobWrites[0].text).not.toContain("Synthetic task notification.");
+  });
+
+  test("code-agent-transcripts includes redacted Claude reasoning only when enabled", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const claudeRoot = join(workspace, "claude-reasoning-turn");
+    const projectDir = join(claudeRoot, "Users-alice-project");
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(
+      join(projectDir, "session.jsonl"),
+      [
+        {
+          type: "user",
+          uuid: "human-reasoning",
+          promptId: "prompt-reasoning",
+          origin: { kind: "human" },
+          sessionId: "claude-session-reasoning",
+          timestamp: "2026-07-01T01:00:00.000Z",
+          message: { role: "user", content: "Think." },
+        },
+        {
+          type: "assistant",
+          uuid: "assistant-reasoning",
+          sessionId: "claude-session-reasoning",
+          timestamp: "2026-07-01T01:00:01.000Z",
+          message: {
+            role: "assistant",
+            stop_reason: "tool_use",
+            content: [{ type: "thinking", thinking: "Reason with sk-secretsecretsecretsecretsecret." }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "assistant-final",
+          sessionId: "claude-session-reasoning",
+          timestamp: "2026-07-01T01:00:02.000Z",
+          message: {
+            role: "assistant",
+            stop_reason: "end_turn",
+            content: [{ type: "text", text: "Done." }],
+          },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    const run = makeCodeAgentContext({
+      "include-codex": false,
+      "include-claude": true,
+      "include-reasoning": true,
+      "claude-root": claudeRoot,
+      "lookback-days": 30,
+    });
+
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 2) });
+    expect(run.blobWrites).toHaveLength(1);
+    expect(run.blobWrites[0].text).toContain("Reason with [REDACTED_SECRET].");
+    expect(run.blobWrites[0].text).not.toContain("sk-secretsecretsecretsecretsecret");
+  });
+
+  test("telegram-bot records its rolling Bot API compatibility reference", () => {
+    expect(existsSync(new URL("../../template/connectors/telegram-bot/docs", import.meta.url))).toBe(false);
+    expect(telegramBotApiReference).toMatchObject({
+      schemaVersion: 1,
+      provider: "telegram",
+      api: "Bot API",
+      transport: "cloud",
+      compatibility: {
+        minimumVersion: "10.0",
+        testedAgainstVersion: "10.1",
+        testedAgainstReleaseDate: "2026-06-11",
+      },
+    });
+    expect(telegramBotApiReference.references.testedAgainstRelease).toBe(
+      "https://core.telegram.org/bots/api-changelog#june-11-2026",
+    );
+    expect(telegramBotApiReference.methods).toEqual([
+      "deleteWebhook",
+      "getMe",
+      "getUpdates",
+    ]);
+  });
+
+  test("telegram-bot connect verifies bot identity and stores connection state", async () => {
+    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { connectOnce } = await import(telegramUrl) as {
+      connectOnce(context: unknown, deps?: unknown): Promise<unknown>;
+    };
+
+    let syncState: unknown;
+    const calls: Array<{ url: string; body: any }> = [];
+    const context = {
+      auth: {
+        type: "apiKey",
+        async getToken() {
+          return "telegram-token";
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      warnings: {
+        async clear() {},
+      },
+      config: {},
+      signal: new AbortController().signal,
+    };
+
+    const bot = await connectOnce(context, {
+      now: () => 1000,
+      fetchImpl: async (url: string, init: RequestInit) => {
+        calls.push({ url: String(url), body: JSON.parse(String(init.body)) });
+        return Response.json({
+          ok: true,
+          result: {
+            id: 42,
+            username: "lamarck_test_bot",
+            first_name: "Lamarck Test",
+            can_join_groups: true,
+            can_read_all_group_messages: false,
+          },
+        });
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain("/getMe");
+    expect(telegramBotApiReference.methods).toContain("getMe");
+    expect(calls[0].body).toEqual({});
+    expect(bot).toEqual({
+      id: 42,
+      username: "lamarck_test_bot",
+      firstName: "Lamarck Test",
+      canJoinGroups: true,
+      canReadAllGroupMessages: false,
+    });
+    expect(syncState).toMatchObject({
+      version: 1,
+      connection: { status: "connected", checkedAt: 1000 },
+      bot,
+    });
+  });
+
+  test("telegram-bot captures inbound messages as raw-first events", async () => {
+    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(telegramUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<{ updates: number; events: number }>;
+    };
+
+    let syncState: any = {
+      version: 1,
+      bot: { id: 42, username: "lamarck_test_bot" },
+    };
+    const events: any[] = [];
+    const requests: any[] = [];
+    const context = {
+      auth: {
+        type: "apiKey",
+        async getToken() {
+          return "telegram-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      warnings: {
+        async clear() {},
+        async set() {},
+      },
+      config: {},
+      signal: new AbortController().signal,
+    };
+
+    const result = await syncOnce(context, {
+      now: () => 2000,
+      fetchImpl: async (url: string, init: RequestInit) => {
+        requests.push({ url: String(url), body: JSON.parse(String(init.body)) });
+        return Response.json({
+          ok: true,
+          result: [
+            {
+              update_id: 10,
+              message: {
+                message_id: 1,
+                date: 1700000000,
+                text: "/start",
+                from: {
+                  id: 123,
+                  is_bot: false,
+                  username: "alice",
+                  first_name: "Alice",
+                },
+                chat: {
+                  id: 123,
+                  type: "private",
+                  username: "alice",
+                  first_name: "Alice",
+                },
+              },
+            },
+            {
+              update_id: 11,
+              message: {
+                message_id: 2,
+                date: 1700000001,
+                text: "@lamarck_test_bot capture this",
+                from: {
+                  id: 123,
+                  is_bot: false,
+                  username: "alice",
+                  first_name: "Alice",
+                },
+                chat: {
+                  id: -100,
+                  type: "group",
+                  title: "Test Group",
+                },
+              },
+            },
+            {
+              update_id: 12,
+              callback_query: {
+                id: "callback-1",
+                from: { id: 123, is_bot: false, username: "alice" },
+                data: "ignored",
+              },
+            },
+          ],
+        });
+      },
+    });
+
+    expect(result).toEqual({ updates: 3, events: 1 });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].url).toContain("/getUpdates");
+    expect(requests[0].body).toMatchObject({
+      timeout: 25,
+      limit: 100,
+      allowed_updates: telegramBotApiReference.updateTypes,
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "telegram.message.received",
+      externalId: "bot:42:update:10",
+      startedAt: 1700000000000,
+      payload: {
+        schema: "telegram.message.v1",
+        provider: "telegram",
+        transport: "telegram-bot-api",
+        telegram: { botId: 42, updateId: 10, updateType: "message" },
+        messageKey: "bot:42:chat:123:message:1",
+        chatKey: "bot:42:chat:123",
+        text: "/start",
+        textKind: "text",
+        message: {
+          message_id: 1,
+          date: 1700000000,
+          text: "/start",
+          from: { id: 123, is_bot: false, username: "alice", first_name: "Alice" },
+          chat: { id: 123, type: "private", username: "alice", first_name: "Alice" },
+        },
+      },
+    });
+    expect(events[0].payload.placeholder).toBeUndefined();
+    expect(events[0].payload.update).toBeUndefined();
+    expect(events[0].payload.messageTransport).toBeUndefined();
+    expect(events[0].payload.from).toBeUndefined();
+    expect(events[0].payload.chat).toBeUndefined();
+    expect(events[0].payload.mediaRefs).toBeUndefined();
+    expect(syncState.cursor.lastUpdateId).toBe(12);
+    expect(syncState.setup.pendingUsers["123"]).toMatchObject({
+      id: 123,
+      username: "alice",
+      lastText: "/start",
+      lastUpdateId: 10,
+    });
+    expect(syncState.setup.pendingGroups["-100"]).toMatchObject({
+      id: -100,
+      title: "Test Group",
+      lastUpdateId: 11,
+    });
+  });
+
+  test("telegram-bot preserves raw messages and extracts media refs", async () => {
+    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { eventFromUpdate } = await import(telegramUrl) as {
+      eventFromUpdate(update: unknown, opts?: unknown): any;
+    };
+
+    const photoEvent = eventFromUpdate({
+      update_id: 30,
+      message: {
+        message_id: 7,
+        message_thread_id: 777,
+        media_group_id: "album-1",
+        date: 1700000100,
+        caption: "/save this photo",
+        caption_entities: [{ type: "bot_command", offset: 0, length: 5 }],
+        sender_chat: { id: -100, type: "supergroup", title: "Project Notes" },
+        author_signature: "Project Admin",
+        from: { id: 123, is_bot: false, username: "alice", first_name: "Alice" },
+        chat: { id: -100, type: "supergroup", title: "Project Notes" },
+        photo: [
+          { file_id: "photo-small", file_unique_id: "photo-u-small", width: 160, height: 120, file_size: 9000 },
+          { file_id: "photo-large", file_unique_id: "photo-u-large", width: 1280, height: 960, file_size: 234567 },
+        ],
+        reply_to_message: {
+          message_id: 6,
+          date: 1700000099,
+          text: "previous note",
+          from: { id: 456, is_bot: false, username: "alice", first_name: "Alice" },
+          chat: { id: -100, type: "supergroup", title: "Project Notes" },
+        },
+        forward_origin: {
+          type: "channel",
+          date: 1699999999,
+          chat: { id: -200, type: "channel", title: "News" },
+          message_id: 99,
+          author_signature: "News Desk",
+        },
+      },
+    }, { bot: { id: 42, username: "lamarck_test_bot" } });
+
+    expect(photoEvent).toMatchObject({
+      type: "telegram.message.received",
+      externalId: "bot:42:update:30",
+      payload: {
+        schema: "telegram.message.v1",
+        provider: "telegram",
+        transport: "telegram-bot-api",
+        telegram: { botId: 42, updateId: 30, updateType: "message" },
+        messageKey: "bot:42:chat:-100:message:7",
+        chatKey: "bot:42:chat:-100",
+        text: "/save this photo",
+        textKind: "caption",
+        attachmentTypes: ["photo"],
+        message: {
+          message_id: 7,
+          message_thread_id: 777,
+          media_group_id: "album-1",
+          caption_entities: [{ type: "bot_command", offset: 0, length: 5 }],
+          reply_to_message: {
+            message_id: 6,
+            text: "previous note",
+            from: { id: 456, is_bot: false, username: "alice", first_name: "Alice" },
+          },
+          forward_origin: {
+            type: "channel",
+            date: 1699999999,
+            chat: { id: -200, type: "channel", title: "News" },
+            message_id: 99,
+            author_signature: "News Desk",
+          },
+        },
+        mediaRefs: [{
+          kind: "telegram-file",
+          telegramType: "photo",
+          fileId: "photo-large",
+          fileUniqueId: "photo-u-large",
+          width: 1280,
+          height: 960,
+          mimeType: "image/jpeg",
+          sizeBytes: 234567,
+        }],
+      },
+    });
+    expect(photoEvent.payload.update).toBeUndefined();
+    expect(photoEvent.payload.textEntities).toBeUndefined();
+    expect(photoEvent.payload.attachments).toBeUndefined();
+    expect(photoEvent.payload.replyTo).toBeUndefined();
+    expect(photoEvent.payload.forward).toBeUndefined();
+
+    const documentEvent = eventFromUpdate({
+      update_id: 31,
+      message: {
+        message_id: 8,
+        date: 1700000200,
+        caption: "read this",
+        from: { id: 123, is_bot: false, username: "alice", first_name: "Alice" },
+        chat: { id: 123, type: "private", username: "alice", first_name: "Alice" },
+        document: {
+          file_id: "doc-file",
+          file_unique_id: "doc-unique",
+          file_name: "report.pdf",
+          mime_type: "application/pdf",
+          file_size: 123456,
+          thumbnail: {
+            file_id: "thumb-file",
+            file_unique_id: "thumb-unique",
+            width: 320,
+            height: 180,
+            file_size: 12000,
+          },
+        },
+      },
+    }, { bot: { id: 42, username: "lamarck_test_bot" } });
+
+    expect(documentEvent).toMatchObject({
+      externalId: "bot:42:update:31",
+      payload: {
+        text: "read this",
+        textKind: "caption",
+        attachmentTypes: ["document"],
+        mediaRefs: [{
+          kind: "telegram-file",
+          telegramType: "document",
+          fileId: "doc-file",
+          fileUniqueId: "doc-unique",
+          fileName: "report.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 123456,
+        }],
+        message: {
+          document: {
+            thumbnail: {
+              file_id: "thumb-file",
+              file_unique_id: "thumb-unique",
+              width: 320,
+              height: 180,
+              file_size: 12000,
+            },
+          },
+        },
+      },
+    });
+    expect(documentEvent.payload.update).toBeUndefined();
+
+    const messageBearingUpdates = [
+      "business_message",
+      "edited_business_message",
+      "guest_message",
+    ];
+    for (const [index, updateType] of messageBearingUpdates.entries()) {
+      const event = eventFromUpdate({
+        update_id: 40 + index,
+        [updateType]: {
+          message_id: 20 + index,
+          date: 1700000400 + index,
+          text: `${updateType} text`,
+          from: { id: 123, is_bot: false, username: "alice" },
+          chat: { id: 123, type: "private", username: "alice" },
+        },
+      }, { bot: { id: 42 } });
+
+      expect(event).toMatchObject({
+        type: "telegram.message.received",
+        externalId: `bot:42:update:${40 + index}`,
+        payload: {
+          telegram: { botId: 42, updateId: 40 + index, updateType },
+          messageKey: `bot:42:chat:123:message:${20 + index}`,
+          chatKey: "bot:42:chat:123",
+          text: `${updateType} text`,
+          textKind: "text",
+          message: {
+            message_id: 20 + index,
+            text: `${updateType} text`,
+          },
+        },
+      });
+    }
+
+    const allMediaEvent = eventFromUpdate({
+      update_id: 32,
+      message: {
+        message_id: 9,
+        date: 1700000300,
+        chat: { id: 123, type: "private" },
+        from: { id: 123, is_bot: false },
+        animation: { file_id: "anim-file", file_unique_id: "anim-u", width: 640, height: 360, duration: 2, file_name: "clip.gif", mime_type: "image/gif", file_size: 111 },
+        audio: { file_id: "audio-file", file_unique_id: "audio-u", duration: 120, file_name: "song.mp3", mime_type: "audio/mpeg", file_size: 222 },
+        video: { file_id: "video-file", file_unique_id: "video-u", width: 1920, height: 1080, duration: 60, file_name: "movie.mp4", mime_type: "video/mp4", file_size: 333 },
+        voice: { file_id: "voice-file", file_unique_id: "voice-u", duration: 5, mime_type: "audio/ogg", file_size: 444 },
+        sticker: { file_id: "sticker-file", file_unique_id: "sticker-u", width: 512, height: 512, file_size: 555, is_animated: false, is_video: false },
+        video_note: { file_id: "note-file", file_unique_id: "note-u", length: 240, duration: 7, file_size: 666 },
+        live_photo: { file_id: "live-file", file_unique_id: "live-u", width: 1440, height: 1080, duration: 3, mime_type: "video/mp4", file_size: 777 },
+        paid_media: {
+          star_count: 10,
+          paid_media: [
+            { type: "photo", photo: [{ file_id: "paid-photo", file_unique_id: "paid-photo-u", width: 800, height: 600, file_size: 888 }] },
+            { type: "video", video: { file_id: "paid-video", file_unique_id: "paid-video-u", width: 1280, height: 720, duration: 9, mime_type: "video/mp4", file_size: 999 } },
+            { type: "live_photo", live_photo: { file_id: "paid-live", file_unique_id: "paid-live-u", width: 1024, height: 768, duration: 4, mime_type: "video/mp4", file_size: 1000 } },
+            { type: "preview", width: 100, height: 100 },
+          ],
+        },
+        contact: { phone_number: "+15555555555", first_name: "Alice" },
+        location: { latitude: 25.03, longitude: 121.56 },
+        poll: { id: "poll-1", question: "Ship?", options: [] },
+      },
+    }, { bot: { id: 42 } });
+
+    expect(allMediaEvent.payload.attachmentTypes).toEqual([
+      "video",
+      "voice",
+      "audio",
+      "animation",
+      "sticker",
+      "video_note",
+      "live_photo",
+      "paid_media",
+      "contact",
+      "location",
+      "poll",
+    ]);
+    expect(allMediaEvent.payload.mediaRefs).toEqual([
+      { kind: "telegram-file", telegramType: "video", fileId: "video-file", fileUniqueId: "video-u", fileName: "movie.mp4", width: 1920, height: 1080, durationSec: 60, mimeType: "video/mp4", sizeBytes: 333 },
+      { kind: "telegram-file", telegramType: "voice", fileId: "voice-file", fileUniqueId: "voice-u", durationSec: 5, mimeType: "audio/ogg", sizeBytes: 444 },
+      { kind: "telegram-file", telegramType: "audio", fileId: "audio-file", fileUniqueId: "audio-u", fileName: "song.mp3", durationSec: 120, mimeType: "audio/mpeg", sizeBytes: 222 },
+      { kind: "telegram-file", telegramType: "animation", fileId: "anim-file", fileUniqueId: "anim-u", fileName: "clip.gif", width: 640, height: 360, durationSec: 2, mimeType: "image/gif", sizeBytes: 111 },
+      { kind: "telegram-file", telegramType: "sticker", fileId: "sticker-file", fileUniqueId: "sticker-u", width: 512, height: 512, sizeBytes: 555 },
+      { kind: "telegram-file", telegramType: "video_note", fileId: "note-file", fileUniqueId: "note-u", width: 240, height: 240, durationSec: 7, sizeBytes: 666 },
+      { kind: "telegram-file", telegramType: "live_photo", fileId: "live-file", fileUniqueId: "live-u", width: 1440, height: 1080, durationSec: 3, mimeType: "video/mp4", sizeBytes: 777 },
+      { kind: "telegram-file", telegramType: "paid_media", paidMediaType: "photo", paidMediaIndex: 0, fileId: "paid-photo", fileUniqueId: "paid-photo-u", width: 800, height: 600, mimeType: "image/jpeg", sizeBytes: 888 },
+      { kind: "telegram-file", telegramType: "paid_media", paidMediaType: "video", paidMediaIndex: 1, fileId: "paid-video", fileUniqueId: "paid-video-u", width: 1280, height: 720, durationSec: 9, mimeType: "video/mp4", sizeBytes: 999 },
+      { kind: "telegram-file", telegramType: "paid_media", paidMediaType: "live_photo", paidMediaIndex: 2, fileId: "paid-live", fileUniqueId: "paid-live-u", width: 1024, height: 768, durationSec: 4, mimeType: "video/mp4", sizeBytes: 1000 },
+    ]);
+  });
+
+  test("telegram-bot pairs a direct-message user with a one-time code", async () => {
+    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { syncOnce, pairingChallengeForCode } = await import(telegramUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<{ updates: number; events: number }>;
+      pairingChallengeForCode(code: string, nowMs: number, opts?: { salt?: string }): unknown;
+    };
+
+    let syncState: any = {
+      version: 1,
+      bot: { id: 42, username: "lamarck_test_bot" },
+      setup: {
+        pendingUsers: {},
+        pendingGroups: {},
+        pairingChallenge: pairingChallengeForCode("842913", 1000, { salt: "test-salt" }),
+      },
+    };
+    const events: any[] = [];
+    let requestCount = 0;
+    const context = {
+      auth: {
+        type: "apiKey",
+        async getToken() {
+          return "telegram-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      warnings: {
+        async clear() {},
+        async set() {},
+      },
+      config: {
+        telegramSetup: {
+          dm: { mode: "paired_only" },
+          groups: { mode: "disabled", requireMention: true },
+        },
+      },
+      signal: new AbortController().signal,
+    };
+    const updates = [
+      [
+        {
+          update_id: 12,
+          message: {
+            message_id: 1,
+            date: 1700000002,
+            text: "/pair 842913",
+            from: {
+              id: 123,
+              is_bot: false,
+              username: "alice",
+              first_name: "Alice",
+            },
+            chat: {
+              id: 123,
+              type: "private",
+              username: "alice",
+              first_name: "Alice",
+            },
+          },
+        },
+      ],
+      [
+        {
+          update_id: 13,
+          message: {
+            message_id: 2,
+            date: 1700000003,
+            text: "capture after pairing",
+            from: {
+              id: 123,
+              is_bot: false,
+              username: "alice",
+              first_name: "Alice",
+            },
+            chat: {
+              id: 123,
+              type: "private",
+              username: "alice",
+              first_name: "Alice",
+            },
+          },
+        },
+      ],
+    ];
+    const fetchImpl = async () => {
+      const result = updates[requestCount++] ?? [];
+      return Response.json({ ok: true, result });
+    };
+
+    expect(await syncOnce(context, { now: () => 2000, fetchImpl })).toEqual({ updates: 1, events: 0 });
+    expect(events).toHaveLength(0);
+    expect(syncState.setup.pairingChallenge).toBeUndefined();
+    expect(syncState.setup.pairedUsers["123"]).toMatchObject({
+      id: 123,
+      username: "alice",
+      pairingMethod: "otp",
+      lastUpdateId: 12,
+    });
+    expect(syncState.setup.lastPairingAttempt).toMatchObject({
+      status: "paired_user",
+      id: "123",
+    });
+
+    expect(await syncOnce(context, { now: () => 3000, fetchImpl })).toEqual({ updates: 1, events: 1 });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "telegram.message.received",
+      externalId: "bot:42:update:13",
+      payload: {
+        text: "capture after pairing",
+        messageKey: "bot:42:chat:123:message:2",
+        message: {
+          message_id: 2,
+          from: { id: 123, username: "alice" },
+        },
+      },
+    });
+  });
+
+  test("telegram-bot pairs a group with a one-time code", async () => {
+    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { syncOnce, pairingChallengeForCode } = await import(telegramUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<{ updates: number; events: number }>;
+      pairingChallengeForCode(code: string, nowMs: number, opts?: { salt?: string }): unknown;
+    };
+
+    let syncState: any = {
+      version: 1,
+      bot: { id: 42, username: "lamarck_test_bot" },
+      setup: {
+        pendingUsers: {},
+        pendingGroups: {},
+        pairingChallenge: pairingChallengeForCode("112233", 1000, { salt: "group-salt" }),
+      },
+    };
+    const events: any[] = [];
+    let requestCount = 0;
+    const context = {
+      auth: {
+        type: "apiKey",
+        async getToken() {
+          return "telegram-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      warnings: {
+        async clear() {},
+        async set() {},
+      },
+      config: {
+        telegramSetup: {
+          dm: { mode: "disabled" },
+          groups: { mode: "paired_only", requireMention: true },
+        },
+      },
+      signal: new AbortController().signal,
+    };
+    const updates = [
+      [
+        {
+          update_id: 20,
+          message: {
+            message_id: 1,
+            date: 1700000010,
+            text: "/pair 112233",
+            from: {
+              id: 123,
+              is_bot: false,
+              username: "alice",
+              first_name: "Alice",
+            },
+            chat: {
+              id: -100,
+              type: "group",
+              title: "Project Notes",
+            },
+          },
+        },
+      ],
+      [
+        {
+          update_id: 21,
+          message: {
+            message_id: 2,
+            date: 1700000011,
+            text: "@lamarck_test_bot capture group note",
+            from: {
+              id: 123,
+              is_bot: false,
+              username: "alice",
+              first_name: "Alice",
+            },
+            chat: {
+              id: -100,
+              type: "group",
+              title: "Project Notes",
+            },
+          },
+        },
+      ],
+    ];
+    const fetchImpl = async () => Response.json({ ok: true, result: updates[requestCount++] ?? [] });
+
+    expect(await syncOnce(context, { now: () => 2000, fetchImpl })).toEqual({ updates: 1, events: 0 });
+    expect(syncState.setup.pairingChallenge).toBeUndefined();
+    expect(syncState.setup.pairedGroups["-100"]).toMatchObject({
+      id: -100,
+      title: "Project Notes",
+      pairingMethod: "otp",
+      lastUpdateId: 20,
+      pairedBy: { id: 123, username: "alice" },
+    });
+    expect(syncState.setup.lastPairingAttempt).toMatchObject({
+      status: "paired_group",
+      id: "-100",
+    });
+
+    expect(await syncOnce(context, { now: () => 3000, fetchImpl })).toEqual({ updates: 1, events: 1 });
+    expect(events[0]).toMatchObject({
+      type: "telegram.message.received",
+      externalId: "bot:42:update:21",
+      payload: {
+        text: "@lamarck_test_bot capture group note",
+        messageKey: "bot:42:chat:-100:message:2",
+        message: {
+          message_id: 2,
+          chat: { id: -100, type: "group", title: "Project Notes" },
+        },
+      },
+    });
+  });
+
+  test("oura sync uses revision-aware external ids and per-stream cursors", async () => {
+    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(ouraUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+
+    let syncState: unknown;
+    let score = 90;
+    const events: any[] = [];
+    const requests: URL[] = [];
+    const context = {
+      auth: {
+        type: "managedProvider",
+        async getToken() {
+          return "oura-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          const start = events.length;
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${start + index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        lookbackDays: 1,
+        backfillYears: 0,
+        streams: ["daily_sleep"],
+      },
+      host: {
+        lamarckApiOrigin: "https://dev-api.example.test",
+      },
+      signal: new AbortController().signal,
+    };
+
+    const fetchImpl = async (url: string, init: RequestInit) => {
+      const requestUrl = new URL(url);
+      requests.push(requestUrl);
+      expect((init.headers as Record<string, string>).Authorization).toBe("Bearer oura-token");
+      return new Response(JSON.stringify({
+        data: [{
+          id: "sleep-doc-1",
+          day: "2026-01-02",
+          timestamp: "2026-01-02T08:00:00+00:00",
+          contributors: { total_sleep: score },
+          score,
+        }],
+        next_token: null,
+      }), { status: 200 });
+    };
+
+    const now = Date.UTC(2026, 0, 3, 12);
+    await syncOnce(context, { fetchImpl, now });
+    const firstExternalId = events[0].externalId;
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "oura.daily_sleep",
+      externalId: expect.stringMatching(/^daily_sleep:sleep-doc-1:[a-f0-9]{16}$/),
+      startedAt: Date.UTC(2026, 0, 2),
+      payload: {
+        schema: "oura.daily_sleep.v1",
+        provider: "oura",
+        stream: "daily_sleep",
+        record: {
+          id: "sleep-doc-1",
+          day: "2026-01-02",
+          score: 90,
+        },
+      },
+    });
+    expect(syncState).toEqual({
+      version: 2,
+      incremental: {
+        streams: {
+          daily_sleep: {
+            lastSyncedDate: "2026-01-03",
+            lastSyncedAt: now,
+          },
+        },
+      },
+      backfill: undefined,
+    });
+    expect(requests[0].origin).toBe("https://dev-api.example.test");
+    expect(requests[0].pathname).toBe("/providers/oura/v1/streams/daily_sleep");
+    expect(requests[0].searchParams.get("start_date")).toBe("2026-01-02");
+    expect(requests[0].searchParams.get("end_date")).toBe("2026-01-03");
+
+    score = 91;
+    await syncOnce(context, { fetchImpl, now });
+
+    expect(events).toHaveLength(2);
+    expect(events[1].externalId).not.toBe(firstExternalId);
+    expect(events[1].externalId).toMatch(/^daily_sleep:sleep-doc-1:[a-f0-9]{16}$/);
+    expect(requests[1].searchParams.get("start_date")).toBe("2026-01-02");
+    expect(requests[1].searchParams.get("end_date")).toBe("2026-01-03");
+  });
+
+  test("oura backfill completes available chunks after incremental sync", async () => {
+    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(ouraUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const requests: URL[] = [];
+    const context = {
+      auth: {
+        type: "managedProvider",
+        async getToken() {
+          return "oura-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          const start = events.length;
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${start + index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        lookbackDays: 1,
+        backfillYears: 1,
+        streams: ["daily_sleep"],
+      },
+      signal: new AbortController().signal,
+    };
+
+    const fetchImpl = async (url: string) => {
+      const requestUrl = new URL(url);
+      requests.push(requestUrl);
+      const day = requestUrl.searchParams.get("start_date") ?? "2026-01-02";
+      return new Response(JSON.stringify({
+        data: [{
+          id: `sleep-${day}`,
+          day,
+          timestamp: `${day}T08:00:00+00:00`,
+          score: 90,
+        }],
+        next_token: null,
+      }), { status: 200 });
+    };
+
+    const now = Date.UTC(2026, 0, 3, 12);
+    await syncOnce(context, { fetchImpl, now });
+
+    expect(requests).toHaveLength(6);
+    expect(requests[0].searchParams.get("start_date")).toBe("2026-01-02");
+    expect(requests[0].searchParams.get("end_date")).toBe("2026-01-03");
+    expect(requests[1].searchParams.get("start_date")).toBe("2025-01-03");
+    expect(requests[1].searchParams.get("end_date")).toBe("2025-04-03");
+    expect(requests[5].searchParams.get("start_date")).toBe("2025-12-29");
+    expect(requests[5].searchParams.get("end_date")).toBe("2026-01-03");
+    expect(events).toHaveLength(6);
+    expect(syncState).toEqual({
+      version: 2,
+      incremental: {
+        streams: {
+          daily_sleep: {
+            lastSyncedDate: "2026-01-03",
+            lastSyncedAt: now,
+          },
+        },
+      },
+      backfill: {
+        fromDate: "2025-01-03",
+        untilDate: "2026-01-03",
+        streams: {
+          daily_sleep: {
+            nextDate: "2026-01-03",
+            done: true,
+            lastSyncedAt: now,
+          },
+        },
+        done: true,
+      },
+    });
+
+    await syncOnce(context, { fetchImpl, now });
+    expect(requests).toHaveLength(7);
+    expect(requests[6].searchParams.get("start_date")).toBe("2026-01-02");
+    expect(requests[6].searchParams.get("end_date")).toBe("2026-01-03");
+  });
+
+  test("oura datetime backfill uses provider-safe 30 day chunks", async () => {
+    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(ouraUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+
+    let syncState: unknown;
+    const requests: URL[] = [];
+    const context = {
+      auth: {
+        type: "managedProvider",
+        async getToken() {
+          return "oura-token";
+        },
+      },
+      guard: {
+        async writeEvents() {
+          return { ids: [] };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        lookbackDays: 1,
+        backfillYears: 1,
+        streams: ["ring_battery_level"],
+      },
+      signal: new AbortController().signal,
+    };
+
+    const fetchImpl = async (url: string) => {
+      requests.push(new URL(url));
+      return new Response(JSON.stringify({
+        data: [],
+        next_token: null,
+      }), { status: 200 });
+    };
+
+    const now = Date.UTC(2026, 0, 3, 12);
+    await syncOnce(context, { fetchImpl, now });
+
+    expect(requests[0].searchParams.get("start_datetime")).toBe("2026-01-02T12:00:00.000Z");
+    expect(requests[0].searchParams.get("end_datetime")).toBe("2026-01-03T12:00:00.000Z");
+    expect(requests[1].searchParams.get("start_datetime")).toBe("2025-01-03T00:00:00.000Z");
+    expect(requests[1].searchParams.get("end_datetime")).toBe("2025-02-02T00:00:00.000Z");
+    for (const request of requests.slice(1)) {
+      const start = Date.parse(request.searchParams.get("start_datetime") ?? "");
+      const end = Date.parse(request.searchParams.get("end_datetime") ?? "");
+      expect(end - start).toBeLessThanOrEqual(30 * 24 * 60 * 60 * 1000);
+    }
+  });
+
+  test("oura backfill records errors and resumes from the failed chunk", async () => {
+    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(ouraUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const requests: URL[] = [];
+    const warnings = new Map<string, any>();
+    let failSecondBackfillChunk = true;
+    const context = {
+      auth: {
+        type: "managedProvider",
+        async getToken() {
+          return "oura-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          const start = events.length;
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${start + index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      warnings: {
+        async set(warning: any) {
+          warnings.set(warning.key, warning);
+        },
+        async clear(key: string) {
+          warnings.delete(key);
+        },
+      },
+      config: {
+        lookbackDays: 1,
+        backfillYears: 1,
+        streams: ["daily_sleep"],
+      },
+      signal: new AbortController().signal,
+    };
+
+    const fetchImpl = async (url: string) => {
+      const requestUrl = new URL(url);
+      requests.push(requestUrl);
+      const startDate = requestUrl.searchParams.get("start_date") ?? "2026-01-02";
+      if (failSecondBackfillChunk && startDate === "2025-04-03") {
+        throw new Error("synthetic rate limit");
+      }
+      return new Response(JSON.stringify({
+        data: [{
+          id: `sleep-${startDate}`,
+          day: startDate,
+          timestamp: `${startDate}T08:00:00+00:00`,
+          score: 90,
+        }],
+        next_token: null,
+      }), { status: 200 });
+    };
+
+    const now = Date.UTC(2026, 0, 3, 12);
+    await syncOnce(context, { fetchImpl, now });
+
+    expect(requests).toHaveLength(3);
+    expect(requests[1].searchParams.get("start_date")).toBe("2025-01-03");
+    expect(requests[2].searchParams.get("start_date")).toBe("2025-04-03");
+    expect(syncState).toMatchObject({
+      version: 2,
+      backfill: {
+        fromDate: "2025-01-03",
+        untilDate: "2026-01-03",
+        streams: {
+          daily_sleep: {
+            nextDate: "2025-04-03",
+            done: false,
+          },
+        },
+        lastError: {
+          stream: "daily_sleep",
+          nextDate: "2025-04-03",
+          chunkEndDate: "2025-07-02",
+          message: "synthetic rate limit",
+          at: now,
+        },
+      },
+    });
+    expect(warnings.get("backfill")).toMatchObject({
+      key: "backfill",
+      message: "Oura backfill paused at daily_sleep 2025-04-03: synthetic rate limit",
+      details: {
+        provider: "oura",
+        stream: "daily_sleep",
+        nextDate: "2025-04-03",
+        chunkEndDate: "2025-07-02",
+      },
+    });
+
+    failSecondBackfillChunk = false;
+    await syncOnce(context, { fetchImpl, now });
+
+    expect(requests[4].searchParams.get("start_date")).toBe("2025-04-03");
+    expect(syncState).toMatchObject({
+      backfill: {
+        streams: {
+          daily_sleep: {
+            nextDate: "2026-01-03",
+            done: true,
+          },
+        },
+        done: true,
+      },
+    });
+    expect(warnings.has("backfill")).toBe(false);
+  });
+
+  test("oura heartrate sync emits 15 minute batch events", async () => {
+    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(ouraUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const requests: URL[] = [];
+    const context = {
+      auth: {
+        type: "managedProvider",
+        async getToken() {
+          return "oura-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          const start = events.length;
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${start + index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        lookbackDays: 1,
+        backfillYears: 0,
+        streams: ["heartrate"],
+      },
+      signal: new AbortController().signal,
+    };
+
+    const fetchImpl = async (url: string) => {
+      requests.push(new URL(url));
+      return new Response(JSON.stringify({
+        data: [
+          { timestamp: "2026-01-03T11:01:00+00:00", bpm: 60, source: "awake" },
+          { timestamp: "2026-01-03T11:14:00+00:00", bpm: 66, source: "awake" },
+          { timestamp: "2026-01-03T11:16:00+00:00", bpm: 72, source: "workout" },
+        ],
+        next_token: null,
+      }), { status: 200 });
+    };
+
+    const now = Date.UTC(2026, 0, 3, 12);
+    await syncOnce(context, { fetchImpl, now });
+
+    expect(requests[0].searchParams.get("start_datetime")).toBe("2026-01-02T12:00:00.000Z");
+    expect(requests[0].searchParams.get("end_datetime")).toBe("2026-01-03T12:00:00.000Z");
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      type: "oura.heartrate.batch",
+      externalId: expect.stringMatching(/^heartrate:2026-01-03T11:00:00\.000Z:[a-f0-9]{16}$/),
+      startedAt: Date.UTC(2026, 0, 3, 11),
+      endedAt: Date.UTC(2026, 0, 3, 11, 15),
+      payload: {
+        schema: "oura.heartrate.batch.v1",
+        provider: "oura",
+        stream: "heartrate",
+        bucketMs: 15 * 60 * 1000,
+        sampleCount: 2,
+        sourceCounts: { awake: 2 },
+        minBpm: 60,
+        maxBpm: 66,
+        avgBpm: 63,
+      },
+    });
+    expect(events[0].payload.samples).toHaveLength(2);
+    expect(events[1]).toMatchObject({
+      type: "oura.heartrate.batch",
+      startedAt: Date.UTC(2026, 0, 3, 11, 15),
+      payload: {
+        sampleCount: 1,
+        sourceCounts: { workout: 1 },
+        minBpm: 72,
+        maxBpm: 72,
+        avgBpm: 72,
+      },
+    });
+    expect(syncState).toEqual({
+      version: 2,
+      incremental: {
+        streams: {
+          heartrate: {
+            lastSyncedDateTime: "2026-01-03T12:00:00.000Z",
+            lastSyncedAt: now,
+          },
+        },
+      },
+      backfill: undefined,
+    });
+  });
+
+  test("oura ring battery sync emits threshold transition events", async () => {
+    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(ouraUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const requests: URL[] = [];
+    const context = {
+      auth: {
+        type: "managedProvider",
+        async getToken() {
+          return "oura-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          const start = events.length;
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${start + index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        lookbackDays: 1,
+        backfillYears: 0,
+        streams: ["ring_battery_level"],
+      },
+      signal: new AbortController().signal,
+    };
+
+    const batteryRows = [
+      { timestamp: "2026-01-03T00:00:00Z", level: 12, charging: false, in_charger: false },
+      { timestamp: "2026-01-03T01:00:00Z", level: 9, charging: false, in_charger: false },
+      { timestamp: "2026-01-03T02:00:00Z", level: 4, charging: false, in_charger: false },
+      { timestamp: "2026-01-03T03:00:00Z", level: 3, charging: false, in_charger: false },
+      { timestamp: "2026-01-03T04:00:00Z", level: 4, charging: true, in_charger: true },
+      { timestamp: "2026-01-03T05:00:00Z", level: 21, charging: false, in_charger: false },
+    ];
+
+    const fetchImpl = async (url: string) => {
+      requests.push(new URL(url));
+      return new Response(JSON.stringify({
+        data: batteryRows,
+        next_token: null,
+      }), { status: 200 });
+    };
+
+    const now = Date.UTC(2026, 0, 3, 12);
+    await syncOnce(context, { fetchImpl, now });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0].searchParams.get("start_datetime")).toBe("2026-01-02T12:00:00.000Z");
+    expect(requests[0].searchParams.get("end_datetime")).toBe("2026-01-03T12:00:00.000Z");
+    expect(events.map((event) => event.type)).toEqual([
+      "oura.ring_battery.low",
+      "oura.ring_battery.critical",
+      "oura.ring_battery.recovered",
+    ]);
+    expect(events[0]).toMatchObject({
+      externalId: "ring_battery:low:2026-01-03T01:00:00.000Z",
+      startedAt: Date.UTC(2026, 0, 3, 1),
+      payload: {
+        schema: "oura.ring_battery.transition.v1",
+        level: 9,
+        threshold: 10,
+        lowLevel: 10,
+        criticalLevel: 5,
+        recoveredLevel: 20,
+        charging: false,
+        inCharger: false,
+      },
+    });
+    expect(events[1]).toMatchObject({
+      externalId: "ring_battery:critical:2026-01-03T02:00:00.000Z",
+      payload: {
+        level: 4,
+        threshold: 5,
+        lowStartedAt: "2026-01-03T01:00:00.000Z",
+      },
+    });
+    expect(events[2]).toMatchObject({
+      externalId: "ring_battery:recovered:2026-01-03T04:00:00.000Z",
+      payload: {
+        level: 4,
+        previousLowStartedAt: "2026-01-03T01:00:00.000Z",
+        previousCriticalStartedAt: "2026-01-03T02:00:00.000Z",
+        charging: true,
+        inCharger: true,
+      },
+    });
+    expect(syncState).toMatchObject({
+      version: 2,
+      incremental: {
+        streams: {
+          ring_battery_level: {
+            lastSyncedDateTime: "2026-01-03T12:00:00.000Z",
+            lastSyncedAt: now,
+            ringBattery: {
+              lowActive: false,
+              criticalActive: false,
+              lastTimestamp: "2026-01-03T05:00:00.000Z",
+              lastLevel: 21,
+            },
+          },
+        },
+      },
+      backfill: undefined,
+    });
+
+    await syncOnce(context, { fetchImpl, now });
+    expect(requests).toHaveLength(2);
+    expect(events).toHaveLength(3);
+  });
+
+  test("oura ring battery sync debounces charge-state recovery flaps", async () => {
+    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(ouraUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const context = {
+      auth: {
+        type: "managedProvider",
+        async getToken() {
+          return "oura-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          const start = events.length;
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${start + index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        lookbackDays: 1,
+        backfillYears: 0,
+        streams: ["ring_battery_level"],
+      },
+      signal: new AbortController().signal,
+    };
+
+    const producerTimestamp = 1779462666737;
+    const batteryRows = [
+      { timestamp: "2026-05-22T03:09:14.900Z", level: 9, charging: false, in_charger: false, producer_timestamp: 1779414803228 },
+      { timestamp: "2026-05-22T12:41:38.200Z", level: 4, charging: false, in_charger: false, producer_timestamp: producerTimestamp },
+      { timestamp: "2026-05-22T18:37:32.500Z", level: 4, charging: true, in_charger: false, producer_timestamp: producerTimestamp },
+      { timestamp: "2026-05-22T18:37:36.100Z", level: 4, charging: false, in_charger: false, producer_timestamp: producerTimestamp },
+      { timestamp: "2026-05-22T18:37:36.200Z", level: 4, charging: true, in_charger: false, producer_timestamp: producerTimestamp },
+      { timestamp: "2026-05-22T18:37:40.500Z", level: 4, charging: false, in_charger: false, producer_timestamp: producerTimestamp },
+      { timestamp: "2026-05-22T18:37:47.900Z", level: 10, charging: false, in_charger: true, producer_timestamp: producerTimestamp },
+    ];
+
+    const fetchImpl = async () => {
+      return new Response(JSON.stringify({
+        data: batteryRows,
+        next_token: null,
+      }), { status: 200 });
+    };
+
+    await syncOnce(context, { fetchImpl, now: Date.UTC(2026, 4, 23) });
+
+    expect(events.map((event) => event.type)).toEqual([
+      "oura.ring_battery.low",
+      "oura.ring_battery.critical",
+      "oura.ring_battery.recovered",
+    ]);
+    expect(events.map((event) => event.externalId)).toEqual([
+      "ring_battery:low:2026-05-22T03:09:14.900Z",
+      "ring_battery:critical:2026-05-22T12:41:38.200Z",
+      "ring_battery:recovered:2026-05-22T18:37:47.900Z",
+    ]);
+    expect(events[2]).toMatchObject({
+      startedAt: Date.UTC(2026, 4, 22, 18, 37, 47, 900),
+      payload: {
+        level: 10,
+        previousLowStartedAt: "2026-05-22T03:09:14.900Z",
+        previousCriticalStartedAt: "2026-05-22T12:41:38.200Z",
+        charging: false,
+        inCharger: true,
+      },
+    });
+    expect(syncState).toMatchObject({
+      incremental: {
+        streams: {
+          ring_battery_level: {
+            ringBattery: {
+              lowActive: false,
+              criticalActive: false,
+              lastTimestamp: "2026-05-22T18:37:47.900Z",
+              lastLevel: 10,
+              lastInCharger: true,
+            },
+          },
+        },
+      },
+    });
+  });
+
+  test("oura ring configuration sync is throttled by state", async () => {
+    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(ouraUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+
+    let syncState: unknown;
+    const events: any[] = [];
+    const requests: URL[] = [];
+    const context = {
+      auth: {
+        type: "managedProvider",
+        async getToken() {
+          return "oura-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          const start = events.length;
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${start + index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        backfillYears: 0,
+        streams: ["ring_configuration"],
+      },
+      signal: new AbortController().signal,
+    };
+
+    const fetchImpl = async (url: string) => {
+      requests.push(new URL(url));
+      return new Response(JSON.stringify({
+        data: [{
+          id: "ring-1",
+          set_up_at: "2025-01-01T00:00:00Z",
+          hardware_type: "gen4",
+          firmware_version: "3.0.0",
+        }],
+        next_token: null,
+      }), { status: 200 });
+    };
+
+    const firstRun = Date.UTC(2026, 0, 3, 12);
+    await syncOnce(context, { fetchImpl, now: firstRun });
+    expect(requests).toHaveLength(1);
+    expect(events).toHaveLength(1);
+    expect(syncState).toEqual({
+      version: 2,
+      incremental: {
+        streams: {
+          ring_configuration: {
+            lastSyncedAt: firstRun,
+          },
+        },
+      },
+      backfill: undefined,
+    });
+
+    await syncOnce(context, { fetchImpl, now: firstRun + 6 * 60 * 60 * 1000 });
+    expect(requests).toHaveLength(1);
+    expect(events).toHaveLength(1);
+
+    await syncOnce(context, { fetchImpl, now: firstRun + 31 * 24 * 60 * 60 * 1000 });
+    expect(requests).toHaveLength(2);
+    expect(events).toHaveLength(2);
+  });
+
+  test("installs connectors as workspace folders, registers them, and removes the folder", async () => {
+    const sourceDir = join(workspace, "source-connectors", "calendar");
+    mkdirSync(sourceDir, { recursive: true });
+    writeFileSync(
+      join(sourceDir, "connector.yaml"),
+      `manifestVersion: 1
+id: calendar
+name: Calendar
+entry: ./index.mjs
+runtime:
+  mode: manual
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(sourceDir, "index.mjs"),
+      `export default {
+  async run({ guard, state, host }) {
+    await guard.writeEvent({
+      type: "calendar.install-test",
+      externalId: "installed",
+      startedAt: 4500,
+      payload: { installed: true },
+    });
+    await state.set({ installed: true, lamarckApiOrigin: host.lamarckApiOrigin });
+  },
+};
+`,
+    );
+
+    const installed = await installConnector({ sourceDir, workspacePath: workspace });
+    expect(installed.dir).toBe(join(workspace, "connectors", "calendar"));
+    expect(readFileSync(join(installed.dir, "connector.yaml"), "utf8")).toContain("id: calendar");
+    expect(await listInstalledConnectorDirs(workspace)).toEqual([installed.dir]);
+
+    const manifests = await registerWorkspaceConnectors(supervisor, workspace);
+    expect(manifests.map((manifest) => manifest.id)).toEqual(["calendar"]);
+    expect(await supervisor.list()).toEqual([]);
+    const integration = supervisor.ensureIntegration({ connectorId: "calendar" });
+    expect(integration.id).not.toBe("calendar");
+
+    await expect(supervisor.run(integration.id)).rejects.toThrow("not trusted");
+    await supervisor.approveCurrentPackage("calendar");
+    await supervisor.run(integration.id);
+
+    const event = dataDb.prepare("SELECT source, type, external_id FROM events WHERE type = ?")
+      .get("calendar.install-test") as any;
+    expect(event).toEqual({
+      source: "connector:calendar",
+      type: "calendar.install-test",
+      external_id: "installed",
+    });
+    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({
+      installed: true,
+      lamarckApiOrigin: "https://dev-api.example.test",
+    });
+    expect(supervisor.getIntegration(integration.id)?.trustStatus).toBe("custom");
+
+    expect(await removeInstalledConnector(workspace, "calendar")).toBe(true);
+    expect(existsSync(installed.dir)).toBe(false);
+    expect(await listInstalledConnectorDirs(workspace)).toEqual([]);
+  });
+
+  test("materializes built-in connectors through the same workspace connectors path", async () => {
+    const sourceDir = join(workspace, "built-in-connectors", "app-commits");
+    mkdirSync(sourceDir, { recursive: true });
+    writeFileSync(
+      join(sourceDir, "connector.json"),
+      JSON.stringify({
+        manifestVersion: 1,
+        id: "app-commits",
+        name: "App Commits",
+        entry: "./index.mjs",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        platforms: { darwin: {} },
+        auth: { type: "none" },
+      }),
+    );
+    writeFileSync(
+      join(sourceDir, "index.mjs"),
+      "export default { async run() {} };\n",
+    );
+
+    const installed = await materializeBuiltInConnector({ sourceDir, workspacePath: workspace });
+    expect(installed.dir).toBe(join(workspace, "connectors", "app-commits"));
+    expect((await loadConnectorManifest(installed.dir)).id).toBe("app-commits");
+    await expect(materializeBuiltInConnector({ sourceDir, workspacePath: workspace }))
+      .rejects.toThrow("Connector already installed: app-commits");
+  });
+
+  test("workspace boot cascades Sources whose Connector package is truly absent", async () => {
+    const authManager = new ConnectorAuthManager(secrets);
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager,
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "removed-outside-core",
+        name: "Removed Outside Core",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      { async run() {} },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "removed-outside-core" });
+    await authManager.setToken(source.authRef!, "orphan-token");
+
+    const restarted = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager,
+    });
+    expect(await registerWorkspaceConnectors(restarted, workspace)).toEqual([]);
+    expect(restarted.getIntegration(source.id)).toBeUndefined();
+    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+    expect(
+      dataDb.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'connector.removed'").get(),
+    ).toMatchObject({ n: 1 });
+  });
+
+  function writeBuiltIn(
+    builtinsDir: string,
+    id: string,
+    integrationsMode: "singleton" | "multiple" = "singleton",
+  ): string {
+    const dir = join(builtinsDir, id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: ${id}
+name: ${id}
+entry: ./index.mjs
+runtime:
+  mode: manual
+integrations:
+  mode: ${integrationsMode}
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(join(dir, "index.mjs"), "export default { async run() {} };\n");
+    return dir;
+  }
+
+  test("an omitted platforms map means supported everywhere", () => {
+    const manifest = validateConnectorManifest({
+      manifestVersion: 1,
+      id: "anywhere",
+      name: "Anywhere",
+      entry: "./index.mjs",
+      runtime: { mode: "manual" },
+      integrations: { mode: "singleton" },
+      auth: { type: "none" },
+    } as ConnectorManifest);
+    expect(isPlatformSupported(manifest, "darwin")).toBe(true);
+    expect(isPlatformSupported(manifest, "linux")).toBe(true);
+
+    const darwinOnly = validateConnectorManifest({
+      ...manifest,
+      platforms: { darwin: {} },
+    });
+    expect(isPlatformSupported(darwinOnly, "darwin")).toBe(true);
+    expect(isPlatformSupported(darwinOnly, "linux")).toBe(false);
+  });
+
+  test("lists bundled built-ins as available and installs one explicitly", async () => {
+    const guard = new Guard({ db: dataDb, source: "system:test" });
+    const builtins = join(workspace, "builtins");
+    writeBuiltIn(builtins, "seed");
+    const broken = join(builtins, "broken");
+    mkdirSync(broken, { recursive: true });
+    writeFileSync(join(broken, "connector.yaml"), "id: broken\n");
+
+    // Listing is read-only: valid entries surface, invalid ones are reported.
+    const errors: string[] = [];
+    const available = await listAvailableBuiltIns(builtins, (dir) => errors.push(dir));
+    expect(available.map((entry) => entry.manifest.id)).toEqual(["seed"]);
+    expect(errors).toEqual([broken]);
+    expect(existsSync(join(workspace, "connectors", "seed"))).toBe(false);
+    // Missing builtins dir (packaged without templates) is a quiet no-op.
+    expect(await listAvailableBuiltIns(join(workspace, "no-such-dir"))).toEqual([]);
+
+    // Explicit install: copies the package and records connector.installed.
+    const installed = await installConnectorFromSource({
+      sourceDir: join(builtins, "seed"),
+      workspacePath: workspace,
+      connectorId: "seed",
+      guard,
+    });
+    expect(installed.dir).toBe(join(workspace, "connectors", "seed"));
+    expect(existsSync(join(installed.dir, "index.mjs"))).toBe(true);
+
+    const event = dataDb
+      .prepare("SELECT payload FROM events WHERE type = ?")
+      .get("connector.installed") as any;
+    const payload = JSON.parse(event.payload);
+    expect(payload.connector_id).toBe("seed");
+    expect(typeof payload.package_hash).toBe("string");
+
+    // Double-install is rejected and leaves no extra D0 record.
+    await expect(
+      installConnectorFromSource({
+        sourceDir: join(builtins, "seed"),
+        workspacePath: workspace,
+        connectorId: "seed",
+        guard,
+      }),
+    ).rejects.toThrow("Connector already installed: seed");
+    expect(
+      dataDb.prepare("SELECT COUNT(*) AS n FROM events WHERE type = ?").get("connector.installed"),
+    ).toMatchObject({ n: 1 });
+  });
+
+  test("updates a same-id Connector by hash while preserving every Source", async () => {
+    const guard = new Guard({ db: dataDb, source: "system:test" });
+    const builtins = join(workspace, "builtins");
+    const candidateDir = writeBuiltIn(builtins, "seed", "multiple");
+    await installConnectorFromSource({
+      sourceDir: candidateDir,
+      workspacePath: workspace,
+      connectorId: "seed",
+      guard,
+    });
+    const installedDir = join(workspace, "connectors", "seed");
+    await supervisor.registerDirectory(installedDir);
+    const source = supervisor.addIntegration({
+      connectorId: "seed",
+      integrationKey: "work",
+      config: { folder: "inbox" },
+      scheduleCron: "0 * * * *",
+    });
+    systemDb.prepare(
+      "UPDATE connector_integrations SET sync_state = ? WHERE id = ?",
+    ).run(JSON.stringify({ cursor: 42 }), source.id);
+    const paused = await supervisor.pauseIntegration(source.id);
+    const oldHash = await hashConnectorPackage(installedDir);
+
+    writeFileSync(
+      join(candidateDir, "index.mjs"),
+      "export default { async run() { /* revision 2 */ } };\n",
+    );
+    const newHash = await hashConnectorPackage(candidateDir);
+    expect(newHash).not.toBe(oldHash);
+
+    const updated = await updateConnectorFromSource({
+      sourceDir: candidateDir,
+      workspacePath: workspace,
+      connectorId: "seed",
+      supervisor,
+      guard,
+    });
+    expect(updated).toMatchObject({
+      updated: true,
+      fromHash: oldHash,
+      toHash: newHash,
+    });
+    expect(readFileSync(join(installedDir, "index.mjs"), "utf8")).toContain("revision 2");
+
+    const preserved = supervisor.getIntegration(source.id)!;
+    expect(preserved.id).toBe(source.id);
+    expect(preserved.integrationKey).toBe("work");
+    expect(preserved.config).toEqual({ folder: "inbox" });
+    expect(preserved.syncState).toEqual({ cursor: 42 });
+    expect(preserved.scheduleCron).toBe("0 * * * *");
+    expect(preserved.pausedAt).toBe(paused.pausedAt);
+    expect(preserved.packageHash).toBe(newHash);
+    expect((await supervisor.list()).filter((item) => item.connectorId === "seed")).toHaveLength(1);
+
+    const event = dataDb.prepare(
+      "SELECT payload FROM events WHERE type = 'connector.updated'",
+    ).get() as { payload: string };
+    expect(JSON.parse(event.payload)).toEqual({
+      connector_id: "seed",
+      from_hash: oldHash,
+      to_hash: newHash,
+    });
+
+    const noOp = await updateConnectorFromSource({
+      sourceDir: candidateDir,
+      workspacePath: workspace,
+      connectorId: "seed",
+      supervisor,
+      guard,
+    });
+    expect(noOp.updated).toBe(false);
+    expect(
+      dataDb.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'connector.updated'").get(),
+    ).toMatchObject({ n: 1 });
+  });
+
+  test("rejects incompatible Connector updates and rolls back failed audit", async () => {
+    const guard = new Guard({ db: dataDb, source: "system:test" });
+    const builtins = join(workspace, "builtins");
+    const candidateDir = writeBuiltIn(builtins, "seed", "multiple");
+    await installConnectorFromSource({
+      sourceDir: candidateDir,
+      workspacePath: workspace,
+      connectorId: "seed",
+      guard,
+    });
+    const installedDir = join(workspace, "connectors", "seed");
+    await supervisor.registerDirectory(installedDir);
+    const source = supervisor.addIntegration({ connectorId: "seed", integrationKey: "work" });
+    const oldHash = await hashConnectorPackage(installedDir);
+
+    writeBuiltIn(builtins, "seed", "singleton");
+    await expect(updateConnectorFromSource({
+      sourceDir: candidateDir,
+      workspacePath: workspace,
+      connectorId: "seed",
+      supervisor,
+      guard,
+    })).rejects.toThrow("cannot change integrations.mode while Sources exist");
+    expect(await hashConnectorPackage(installedDir)).toBe(oldHash);
+    expect(supervisor.getIntegration(source.id)).toBeDefined();
+
+    writeBuiltIn(builtins, "seed", "multiple");
+    writeFileSync(
+      join(candidateDir, "index.mjs"),
+      "export default { async run() { /* rejected revision */ } };\n",
+    );
+    const failingGuard = {
+      withSource: (sourceName: string) => guard.withSource(sourceName),
+      queryOne: (sql: string, params?: any) => guard.queryOne(sql, params),
+      writeEvent: (event: any) => {
+        if (event.type === "connector.updated") throw new Error("D0 unavailable");
+        return guard.writeEvent(event);
+      },
+    };
+    await expect(updateConnectorFromSource({
+      sourceDir: candidateDir,
+      workspacePath: workspace,
+      connectorId: "seed",
+      supervisor,
+      guard: failingGuard,
+    })).rejects.toThrow("D0 unavailable");
+    expect(await hashConnectorPackage(installedDir)).toBe(oldHash);
+    expect(supervisor.getIntegration(source.id)?.packageHash).toBe(oldHash);
+    expect(
+      dataDb.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'connector.updated'").get(),
+    ).toMatchObject({ n: 0 });
+  });
+
+  test("reinstall after removal works and D0 keeps the full history", async () => {
+    const guard = new Guard({ db: dataDb, source: "system:test" });
+    const builtins = join(workspace, "builtins");
+    writeBuiltIn(builtins, "seed");
+    const installOnce = () =>
+      installConnectorFromSource({
+        sourceDir: join(builtins, "seed"),
+        workspacePath: workspace,
+        connectorId: "seed",
+        guard,
+      });
+
+    await installOnce();
+    await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
+    expect(supervisor.isRegistered("seed")).toBe(true);
+
+    // The remove-connector flow cascades Sources before deleting the package,
+    // then unregisters and records connector.removed in D0.
+    expect(await removeConnectorFromWorkspace({
+      workspacePath: workspace,
+      connectorId: "seed",
+      supervisor,
+    })).toBe(true);
+    expect(supervisor.isRegistered("seed")).toBe(false);
+
+    // Nothing restores it implicitly — reinstalling is an explicit action.
+    await installOnce();
+    await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
+    expect(existsSync(join(workspace, "connectors", "seed", "index.mjs"))).toBe(true);
+
+    const history = dataDb
+      .prepare(
+        "SELECT type, COUNT(*) AS n FROM events WHERE type LIKE 'connector.%' GROUP BY type ORDER BY type",
+      )
+      .all() as Array<{ type: string; n: number }>;
+    expect(history).toEqual([
+      { type: "connector.installed", n: 2 },
+      { type: "connector.removed", n: 1 },
+    ]);
+  });
+
+  test("remove connector cascades Sources and reinstall starts with zero Sources", async () => {
+    const guard = new Guard({ db: dataDb, source: "system:test" });
+    const builtins = join(workspace, "builtins");
+    writeBuiltIn(builtins, "seed", "multiple");
+    const installOnce = () =>
+      installConnectorFromSource({
+        sourceDir: join(builtins, "seed"),
+        workspacePath: workspace,
+        connectorId: "seed",
+        guard,
+      });
+
+    await installOnce();
+    await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
+    const setup = supervisor.ensureIntegration({ connectorId: "seed" });
+    const work = supervisor.updateIntegration(setup.id, {
+      integrationKey: "work",
+      setupStatus: "ready",
+    });
+
+    expect(await removeConnectorFromWorkspace({
+      workspacePath: workspace,
+      connectorId: "seed",
+      supervisor,
+    })).toBe(true);
+    expect(supervisor.getIntegration(work.id)).toBeUndefined();
+
+    await installOnce();
+    await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
+    expect((await supervisor.list()).filter((row) => row.connectorId === "seed")).toEqual([]);
+
+    const replacement = supervisor.ensureIntegration({ connectorId: "seed", integrationKey: "work" });
+    expect(replacement.id).not.toBe(work.id);
+  });
+
+  test("loads connector runtime from directory entry", async () => {
+    const dir = join(workspace, "connectors", "demo");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: demo
+name: Demo
+entry: ./index.mjs
+runtime:
+  mode: manual
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(dir, "index.mjs"),
+      `export default {
+  async run({ guard, state }) {
+    await guard.writeEvent({
+      type: "demo.event",
+      externalId: "loaded",
+      startedAt: 5000,
+      payload: { loaded: true },
+    });
+    await state.set({ loaded: true });
+  },
+};
+`,
+    );
+
+    const manifest = await supervisor.registerDirectory(dir);
+    const integration = supervisor.ensureIntegration({ connectorId: manifest.id });
+    await expect(supervisor.run(integration.id)).rejects.toThrow("not trusted");
+    await supervisor.approveCurrentPackage("demo");
+    await supervisor.run(integration.id);
+
+    const event = dataDb.prepare("SELECT source, type, external_id FROM events WHERE type = ?")
+      .get("demo.event") as any;
+    expect(event).toEqual({
+      source: "connector:demo",
+      type: "demo.event",
+      external_id: "loaded",
+    });
+    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ loaded: true });
+  });
+
+  test("manages Source lifecycle: connect, pause, resume, remove", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "managed-feed",
+        name: "Managed Feed",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "multiple" },
+        auth: { type: "apiKey" },
+      },
+      { async run() {} },
+    );
+
+    const integration = supervisor.ensureIntegration({
+      connectorId: "managed-feed",
+      integrationKey: "work",
+    });
+    expect(integration.setupStatus).toBe("setup");
+
+    // apiKey connect stores the token and promotes through the evaluator.
+    await expect(
+      supervisor.connectIntegrationWithToken(integration.id, "  ")
+    ).rejects.toThrow("non-empty token");
+    const connected = await supervisor.connectIntegrationWithToken(integration.id, "tok-1");
+    expect(connected.setupStatus).toBe("ready");
+    expect(await supervisor.getAuthManager().hasToken(connected.authRef!)).toBe(true);
+
+    supervisor.updateIntegration(integration.id, {
+      config: { folder: "inbox" },
+      scheduleCron: "0 * * * *",
+    });
+    const paused = await supervisor.pauseIntegration(integration.id);
+    expect(paused.pausedAt).toBeGreaterThan(0);
+    expect(paused.resumeAt).toBeUndefined();
+    expect(paused.status).toBe("idle");
+
+    // Disconnect removes only account readiness. The Source and all other
+    // Source-owned state survive, and a later reconnect is explicit.
+    const disconnected = await supervisor.disconnectIntegration(integration.id);
+    expect(disconnected.setupStatus).toBe("setup");
+    expect(disconnected.pausedAt).toBe(paused.pausedAt);
+    expect(disconnected.config).toEqual({ folder: "inbox" });
+    expect(disconnected.scheduleCron).toBe("0 * * * *");
+    expect(await supervisor.getAuthManager().hasToken(connected.authRef!)).toBe(false);
+    const reconnected = await supervisor.connectIntegrationWithToken(integration.id, "tok-2");
+    expect(reconnected.setupStatus).toBe("ready");
+    expect(reconnected.pausedAt).toBe(paused.pausedAt);
+
+    const resumed = supervisor.resumeIntegration(integration.id);
+    expect(resumed.pausedAt).toBeUndefined();
+    expect(resumed.resumeAt).toBeUndefined();
+
+    // Remove purges credentials and deletes the row.
+    await supervisor.removeIntegration(integration.id);
+    expect(supervisor.getIntegration(integration.id)).toBeUndefined();
+    expect(await supervisor.getAuthManager().hasToken(connected.authRef!)).toBe(false);
+
+    // Removing the last Source leaves the Connector installed with zero
+    // Sources; no setup placeholder is recreated.
+    expect((await supervisor.list()).find((c) => c.connectorId === "managed-feed")).toBeUndefined();
+    expect(supervisor.isRegistered("managed-feed")).toBe(true);
+  });
+
+  test("Remove Connector cascades active Sources, credentials, and run history", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "cascade-feed",
+        name: "Cascade Feed",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "multiple" },
+        auth: { type: "apiKey" },
+      },
+      {
+        async run({ signal }) {
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const work = supervisor.ensureIntegration({ connectorId: "cascade-feed", integrationKey: "work" });
+    const personal = supervisor.ensureIntegration({ connectorId: "cascade-feed", integrationKey: "personal" });
+    const connectedWork = await supervisor.connectIntegrationWithToken(work.id, "work-token");
+    const connectedPersonal = await supervisor.connectIntegrationWithToken(personal.id, "personal-token");
+    supervisor.start(work.id, { trigger: "watch" });
+    expect((await supervisor.list()).find((source) => source.id === work.id)?.running).toBe(true);
+
+    expect(await supervisor.unregister("cascade-feed")).toBe(true);
+    expect(supervisor.isRegistered("cascade-feed")).toBe(false);
+    expect((await supervisor.list()).filter((source) => source.connectorId === "cascade-feed")).toEqual([]);
+    expect(await supervisor.getAuthManager().hasToken(connectedWork.authRef!)).toBe(false);
+    expect(await supervisor.getAuthManager().hasToken(connectedPersonal.authRef!)).toBe(false);
+    expect(systemDb.prepare(
+      "SELECT COUNT(*) AS count FROM connector_runs WHERE connector_id = ?",
+    ).get("cascade-feed")).toEqual({ count: 0 });
+  });
+
+  test("rejects browser auth token connect because it uses the browser flow", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-feed",
+        name: "OAuth Feed",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+          tokenEndpoint: "https://oauth2.googleapis.com/token",
+          clientId: "feed-client-id",
+        },
+      },
+      { async run() {} },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "oauth-feed" });
+    await expect(
+      supervisor.connectIntegrationWithToken(integration.id, "tok")
+    ).rejects.toThrow("browser auth");
+  });
+
+  test("oauth callback binds auth_ref to first-connect setup rows", async () => {
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager: new ConnectorAuthManager(secrets, {
+        managedProviderApiOrigin: "https://api.lamarck.ai",
+        lamarckSession: {
+          accessToken: async () => "desktop-session-token",
+          clearLocalSession: async () => {},
+        },
+        fetchImpl: async (url, init) => {
+          if (String(url).includes("/capability-token")) {
+            const body = JSON.parse(String(init?.body ?? "{}")) as { integrationId?: string };
+            return new Response(JSON.stringify({
+              tokenType: "Bearer",
+              accessToken: "lamarck-capability-token",
+              expiresAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
+              providerId: "oura",
+              integrationId: body.integrationId,
+            }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          return new Response(JSON.stringify({
+            access_token: "access-token",
+            refresh_token: "refresh-token",
+            expires_in: 3600,
+          }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        },
+      }),
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-bind",
+        name: "OAuth Bind",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+          tokenEndpoint: "https://oauth2.googleapis.com/token",
+          clientId: "feed-client-id",
+        },
+      },
+      { async run() {} },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "oauth-bind" });
+    systemDb.prepare("UPDATE connector_integrations SET auth_ref = NULL WHERE id = ?").run(integration.id);
+    expect(supervisor.getIntegration(integration.id)?.authRef).toBeUndefined();
+
+    const started = supervisor.startOAuthIntegration(integration.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({ state, code: "code-1" })))
+      .resolves.toMatchObject({ status: "connected", integrationId: integration.id });
+
+    const connected = supervisor.getIntegration(integration.id)!;
+    expect(connected.authRef).toBe(`connector-integration:${integration.id}:auth`);
+    expect(connected.setupStatus).toBe("ready");
+    expect(await supervisor.getAuthManager().hasToken(connected.authRef!)).toBe(true);
+  });
+
+  test("removing a Source cancels pending OAuth so a late callback cannot recreate credentials", async () => {
+    let tokenExchanges = 0;
+    const authManager = new ConnectorAuthManager(secrets, {
+      fetchImpl: async () => {
+        tokenExchanges += 1;
+        return new Response(JSON.stringify({ access_token: "late-token" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager,
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-remove",
+        name: "OAuth Remove",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+          tokenEndpoint: "https://oauth2.googleapis.com/token",
+          clientId: "remove-client-id",
+        },
+      },
+      { async run() {} },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "oauth-remove" });
+    const started = supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+
+    await supervisor.removeIntegration(source.id);
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({ state, code: "late" })))
+      .resolves.toEqual({ status: "failed", error: "OAuth state is invalid or already used" });
+    expect(tokenExchanges).toBe(0);
+    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+  });
+
+  test("removing a Source prevents an in-flight OAuth exchange from writing credentials", async () => {
+    let releaseExchange!: (response: Response) => void;
+    let markExchangeStarted!: () => void;
+    const exchangeStarted = new Promise<void>((resolve) => {
+      markExchangeStarted = resolve;
+    });
+    const exchangeResponse = new Promise<Response>((resolve) => {
+      releaseExchange = resolve;
+    });
+    const authManager = new ConnectorAuthManager(secrets, {
+      fetchImpl: async () => {
+        markExchangeStarted();
+        return exchangeResponse;
+      },
+    });
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager,
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-in-flight-remove",
+        name: "OAuth In-flight Remove",
+        entry: "./index.ts",
+        runtime: { mode: "poll" },
+        integrations: { mode: "singleton" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://accounts.example.test/authorize",
+          tokenEndpoint: "https://accounts.example.test/token",
+          clientId: "in-flight-client",
+        },
+      },
+      { async run() {} },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "oauth-in-flight-remove" });
+    const started = supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    const completion = supervisor.completeOAuthCallback(new URLSearchParams({ state, code: "code" }));
+
+    await exchangeStarted;
+    await supervisor.removeIntegration(source.id);
+    releaseExchange(new Response(JSON.stringify({ access_token: "must-not-survive" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await expect(completion).resolves.toMatchObject({
+      status: "failed",
+      error: "Source was removed during authentication",
+    });
+    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+  });
+
+  test("browser auth manifest flows expose the intended runtime handles", async () => {
+    const seenAuthTypes: string[] = [];
+    const seenTokens: string[] = [];
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager: new ConnectorAuthManager(secrets, {
+        managedProviderApiOrigin: "https://api.lamarck.ai",
+        lamarckSession: {
+          accessToken: async () => "desktop-session-token",
+          clearLocalSession: async () => {},
+        },
+        fetchImpl: async (url, init) => {
+          if (String(url).includes("/capability-token")) {
+            const body = JSON.parse(String(init?.body ?? "{}")) as { integrationId?: string };
+            return new Response(JSON.stringify({
+              tokenType: "Bearer",
+              accessToken: "lamarck-capability-token",
+              expiresAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
+              providerId: "oura",
+              integrationId: body.integrationId,
+            }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          return new Response(JSON.stringify({
+            access_token: "access-token",
+            refresh_token: "refresh-token",
+            expires_in: 3600,
+          }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        },
+      }),
+    });
+
+    const manifests: Array<{
+      manifest: ConnectorManifest;
+      connect: (integrationId: string) => Promise<void>;
+    }> = [
+      {
+        manifest: {
+          manifestVersion: 1,
+          id: "oauth-public",
+          name: "OAuth Public",
+          entry: "./index.ts",
+          runtime: { mode: "poll" },
+          integrations: { mode: "singleton" },
+          auth: {
+            type: "oauth2-public",
+            authorizationEndpoint: "https://provider.example/oauth/authorize",
+            tokenEndpoint: "https://provider.example/oauth/token",
+            clientId: "public-client",
+          },
+        },
+        connect: async (integrationId) => {
+          const started = supervisor.startOAuthIntegration(integrationId, {
+            redirectUri: "http://localhost:32123/oauth/callback",
+          });
+          const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+          await supervisor.completeOAuthCallback(new URLSearchParams({ state, code: "code-1" }));
+        },
+      },
+      {
+        manifest: {
+          manifestVersion: 1,
+          id: "managed-oura",
+          name: "Managed Oura",
+          entry: "./index.ts",
+          runtime: { mode: "poll" },
+          integrations: { mode: "singleton" },
+          auth: {
+            type: "managedProvider",
+            providerId: "oura",
+          },
+        },
+        connect: async (integrationId) => {
+          const authRef = `managed:${integrationId}`;
+          await secrets.set(authRef, JSON.stringify({
+            kind: "managedProvider",
+            providerId: "oura",
+            integrationId,
+          }));
+          await supervisor.connectIntegration(integrationId, { authRef });
+        },
+      },
+    ];
+
+    for (const { manifest, connect } of manifests) {
+      supervisor.register(manifest, {
+        async run({ auth }) {
+          seenAuthTypes.push(auth.type);
+          if (auth.type !== "none") {
+            seenTokens.push(await auth.getToken());
+          }
+        },
+      });
+      const integration = supervisor.ensureIntegration({ connectorId: manifest.id });
+      await connect(integration.id);
+      await supervisor.run(integration.id);
+    }
+
+    expect(seenAuthTypes).toEqual(["oauth2", "managedProvider"]);
+    expect(seenTokens).toEqual(["access-token", "lamarck-capability-token"]);
+  });
+
+  test("emits D0 audit events for connector approve and remove", async () => {
+    const dir = join(workspace, "connectors", "audited");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: audited
+name: Audited
+entry: ./index.mjs
+runtime:
+  mode: manual
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(join(dir, "index.mjs"), "export default { async run() {} };\n");
+
+    await supervisor.registerDirectory(dir);
+    supervisor.ensureIntegration({ connectorId: "audited" });
+    await supervisor.approveCurrentPackage("audited");
+
+    const approved = dataDb
+      .prepare("SELECT source, payload FROM events WHERE type = ?")
+      .get("connector.approved") as any;
+    expect(approved.source).toBe("system:test");
+    const approvedPayload = JSON.parse(approved.payload);
+    expect(approvedPayload.connector_id).toBe("audited");
+    expect(approvedPayload.approved_hash).toMatch(/^sha256:/);
+    const approvalState = systemDb
+      .prepare("SELECT approved_hash FROM connector_custom_approvals WHERE connector_id = ?")
+      .get("audited") as { approved_hash: string };
+    expect(approvalState.approved_hash).toBe(approvedPayload.approved_hash);
+
+    expect(await supervisor.unregister("audited")).toBe(true);
+    expect(
+      systemDb.prepare(
+        "SELECT approved_hash FROM connector_custom_approvals WHERE connector_id = ?",
+      ).get("audited"),
+    ).toBeUndefined();
+    const removed = dataDb
+      .prepare("SELECT source, payload FROM events WHERE type = ?")
+      .get("connector.removed") as any;
+    expect(removed.source).toBe("system:test");
+    expect(JSON.parse(removed.payload)).toEqual({ connector_id: "audited" });
+
+    // Connector removal cascades its Sources; no missing-package row survives.
+    expect((await supervisor.list()).find((c) => c.connectorId === "audited")).toBeUndefined();
+
+    await supervisor.registerDirectory(dir);
+    expect(supervisor.listInstalledConnectors()).toEqual([
+      expect.objectContaining({ connectorId: "audited", packageTrust: "untrusted" }),
+    ]);
+  });
+
+  test("runs workspace package connectors with only the allowlisted OS environment", async () => {
+    const dir = join(workspace, "connectors", "pid-probe");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: pid-probe
+name: PID Probe
+entry: ./index.mjs
+runtime:
+  mode: manual
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(dir, "index.mjs"),
+      `export default {
+  async run({ guard, state, config }) {
+    await guard.writeEvent({
+      type: "pid.sample",
+      externalId: "pid",
+      startedAt: 1,
+      payload: {
+        pid: process.pid,
+        configType: typeof config,
+        env: {
+          marker: process.env.LAMARCK_CONNECTOR_ENV_MARKER ?? null,
+          ambientSecret: process.env.OPENAI_API_KEY ?? null,
+          guardToken: process.env.LAMARCK_GUARD_TOKEN ?? null,
+          guardOrigin: process.env.LAMARCK_GUARD_ORIGIN ?? null,
+          coreToken: process.env.LAMARCK_CORE_TOKEN ?? null,
+          vaultKey: process.env.LAMARCK_VAULT_KEY ?? null,
+          locale: process.env.LANG ?? null,
+          timeLocale: process.env.LC_TIME ?? null,
+          inventedLocale: process.env.LC_LAMARCK_SECRET ?? null,
+          electronRunAsNode: process.env.ELECTRON_RUN_AS_NODE ?? null,
+        },
+      },
+    });
+    await state.set({ pid: process.pid });
+  },
+};
+`,
+    );
+
+    await supervisor.registerDirectory(dir);
+    const integration = supervisor.ensureIntegration({ connectorId: "pid-probe" });
+    await supervisor.approveCurrentPackage("pid-probe");
+    const childEnvironment = {
+      LAMARCK_CONNECTOR_ENV_MARKER: "ordinary-runtime-value",
+      OPENAI_API_KEY: "ambient-secret",
+      LAMARCK_GUARD_TOKEN: "guard-secret",
+      LAMARCK_GUARD_ORIGIN: "http://127.0.0.1:49999",
+      LAMARCK_CORE_TOKEN: "core-secret",
+      LAMARCK_VAULT_KEY: "vault-secret",
+      LANG: "connector-test-locale",
+      LC_TIME: "connector-test-time-locale",
+      LC_LAMARCK_SECRET: "locale-prefixed-secret",
+      ELECTRON_RUN_AS_NODE: "host-private-value",
+    };
+    const previousEnvironment = Object.fromEntries(
+      Object.keys(childEnvironment).map((key) => [key, process.env[key]]),
+    );
+    Object.assign(process.env, childEnvironment);
+    try {
+      await supervisor.run(integration.id);
+    } finally {
+      for (const [key, previous] of Object.entries(previousEnvironment)) {
+        if (previous === undefined) delete process.env[key];
+        else process.env[key] = previous;
+      }
+    }
+
+    const event = dataDb.prepare("SELECT payload FROM events WHERE type = ?").get("pid.sample") as any;
+    const payload = JSON.parse(event.payload);
+    expect(typeof payload.pid).toBe("number");
+    // The whole point: connector code did not execute in this process.
+    expect(payload.pid).not.toBe(process.pid);
+    // mergeConfig normalizes absent config to {} on both runner paths; the
+    // process boundary must not degrade it to null.
+    expect(payload.configType).toBe("object");
+    expect(payload.env).toEqual({
+      marker: null,
+      ambientSecret: null,
+      guardToken: null,
+      guardOrigin: null,
+      coreToken: null,
+      vaultKey: null,
+      locale: "connector-test-locale",
+      timeLocale: "connector-test-time-locale",
+      inventedLocale: null,
+      electronRunAsNode: "1",
+    });
+    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ pid: payload.pid });
+  });
+
+  test("workspace package connectors can write text blobs over runner RPC", async () => {
+    const dir = join(workspace, "connectors", "blob-rpc");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: blob-rpc
+name: Blob RPC
+entry: ./index.mjs
+runtime:
+  mode: manual
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(dir, "index.mjs"),
+      `const blobText = "runner process redacted blob payload";
+
+export default {
+  async run({ guard }) {
+    const result = await guard.writeTextBlob({
+      text: blobText,
+      variant: "redacted-text",
+      mediaType: "text/plain; charset=utf-8",
+    });
+    await guard.writeEvent({
+      type: "blob.rpc",
+      externalId: "blob-rpc",
+      startedAt: 1,
+      payload: {
+        contentRef: result.ref,
+        bytes: result.bytes,
+        compressedBytes: result.compressedBytes,
+        pid: process.pid,
+      },
+    });
+  },
+};
+`,
+    );
+
+    await supervisor.registerDirectory(dir);
+    const integration = supervisor.ensureIntegration({ connectorId: "blob-rpc" });
+    await supervisor.approveCurrentPackage("blob-rpc");
+    await supervisor.run(integration.id);
+
+    const blobText = "runner process redacted blob payload";
+    const digestHex = createHash("sha256").update(blobText).digest("hex");
+    const event = dataDb.prepare("SELECT payload FROM events WHERE type = ?").get("blob.rpc") as any;
+    const payload = JSON.parse(event.payload);
+    expect(payload.pid).not.toBe(process.pid);
+    expect(payload.contentRef).toEqual({
+      kind: "content-blob",
+      version: 1,
+      digest: `sha256:${digestHex}`,
+      variant: "redacted-text",
+      mediaType: "text/plain; charset=utf-8",
+      encoding: "gzip",
+    });
+
+    const blobPath = join(
+      workspace,
+      ".lamarck",
+      "blobs",
+      "content",
+      "v1",
+      "sha256",
+      digestHex.slice(0, 2),
+      digestHex.slice(2, 4),
+      `${digestHex}.gz`,
+    );
+    expect(gunzipSync(readFileSync(blobPath)).toString("utf8")).toBe(blobText);
+    expect(JSON.stringify(payload.contentRef)).not.toContain(blobPath);
+  });
+
+	  test("workspace package connectors can patch config from config UI sessions", async () => {
+	    const dir = join(workspace, "connectors", "config-ui-rpc");
+	    mkdirSync(dir, { recursive: true });
+	    writeFileSync(
+	      join(dir, "connector.yaml"),
+	      `manifestVersion: 1
+id: config-ui-rpc
+name: Config UI RPC
+entry: ./index.mjs
+runtime:
+  mode: manual
+integrations:
+  mode: singleton
+config:
+  mode:
+    type: string
+    label: Mode
+    default: rich-local
+configPanels:
+  privacy-controls:
+    label: Privacy Controls
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+	    );
+	    writeFileSync(
+	      join(dir, "index.mjs"),
+	      `export default {
+  async run() {},
+  async configUi({ panelId, config, configStore, state }) {
+    if (panelId !== "privacy-controls") throw new Error("wrong panel");
+    if (config.mode !== "rich-local") throw new Error("missing default");
+    const previous = await state.get();
+    if (previous !== undefined) throw new Error("unexpected existing state");
+    await configStore.patch({
+      set: {
+        privacyPolicy: {
+          version: 1,
+          apps: { "com.apple.finder": { action: "metadata_only" } },
+        },
+      },
+    });
+    await state.set({ pendingUsers: {}, approvedUsers: { "123": { username: "alice" } } });
+    return { url: "http://127.0.0.1:49321/panel?token=abcdefghijklmnop" };
+  },
+};
+`,
+	    );
+
+	    await supervisor.registerDirectory(dir);
+	    const integration = supervisor.ensureIntegration({ connectorId: "config-ui-rpc" });
+	    supervisor.updateIntegration(integration.id, { config: { opaque: { keep: true } } });
+	    await supervisor.approveCurrentPackage("config-ui-rpc");
+
+	    const started = await supervisor.startConfigUi(integration.id, "privacy-controls");
+	    expect(started.url).toContain("token=abcdefghijklmnop");
+	    expect(supervisor.getIntegration(integration.id)?.config).toEqual({
+	      opaque: { keep: true },
+	      privacyPolicy: {
+	        version: 1,
+	        apps: { "com.apple.finder": { action: "metadata_only" } },
+	      },
+	    });
+	    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({
+	      pendingUsers: {},
+	      approvedUsers: { "123": { username: "alice" } },
+	    });
+	    expect(await supervisor.stopConfigUiSession(started.sessionId)).toBe(true);
+	  });
+
+	  test("workspace package connectors can report warnings over runner RPC", async () => {
+    const dir = join(workspace, "connectors", "warning-rpc");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: warning-rpc
+name: Warning RPC
+entry: ./index.mjs
+runtime:
+  mode: manual
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(dir, "index.mjs"),
+      `export default {
+  async run({ warnings }) {
+    await warnings.set({ key: "stale", message: "old warning" });
+    await warnings.clear("stale");
+    await warnings.set({
+      key: "backfill",
+      message: "Backfill paused from child",
+      details: { stream: "daily_sleep" },
+    });
+  },
+};
+`,
+    );
+
+    await supervisor.registerDirectory(dir);
+    const integration = supervisor.ensureIntegration({ connectorId: "warning-rpc" });
+    await supervisor.approveCurrentPackage("warning-rpc");
+    await supervisor.run(integration.id);
+
+    const stored = supervisor.getIntegration(integration.id);
+    expect(stored?.status).toBe("idle");
+    expect(stored?.lastError).toBeUndefined();
+    expect(stored?.warnings).toHaveLength(1);
+    expect(stored?.warnings?.[0]).toMatchObject({
+      key: "backfill",
+      message: "Backfill paused from child",
+      details: { stream: "daily_sleep" },
+    });
+  });
+
+  test("force-kills runner processes that ignore abort", async () => {
+    const fastKillSupervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      runnerKillGraceMs: 150,
+    });
+    const dir = join(workspace, "connectors", "stubborn");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: stubborn
+name: Stubborn
+entry: ./index.mjs
+runtime:
+  mode: watch
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(dir, "index.mjs"),
+      `// Survives polite kills: ignores both the abort signal and SIGTERM.
+process.on("SIGTERM", () => {});
+export default {
+  async run() {
+    await new Promise(() => {});
+  },
+};
+`,
+    );
+
+    await fastKillSupervisor.registerDirectory(dir);
+    const integration = fastKillSupervisor.ensureIntegration({ connectorId: "stubborn" });
+    await fastKillSupervisor.approveCurrentPackage("stubborn");
+
+    const handle = fastKillSupervisor.start(integration.id);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    handle.abort();
+    const settled = await waitWithTestTimeout(handle.promise, 3_000);
+    expect(settled).toBe(true);
+    expect(fastKillSupervisor.getIntegration(integration.id)?.status).toBe("idle");
+  });
+
+  test("package runner abort is cooperative: the connector cleans up before any kill", async () => {
+    const dir = join(workspace, "connectors", "tidy");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: tidy
+name: Tidy
+entry: ./index.mjs
+runtime:
+  mode: watch
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(dir, "index.mjs"),
+      `export default {
+  async run({ guard, state, signal }) {
+    await guard.writeEvent({ type: "tidy.start", externalId: "start", startedAt: 1, payload: {} });
+    await new Promise((resolve) => {
+      if (signal.aborted) return resolve();
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    await state.set({ cleanedUp: true });
+  },
+};
+`,
+    );
+
+    await supervisor.registerDirectory(dir);
+    const integration = supervisor.ensureIntegration({ connectorId: "tidy" });
+    await supervisor.approveCurrentPackage("tidy");
+
+    const handle = supervisor.start(integration.id);
+    const started = await waitWithTestTimeout(
+      (async () => {
+        while (!dataDb.prepare("SELECT id FROM events WHERE type = ?").get("tidy.start")) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      })(),
+      5_000,
+    );
+    expect(started).toBe(true);
+
+    handle.abort();
+    const settled = await waitWithTestTimeout(handle.promise, 3_000);
+    expect(settled).toBe(true);
+    // The cleanup write only lands if abort stayed cooperative — an immediate
+    // SIGKILL would have killed the child before state.set.
+    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ cleanedUp: true });
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
+  });
+
+  test("kills runner processes that hang during top-level import", async () => {
+    const hangSupervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      runnerCommandTimeoutMs: 300,
+    });
+    const dir = join(workspace, "connectors", "import-hang");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: import-hang
+name: Import Hang
+entry: ./index.mjs
+runtime:
+  mode: poll
+  defaultSchedule: "*/15 * * * *"
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(dir, "index.mjs"),
+      `await new Promise(() => {}); // top-level hang
+export default { async run() {} };
+`,
+    );
+
+    await hangSupervisor.registerDirectory(dir);
+    const integration = hangSupervisor.ensureIntegration({ connectorId: "import-hang" });
+    await hangSupervisor.approveCurrentPackage("import-hang");
+
+    // Bounded by runnerCommandTimeoutMs: the hanging import is killed and the
+    // run fails instead of waiting forever.
+    await expect(hangSupervisor.run(integration.id)).rejects.toThrow("timed out");
+    expect(hangSupervisor.getIntegration(integration.id)?.status).toBe("error");
+  });
+
+  test("isolates runner process crashes from the core", async () => {
+    const dir = join(workspace, "connectors", "crasher");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: crasher
+name: Crasher
+entry: ./index.mjs
+runtime:
+  mode: poll
+  defaultSchedule: "*/15 * * * *"
+integrations:
+  mode: singleton
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(dir, "index.mjs"),
+      `export default {
+  async run() {
+    process.exit(7);
+  },
+};
+`,
+    );
+
+    await supervisor.registerDirectory(dir);
+    const integration = supervisor.ensureIntegration({ connectorId: "crasher" });
+    await supervisor.approveCurrentPackage("crasher");
+
+    await expect(supervisor.run(integration.id)).rejects.toThrow("exited unexpectedly");
+    const stored = supervisor.getIntegration(integration.id);
+    expect(stored?.status).toBe("error");
+    expect(stored?.lastError).toContain("exited unexpectedly");
+  });
+
+  test("rejects connector entries outside connector directory", () => {
+    expect(() => resolveConnectorEntry("/tmp/connector", "../outside.mjs")).toThrow("inside connector directory");
+  });
+
+  test("uses the connector source namespace helper", () => {
+    expect(sourceForConnector("terminal")).toBe("connector:terminal");
+    expect(sourceForConnector("calendar", "work")).toBe("connector:calendar:work");
+    expect(() => sourceForConnector("../terminal")).toThrow("Invalid connector id");
+  });
+});

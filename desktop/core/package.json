@@ -1,0 +1,41 @@
+{
+  "name": "@lamarck/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.10.0"
+  },
+  "main": "dist/core.mjs",
+  "bin": {
+    "lamarck": "dist/cli.mjs"
+  },
+  "scripts": {
+    "prebuild": "npm --workspace @lamarck/system run build",
+    "build": "node ../../scripts/build-core.mjs",
+    "build:guard": "node ../../scripts/build-core.mjs",
+    "dev": "npm run build && node src/runtime-launcher.mjs",
+    "cli": "node dist/cli.mjs",
+    "pretest": "npm run build",
+    "test": "node test-node/run-all.mjs",
+    "pretest:unit": "npm --workspace @lamarck/system run build",
+    "test:unit": "node test-node/run-vitest.mjs",
+    "pretypecheck": "npm --workspace @lamarck/system run build",
+    "typecheck": "tsc -p tsconfig.json",
+    "pretest:guard-engine": "npm run build:guard",
+    "test:guard-engine": "node test-node/run-guard-engine.mjs",
+    "pretest:guard-service": "npm run build:guard",
+    "test:guard-service": "node test-node/run-guard-service.mjs"
+  },
+  "dependencies": {
+    "@lamarck/system": "0.1.0",
+    "node-pty": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/node": "^24.10.0",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.18"
+  }
+}
