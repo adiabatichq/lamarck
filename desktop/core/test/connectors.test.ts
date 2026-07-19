@@ -617,7 +617,7 @@ auth:
   });
 
   test("connectors can write logical text blob refs without exposing storage paths", async () => {
-    const blobText = "large redacted transcript payload";
+    const blobText = '{"kind":"large-redacted-transcript"}';
     let writtenRef: any;
     const definition: ConnectorDefinition = {
       async run({ guard }) {
@@ -625,7 +625,7 @@ auth:
         const result = await guard.writeTextBlob({
           text: blobText,
           variant: "redacted-text",
-          mediaType: "text/plain; charset=utf-8",
+          mediaType: "application/json",
         });
         writtenRef = result.ref;
         await guard.writeEvent({
@@ -663,7 +663,7 @@ auth:
       version: 1,
       digest: `sha256:${digestHex}`,
       variant: "redacted-text",
-      mediaType: "text/plain; charset=utf-8",
+      mediaType: "application/json",
       encoding: "gzip",
     });
     expect(JSON.stringify(writtenRef)).not.toContain(".lamarck");
@@ -701,6 +701,31 @@ auth:
       variant: "redacted-text",
     });
 
+    const jsonText = '{"root":{"role":"main"},"childTrajectories":[]}';
+    const writtenJson = store.writeText({
+      text: jsonText,
+      mediaType: "application/json",
+    });
+    expect(store.resolve(writtenJson.ref)).toEqual({
+      status: "resolved",
+      kind: "text",
+      text: jsonText,
+      bytes: Buffer.byteLength(jsonText),
+      digest: writtenJson.ref.digest,
+      mediaType: "application/json",
+      variant: "redacted-text",
+    });
+
+    expect(() => store.writeText({
+      text: '{"not":"closed"',
+      mediaType: "application/json",
+    })).toThrow("Content blob text must be valid JSON when mediaType is application/json");
+
+    expect(store.resolve({ ...written.ref, mediaType: "application/json" })).toMatchObject({
+      status: "decode_error",
+      message: expect.stringContaining("Invalid JSON content blob"),
+    });
+
     const missingDigest = `sha256:${"1".repeat(64)}`;
     expect(store.resolve({ ...written.ref, digest: missingDigest })).toEqual({
       status: "missing",
@@ -717,6 +742,10 @@ auth:
     });
 
     expect(store.resolve({ ...written.ref, mediaType: "application/pdf" })).toEqual({
+      status: "unsupported",
+      reason: "unsupported contentRef mediaType",
+    });
+    expect(store.resolve({ ...written.ref, mediaType: "application/json; charset=utf-8" })).toEqual({
       status: "unsupported",
       reason: "unsupported contentRef mediaType",
     });

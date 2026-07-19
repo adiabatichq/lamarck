@@ -135,7 +135,7 @@ export interface ConnectorEventInput {
 export interface ConnectorTextBlobInput {
   text: string;
   variant?: "redacted-text";
-  mediaType?: "text/plain; charset=utf-8";
+  mediaType?: "text/plain; charset=utf-8" | "application/json";
 }
 
 export interface ConnectorTextBlobResult {

@@ -16,7 +16,7 @@ export type {
 export interface WriteTextBlobInput {
   text: string;
   variant?: "redacted-text";
-  mediaType?: "text/plain; charset=utf-8";
+  mediaType?: "text/plain; charset=utf-8" | "application/json";
 }
 
 export interface WriteTextBlobResult {
@@ -31,6 +31,13 @@ export class ContentBlobStore {
   writeText(input: WriteTextBlobInput): WriteTextBlobResult {
     if (typeof input.text !== "string") {
       throw new Error("Content blob text must be a string");
+    }
+    if (input.mediaType === "application/json") {
+      try {
+        JSON.parse(input.text);
+      } catch {
+        throw new Error("Content blob text must be valid JSON when mediaType is application/json");
+      }
     }
     const bytes = Buffer.from(input.text, "utf8");
     const digestHex = createHash("sha256").update(bytes).digest("hex");
@@ -94,6 +101,13 @@ export class ContentBlobStore {
     } catch (err) {
       return { status: "decode_error", message: errorMessage(err) };
     }
+    if (parsed.ref.mediaType === "application/json") {
+      try {
+        JSON.parse(text);
+      } catch (err) {
+        return { status: "decode_error", message: `Invalid JSON content blob: ${errorMessage(err)}` };
+      }
+    }
 
     return {
       status: "resolved",
@@ -117,7 +131,10 @@ function parseContentBlobRef(value: unknown): { ok: true; ref: ContentBlobRef; d
   if (value.kind !== "content-blob") return { ok: false, reason: "unsupported contentRef kind" };
   if (value.version !== 1) return { ok: false, reason: "unsupported contentRef version" };
   if (value.variant !== "redacted-text") return { ok: false, reason: "unsupported contentRef variant" };
-  if (value.mediaType !== "text/plain; charset=utf-8") return { ok: false, reason: "unsupported contentRef mediaType" };
+  if (value.mediaType !== "text/plain; charset=utf-8"
+    && value.mediaType !== "application/json") {
+    return { ok: false, reason: "unsupported contentRef mediaType" };
+  }
   if (value.encoding !== "gzip") return { ok: false, reason: "unsupported contentRef encoding" };
   if (typeof value.digest !== "string") return { ok: false, reason: "contentRef digest must be a string" };
   const digestHex = value.digest.startsWith("sha256:") ? value.digest.slice("sha256:".length) : "";
