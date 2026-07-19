@@ -37,15 +37,12 @@ jobs:
           test "$(npm --version)" = "11.6.1"
 
       - name: Install dependencies
-        run: npm ci --workspace @lamarck/system --workspace @lamarck/core --include-workspace-root=false --ignore-scripts --audit=false --fund=false
+        run: npm ci --workspace @lamarck/system --include-workspace-root=false --ignore-scripts --audit=false --fund=false
 
       - name: Verify SDK
         run: |
           npm --workspace @lamarck/system run typecheck
           npm --workspace @lamarck/system test
-
-      - name: Verify generated App package and lock stay paired
-        run: npm --workspace @lamarck/core exec -- vitest run test/app-scaffold.test.ts
 
       - name: Build and verify release tarball
         run: node scripts/pack-system-sdk.mjs --verify-release

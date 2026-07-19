@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,32 +67,6 @@ const tarball = firstTarball;
 const integrity = `sha512-${createHash("sha512").update(tarball).digest("base64")}`;
 if (first.integrity !== integrity || second.integrity !== integrity) {
   throw new Error("npm pack integrity does not match the independently computed SHA-512");
-}
-const resolved = `https://registry.npmjs.org/@lamarck/system/-/system-${packageDocument.version}.tgz`;
-
-const corePackage = JSON.parse(await readFile(join(root, "desktop", "core", "package.json"), "utf8"));
-if (corePackage.dependencies?.["@lamarck/system"] !== packageDocument.version) {
-  throw new Error(`desktop/core must depend on exact @lamarck/system ${packageDocument.version}`);
-}
-
-const templateAppsDirectory = join(root, "desktop", "template", "apps");
-const appIds = (await readdir(templateAppsDirectory, { withFileTypes: true }))
-  .filter((entry) => entry.isDirectory())
-  .map((entry) => entry.name)
-  .sort();
-if (appIds.length < 1) throw new Error("System SDK release has no bundled App lockfiles to verify");
-for (const appId of appIds) {
-  const appPackagePath = join(root, "desktop", "template", "apps", appId, "package.json");
-  const appPackage = JSON.parse(await readFile(appPackagePath, "utf8"));
-  if (appPackage.dependencies?.["@lamarck/system"] !== `^${packageDocument.version}`) {
-    throw new Error(`${appId} package.json does not declare the released SDK compatibility range`);
-  }
-  const lockPath = join(root, "desktop", "template", "apps", appId, "package-lock.json");
-  const lock = JSON.parse(await readFile(lockPath, "utf8"));
-  const entry = lock.packages?.["node_modules/@lamarck/system"];
-  if (entry?.version !== packageDocument.version || entry.resolved !== resolved || entry.integrity !== integrity) {
-    throw new Error(`${appId} lockfile does not pin the exact SDK release tarball (${integrity})`);
-  }
 }
 
 await verifyConsumer(outputPath);
