@@ -14,6 +14,8 @@ The package supplies the client and protocol contract. At runtime, Lamarck binds
 
 ## Release
 
-`system-sdk-v<version>` tags publish the exact tarball produced by `scripts/pack-system-sdk.mjs`. The release gate verifies that the tarball SHA-512 is already pinned by every bundled App lockfile, so CI never silently republishes different bytes than the runtime expects.
+`system-sdk-v<version>` tags publish the exact tarball produced by `scripts/pack-system-sdk.mjs`. The release gate verifies the SDK, reproducible tarball contents, clean consumer installation, and registry bytes without depending on Core, Shell, or bundled App lockfiles. It accepts an existing immutable version only when the registry integrity and tarball URL match the locally verified artifact.
+
+After publication succeeds, a separate downstream job reads the official version, tarball URL, and SHA-512 integrity from the npm registry. It updates the first-party starter App lockfiles and opens an independent pull request for normal repository CI. Starter locks therefore record published registry bytes instead of predicting an unpublished tarball; incompatible version-range changes remain an explicit manual decision.
 
 Publishing uses npm trusted publishing from the protected GitHub `npm-publish` environment and does not store an npm token. npm requires a package to exist before a trusted publisher can be configured, so the first release is a one-time bootstrap: an npm scope owner publishes that same verified tarball interactively with 2FA, configures the trusted publisher for this repository, workflow, and environment, and then removes any bootstrap credential. The tag workflow is idempotent for that bootstrap version: it accepts an existing version only when the registry integrity and tarball URL exactly match the locally verified artifact.
