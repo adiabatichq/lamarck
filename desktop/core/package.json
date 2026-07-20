@@ -28,7 +28,7 @@
     "test:guard-service": "node test-node/run-guard-service.mjs"
   },
   "dependencies": {
-    "@lamarck/system": "0.1.0",
+    "@lamarck/system": "0.1.1",
     "node-pty": "^1.0.0"
   },
   "devDependencies": {
