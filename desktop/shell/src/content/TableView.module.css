@@ -1,0 +1,115 @@
+.center,
+.container {
+  height: 100%;
+  background: var(--system-ground, var(--color-bg-content));
+  color: var(--system-text, var(--color-text-content));
+}
+
+.center {
+  display: grid;
+  place-items: center;
+  color: var(--system-muted, var(--color-text-secondary));
+  font-family: var(--font-mono);
+  font-size: 9px;
+}
+
+.container {
+  display: flex;
+  flex-direction: column;
+}
+
+.toolbar {
+  display: flex;
+  min-height: 58px;
+  align-items: center;
+  gap: 12px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--system-line, var(--color-border));
+  flex-shrink: 0;
+}
+
+.tableName {
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 590;
+  letter-spacing: -0.025em;
+}
+
+.meta {
+  color: var(--system-faint, var(--color-text-muted));
+  font-family: var(--font-mono);
+  font-size: 7.5px;
+}
+
+.refreshBtn {
+  display: grid;
+  width: 29px;
+  height: 29px;
+  margin-left: auto;
+  place-items: center;
+  border: 1px solid var(--system-line-strong, var(--color-border));
+  color: var(--system-muted, var(--color-text-secondary));
+}
+
+.refreshBtn:hover { border-color: var(--system-active, var(--color-accent)); color: var(--system-active, var(--color-accent)); }
+.tableWrap { flex: 1; overflow: auto; }
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  table-layout: auto;
+}
+
+.table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  border-right: 1px solid var(--system-line, var(--color-border));
+  border-bottom: 1px solid var(--system-line-strong, var(--color-border));
+  padding: 9px 12px;
+  background: #0d1016;
+  color: var(--system-muted, var(--color-text-secondary));
+  font-weight: 650;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.colHeader { display: flex; align-items: center; gap: 6px; }
+
+.colTypeBadge,
+.pkBadge {
+  border: 1px solid var(--system-line, var(--color-border));
+  padding: 1px 4px;
+  color: var(--system-faint, var(--color-text-muted));
+  font-size: 6.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.pkBadge { border-color: rgba(143, 223, 255, 0.24); color: var(--system-link, var(--color-accent)); }
+
+.table td {
+  max-width: 320px;
+  overflow: hidden;
+  border-right: 1px solid var(--system-line, var(--color-border));
+  border-bottom: 1px solid var(--system-line, var(--color-border));
+  padding: 7px 12px;
+  color: var(--system-text, var(--color-text-content));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.table tbody tr:hover td { background: rgba(79, 227, 193, 0.025); }
+.nullValue { color: var(--system-faint, var(--color-text-muted)); font-style: italic; }
+.emptyRow { padding: 32px 14px !important; color: var(--system-faint, var(--color-text-muted)); text-align: center; }
+
+.footer {
+  padding: 8px 20px;
+  border-top: 1px solid var(--system-line, var(--color-border));
+  color: var(--system-faint, var(--color-text-muted));
+  font-family: var(--font-mono);
+  font-size: 7.5px;
+  flex-shrink: 0;
+}

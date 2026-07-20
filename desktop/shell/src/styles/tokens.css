@@ -1,0 +1,78 @@
+:root {
+  color-scheme: light;
+
+  /* Brand typography. Desktop packages will eventually bundle the two web
+     families; the deliberate macOS fallbacks keep the local-first build whole. */
+  --font-display: "Bricolage Grotesque", "Avenir Next", "Gill Sans", sans-serif;
+  --font-sans: "Instrument Sans", "Avenir Next", "Helvetica Neue", sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", "SF Mono", Menlo, monospace;
+
+  /* Quiet Canvas / Use */
+  --use-ground: #f3f0e8;
+  --use-chrome: #fdfbf7;
+  --use-surface: #fffefd;
+  --use-ink: #151612;
+  --use-ink-soft: #3f403a;
+  --use-muted: #77736b;
+  --use-faint: #9c978e;
+  --use-line: rgba(21, 22, 18, 0.105);
+  --use-line-strong: rgba(21, 22, 18, 0.2);
+  --use-action: #2563eb;
+  --use-attention: #b7791f;
+  --use-danger: #c24132;
+
+  /* Instrument Room / System */
+  --system-ground: #07080c;
+  --system-panel: #11141c;
+  --system-raised: #171b25;
+  --system-text: #e8eaee;
+  --system-muted: #979eaa;
+  --system-faint: #5f6672;
+  --system-line: rgba(200, 210, 225, 0.13);
+  --system-line-strong: rgba(200, 210, 225, 0.28);
+  --system-active: #4fe3c1;
+  --system-link: #8fdfff;
+  --system-warning: #e8c15a;
+  --system-danger: #e0645c;
+
+  /* Shell geometry */
+  --shell-title-height: 42px;
+  --use-rail-width: 58px;
+
+  /* Compatibility aliases for retained inspectors and safety modals. */
+  --color-bg-titlebar: var(--use-chrome);
+  --color-bg-activity: var(--use-chrome);
+  --color-bg-sidebar: var(--use-chrome);
+  --color-bg-tab-bar: var(--use-ground);
+  --color-bg-tab-active: var(--use-surface);
+  --color-bg-tab-inactive: var(--use-ground);
+  --color-bg-content: var(--use-surface);
+  --color-bg-primary: var(--use-ground);
+  --color-bg-secondary: var(--use-surface);
+  --color-bg-tertiary: #f2eee6;
+  --color-bg-terminal: var(--system-ground);
+  --color-text-content: var(--use-ink);
+  --color-text-primary: var(--use-ink);
+  --color-text-secondary: var(--use-muted);
+  --color-text-muted: var(--use-faint);
+  --color-border: var(--use-line);
+  --color-border-light: var(--use-line);
+  --color-accent: var(--use-action);
+  --color-accent-hover: #174fc9;
+
+  --color-paper: var(--use-surface);
+  --color-paper-raised: #faf6ee;
+  --color-ink: var(--use-ink);
+  --color-ink-soft: var(--use-muted);
+  --color-ink-faint: var(--use-faint);
+  --color-rule: var(--use-line);
+
+  --titlebar-height: var(--shell-title-height);
+  --activity-bar-width: var(--use-rail-width);
+  --sidebar-width: 240px;
+  --tab-bar-height: 35px;
+  --terminal-min-height: 150px;
+  --font-size-sm: 11px;
+  --font-size-base: 12px;
+  --font-size-lg: 14px;
+}

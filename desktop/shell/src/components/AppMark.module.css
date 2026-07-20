@@ -1,0 +1,61 @@
+.mark {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--app-accent) 58%, #181914);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.34), transparent 42%),
+    color-mix(in srgb, var(--app-accent) 76%, #f9f3e8);
+  color: #fffef9;
+  font-family: var(--font-display);
+  font-weight: 720;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.18);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.3),
+    0 2px 7px rgba(31, 30, 24, 0.13);
+}
+
+.mark::after {
+  content: "";
+  position: absolute;
+  inset: auto -24% -38% 26%;
+  height: 70%;
+  border-radius: 50%;
+  background: rgba(18, 19, 16, 0.16);
+  transform: rotate(-18deg);
+}
+
+.mark > span {
+  position: relative;
+  z-index: 1;
+}
+
+.small {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  font-size: 9px;
+}
+
+.medium {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  font-size: 11px;
+}
+
+.large {
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  font-size: 15px;
+}
+
+.muted {
+  filter: saturate(0.55);
+  opacity: 0.72;
+}

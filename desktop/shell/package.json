@@ -1,0 +1,40 @@
+{
+  "name": "@lamarck/shell",
+  "productName": "Lamarck",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.10.0"
+  },
+  "main": "dist-electron/main.cjs",
+  "scripts": {
+    "dev": "node ../../scripts/start-desktop-dev.mjs",
+    "dev:renderer": "vite",
+    "build": "node ../../scripts/build-desktop.mjs",
+    "build:electron": "node ../../scripts/build-desktop.mjs --host-only",
+    "pretest": "npm --workspace @lamarck/system run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "pretypecheck": "npm --workspace @lamarck/system run build",
+    "typecheck": "tsc -p tsconfig.json",
+    "start": "node ../../scripts/start-desktop.mjs",
+    "electron": "npm run start",
+    "electron:dev": "npm run dev"
+  },
+  "dependencies": {
+    "@lamarck/system": "0.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "electron": "^42.0.0",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "vitest": "^4.0.18"
+  }
+}
