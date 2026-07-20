@@ -16,6 +16,7 @@ const env = {
 };
 
 const gates = [
+  ["Toolchain alignment", ["run", "verify:toolchain"]],
   ["Repository module boundaries", ["run", "verify:module-boundaries"]],
   ["System SDK consumer alignment", ["run", "verify:system-sdk-consumers"]],
   ["System SDK consumer sync tests", ["run", "test:system-sdk-consumer-sync"]],
@@ -45,7 +46,7 @@ console.log("\n[verify] All portable source gates passed");
 
 function assertSupportedNode() {
   const [major = 0, minor = 0] = process.versions.node.split(".").map(Number);
-  if (major < 24 || (major === 24 && minor < 10)) {
-    throw new Error(`Lamarck verification requires Node 24.10+ (current: ${process.version})`);
+  if (major < 24 || (major === 24 && minor < 12)) {
+    throw new Error(`Lamarck verification requires Node 24.12+ (current: ${process.version})`);
   }
 }

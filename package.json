@@ -9,14 +9,15 @@
     "url": "git+https://github.com/adiabatichq/lamarck.git"
   },
   "engines": {
-    "node": ">=24.10.0"
+    "node": ">=24.12.0"
   },
-  "packageManager": "npm@11.6.1",
+  "packageManager": "npm@11.16.0",
   "scripts": {
     "build": "node scripts/build-desktop.mjs",
     "start": "node scripts/start-desktop.mjs",
     "dev": "npm --workspace @lamarck/shell run dev",
     "verify": "node scripts/verify.mjs",
+    "verify:toolchain": "node scripts/check-toolchain-alignment.mjs",
     "verify:module-boundaries": "node scripts/verify-module-boundaries.mjs",
     "verify:system-sdk-consumers": "node scripts/verify-system-sdk-consumers.mjs",
     "test:system-sdk-consumer-sync": "node --test scripts/update-system-sdk-consumers.test.mjs",

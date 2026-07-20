@@ -273,8 +273,8 @@ export function assertBuilderInventory(
     || !isExactObject(inventory.runtime, [
       "nodeExecutableSha256", "nodeVersion", "npmCliSha256", "npmVersion",
     ])
-    || inventory.runtime.nodeVersion !== "v24.10.0"
-    || inventory.runtime.npmVersion !== "11.6.1"
+    || inventory.runtime.nodeVersion !== "v24.18.0"
+    || inventory.runtime.npmVersion !== "11.16.0"
     || !isSha256(inventory.runtime.nodeExecutableSha256)
     || !isSha256(inventory.runtime.npmCliSha256)
     || !isExactObject(inventory.tools, [

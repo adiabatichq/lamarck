@@ -123,8 +123,8 @@ async function verifyOutputs(context, outputs) {
 
 function assertSupportedNode() {
   const [major = 0, minor = 0] = process.versions.node.split(".").map(Number);
-  if (major < 24 || (major === 24 && minor < 10)) {
-    throw new Error(`Lamarck Desktop requires Node 24.10+ (current: ${process.version})`);
+  if (major < 24 || (major === 24 && minor < 12)) {
+    throw new Error(`Lamarck Desktop requires Node 24.12+ (current: ${process.version})`);
   }
 }
 

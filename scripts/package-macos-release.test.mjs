@@ -399,9 +399,9 @@ test("Shell builder inventory is bound to exact snapshot, lock, image, and tool 
     packageLockSha256: lockDigest,
     builderImageId: image,
     runtime: {
-      nodeVersion: "v24.10.0",
+      nodeVersion: "v24.18.0",
       nodeExecutableSha256: sha("node"),
-      npmVersion: "11.6.1",
+      npmVersion: "11.16.0",
       npmCliSha256: sha("npm"),
     },
     tools: Object.fromEntries(Object.entries({

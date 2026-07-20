@@ -19,7 +19,7 @@ const [snapshotValue, exportValue] = process.argv.slice(2);
 if (!snapshotValue || !exportValue || process.argv.length !== 4) {
   throw new Error("usage: build-macos-release-shell-inside.mjs <snapshot> <export>");
 }
-if (process.version !== "v24.10.0") throw new Error("macOS release builder requires Node v24.10.0");
+if (process.version !== "v24.18.0") throw new Error("macOS release builder requires Node v24.18.0");
 
 const snapshot = resolve(snapshotValue);
 const exportRoot = resolve(exportValue);
@@ -68,7 +68,7 @@ run(process.execPath, [npmCli, "ci",
 ], { cwd: source, env: environment });
 
 const npmPackage = JSON.parse(await readFile("/usr/local/lib/node_modules/npm/package.json", "utf8"));
-if (npmPackage.version !== "11.6.1") throw new Error("macOS release builder requires npm 11.6.1");
+if (npmPackage.version !== "11.16.0") throw new Error("macOS release builder requires npm 11.16.0");
 
 const lock = JSON.parse(await readFile(join(source, "package-lock.json"), "utf8"));
 const toolSpecs = {
