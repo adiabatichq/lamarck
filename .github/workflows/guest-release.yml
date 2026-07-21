@@ -1,0 +1,162 @@
+name: Guest Release
+
+# Guest releases are intentionally independent from Desktop releases. A
+# protected guest-v* GitHub Release builds and signs one immutable Guest,
+# publishes it to R2, then proposes the exact Guest pin in a pull request.
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+concurrency:
+  group: guest-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'adiabatichq/lamarck' && startsWith(github.event.release.tag_name, 'guest-v')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    environment: r2-releases
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24.18.0"
+          package-manager-cache: false
+
+      - name: Verify release identity and toolchain
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v24.18.0"
+          test "$(npm --version)" = "11.16.0"
+          version="${RELEASE_TAG#guest-v}"
+          node -e 'if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$/.test(process.argv[1])) process.exit(64)' "$version"
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify native Docker builder
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          docker version
+
+      - name: Verify release tooling
+        run: |
+          node --test scripts/r2-object-store.test.mjs
+          node desktop/capsule-guest/scripts/test-release-pipeline.mjs
+
+      - name: Materialize Guest signing key
+        env:
+          GUEST_SIGNING_KEY_PEM: ${{ secrets.LAMARCK_GUEST_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          key_path="${RUNNER_TEMP}/lamarck-guest-signing-key.pem"
+          umask 077
+          printf '%s' "$GUEST_SIGNING_KEY_PEM" > "$key_path"
+          test -s "$key_path"
+          chmod 0600 "$key_path"
+          echo "LAMARCK_GUEST_SIGNING_KEY=$key_path" >> "$GITHUB_ENV"
+
+      - name: Build, sign, and boot-smoke Guest release
+        env:
+          LAMARCK_GUEST_IMAGE_VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_DATE_EPOCH: "0"
+        run: npm run capsule-guest:image
+
+      - name: Publish immutable Guest release to R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_RELEASES_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
+          R2_RELEASES_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
+          R2_RELEASES_BUCKET: ${{ vars.R2_RELEASES_BUCKET || 'lamarck-desktop-releases-prod' }}
+        run: node scripts/upload-guest-release.mjs
+
+      - name: Reclaim build storage before public verification
+        run: |
+          docker builder prune --all --force
+          docker image prune --all --force
+          node -e 'require("node:fs").rmSync(".lamarck/build/capsule-guest/release", { recursive: true, force: true })'
+
+      - name: Verify release through the public domain
+        env:
+          RELEASES_PUBLIC_BASE: ${{ vars.RELEASES_PUBLIC_BASE || 'https://releases.lamarck.ai' }}
+        run: node scripts/fetch-guest-release.mjs --destination "${RUNNER_TEMP}/guest-public-verification"
+
+      - name: Upload Guest pin proposal
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: guest-release-pin
+          path: desktop/capsule-guest/release-pin.json
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Remove Guest signing key
+        if: always()
+        run: rm -f -- "${RUNNER_TEMP}/lamarck-guest-signing-key.pem"
+
+  propose-pin:
+    needs: release
+    if: github.repository == 'adiabatichq/lamarck'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: main
+
+      - name: Download Guest pin proposal
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: guest-release-pin
+          path: release-handoff/guest-pin
+
+      - name: Open Guest pin pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GUEST_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          pin_path="desktop/capsule-guest/release-pin.json"
+          cp release-handoff/guest-pin/release-pin.json "$pin_path"
+          git add -- "$pin_path"
+          if git diff --cached --quiet; then
+            echo "main already pins ${GUEST_TAG}"
+            exit 0
+          fi
+          test "$(git diff --cached --name-only)" = "$pin_path"
+          existing_pr="$(gh pr list --state open --base main --search "Pin Capsule Guest ${GUEST_TAG} in:title" --json number --jq '.[0].number // empty')"
+          if test -n "$existing_pr"; then
+            echo "A Guest pin PR already exists: #${existing_pr}"
+            exit 0
+          fi
+          digest="$(node -e 'const p=require("./desktop/capsule-guest/release-pin.json"); process.stdout.write(p.manifestDigest)' )"
+          branch="automation/guest-pin-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -m "Pin Capsule Guest ${GUEST_TAG}"
+          git push --set-upstream origin "$branch"
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "Pin Capsule Guest ${GUEST_TAG}" \
+            --body "Pins manifest ${digest} published by ${GUEST_TAG}. Merging this PR changes the Guest consumed by future Desktop builds; it does not republish existing Desktop artifacts."

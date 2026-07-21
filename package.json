@@ -21,6 +21,7 @@
     "verify:module-boundaries": "node scripts/verify-module-boundaries.mjs",
     "verify:system-sdk-consumers": "node scripts/verify-system-sdk-consumers.mjs",
     "test:system-sdk-consumer-sync": "node --test scripts/update-system-sdk-consumers.test.mjs",
+    "test:r2-object-store": "node --test scripts/r2-object-store.test.mjs",
     "capsule:test": "node scripts/test-capsule.mjs",
     "capsule-guest:image": "desktop/capsule-guest/scripts/build-guest-image.sh",
     "capsule-guest:verify": "node desktop/capsule-guest/scripts/verify-guest-release.mjs .lamarck/build/capsule-guest/release",
@@ -29,6 +30,7 @@
     "capsule-guest:e2e:linux": "desktop/capsule-guest/scripts/test-linux-runtime.sh",
     "capsule-vm:build:macos": "node scripts/build-capsule-vm-macos.mjs",
     "package:macos": "node scripts/package-macos-release.mjs",
+    "package:macos:alpha": "node scripts/package-macos-alpha.mjs",
     "package:macos:dry-run": "node scripts/package-macos-release.mjs --dry-run",
     "package:macos:test": "node --test scripts/package-macos-release.test.mjs",
     "package:patch": "node scripts/package-os-patch.mjs"
