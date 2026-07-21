@@ -1335,39 +1335,43 @@ async function createWindow(): Promise<void> {
       preload: join(__dirname, "preload.cjs"),
     },
   });
-  shellWebContents.set(win.webContents.id, allowsShellUrl);
-  win.webContents.on("before-input-event", (event, input) => {
+  const shellContents = win.webContents;
+  const shellWebContentsId = shellContents.id;
+  shellWebContents.set(shellWebContentsId, allowsShellUrl);
+  shellContents.on("before-input-event", (event, input) => {
     if (!isOpenLauncherShortcut(input)) return;
     event.preventDefault();
-    win.webContents.send("shell:open-launcher");
+    if (!shellContents.isDestroyed()) shellContents.send("shell:open-launcher");
   });
-  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  win.webContents.on("will-navigate", (event, url) => {
+  shellContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  shellContents.on("will-navigate", (event, url) => {
     if (!allowsShellUrl(url)) event.preventDefault();
   });
-  win.webContents.on("will-attach-webview", (event) => event.preventDefault());
+  shellContents.on("will-attach-webview", (event) => event.preventDefault());
 
   win.on("closed", () => {
-    shellWebContents.delete(win.webContents.id);
-    disposeTerminalsForWebContents(win.webContents.id);
-    void closeAppViewersForOwner(win.webContents.id);
+    // Electron destroys BrowserWindow before emitting "closed". Only use the
+    // identifier captured while the window and its WebContents were alive.
+    shellWebContents.delete(shellWebContentsId);
+    disposeTerminalsForWebContents(shellWebContentsId);
+    void closeAppViewersForOwner(shellWebContentsId);
   });
 
   if (development || process.env.LAMARCK_DEBUG_RENDERER === "1") {
-    win.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    shellContents.on("console-message", (_event, level, message, line, sourceId) => {
       console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`);
     });
-    win.webContents.on("did-fail-load", (_event, code, description, url, isMainFrame) => {
+    shellContents.on("did-fail-load", (_event, code, description, url, isMainFrame) => {
       console.error(`[renderer] Load failed: ${code} ${description} ${url} mainFrame=${isMainFrame}`);
     });
-    win.webContents.on("render-process-gone", (_event, details) => {
+    shellContents.on("render-process-gone", (_event, details) => {
       console.error("[renderer] Process gone:", details);
     });
-    win.webContents.on("preload-error", (_event, preloadPath, error) => {
+    shellContents.on("preload-error", (_event, preloadPath, error) => {
       console.error(`[renderer] Preload failed: ${preloadPath}`, error);
     });
-    win.webContents.on("did-finish-load", () => {
-      console.log(`[renderer] Loaded ${win.webContents.getURL()}`);
+    shellContents.on("did-finish-load", () => {
+      console.log(`[renderer] Loaded ${shellContents.getURL()}`);
     });
   }
 
