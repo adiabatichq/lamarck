@@ -27,9 +27,19 @@ let cachedCoreBaseUrl: string | null = null;
 
 export async function getCoreBaseUrl(): Promise<string> {
   if (cachedCoreBaseUrl) return cachedCoreBaseUrl;
-  const hostBase = await window.lamarckHost?.getCoreBaseUrl().catch(() => null);
-  const resolved = hostBase
-    ?? import.meta.env.VITE_LAMARCK_CORE_URL
+
+  // In Electron, a rejected host call means Core is still starting or failed
+  // to start. Do not turn that transient state into the browser-dev fallback:
+  // caching localhost:3000 here strands the packaged shell there even after
+  // Core becomes ready on its persisted workspace port.
+  if (window.lamarckHost) {
+    const hostBase = await window.lamarckHost.getCoreBaseUrl();
+    if (!hostBase) throw new Error("Electron host returned an empty Core URL.");
+    cachedCoreBaseUrl = hostBase;
+    return hostBase;
+  }
+
+  const resolved = import.meta.env.VITE_LAMARCK_CORE_URL
     ?? "http://localhost:3000";
   cachedCoreBaseUrl = resolved;
   return resolved;
