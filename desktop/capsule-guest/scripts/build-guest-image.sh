@@ -47,6 +47,14 @@ node "$guest/scripts/prepare-build-snapshot.mjs" create "$repo" "$snapshot"
 mkdir -m 0700 "$prebuilt" "$build_export"
 snapshot_guest="$snapshot/desktop/capsule-guest"
 builder_iid_file="$build_staging/builder-image-id"
+host_uid="$(id -u)"
+host_gid="$(id -g)"
+case "$host_uid:$host_gid" in
+	*[!0-9:]*|:*|*:)
+		echo "Host UID and GID must be non-negative decimal integers" >&2
+		exit 70
+		;;
+esac
 download_cache=""
 if [ "$download_cache_requested" = "1" ]; then
 	download_cache="$(node \
@@ -62,6 +70,23 @@ docker build --platform linux/arm64 \
 	-f "$snapshot/desktop/capsule-guest/buildroot/Dockerfile" \
 	"$snapshot/desktop/capsule-guest/buildroot"
 builder_image_id="$(node "$snapshot_guest/scripts/docker-image-id.mjs" "$builder_iid_file")"
+reclaim_builder_outputs() {
+	[ "$(uname -s)" = Linux ] || return 0
+	docker run --rm --platform linux/arm64 \
+		--network none \
+		--read-only \
+		--cap-drop ALL \
+		--cap-add CHOWN \
+		--cap-add DAC_READ_SEARCH \
+		--security-opt no-new-privileges:true \
+		--pids-limit 64 \
+		--user 0:0 \
+		-v "$prebuilt:/prebuilt" \
+		-v "$build_export:/export" \
+		--entrypoint /usr/bin/chown \
+		"$builder_image_id" \
+		-R "$host_uid:$host_gid" /prebuilt /export
+}
 docker run --rm --platform linux/arm64 \
 	--network bridge \
 	-v "$snapshot:/snapshot:ro" \
@@ -88,6 +113,7 @@ set -- "$@" \
 	"$builder_image_id" \
 	/src/desktop/capsule-guest/scripts/build-buildroot-inside.sh
 "$@"
+reclaim_builder_outputs
 node "$snapshot_guest/scripts/prepare-build-snapshot.mjs" verify "$snapshot"
 
 release_staging="$(mktemp -d "$work/release-staging.XXXXXX")"

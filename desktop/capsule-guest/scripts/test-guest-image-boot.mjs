@@ -93,6 +93,7 @@ try {
       "--name", dockerContainer,
       "--network", "none",
       "--read-only",
+      "--user", dockerHostIdentity(),
       "--cap-drop", "ALL",
       "--security-opt", "no-new-privileges:true",
       "--pids-limit", "256",
@@ -127,6 +128,15 @@ function requireCommand(command, args) {
   if (!hasCommand(command, args)) {
     throw new Error(`Guest boot smoke requires ${command} or LAMARCK_QEMU_AARCH64`);
   }
+}
+
+function dockerHostIdentity() {
+  const uid = process.getuid?.();
+  const gid = process.getgid?.();
+  if (!Number.isSafeInteger(uid) || uid < 0 || !Number.isSafeInteger(gid) || gid < 0) {
+    throw new Error("Guest boot smoke Docker fallback requires a POSIX Host UID and GID");
+  }
+  return `${uid}:${gid}`;
 }
 
 function run(command, args) {

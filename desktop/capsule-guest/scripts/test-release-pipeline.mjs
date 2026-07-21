@@ -37,8 +37,25 @@ try {
   assert(buildScript.includes("--iidfile \"$builder_iid_file\""), "Guest builder does not capture an immutable image ID");
   assert(!buildScript.includes("-t lamarck-capsule-buildroot"), "Guest builder still publishes a mutable Docker tag");
   assert(
-    buildScript.match(/\"\$builder_image_id\"/g)?.length === 3,
+    buildScript.match(/\"\$builder_image_id\"/g)?.length === 4,
     "Guest build stages are not all bound to the same immutable builder image ID",
+  );
+  const buildrootRun = buildScript.indexOf('\n"$@"\n');
+  const reclaimCall = buildScript.lastIndexOf("\nreclaim_builder_outputs\n");
+  const complianceGeneration = buildScript.indexOf("generate-compliance.mjs");
+  assert(
+    buildScript.includes("--network none")
+      && buildScript.includes("--read-only")
+      && buildScript.includes("--cap-drop ALL")
+      && buildScript.includes("--cap-add CHOWN")
+      && buildScript.includes("--cap-add DAC_READ_SEARCH")
+      && buildScript.includes("--security-opt no-new-privileges:true")
+      && buildScript.includes("--user 0:0")
+      && buildScript.includes('-R "$host_uid:$host_gid" /prebuilt /export')
+      && buildrootRun >= 0
+      && reclaimCall > buildrootRun
+      && complianceGeneration > reclaimCall,
+    "Guest builder does not narrowly return Linux bind-mount ownership before Host release work",
   );
   assert(
     buildScript.includes('download_cache_requested="${LAMARCK_GUEST_BUILDROOT_DOWNLOAD_CACHE:-}"'),
@@ -133,6 +150,12 @@ try {
   const bootScript = await readFile(join(scripts, "test-guest-image-boot.mjs"), "utf8");
   assert(bootScript.includes('"--iidfile", imageIdFile'), "QEMU smoke does not capture an immutable runner ID");
   assert(!bootScript.includes("lamarck-capsule-qemu-smoke:"), "QEMU smoke still runs a mutable Docker tag");
+  assert(
+    bootScript.includes('\"--user\", dockerHostIdentity()')
+      && bootScript.includes("process.getuid?.()")
+      && bootScript.includes("process.getgid?.()"),
+    "QEMU smoke does not use the Host owner identity for private release bind mounts",
+  );
   assert(
     bootScript.includes('"virtio-blk-device,drive=rootfs,bus=virtio-mmio-bus.0"'),
     "QEMU smoke does not pin rootfs to the first Linux virtio block device",
