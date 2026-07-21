@@ -277,6 +277,21 @@ test("local and hermetic release builds share the canonical Desktop recipe", asy
   assert.ok(MACOS_RELEASE_SOURCE_FILES.includes("scripts/build-desktop.mjs"));
 });
 
+test("macOS packages replace Electron branding with the committed Lamarck icon", async () => {
+  const iconPath = join(root, "desktop", "shell", "assets", "Lamarck.icns");
+  const icon = await readFile(iconPath);
+  const alphaPackager = await readFile(join(root, "scripts", "package-macos-alpha.mjs"), "utf8");
+  const releasePackager = await readFile(join(root, "scripts", "package-macos-release.mjs"), "utf8");
+
+  assert.equal(icon.subarray(0, 4).toString("ascii"), "icns");
+  assert.ok(icon.length > 100_000);
+  assert.ok(MACOS_RELEASE_SOURCE_FILES.includes("desktop/shell/assets/Lamarck.icns"));
+  for (const packager of [alphaPackager, releasePackager]) {
+    assert.match(packager, /\["CFBundleIconFile", "Lamarck\.icns"\]/);
+    assert.match(packager, /rm\(join\(resources, "electron\.icns"\)/);
+  }
+});
+
 test("Desktop and macOS release outputs do not bundle an App System SDK copy", async () => {
   const electronBuilder = await readFile(
     join(root, "scripts", "build-electron-main.mjs"),
@@ -314,6 +329,7 @@ test("macOS release source snapshot is exact, private, and excludes ambient outp
     "desktop/capsule-guest/scripts/release-contract.mjs",
     "desktop/capsule-vm-macos/Package.swift",
     "desktop/capsule-vm-macos/Sources/fixture.txt",
+    "desktop/shell/assets/Lamarck.icns",
     "scripts/build-desktop.mjs",
     "scripts/build-capsule-vm-macos.mjs",
     "scripts/build-macos-release-shell-inside.mjs",

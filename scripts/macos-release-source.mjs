@@ -30,6 +30,7 @@ export const MACOS_RELEASE_SOURCE_FILES = Object.freeze([
   "desktop/core/package.json",
   "desktop/core/tsconfig.json",
   "desktop/shell/index.html",
+  "desktop/shell/assets/Lamarck.icns",
   "desktop/shell/package.json",
   "desktop/shell/tsconfig.json",
   "desktop/shell/vite.config.ts",

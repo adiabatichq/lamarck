@@ -402,8 +402,17 @@ async function assembleApplication(
   const appResources = join(resources, "app");
   const electronResources = join(appResources, "dist-electron");
   const plist = join(contents, "Info.plist");
+  const appIconSource = join(
+    sourceSnapshotRoot,
+    "desktop",
+    "shell",
+    "assets",
+    "Lamarck.icns",
+  );
 
   await rm(join(resources, "default_app.asar"), { force: true });
+  await rm(join(resources, "electron.icns"), { force: true });
+  await copyRealFile(appIconSource, join(resources, "Lamarck.icns"));
   for (const key of [
     "ElectronAsarIntegrity",
     "NSAppTransportSecurity",
@@ -417,6 +426,7 @@ async function assembleApplication(
     ["CFBundleIdentifier", releaseConfig.bundleIdentifier],
     ["CFBundleName", "Lamarck"],
     ["CFBundleDisplayName", "Lamarck"],
+    ["CFBundleIconFile", "Lamarck.icns"],
     ["CFBundleShortVersionString", releaseConfig.version],
     ["CFBundleVersion", releaseConfig.version],
   ]) {
@@ -497,6 +507,7 @@ async function validatePackagedApplication(appPath, releaseConfig) {
     ["CFBundleIdentifier", releaseConfig.bundleIdentifier],
     ["CFBundleName", "Lamarck"],
     ["CFBundleDisplayName", "Lamarck"],
+    ["CFBundleIconFile", "Lamarck.icns"],
     ["CFBundleShortVersionString", releaseConfig.version],
     ["CFBundleVersion", releaseConfig.version],
     ["CFBundleExecutable", "Electron"],
@@ -518,6 +529,8 @@ async function validatePackagedApplication(appPath, releaseConfig) {
       throw new Error(`packaged Info.plist retained forbidden key ${forbiddenKey}`);
     }
   }
+  await requireRealFile(join(resources, "Lamarck.icns"), "packaged Lamarck app icon");
+  await requireAbsent(join(resources, "electron.icns"), "Electron default app icon");
   await requireAbsent(join(resources, "default_app.asar"), "Electron default app archive");
   await requireRealDirectory(join(resources, "template"), "packaged workspace template");
   assertExactList(

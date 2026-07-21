@@ -28,6 +28,7 @@ const ALPHA_DISPLAY_NAME = "Lamarck Alpha";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const shellRoot = join(root, "desktop", "shell");
+const appIconSource = join(shellRoot, "assets", "Lamarck.icns");
 
 if (process.platform !== "darwin" || process.arch !== "arm64") {
   throw new Error("the alpha packager builds macOS arm64 on macOS arm64 only");
@@ -72,6 +73,7 @@ await requireDirectory(distRoot, "renderer build output (npm run build)");
 await requireDirectory(nativeRoot, "capsule native staging (npm run capsule-guest:stage)");
 await requireDirectory(templateRoot, "workspace template");
 await requireDirectory(electronSourceApp, "Electron.app (node node_modules/electron/install.js)");
+await requireFile(appIconSource, "Lamarck app icon");
 for (const name of FIXED_ELECTRON_FILES) {
   await requireFile(join(electronOutRoot, name), `electron build output ${name}`);
 }
@@ -95,6 +97,8 @@ try {
   const plist = join(contents, "Info.plist");
 
   await rm(join(resources, "default_app.asar"), { force: true });
+  await rm(join(resources, "electron.icns"), { force: true });
+  await cp(appIconSource, join(resources, "Lamarck.icns"));
   for (const key of [
     "ElectronAsarIntegrity",
     "NSAppTransportSecurity",
@@ -108,6 +112,7 @@ try {
     ["CFBundleIdentifier", ALPHA_BUNDLE_ID],
     ["CFBundleName", ALPHA_DISPLAY_NAME],
     ["CFBundleDisplayName", ALPHA_DISPLAY_NAME],
+    ["CFBundleIconFile", "Lamarck.icns"],
     ["CFBundleShortVersionString", version],
     ["CFBundleVersion", version],
   ]) run("plutil", ["-replace", key, "-string", value, plist]);
