@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "imageVersion": "0.1.1",
+  "manifestDigest": "sha256:66b0e7e992b8410216524b7c345ff911dcc8419e6bd8109a8a058f8ab70e45e2",
+  "inventorySha256": "sha256:9985677dc4277990f0ce45160c287455283af1b6b1da62efe091970bc97bd018",
+  "objectPrefix": "guest/macos/arm64/66b0e7e992b84102"
+}
