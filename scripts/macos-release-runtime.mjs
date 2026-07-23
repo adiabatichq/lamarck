@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 const NODE_PTY_SMOKE_SOURCE = String.raw`
-const { realpathSync } = require("node:fs");
+const { realpathSync, writeSync } = require("node:fs");
 const { createRequire } = require("node:module");
 const { join } = require("node:path");
 
@@ -43,8 +43,17 @@ if (
 ) throw new Error("packaged node-pty did not load its native runtime API");
 
 const expectedOutput = "lamarck-pty-spawn-ok";
+const startMarker = "lamarck-pty-start";
+const exitMarker = "lamarck-pty-exit";
 let output = "";
-const terminal = pty.spawn("/bin/sh", ["-c", "printf lamarck-pty-spawn-ok"], {
+let sentExitMarker = false;
+let settled = false;
+const terminal = pty.spawn("/bin/sh", [
+  "-c",
+  'IFS= read -r marker; [ "$marker" = lamarck-pty-start ] || exit 9; '
+    + 'printf lamarck-pty-spawn-ok; '
+    + 'IFS= read -r marker; [ "$marker" = lamarck-pty-exit ] || exit 10',
+], {
   name: "xterm-256color",
   cols: 80,
   rows: 24,
@@ -56,29 +65,51 @@ const terminal = pty.spawn("/bin/sh", ["-c", "printf lamarck-pty-spawn-ok"], {
     TERM: "xterm-256color",
   },
 });
-const timeout = setTimeout(() => {
+let timeout;
+let dataSubscription;
+let exitSubscription;
+
+const dispose = () => {
+  if (timeout) clearTimeout(timeout);
+  dataSubscription?.dispose?.();
+  exitSubscription?.dispose?.();
+};
+const fail = (message) => {
+  if (settled) return;
+  settled = true;
+  dispose();
   try { terminal.kill(); } catch {}
-  throw new Error("packaged node-pty fixed-command smoke timed out");
-}, 5_000);
-terminal.onData((data) => {
+  try { writeSync(2, message + "\n"); } catch {}
+  process.exit(1);
+};
+
+dataSubscription = terminal.onData((data) => {
   output += data;
   if (Buffer.byteLength(output, "utf8") > 1_024) {
-    try { terminal.kill(); } catch {}
-    throw new Error("packaged node-pty fixed-command smoke exceeded its output limit");
+    fail("packaged node-pty fixed-command smoke exceeded its output limit");
+    return;
+  }
+  if (!sentExitMarker && output.includes(expectedOutput)) {
+    sentExitMarker = true;
+    terminal.write(exitMarker + "\r");
   }
 });
-terminal.onExit(({ exitCode, signal }) => {
-  clearTimeout(timeout);
+exitSubscription = terminal.onExit(({ exitCode, signal }) => {
   if (exitCode !== 0 || (signal !== 0 && signal !== null && signal !== undefined)) {
-    throw new Error(
+    fail(
       "packaged node-pty fixed-command smoke did not exit cleanly: "
         + exitCode + "/" + signal,
     );
+    return;
   }
-  if (output !== expectedOutput) {
-    throw new Error("packaged node-pty fixed-command smoke returned unexpected output");
+  if (!sentExitMarker || !output.includes(expectedOutput)) {
+    fail("packaged node-pty fixed-command smoke returned unexpected output");
+    return;
   }
-  process.stdout.write(JSON.stringify({
+  if (settled) return;
+  settled = true;
+  dispose();
+  writeSync(1, JSON.stringify({
     ok: true,
     platform: process.platform,
     architecture: process.arch,
@@ -86,7 +117,12 @@ terminal.onExit(({ exitCode, signal }) => {
     napi: process.versions.napi,
     spawnedFixedCommand: true,
   }));
+  process.exit(0);
 });
+timeout = setTimeout(() => {
+  fail("packaged node-pty fixed-command smoke timed out");
+}, 5_000);
+terminal.write(startMarker + "\r");
 `;
 
 /**
@@ -144,7 +180,14 @@ export function runPackagedNodePtySmoke(appResourcesValue, options = {}) {
     timeout: options.timeoutMs ?? 15_000,
     maxBuffer: 1024 * 1024,
   });
-  if (result.error) throw result.error;
+  if (result.error) {
+    const diagnostic = result.stderr.trim();
+    throw new Error(
+      `packaged node-pty smoke process failed (${result.error.code ?? "unknown"})`
+        + `${diagnostic ? `: ${diagnostic}` : ""}`,
+      { cause: result.error },
+    );
+  }
   if (result.status !== 0) {
     throw new Error(
       `packaged node-pty smoke exited with ${result.status ?? result.signal}: ${result.stderr.trim()}`,

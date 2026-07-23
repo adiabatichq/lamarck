@@ -162,6 +162,10 @@ try {
     executable: join(appPath, "Contents", "MacOS", "Electron"),
     expectedPlatform: "darwin",
     expectedArchitecture: "arm64",
+    // A newly assembled ad-hoc bundle can spend longer than the ordinary
+    // runtime timeout in macOS's first-launch assessment. The in-process PTY
+    // operation remains independently bounded to five seconds.
+    timeoutMs: 60_000,
   });
 
   console.log("[alpha] Archiving");

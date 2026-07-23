@@ -41,6 +41,7 @@ if (process.platform === "darwin") {
     "swift",
     "test",
     "--disable-sandbox",
+    "--no-parallel",
     "--package-path",
     join(root, "desktop", "capsule-vm-macos"),
     "--scratch-path",
