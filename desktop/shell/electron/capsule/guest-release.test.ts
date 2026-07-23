@@ -40,11 +40,13 @@ describe("Capsule Guest release descriptor", () => {
       expectedArchitecture: "arm64",
       expectedSupervisorVersion: "0.1.0",
       expectedFeatures: [
+        "artifact-adoption-receipt-v1",
         "artifact-erofs-v1",
         "build-v1",
         "oci-policy-v1",
         "sdk-uds-v1",
         "tickets-v1",
+        "vsock-record-v2",
         "warm-rebuild-v1",
       ],
     });
@@ -62,7 +64,8 @@ describe("Capsule Guest release descriptor", () => {
     const invalidDescriptors: Array<[string, (value: Record<string, unknown>) => void]> = [
       ["unknown field", (value) => { value.imageVersion = "0.1.0"; }],
       ["missing field", (value) => { delete value.runtimeAbi; }],
-      ["wire version", (value) => { value.vmWireVersion = 2; }],
+      ["wire version", (value) => { value.vmWireVersion = 1; }],
+      ["Guest protocol version", (value) => { value.guestProtocolVersion = 1; }],
       ["manifest digest", (value) => { value.manifestDigest = `sha256:${"A".repeat(64)}`; }],
       ["public key alphabet", (value) => { value.pinnedEd25519PublicKey = PUBLIC_KEY.replace("=", "_"); }],
       ["public key size", (value) => { value.pinnedEd25519PublicKey = Buffer.alloc(31).toString("base64"); }],
@@ -70,6 +73,13 @@ describe("Capsule Guest release descriptor", () => {
       ["duplicate feature", (value) => { value.features = ["build-v1", "build-v1"]; }],
       ["missing required warm Build feature", (value) => {
         value.features = (value.features as string[]).filter((item) => item !== "warm-rebuild-v1");
+      }],
+      ["missing required artifact adoption receipt feature", (value) => {
+        value.features = (value.features as string[])
+          .filter((item) => item !== "artifact-adoption-receipt-v1");
+      }],
+      ["missing required explicit vsock relay feature", (value) => {
+        value.features = (value.features as string[]).filter((item) => item !== "vsock-record-v2");
       }],
       ["runtime ABI", (value) => { value.runtimeAbi = "node-any"; }],
       ["Node version", (value) => { value.nodeVersion = "v24.10.0"; }],
@@ -198,19 +208,21 @@ async function loadFixture(resourcesRoot: string) {
 function validDescriptor(): CapsuleGuestReleaseDescriptor {
   return {
     schemaVersion: 1,
-    vmWireVersion: 1,
-    guestProtocolVersion: 1,
+    vmWireVersion: 2,
+    guestProtocolVersion: 2,
     architecture: "arm64",
     bundleRelativePath: "capsule-guest-arm64",
     manifestDigest: DIGEST,
     pinnedEd25519PublicKey: PUBLIC_KEY,
     supervisorVersion: "0.1.0",
     features: [
+      "artifact-adoption-receipt-v1",
       "artifact-erofs-v1",
       "build-v1",
       "oci-policy-v1",
       "sdk-uds-v1",
       "tickets-v1",
+      "vsock-record-v2",
       "warm-rebuild-v1",
     ],
     runtimeAbi: "capsule-node-v1",

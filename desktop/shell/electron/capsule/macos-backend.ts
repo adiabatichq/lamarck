@@ -8,18 +8,41 @@ import {
   type BlobTransferPolicy,
 } from "../../../capsule/src/protocol/blob-transfer";
 import {
+  encodeJsonFrame,
+  MAX_ARTIFACT_ADOPTION_RECEIPT_BYTES,
+} from "../../../capsule/src/protocol/codec";
+import { parseArtifactAdoptionReceipt } from "../../../capsule/src/protocol/validate";
+import {
+  APP_MANIFEST_DIGEST_PATTERN,
+  APP_MANIFEST_MAX_BYTES,
+  digestNormalizedAppManifest,
+  type AppManifestDigest,
+} from "../../../capsule/src/app-manifest-authority";
+import {
+  CAPSULE_STATE_CAPACITY_MIN_BYTES,
+  createCapsuleBuildStateCapacityPlan,
+  createCapsuleRuntimeStoragePlan,
+  createCapsuleRuntimeStateCapacityPlan,
+  type CapsuleBuildStorageInput,
+  type CapsuleBuildStoragePlan,
+  type CapsuleLiveRuntimeStorageLease,
+  type CapsuleRetainedBlob,
+  type CapsuleRuntimeStoragePlan,
+} from "../../../capsule/src/storage-plan";
+import {
   evaluateNpmInstallInput,
   MAX_INSTALL_NPMRC_BYTES,
   MAX_INSTALL_PACKAGE_JSON_BYTES,
   MAX_INSTALL_PACKAGE_LOCK_BYTES,
 } from "../../../capsule/src/build/install-input";
-import type {
-  GuestEvent,
-  HostOperation,
-  ImportedBlobFormat,
-  ImportedBlobKind,
-  JsonValue,
-  StreamKind,
+import {
+  CAPSULE_PROTOCOL_VERSION,
+  type GuestEvent,
+  type HostOperation,
+  type ImportedBlobFormat,
+  type ImportedBlobKind,
+  type JsonValue,
+  type StreamKind,
 } from "../../../capsule/src/protocol/types";
 import { generateOpaqueId } from "../../../capsule/src/protocol/tickets";
 import type {
@@ -29,9 +52,14 @@ import type {
   CapsuleUiLostEvent,
   CapsuleUiSpec,
 } from "./backend";
-import { CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE } from "./backend";
+import {
+  CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE,
+  CapsuleManifestAuthorityChangedError,
+  CapsuleRestartRequiredError,
+} from "./backend";
 import {
   launchCapsuleVmHost,
+  type CapsuleVmGuestImage,
   type CapsuleVmHostStream,
 } from "../capsule-vm/launcher";
 import type { CapsuleVmEvent } from "../capsule-vm/protocol";
@@ -62,11 +90,7 @@ import {
   type HostArtifactActivation,
 } from "./artifact-store";
 import type { SystemStreamServer } from "./system-stream";
-import {
-  CAPSULE_STORAGE_POLICY,
-  CapsuleStorageBudget,
-  type CapsuleStorageBudgetLike,
-} from "./storage-budget";
+import { CapsuleStorageBudget, type CapsuleStorageBudgetLike } from "./storage-budget";
 import {
   correlateBlobExportedEvent,
   correlateBlobFailedEvent,
@@ -131,10 +155,21 @@ export interface MacOsCapsuleBackendOptions {
 
 interface VmHostLike {
   probe(): Promise<{ virtualizationSupported: boolean }>;
-  startGuest(image: LoadedCapsuleGuestRelease["vmImage"]): Promise<{
+  prepareState(options: {
+    stateDirectory: string;
+    stateDiskBytes: number;
+  }): Promise<{
+    preparationId: string;
+    stateDiskBytes: number;
+    existingPhysicalBytes: number;
+    additionalPhysicalBytes: number;
+    peakPhysicalBytes: number;
+  }>;
+  startGuest(image: CapsuleVmGuestImage): Promise<{
     imageDigest: string;
     architecture: "arm64" | "x86_64";
   }>;
+  cancelStatePreparation(preparationId: string): Promise<void>;
   stopGuest(): Promise<void>;
   close(): void;
   on(event: "stream", listener: (stream: CapsuleVmHostStream) => void): this;
@@ -206,6 +241,7 @@ export interface MacOsCapsuleBackendDependencies {
     ownerKey?: string;
     storageBudget?: CapsuleStorageBudgetLike;
   }): Promise<CapsuleTreeSnapshot>;
+  manifestDigest(snapshot: CapsuleTreeSnapshot): Promise<AppManifestDigest>;
   installInput(snapshot: CapsuleTreeSnapshot): ReturnType<typeof inspectSnapshotInstallInput>;
   dependencies(options: {
     packageSnapshot: Pick<CapsuleTreeSnapshot, "path" | "digest" | "bytes">;
@@ -225,6 +261,7 @@ interface BootBoundary {
   readonly helper: VmHostLike;
   readonly session: GuestSessionLike;
   readonly release: LoadedCapsuleGuestRelease;
+  readonly stateDiskBytes: number;
   intentional: boolean;
 }
 
@@ -287,6 +324,7 @@ const DEFAULT_DEPENDENCIES: MacOsCapsuleBackendDependencies = {
   }),
   createSession: (control, options) => new CapsuleGuestSession(control, options),
   snapshot: createCapsulePackageSnapshot,
+  manifestDigest: readSnapshotManifestDigest,
   installInput: inspectSnapshotInstallInput,
   dependencies: createNpmDependencyBundle,
   artifactStore: (root, storageBudget) => new HostArtifactStore(root, { storageBudget }),
@@ -348,6 +386,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         available: false,
         backend: "apple-virtualization",
         reason: this.#terminalFailure.message,
+        restartRequired: this.#terminalFailure instanceof CapsuleRestartRequiredError,
       };
     }
     if (this.#dependencies.hostPlatform !== "darwin") {
@@ -401,16 +440,28 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       if (this.#instances.size >= MAX_LIVE_UI_INSTANCES) {
         throw new Error("Capsule backend reached its live UI isolation limit");
       }
-      const boot = await this.#ensureBoot();
+      const release = await this.#loadRelease();
       const snapshot = await this.#dependencies.snapshot({
         packageDir: spec.packageDir,
         cacheDir: join(this.#options.cacheDirectory, "packages", ownerKey),
         ownerKey,
         storageBudget: this.#storageBudget,
       });
+      await this.#assertSnapshotManifestAuthority(snapshot, spec);
       throwIfAborted(signal);
-      const resolved = await this.#resolveArtifact(boot, spec, snapshot, signal);
-      const candidate = await this.#launchCandidate(boot, spec, resolved, signal);
+      const resolved = await this.#resolveArtifact(release, spec, snapshot, signal);
+      const runtimeCapacity = createCapsuleRuntimeStateCapacityPlan({
+        artifact: retainedArtifact(resolved.artifact),
+        liveRuntimeLeases: this.#liveRuntimeStorageLeases(),
+      });
+      const boot = await this.#ensureBoot(runtimeCapacity.stateDiskBytes, release);
+      const candidate = await this.#launchCandidate(
+        boot,
+        spec,
+        resolved,
+        runtimeCapacity.runtimePlan,
+        signal,
+      );
       let activation: ActivationCheckpoint | undefined;
       try {
         activation = await this.#activateCandidate(candidate, snapshot, boot);
@@ -448,19 +499,34 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       const previous = this.#instances.get(instanceId);
       if (!previous) throw new Error("App Capsule UI instance is no longer active");
       if (previous.appId !== spec.appId) throw new Error("Replacement App identity mismatch");
-      const boot = await this.#ensureBoot();
-      if (previous.bootGeneration !== boot.generation) {
+      if (previous.bootGeneration !== this.#boot?.generation) {
         throw new Error("Previous UI belongs to a lost Guest boundary");
       }
+      const release = await this.#loadRelease();
       const snapshot = await this.#dependencies.snapshot({
         packageDir: spec.packageDir,
         cacheDir: join(this.#options.cacheDirectory, "packages", ownerKey),
         ownerKey,
         storageBudget: this.#storageBudget,
       });
+      await this.#assertSnapshotManifestAuthority(snapshot, spec);
       throwIfAborted(signal);
-      const resolved = await this.#resolveArtifact(boot, spec, snapshot, signal);
-      const candidate = await this.#launchCandidate(boot, spec, resolved, signal);
+      const resolved = await this.#resolveArtifact(release, spec, snapshot, signal);
+      const runtimeCapacity = createCapsuleRuntimeStateCapacityPlan({
+        artifact: retainedArtifact(resolved.artifact),
+        liveRuntimeLeases: this.#liveRuntimeStorageLeases(),
+      });
+      const boot = await this.#ensureBoot(runtimeCapacity.stateDiskBytes, release);
+      if (previous.bootGeneration !== boot.generation) {
+        throw new Error("Previous UI belongs to a lost Guest boundary");
+      }
+      const candidate = await this.#launchCandidate(
+        boot,
+        spec,
+        resolved,
+        runtimeCapacity.runtimePlan,
+        signal,
+      );
       let activation: ActivationCheckpoint;
       try {
         // Last-known-good: no mutation of the live instance happens until the
@@ -592,6 +658,50 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     });
   }
 
+  retireApp(appId: string): Promise<void> {
+    this.#abortLaunches(appId, "App retirement requested");
+    return this.#serial.run(async () => {
+      // A boundary-loss path clears the in-memory instance registry before it
+      // knows whether VZ actually stopped. Wait for an in-progress cleanup,
+      // then refuse Host cache retirement if that stop remained ambiguous.
+      // Otherwise an empty registry could be mistaken for authoritative App
+      // teardown and destroy the last-known-good activation after quarantine.
+      if (this.#fatalCleanup) await this.#fatalCleanup;
+      if (this.#terminalFailure) throw this.#terminalFailure;
+
+      const records = [...this.#instances.values()].filter((record) => record.appId === appId);
+      if (records.length > 0) {
+        const boot = await this.#requireCurrentBoot(records[0]!.bootGeneration);
+        for (const record of records) {
+          try {
+            await this.#stopRecord(record, boot);
+            this.#instances.delete(record.instanceId);
+          } catch (error) {
+            // Host cache retirement is allowed only after Guest aggregate
+            // teardown is authoritative. Ambiguity keeps the activation/LKG
+            // intact and quarantines the shared boundary.
+            await this.#loseBoundary(error, boot);
+            throw error;
+          }
+        }
+      }
+
+      const ownerKey = hashAppId(appId);
+      // These are the complete App-owned reconstructable Host targets. The
+      // physical Workspace and D0/D1/D2 are deliberately unreachable here.
+      await this.#artifacts.deactivate(ownerKey);
+      await this.#storageBudget.remove(
+        join(this.#options.cacheDirectory, "packages", ownerKey),
+        { recursive: true },
+      );
+      await this.#storageBudget.remove(
+        join(this.#options.cacheDirectory, "dependencies", ownerKey),
+        { recursive: true },
+      );
+      await this.#artifacts.pruneUnreferenced();
+    });
+  }
+
   stopAll(): Promise<void> {
     if (this.#stopAllPromise) return this.#stopAllPromise;
     if (this.#fatalCleanup) return this.#fatalCleanup;
@@ -647,10 +757,39 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     });
   }
 
-  async #ensureBoot(): Promise<BootBoundary> {
-    if (this.#boot) return this.#boot;
-    if (this.#bootPromise) return await this.#bootPromise;
-    const promise = this.#createBoot();
+  async #ensureBoot(
+    requiredStateDiskBytes: number,
+    release: LoadedCapsuleGuestRelease,
+  ): Promise<BootBoundary> {
+    const current = this.#boot;
+    if (
+      current
+      && current.stateDiskBytes >= requiredStateDiskBytes
+      && sameGuestRelease(current.release, release)
+    ) {
+      return current;
+    }
+    if (this.#bootPromise) {
+      await this.#bootPromise;
+      return await this.#ensureBoot(requiredStateDiskBytes, release);
+    }
+    if (current) {
+      if (this.#instances.size > 0 || this.#workloads.size > 0) {
+        throw new Error(
+          "Capsule Guest capacity or release change was rejected while a live App runtime exists; the last-known-good runtime remains active",
+        );
+      }
+      try {
+        const drained = await current.session.request("vm.drain", {});
+        this.#parseGuestResult(current, parseVmDrainResult, drained);
+        await this.#shutdownBoot(current);
+      } catch (error) {
+        await this.#loseBoundary(error, current);
+        throw error;
+      }
+    }
+
+    const promise = this.#createBoot(requiredStateDiskBytes, release);
     this.#bootPromise = promise;
     try {
       const boot = await promise;
@@ -669,8 +808,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     }
   }
 
-  async #createBoot(): Promise<BootBoundary> {
-    const release = await this.#loadRelease();
+  async #createBoot(
+    stateDiskBytes: number,
+    release: LoadedCapsuleGuestRelease,
+  ): Promise<BootBoundary> {
     const helper = this.#dependencies.launchVm({ executablePath: this.#options.helperPath });
     const generation = ++this.#bootGeneration;
     const earlyData: Duplex[] = [];
@@ -678,7 +819,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     let boundary: BootBoundary | undefined;
     let intentional = false;
     let guestStartAttempted = false;
-    let stateStorage: Awaited<ReturnType<CapsuleStorageBudgetLike["reserveFile"]>> | undefined;
+    let statePreparation: Awaited<ReturnType<VmHostLike["prepareState"]>> | undefined;
+    let stateStorage: Awaited<ReturnType<CapsuleStorageBudgetLike["reserveStateDisk"]>> | undefined;
     let stateStorageSettled = false;
     let settleControl!: (value: GuestSessionLike) => void;
     let rejectControl!: (error: Error) => void;
@@ -695,6 +837,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         helper,
         session,
         release,
+        stateDiskBytes,
         get intentional() { return intentional; },
         set intentional(value: boolean) { intentional = value; },
       };
@@ -704,7 +847,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       const normalized = asError(error);
       rejectControl(normalized);
       const boot = provisional();
-      if (!intentional && boot) void this.#loseBoundary(normalized, boot);
+      if (!intentional && boot) this.#loseBoundaryInBackground(normalized, boot);
     };
 
     // All lifecycle and stream listeners are installed before probe/start, so
@@ -755,15 +898,25 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       if (!probe.virtualizationSupported) {
         throw new Error("Virtualization.framework is unavailable to the signed helper");
       }
-      stateStorage = await this.#storageBudget.reserveFile({
+      statePreparation = await helper.prepareState({
+        stateDirectory: release.vmImage.stateDirectory,
+        stateDiskBytes,
+      });
+      stateStorage = await this.#storageBudget.reserveStateDisk({
         owner: "host",
-        scope: "vm-state",
         path: join(this.#options.stateDirectory, "state.raw"),
-        bytes: CAPSULE_STORAGE_POLICY.vmStateDiskBytes,
+        stateDiskBytes: statePreparation.stateDiskBytes,
+        existingPhysicalBytes: statePreparation.existingPhysicalBytes,
+        additionalPhysicalBytes: statePreparation.additionalPhysicalBytes,
+        peakPhysicalBytes: statePreparation.peakPhysicalBytes,
       });
       guestStartAttempted = true;
-      const started = await helper.startGuest(release.vmImage);
-      await stateStorage.settle();
+      const started = await helper.startGuest({
+        ...release.vmImage,
+        stateDiskBytes,
+        statePreparationId: statePreparation.preparationId,
+      });
+      await stateStorage.commit();
       stateStorageSettled = true;
       if (
         started.imageDigest !== release.handshake.expectedImageDigest
@@ -778,47 +931,67 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       parsePingResult(ping, nonce);
       return provisional()!;
     } catch (error) {
+      const bootFailure = asError(error);
       intentional = true;
       for (const data of earlyData) data.destroy();
-      session?.close();
-      let cleanupError: unknown;
+      let stopError: unknown;
+      if (statePreparation && !guestStartAttempted) {
+        try {
+          await helper.cancelStatePreparation(statePreparation.preparationId);
+        } catch {
+          // Closing the helper below is the authoritative fallback for a
+          // preparation-only lease: process teardown drops the BSD lock and
+          // no VZVirtualMachine has started or retained the state inode.
+        }
+      }
       if (guestStartAttempted) {
         try {
           await helper.stopGuest();
-        } catch (stopError) {
-          cleanupError = stopError;
+        } catch (error) {
+          stopError = error;
         }
       }
+      // Keep CONTROL intact until Virtualization.framework has begun and
+      // confirmed teardown. Closing it first makes the Guest treat transport
+      // loss as a fault and race a reboot against the Host stop request.
+      session?.close();
       helper.close();
       let storageError: unknown;
       if (stateStorage && !stateStorageSettled) {
         try {
-          if (guestStartAttempted) await stateStorage.settle();
+          if (guestStartAttempted) await stateStorage.reconcileFailure();
           else await stateStorage.release();
           stateStorageSettled = true;
         } catch (error) {
           storageError = error;
         }
       }
-      if (storageError !== undefined) {
-        cleanupError = cleanupError === undefined
-          ? storageError
-          : new AggregateError([cleanupError, storageError], "VM and storage cleanup failed");
-      }
-      if (cleanupError !== undefined) {
-        const quarantined = new AggregateError(
-          [error, cleanupError],
-          "Capsule boot failed and VZ stop was not confirmed; runtime is quarantined until Host restart",
+      if (stopError !== undefined || storageError !== undefined) {
+        const cleanupFailures = [stopError, storageError]
+          .filter((failure): failure is NonNullable<typeof failure> => failure !== undefined);
+        const quarantineReason = stopError !== undefined && storageError !== undefined
+          ? "VZ stop was not confirmed and state-disk usage could not be reconciled"
+          : stopError !== undefined
+            ? "VZ stop was not confirmed"
+            : "State-disk usage could not be reconciled";
+        const quarantined = new CapsuleRestartRequiredError(
+          `Capsule boot failed: ${bootFailure.message}. ${quarantineReason}; runtime is quarantined until Host restart`,
+          {
+            cause: new AggregateError(
+              [bootFailure, ...cleanupFailures],
+              "Capsule boot and cleanup both failed",
+            ),
+          },
         );
         this.#terminalFailure = quarantined;
         throw quarantined;
       }
-      throw error;
+      throw bootFailure;
     }
   }
 
   async #resolveArtifact(
-    boot: BootBoundary,
+    release: LoadedCapsuleGuestRelease,
     spec: CapsuleUiSpec,
     snapshot: CapsuleTreeSnapshot,
     signal: AbortSignal,
@@ -828,7 +1001,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     if (
       active
       && active.packageDigest === snapshot.digest
-      && active.imageDigest === boot.release.handshake.expectedImageDigest
+      && active.imageDigest === release.handshake.expectedImageDigest
       && active.installDigest !== undefined
       && active.dependencyDigest !== undefined
     ) {
@@ -843,17 +1016,25 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     throwIfAborted(signal);
     if (
       installInput.warmEligible
-      && active?.imageDigest === boot.release.handshake.expectedImageDigest
+      && active?.imageDigest === release.handshake.expectedImageDigest
       && active.installDigest === installInput.digest
       && active.dependencyDigest !== undefined
     ) {
+      const input = { mode: "warm" as const, base: active };
       try {
+        const capacity = createCapsuleBuildStateCapacityPlan({
+          build: buildStorageInput(snapshot, input),
+          retainedImportBlobs: buildRetainedBlobs(snapshot, input),
+          liveRuntimeLeases: this.#liveRuntimeStorageLeases(),
+        });
+        const boot = await this.#ensureBoot(capacity.stateDiskBytes, release);
         return await this.#buildArtifact(
           boot,
           spec,
           snapshot,
           installInput.digest,
-          { mode: "warm", base: active },
+          input,
+          capacity.buildPlan,
           signal,
         );
       } catch (error) {
@@ -870,14 +1051,39 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       storageBudget: this.#storageBudget,
     });
     throwIfAborted(signal);
+    const input = { mode: "cold" as const, dependencies };
+    const capacity = createCapsuleBuildStateCapacityPlan({
+      build: buildStorageInput(snapshot, input),
+      retainedImportBlobs: buildRetainedBlobs(snapshot, input),
+      liveRuntimeLeases: this.#liveRuntimeStorageLeases(),
+    });
+    const boot = await this.#ensureBoot(capacity.stateDiskBytes, release);
     return await this.#buildArtifact(
       boot,
       spec,
       snapshot,
       installInput.digest,
-      { mode: "cold", dependencies },
+      input,
+      capacity.buildPlan,
       signal,
     );
+  }
+
+  async #assertSnapshotManifestAuthority(
+    snapshot: CapsuleTreeSnapshot,
+    spec: CapsuleUiSpec,
+  ): Promise<void> {
+    if (
+      !Number.isSafeInteger(spec.manifestGeneration)
+      || spec.manifestGeneration < 1
+      || !APP_MANIFEST_DIGEST_PATTERN.test(spec.manifestDigest)
+    ) {
+      throw new Error("Capsule UI manifest authority is invalid");
+    }
+    const capturedDigest = await this.#dependencies.manifestDigest(snapshot);
+    if (capturedDigest !== spec.manifestDigest) {
+      throw new CapsuleManifestAuthorityChangedError();
+    }
   }
 
   async #buildArtifact(
@@ -886,6 +1092,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     snapshot: CapsuleTreeSnapshot,
     installDigest: `sha256:${string}`,
     input: ArtifactBuildInput,
+    storagePlan: CapsuleBuildStoragePlan,
     signal: AbortSignal,
   ): Promise<ResolvedArtifact> {
     const appKey = hashAppId(spec.appId);
@@ -926,6 +1133,11 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         signal,
       );
     } catch (error) {
+      // A fatal CONTROL/DATA failure starts whole-boundary teardown
+      // synchronously. Guest-owned references die with that boundary; trying
+      // another CONTROL release here can only fail and obscure the operation
+      // that actually lost the boundary.
+      if (boot.intentional) throw error;
       try {
         const released = await this.#releaseImportedBlob(
           boot,
@@ -937,7 +1149,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         if (!released) throw new Error("Guest package import reference disappeared before Build prepare");
       } catch (cleanupError) {
         await this.#loseBoundary(cleanupError, boot);
-        throw new AggregateError([error, cleanupError], "Partial Build import cleanup failed");
+        throw cleanupAggregateError("Partial Build import cleanup failed", error, cleanupError);
       }
       throw error;
     }
@@ -980,6 +1192,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
             }),
         mappedHostUid: namespaceBase,
         mappedHostGid: namespaceBase,
+        storagePlanVersion: storagePlan.version,
+        scratchBytes: storagePlan.scratchBytes,
+        artifactOutputBytes: storagePlan.artifactOutputBytes,
         timeoutMs: BUILD_TIMEOUT_MS,
         resources: {
           memoryBytes: 2 * 1024 * 1024 * 1024,
@@ -1206,11 +1421,15 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     } catch (error) {
       imported.cancel(asError(error));
       boot.session.revokeTicket(ticket.ticket);
+      // Boundary teardown is already the authoritative cleanup for all Guest
+      // imports. A release request on the failed session would replace the
+      // useful transfer/transport failure with a predictable CONTROL error.
+      if (boot.intentional) throw error;
       try {
         await this.#releaseImportedBlob(boot, ownerKey, blobHandle, blobKind, blob);
       } catch (cleanupError) {
         await this.#loseBoundary(cleanupError, boot);
-        throw new AggregateError([error, cleanupError], "Guest blob import cleanup failed");
+        throw cleanupAggregateError("Guest blob import cleanup failed", error, cleanupError);
       }
       throw error;
     }
@@ -1272,16 +1491,55 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       onOutputHandoff();
       const opened = await boot.session.openDataStream(ticket.ticket, "artifact-out");
       const transfer = startBlobTransfer(opened.stream, descriptor.bytes, signal);
+      let observedArtifactBytes = 0;
       try {
         const artifact = await this.#artifacts.receive(
           ownerKey,
           descriptor.digest,
           descriptor.bytes,
-          abortableIterable(opened.stream, transfer.signal, transfer.progress),
+          abortableIterable(
+            opened.stream,
+            transfer.signal,
+            (bytes) => {
+              transfer.progress(bytes);
+              observedArtifactBytes += bytes;
+              if (observedArtifactBytes === descriptor.bytes) transfer.setPhase("guest-fin");
+            },
+            () => transfer.setPhase("host-cas"),
+          ),
         );
-        transfer.complete();
+        // A clean Guest FIN is part of the authenticated export result. Only
+        // after the Host has observed that FIN, verified the exact length and
+        // digest, and durably committed the CAS entry may it acknowledge
+        // adoption. The receipt is bound to this one-use stream, and the
+        // following explicit FIN proves the complete receipt was delivered.
+        // Reaching the advertised byte count alone is never completion.
+        const adoptionReceipt = parseArtifactAdoptionReceipt({
+          type: "artifact.adopted",
+          protocolVersion: CAPSULE_PROTOCOL_VERSION,
+          sessionId: opened.prelude.sessionId,
+          ticket: opened.prelude.ticket,
+          digest: descriptor.digest,
+          bytes: descriptor.bytes,
+        });
+        transfer.setPhase("host-receipt");
+        await raceAbort(
+          writeChunk(
+            opened.stream,
+            encodeJsonFrame(adoptionReceipt, MAX_ARTIFACT_ADOPTION_RECEIPT_BYTES),
+          ),
+          transfer.signal,
+        );
+        transfer.setPhase("host-fin");
+        await raceAbort(endWritable(opened.stream), transfer.signal);
+        // Keep the idle and size-derived absolute deadlines alive through the
+        // Guest's authenticated blob.exported confirmation. A saturated
+        // helper writer or a FIN which never crosses LVRM must fail under the
+        // same transfer budget rather than being reclassified as a detached
+        // event wait.
         exported.armTimeout(BLOB_EVENT_CONFIRM_TIMEOUT_MS);
         await exported.promise;
+        transfer.complete();
         return artifact;
       } catch (error) {
         transfer.cancel(asError(error));
@@ -1298,6 +1556,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     boot: BootBoundary,
     spec: CapsuleUiSpec,
     resolved: ResolvedArtifact,
+    storagePlan: CapsuleRuntimeStoragePlan,
     signal: AbortSignal,
   ): Promise<Candidate> {
     const { artifact } = resolved;
@@ -1355,7 +1614,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         artifactBlobHandle,
         mappedHostUid: namespaceBase,
         mappedHostGid: namespaceBase,
-        scratchBytes: 2 * 1024 * 1024 * 1024,
+        storagePlanVersion: storagePlan.version,
+        scratchBytes: storagePlan.scratchBytes,
       });
       this.#parseGuestResult(boot, parseAppPrepareResult, appResult);
       appPrepared = true;
@@ -1509,7 +1769,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         await this.#restoreActivation(checkpoint);
         candidate.activated = false;
       } catch (rollbackError) {
-        this.#terminalFailure ??= new Error(
+        this.#terminalFailure ??= new CapsuleRestartRequiredError(
           "Host artifact activation could not be rolled back; runtime is quarantined",
           { cause: rollbackError },
         );
@@ -1531,7 +1791,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       await this.#restoreActivation(checkpoint);
       candidate.activated = false;
     } catch (error) {
-      this.#terminalFailure ??= new Error(
+      this.#terminalFailure ??= new CapsuleRestartRequiredError(
         "Host artifact activation rollback failed; runtime is quarantined",
         { cause: error },
       );
@@ -1607,7 +1867,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     if (event.type !== "workload.exited" && event.type !== "workload.faulted") return;
     const claimed = claimedWorkloadIdentity(event);
     if (!claimed) {
-      void this.#loseBoundary(new Error("Guest emitted an unauthenticated workload terminal event"), boot);
+      this.#loseBoundaryInBackground(
+        new Error("Guest emitted an unauthenticated workload terminal event"),
+        boot,
+      );
       return;
     }
     const record = this.#workloads.get(claimed.workloadHandle);
@@ -1625,19 +1888,19 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         );
       }
     } catch (error) {
-      void this.#loseBoundary(asError(error), boot);
+      this.#loseBoundaryInBackground(asError(error), boot);
       return;
     }
 
     if (record.bootGeneration !== boot.generation) {
-      void this.#loseBoundary(new Error("Guest terminal event crossed VM generations"), boot);
+      this.#loseBoundaryInBackground(new Error("Guest terminal event crossed VM generations"), boot);
       return;
     }
     if (record.lifecycle === "stopping" || record.lifecycle === "lost") return;
     record.terminalError = terminalError;
     if (record.lifecycle === "launching") return;
     if (record.lifecycle === "replacement") {
-      void this.#loseBoundary(terminalError, boot);
+      this.#loseBoundaryInBackground(terminalError, boot);
       return;
     }
 
@@ -1660,7 +1923,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     record.detachSystemStream();
 
     if (notificationError !== undefined) {
-      void this.#loseBoundary(notificationError, boot);
+      this.#loseBoundaryInBackground(notificationError, boot);
       return;
     }
     void this.#serial.run(async () => {
@@ -1672,7 +1935,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       } catch (error) {
         await this.#loseBoundary(error, boot);
       }
-    }).catch((error) => this.#loseBoundary(error, boot));
+    }).catch((error) => this.#loseBoundaryInBackground(error, boot));
   }
 
   #waitForBlobImport(
@@ -1846,7 +2109,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         const normalized = asError(error);
         reject(normalized);
         if (!(normalized instanceof GuestOperationError)) {
-          void this.#loseBoundary(normalized, boot);
+          this.#loseBoundaryInBackground(normalized, boot);
         }
       }
     };
@@ -1863,7 +2126,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       timer = setTimeout(() => {
         const error = new Error("Timed out waiting for authenticated Guest event");
         reject(error);
-        void this.#loseBoundary(error, boot);
+        this.#loseBoundaryInBackground(error, boot);
       }, durationMs);
     };
     const promise = new Promise<T>((resolve, rejectValue) => {
@@ -1885,7 +2148,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   async #requireCurrentBoot(generation: number): Promise<BootBoundary> {
-    const boot = await this.#ensureBoot();
+    const boot = this.#boot;
+    if (!boot || boot.intentional) throw new Error("Guest boundary is no longer current");
     if (boot.generation !== generation) throw new Error("Guest boundary changed");
     return boot;
   }
@@ -1898,7 +2162,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     try {
       return parser(value);
     } catch (error) {
-      if (error instanceof CapsuleGuestResultError) void this.#loseBoundary(error, boot);
+      if (error instanceof CapsuleGuestResultError) this.#loseBoundaryInBackground(error, boot);
       throw error;
     }
   }
@@ -1910,7 +2174,6 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   async #shutdownBoot(boot: BootBoundary): Promise<void> {
     boot.intentional = true;
     if (this.#boot === boot) this.#boot = undefined;
-    boot.session.close();
     try {
       await boot.helper.stopGuest();
       // Only the helper's confirmed VZ stop response authorizes reuse of
@@ -1918,21 +2181,38 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       // later boot succeeds, preventing overlap with an unconfirmed old VM.
       this.#namespaceBases.clear();
     } catch (error) {
-      this.#terminalFailure ??= new Error(
+      const terminalFailure = new CapsuleRestartRequiredError(
         "Capsule VM stop was not confirmed; runtime is quarantined until Host restart",
         { cause: error },
       );
-      throw error;
+      this.#terminalFailure ??= terminalFailure;
+      throw this.#terminalFailure;
     } finally {
+      // CONTROL loss is a Guest fault signal. Close it only after the helper
+      // has confirmed the VM stop (or after that confirmation has failed and
+      // the Host has quarantined this runtime).
+      boot.session.close();
       // CapsuleVmHostClient.close synchronously kills the helper transport;
       // stopGuest failure is still surfaced to the caller above.
       boot.helper.close();
     }
   }
 
+  #loseBoundaryInBackground(error: unknown, expected?: BootBoundary): void {
+    // Renderer/System authority has already been revoked synchronously. A
+    // typed quarantine rejection is intentionally observed only by the
+    // foreground operation that triggered it; event callbacks leave the same
+    // state visible through status() without creating an unhandled rejection.
+    void this.#loseBoundary(error, expected).catch(() => {});
+  }
+
   async #loseBoundary(error: unknown, expected?: BootBoundary): Promise<void> {
     if (expected && this.#boot && this.#boot !== expected) return;
-    if (this.#fatalCleanup) return await this.#fatalCleanup;
+    if (this.#fatalCleanup) {
+      await this.#fatalCleanup;
+      if (this.#terminalFailure) throw this.#terminalFailure;
+      return;
+    }
     const failure = asError(error);
     this.#abortAllLaunches(failure.message);
     const boot = expected ?? this.#boot;
@@ -1972,7 +2252,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     })().then(
       settleCleanup,
       (unexpected) => {
-        this.#terminalFailure ??= new Error(
+        this.#terminalFailure ??= new CapsuleRestartRequiredError(
           "Capsule boundary cleanup failed unexpectedly; runtime is quarantined until Host restart",
           { cause: unexpected },
         );
@@ -1984,6 +2264,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     } finally {
       if (this.#fatalCleanup === cleanup) this.#fatalCleanup = undefined;
     }
+    if (this.#terminalFailure) throw this.#terminalFailure;
   }
 
   #allocateNamespace(): number {
@@ -2005,11 +2286,21 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     return streams;
   }
 
+  #liveRuntimeStorageLeases(): CapsuleLiveRuntimeStorageLease[] {
+    return [...new Set(this.#workloads.values())].map((record) => ({
+      artifact: retainedArtifact(record.artifact),
+      scratchBytes: createCapsuleRuntimeStoragePlan(record.artifact.bytes).scratchBytes,
+    }));
+  }
+
   #releaseNamespace(base: number): void {
     this.#namespaceBases.delete(base);
   }
 
   async #withTransientStorage<T>(ownerKey: string, operation: () => Promise<T>): Promise<T> {
+    if (!this.#boot && !this.#bootPromise) {
+      await this.#reconcileStateDiskResidueBeforeStorageAdmission();
+    }
     const packageCache = join(this.#options.cacheDirectory, "packages", ownerKey);
     const dependencyCache = join(this.#options.cacheDirectory, "dependencies", ownerKey);
     const reclaim = async () => {
@@ -2035,6 +2326,33 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     }
     if (failure !== undefined) throw failure;
     return result!;
+  }
+
+  async #reconcileStateDiskResidueBeforeStorageAdmission(): Promise<void> {
+    const release = await this.#loadRelease();
+    const helper = this.#dependencies.launchVm({ executablePath: this.#options.helperPath });
+    helper.on("close", () => {});
+    try {
+      const probe = await helper.probe();
+      if (!probe.virtualizationSupported) {
+        throw new Error("Virtualization.framework is unavailable to the signed helper");
+      }
+      const prepared = await helper.prepareState({
+        stateDirectory: release.vmImage.stateDirectory,
+        stateDiskBytes: CAPSULE_STATE_CAPACITY_MIN_BYTES,
+      });
+      try {
+        await this.#storageBudget.reconcileStateDisk({
+          owner: "host",
+          path: join(this.#options.stateDirectory, "state.raw"),
+          existingPhysicalBytes: prepared.existingPhysicalBytes,
+        });
+      } finally {
+        await helper.cancelStatePreparation(prepared.preparationId);
+      }
+    } finally {
+      helper.close();
+    }
   }
 
   #withLaunch<T>(appId: string, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -2092,9 +2410,17 @@ class BoundedSerialQueue {
 interface ActiveBlobTransfer {
   readonly signal: AbortSignal;
   readonly progress: (bytes: number) => void;
+  setPhase(phase: BlobTransferPhase): void;
   complete(): void;
   cancel(error: Error): void;
 }
+
+type BlobTransferPhase =
+  | "data"
+  | "guest-fin"
+  | "host-cas"
+  | "host-receipt"
+  | "host-fin";
 
 export function startBlobTransfer(
   stream: Duplex,
@@ -2104,6 +2430,7 @@ export function startBlobTransfer(
 ): ActiveBlobTransfer {
   const controller = new AbortController();
   let observedBytes = 0;
+  let phase: BlobTransferPhase = "data";
   let settled = false;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   const clear = () => {
@@ -2121,7 +2448,10 @@ export function startBlobTransfer(
   const armIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      fail(new Error("Host blob DATA stream made no byte progress before its idle deadline"));
+      fail(new Error(
+        "Host blob DATA stream made no byte progress before its idle deadline "
+        + `(${observedBytes}/${expectedBytes} bytes observed; phase=${phase})`,
+      ));
     }, policy.idleTimeoutMs);
   };
   const onParentAbort = () => fail(abortError(parentSignal));
@@ -2148,6 +2478,10 @@ export function startBlobTransfer(
         throw error;
       }
       armIdle();
+    },
+    setPhase: (nextPhase) => {
+      if (settled) throw abortError(controller.signal);
+      phase = nextPhase;
     },
     complete: () => {
       if (settled) throw abortError(controller.signal);
@@ -2188,11 +2522,13 @@ export async function* abortableIterable(
   source: AsyncIterable<Uint8Array>,
   signal: AbortSignal,
   progress: (bytes: number) => void,
+  onComplete: () => void = () => {},
 ): AsyncIterable<Uint8Array> {
   for await (const chunk of iterateWithAbort(source, signal)) {
     progress(chunk.byteLength);
     yield chunk;
   }
+  onComplete();
 }
 
 async function* iterateWithAbort(
@@ -2293,6 +2629,25 @@ function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw abortError(signal);
 }
 
+async function readSnapshotManifestDigest(
+  snapshot: CapsuleTreeSnapshot,
+): Promise<AppManifestDigest> {
+  const selection = await readCapsuleTreeSelection(snapshot, [
+    { path: "manifest.json", maxBytes: APP_MANIFEST_MAX_BYTES },
+  ]);
+  const source = selection.contents.get("manifest.json");
+  if (!source) throw new Error("App package snapshot must contain manifest.json");
+
+  let manifest: unknown;
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(source);
+    manifest = JSON.parse(text);
+  } catch (error) {
+    throw new Error("App package snapshot contains invalid manifest.json", { cause: error });
+  }
+  return digestNormalizedAppManifest(manifest);
+}
+
 async function inspectSnapshotInstallInput(snapshot: CapsuleTreeSnapshot) {
   const selection = await readCapsuleTreeSelection(snapshot, [
     { path: "package.json", maxBytes: MAX_INSTALL_PACKAGE_JSON_BYTES },
@@ -2313,6 +2668,53 @@ async function inspectSnapshotInstallInput(snapshot: CapsuleTreeSnapshot) {
     hasBindingGyp: selection.present.has("binding.gyp"),
     hasShrinkwrap: selection.present.has("npm-shrinkwrap.json"),
   });
+}
+
+function buildStorageInput(
+  snapshot: CapsuleTreeSnapshot,
+  input: ArtifactBuildInput,
+): CapsuleBuildStorageInput {
+  return input.mode === "cold"
+    ? {
+        mode: "cold",
+        packageBytes: snapshot.bytes,
+        dependencyBytes: input.dependencies.snapshot.bytes,
+      }
+    : {
+        mode: "warm",
+        packageBytes: snapshot.bytes,
+        baseArtifactBytes: input.base.artifact.bytes,
+      };
+}
+
+function buildRetainedBlobs(
+  snapshot: CapsuleTreeSnapshot,
+  input: ArtifactBuildInput,
+): CapsuleRetainedBlob[] {
+  return [
+    { key: `package:${snapshot.digest}`, bytes: snapshot.bytes },
+    input.mode === "cold"
+      ? {
+          key: `dependency:${input.dependencies.snapshot.digest}`,
+          bytes: input.dependencies.snapshot.bytes,
+        }
+      : retainedArtifact(input.base.artifact),
+  ];
+}
+
+function retainedArtifact(
+  artifact: Pick<HostArtifact, "digest" | "bytes">,
+): CapsuleRetainedBlob {
+  return { key: `artifact:${artifact.digest}`, bytes: artifact.bytes };
+}
+
+function sameGuestRelease(
+  left: LoadedCapsuleGuestRelease,
+  right: LoadedCapsuleGuestRelease,
+): boolean {
+  return deepEqual(left.descriptor, right.descriptor)
+    && deepEqual(left.handshake, right.handshake)
+    && deepEqual(left.runtime, right.runtime);
 }
 
 function isWarmRebuildUnavailable(error: unknown): boolean {
@@ -2359,6 +2761,19 @@ function sameWorkload(
 
 function asError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
+}
+
+function cleanupAggregateError(
+  summary: string,
+  primary: unknown,
+  cleanup: unknown,
+): AggregateError {
+  const primaryError = asError(primary);
+  const cleanupError = asError(cleanup);
+  return new AggregateError(
+    [primaryError, cleanupError],
+    `${summary}: ${primaryError.message}; cleanup: ${cleanupError.message}`,
+  );
 }
 
 function deepEqual(left: unknown, right: unknown): boolean {

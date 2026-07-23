@@ -42,15 +42,10 @@ export async function createViewerGateway(options: {
         sockets.add(guest);
         guest.once("close", () => sockets.delete(guest));
         if (socket.destroyed) {
-          guest.destroy();
+          guest.destroy(new Error("Viewer bridge closed before the Guest transport attached"));
           return;
         }
-        socket.once("error", () => guest.destroy());
-        socket.once("close", () => guest.destroy());
-        guest.once("error", () => socket.destroy());
-        guest.once("close", () => socket.destroy());
-        socket.pipe(guest).pipe(socket);
-        socket.resume();
+        attachViewerBridge(socket, guest);
       },
       () => socket.destroy(),
     );
@@ -162,6 +157,27 @@ export async function createViewerGateway(options: {
       ]);
     },
   });
+}
+
+/** Owns one Host bridge socket until both byte directions finish or either side aborts. */
+export function attachViewerBridge(socket: Duplex, guest: Duplex): void {
+  const abortGuest = (error: Error) => {
+    if (!guest.destroyed) guest.destroy(error);
+  };
+  socket.once("error", abortGuest);
+  socket.once("close", (hadError: boolean) => {
+    if (hadError) return;
+    if (socket.readableEnded && socket.writableFinished) return;
+    abortGuest(new Error("Viewer bridge closed before both byte directions completed"));
+  });
+  guest.once("error", (error) => {
+    if (!socket.destroyed) socket.destroy(error);
+  });
+  guest.once("close", () => {
+    if (!socket.destroyed) socket.destroy();
+  });
+  socket.pipe(guest).pipe(socket);
+  socket.resume();
 }
 
 function parseProxyTarget(rawUrl: string | undefined, host: string | undefined): URL | null {

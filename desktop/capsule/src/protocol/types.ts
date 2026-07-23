@@ -1,4 +1,6 @@
-export const CAPSULE_PROTOCOL_VERSION = 1 as const;
+import { CAPSULE_STORAGE_PLAN_VERSION } from "../storage-plan";
+
+export const CAPSULE_PROTOCOL_VERSION = 2 as const;
 
 export type GuestArchitecture = "arm64" | "x64";
 export type WorkloadKind = "ui" | "service" | "job";
@@ -48,6 +50,21 @@ export interface DataStreamPrelude {
   kind: StreamKind;
 }
 
+/**
+ * Host proof that an artifact-out stream was durably adopted into Host CAS.
+ * The receipt is sent on the same one-use DATA stream after Guest FIN and
+ * before Host FIN, so a transport RESET or bare EOF cannot impersonate
+ * successful adoption.
+ */
+export interface ArtifactAdoptionReceipt {
+  type: "artifact.adopted";
+  protocolVersion: typeof CAPSULE_PROTOCOL_VERSION;
+  sessionId: string;
+  ticket: string;
+  digest: string;
+  bytes: number;
+}
+
 export interface PingBody {
   nonce: number;
 }
@@ -61,7 +78,9 @@ export interface AppPrepareBody {
   artifactBlobHandle: string;
   mappedHostUid: number;
   mappedHostGid: number;
-  scratchBytes?: number;
+  /** Private Host/Guest policy; never selected by an App manifest. */
+  storagePlanVersion: typeof CAPSULE_STORAGE_PLAN_VERSION;
+  scratchBytes: number;
 }
 
 export interface AppStopBody {
@@ -130,6 +149,10 @@ export interface BuildPrepareBody {
   baseDependencyDigest?: string;
   mappedHostUid: number;
   mappedHostGid: number;
+  /** Private Host/Guest policy recomputed from the authenticated input sizes. */
+  storagePlanVersion: typeof CAPSULE_STORAGE_PLAN_VERSION;
+  scratchBytes: number;
+  artifactOutputBytes: number;
   timeoutMs: number;
   resources: {
     memoryBytes: number;

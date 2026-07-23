@@ -1,15 +1,31 @@
 import { EventEmitter } from "node:events";
-import { Readable, PassThrough, type Duplex } from "node:stream";
+import { createHash } from "node:crypto";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Duplex, PassThrough, Readable } from "node:stream";
 import { describe, expect, test, vi } from "vitest";
-import type { GuestEvent, JsonValue, StreamKind } from "../../../capsule/src/protocol/types";
+import {
+  CAPSULE_PROTOCOL_VERSION,
+  type GuestEvent,
+  type JsonValue,
+  type StreamKind,
+} from "../../../capsule/src/protocol/types";
+import {
+  JsonFrameDecoder,
+  MAX_ARTIFACT_ADOPTION_RECEIPT_BYTES,
+} from "../../../capsule/src/protocol/codec";
+import { parseArtifactAdoptionReceipt } from "../../../capsule/src/protocol/validate";
 import type { CapsuleVmHostStream } from "../capsule-vm/launcher";
 import type { LoadedCapsuleGuestRelease } from "./guest-release";
-import type { HostArtifact, HostArtifactActivation } from "./artifact-store";
+import { HostArtifactStore, type HostArtifact, type HostArtifactActivation } from "./artifact-store";
 import type { CapsuleTreeSnapshot } from "./package-snapshot";
 import type { NpmDependencyBundle } from "./dependency-broker";
 import type { SystemStreamServer } from "./system-stream";
 import { CapsuleGuestRequestError } from "./guest-session";
+import { CapsuleRestartRequiredError, isCapsuleRestartRequiredError } from "./backend";
 import { MacOsCapsuleBackend, type MacOsCapsuleBackendOptions } from "./macos-backend";
+import { CapsuleStorageBudget, type CapsuleStorageBudgetLike } from "./storage-budget";
 
 const IMAGE = `sha256:${"1".repeat(64)}`;
 const PACKAGE_A = `sha256:${"2".repeat(64)}`;
@@ -19,16 +35,90 @@ const INSTALL = `sha256:${"7".repeat(64)}`;
 const INSTALL_B = `sha256:${"8".repeat(64)}`;
 const ARTIFACT_A = `sha256:${"5".repeat(64)}`;
 const ARTIFACT_B = `sha256:${"6".repeat(64)}`;
+const LARGE_DEPENDENCY = `sha256:${"9".repeat(64)}`;
+const MANIFEST_AUTHORITY: `sha256:${string}` = `sha256:${"a".repeat(64)}`;
+const CHANGED_MANIFEST_AUTHORITY: `sha256:${string}` = `sha256:${"b".repeat(64)}`;
+const SESSION_ID = "S".repeat(43);
 
 describe("MacOsCapsuleBackend orchestration", () => {
-  test("reserves the fixed VM state disk before the helper may start it", async () => {
+  test("rejects a package snapshot whose manifest changed after Core issued authority", async () => {
+    const harness = createHarness();
+    harness.manifestDigest = CHANGED_MANIFEST_AUTHORITY;
+
+    await expect(harness.backend.startUi(spec("sender-a")))
+      .rejects.toThrow("App manifest authority changed; refresh and retry");
+
+    expect(harness.vm.startCalls).toBe(0);
+    expect(harness.session.operations).toEqual([]);
+    expect(harness.dependencies).not.toHaveBeenCalled();
+  });
+
+  test("plans a Replay-sized cold launch into an exact 4 GiB state descriptor", async () => {
     const harness = createHarness();
     await harness.backend.startUi(spec("sender-a"));
-    expect(harness.storageEvents.slice(0, 3)).toEqual([
-      "reserve:17179869184:/private/state/capsule/state.raw",
+    expect(harness.storageEvents.slice(0, 4)).toEqual([
+      "reconcile:0:/private/state/capsule/state.raw",
+      "reserve:4294967296:/private/state/capsule/state.raw",
       "startGuest",
       "settle",
     ]);
+    expect(harness.vm.startDescriptors).toEqual([
+      expect.objectContaining({ stateDiskBytes: 4 * 1024 * 1024 * 1024 }),
+    ]);
+    expect(harness.lifecycleEvents.indexOf("dependency.planned"))
+      .toBeLessThan(harness.lifecycleEvents.indexOf("vm.start"));
+    expect(harness.lifecycleEvents.indexOf("state.prepare.cancelled"))
+      .toBeLessThan(harness.lifecycleEvents.indexOf("dependency.planned"));
+    await harness.backend.stopAll();
+    expect(harness.lifecycleEvents.slice(-3)).toEqual([
+      "helper.stop.confirmed",
+      "session.close",
+      "helper.close",
+    ]);
+  });
+
+  test("drains and reboots an idle Guest before growing its exact state capacity", async () => {
+    const harness = createHarness();
+    const first = await harness.backend.startUi(spec("sender-a"));
+    await harness.backend.stopUi(first.instanceId);
+
+    harness.packageDigest = PACKAGE_B;
+    harness.installWarmEligible = false;
+    harness.dependencyDigest = LARGE_DEPENDENCY;
+    harness.dependencyBytes = 128 * 1024 * 1024;
+    harness.session.cacheBlob("dependency", LARGE_DEPENDENCY);
+
+    await harness.backend.startUi(spec("sender-b"));
+    expect(harness.vm.startCalls).toBe(2);
+    expect(harness.vm.stopCalls).toBe(1);
+    expect(harness.session.operations.filter((operation) => operation === "vm.drain"))
+      .toHaveLength(1);
+    const capacities = harness.vm.startDescriptors.map((value) => value.stateDiskBytes as number);
+    expect(capacities[0]).toBe(4 * 1024 * 1024 * 1024);
+    expect(capacities[1]).toBeGreaterThan(capacities[0]!);
+    expect(harness.storageEvents).toContain(
+      `reserve:${capacities[1]}:/private/state/capsule/state.raw`,
+    );
+    await harness.backend.stopAll();
+  });
+
+  test("rejects Guest capacity growth without disturbing a live last-known-good App", async () => {
+    const harness = createHarness();
+    const first = await harness.backend.startUi(spec("sender-a"));
+
+    harness.packageDigest = PACKAGE_B;
+    harness.installWarmEligible = false;
+    harness.dependencyDigest = LARGE_DEPENDENCY;
+    harness.dependencyBytes = 128 * 1024 * 1024;
+    harness.session.cacheBlob("dependency", LARGE_DEPENDENCY);
+
+    await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b")))
+      .rejects.toThrow("last-known-good runtime remains active");
+    expect(harness.vm.startCalls).toBe(1);
+    expect(harness.vm.stopCalls).toBe(0);
+    expect(harness.session.buildStarts).toBe(1);
+    const viewer = await harness.backend.openUiStream(first.instanceId);
+    viewer.destroy();
     await harness.backend.stopAll();
   });
 
@@ -51,6 +141,12 @@ describe("MacOsCapsuleBackend orchestration", () => {
     expect(harness.session.sdkWasAttachedAtStart).toBe(true);
     expect(harness.dependencies).toHaveBeenCalledTimes(1);
     expect(harness.session.buildStarts).toBe(1);
+    expect(harness.session.artifactOutHostReceipts).toBe(1);
+    expect(harness.session.artifactOutHostHalfCloses).toBe(1);
+    expect(harness.lifecycleEvents.indexOf("artifact.cas.committed"))
+      .toBeLessThan(harness.lifecycleEvents.indexOf("artifact.host.receipt"));
+    expect(harness.lifecycleEvents.indexOf("artifact.host.receipt"))
+      .toBeLessThan(harness.lifecycleEvents.indexOf("artifact.host.fin"));
 
     const viewer = await harness.backend.openUiStream(first.instanceId);
     expect(harness.session.operations.at(-1)).toBe("viewer.attach");
@@ -175,6 +271,53 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await harness.backend.stopAll();
   });
 
+  test("does not acknowledge or FIN artifact-out before Host CAS verification succeeds", async () => {
+    const harness = createHarness();
+    harness.store.failNextReceiveAfterDrain = true;
+
+    await expect(harness.backend.startUi(spec("sender-a")))
+      .rejects.toThrow("injected artifact verification failure");
+    expect(harness.session.artifactOutHostReceipts).toBe(0);
+    expect(harness.session.artifactOutHostHalfCloses).toBe(0);
+    expect(harness.lifecycleEvents).not.toContain("artifact.host.receipt");
+    expect(harness.lifecycleEvents).not.toContain("artifact.host.fin");
+    await harness.backend.stopAll();
+  });
+
+  test("does not FIN or activate when the artifact adoption receipt cannot be delivered", async () => {
+    const harness = createHarness();
+    harness.session.failNextArtifactReceiptWrite = true;
+
+    await expect(harness.backend.startUi(spec("sender-a")))
+      .rejects.toThrow("injected artifact adoption receipt write failure");
+    expect(harness.lifecycleEvents).toContain("artifact.cas.committed");
+    expect(harness.session.artifactOutHostReceipts).toBe(0);
+    expect(harness.session.artifactOutHostHalfCloses).toBe(0);
+    expect(harness.store.activation).toBeUndefined();
+    await harness.backend.stopAll();
+  });
+
+  test("keeps the transfer deadline active while the physical Host FIN is stalled", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createHarness();
+      harness.session.holdArtifactOutHostFinal = true;
+
+      const opening = rejectionOf(harness.backend.startUi(spec("sender-a")));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(30_001);
+
+      await expect(opening).resolves.toMatchObject({
+        message: expect.stringContaining("idle deadline (64/64 bytes observed; phase=host-fin)"),
+      });
+      expect(harness.session.artifactOutHostReceipts).toBe(1);
+      expect(harness.session.artifactOutHostHalfCloses).toBe(0);
+      expect(harness.store.activation).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("retires exact Build imports when prepare fails before Guest dispatch", async () => {
     const harness = createHarness();
     harness.session.failBeforeOperation = "build.prepare";
@@ -186,6 +329,47 @@ describe("MacOsCapsuleBackend orchestration", () => {
       expect.objectContaining({ blobKind: "dependency", digest: DEPENDENCY }),
     ]));
     expect(harness.session.imports.size).toBe(0);
+    await harness.backend.stopAll();
+  });
+
+  test("does not mask a boundary-losing secondary import with redundant Guest cleanup", async () => {
+    const harness = createHarness();
+    harness.session.failNextDataStreamKind = "dependency-in";
+    harness.session.loseBoundaryOnDataStreamFailure = true;
+
+    await expect(harness.backend.startUi(spec("sender-a")))
+      .rejects.toThrow("injected dependency-in DATA failure");
+    expect(harness.session.operations).not.toContain("blob.import.release");
+    expect(harness.session.releasedImports).toHaveLength(0);
+    await harness.backend.stopAll();
+  });
+
+  test("reports the secondary import failure and its own cleanup failure", async () => {
+    const harness = createHarness();
+    harness.session.failNextDataStreamKind = "dependency-in";
+    harness.session.failImportReleaseForKind = "dependency";
+
+    await expect(harness.backend.startUi(spec("sender-a"))).rejects.toThrow(
+      "Guest blob import cleanup failed: injected dependency-in DATA failure; cleanup: injected dependency import release failure",
+    );
+    expect(harness.session.releasedImports).toEqual([
+      expect.objectContaining({ blobKind: "dependency", digest: DEPENDENCY }),
+    ]);
+    await harness.backend.stopAll();
+  });
+
+  test("reports a secondary import failure and failed package rollback together", async () => {
+    const harness = createHarness();
+    harness.session.failNextDataStreamKind = "dependency-in";
+    harness.session.failImportReleaseForKind = "package";
+
+    await expect(harness.backend.startUi(spec("sender-a"))).rejects.toThrow(
+      "Partial Build import cleanup failed: injected dependency-in DATA failure; cleanup: injected package import release failure",
+    );
+    expect(harness.session.releasedImports).toEqual([
+      expect.objectContaining({ blobKind: "dependency", digest: DEPENDENCY }),
+      expect.objectContaining({ blobKind: "package", digest: PACKAGE_A }),
+    ]);
     await harness.backend.stopAll();
   });
 
@@ -297,6 +481,20 @@ describe("MacOsCapsuleBackend orchestration", () => {
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
   });
 
+  test("surfaces typed restart-required state from the operation that first sees an unconfirmed stop", async () => {
+    const harness = createHarness();
+    const first = await harness.backend.startUi(spec("sender-a"));
+    harness.packageDigest = PACKAGE_B;
+    harness.session.failAppStop = true;
+    harness.vm.failStop = true;
+
+    const failure = await rejectionOf(
+      harness.backend.replaceUi(first.instanceId, spec("sender-b")),
+    );
+    expect(isCapsuleRestartRequiredError(failure)).toBe(true);
+    expect(failure.message).toContain("quarantined until Host restart");
+  });
+
   test("restores the last-known-good activation when a candidate exits during activation", async () => {
     const harness = createHarness();
     const first = await harness.backend.startUi(spec("sender-a"));
@@ -364,11 +562,18 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.session.emit("fatal", new Error("CONTROL was lost"));
     await vi.waitFor(() => expect(detachedAtNotification).toEqual([1]));
     expect(harness.vm.stopCalls).toBe(1);
+    expect(harness.lifecycleEvents).toContain("helper.stop.begin");
+    expect(harness.lifecycleEvents).not.toContain("session.close");
     await expect(harness.backend.openUiStream(instance.instanceId)).rejects.toThrow("no longer active");
 
     harness.vm.releaseStop();
     await stopFromBoundary;
     expect(harness.vm.stopCalls).toBe(1);
+    expect(harness.lifecycleEvents.slice(-3)).toEqual([
+      "helper.stop.confirmed",
+      "session.close",
+      "helper.close",
+    ]);
   });
 
   test("loses the whole VM boundary when App teardown is not confirmed", async () => {
@@ -430,11 +635,30 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.vm.badArchitecture = true;
     harness.vm.failStop = true;
 
-    await expect(harness.backend.startUi(spec("sender-a")))
-      .rejects.toThrow("quarantined until Host restart");
+    const failure = await rejectionOf(harness.backend.startUi(spec("sender-a")));
+    expect(failure.message).toContain("VM helper start result does not match the verified Guest release");
+    expect(failure.message).toContain("quarantined until Host restart");
+    expect(harness.lifecycleEvents.slice(-3)).toEqual([
+      "helper.stop.begin",
+      "session.close",
+      "helper.close",
+    ]);
     await expect(harness.backend.startUi(spec("sender-b")))
       .rejects.toThrow("quarantined until Host restart");
     expect(harness.vm.startCalls).toBe(1);
+  });
+
+  test("keeps CONTROL open until failed-boot VZ cleanup is confirmed", async () => {
+    const harness = createHarness();
+    harness.vm.badArchitecture = true;
+
+    await expect(harness.backend.startUi(spec("sender-a")))
+      .rejects.toThrow("VM helper start result does not match the verified Guest release");
+    expect(harness.lifecycleEvents.slice(-3)).toEqual([
+      "helper.stop.confirmed",
+      "session.close",
+      "helper.close",
+    ]);
   });
 
   test("rejects a launch when the Host SDK stream closes before UI readiness", async () => {
@@ -494,6 +718,363 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await harness.backend.stopAll();
   });
 
+  test("retires Guest state before removing only the App-owned Host caches", async () => {
+    const harness = createHarness();
+    await harness.backend.startUi(spec("sender-a"));
+    harness.lifecycleEvents.length = 0;
+    harness.storageRemovals.length = 0;
+    harness.store.deactivatedKeys.length = 0;
+    harness.store.pruneCalls = 0;
+    harness.session.trackRetirementLifecycle = true;
+    harness.store.trackRetirementLifecycle = true;
+
+    await harness.backend.retireApp("weather");
+
+    const ownerKey = createHash("sha256").update("weather", "utf8").digest("hex");
+    expect(harness.store.deactivatedKeys).toEqual([ownerKey]);
+    expect(harness.storageRemovals).toEqual([
+      { path: `/private/cache/capsule/packages/${ownerKey}`, recursive: true },
+      { path: `/private/cache/capsule/dependencies/${ownerKey}`, recursive: true },
+    ]);
+    expect(harness.store.pruneCalls).toBe(1);
+    expect(harness.lifecycleEvents).toEqual([
+      "guest.app.stopped",
+      "artifact.deactivated",
+      "cache.removed",
+      "cache.removed",
+      "artifact.pruned",
+    ]);
+    await harness.backend.stopAll();
+  });
+
+  test("preserves activation and Host caches when Guest retirement is ambiguous", async () => {
+    const harness = createHarness();
+    await harness.backend.startUi(spec("sender-a"));
+    harness.lifecycleEvents.length = 0;
+    harness.storageRemovals.length = 0;
+    harness.store.deactivatedKeys.length = 0;
+    harness.store.pruneCalls = 0;
+    harness.session.failAppStop = true;
+
+    await expect(harness.backend.retireApp("weather")).rejects.toThrow("Could not stop UI");
+
+    expect(harness.store.deactivatedKeys).toEqual([]);
+    expect(harness.storageRemovals).toEqual([]);
+    expect(harness.store.pruneCalls).toBe(0);
+    expect(harness.store.activation).toBeDefined();
+  });
+
+  test("rejects cache retirement after boundary loss cannot confirm VZ stop", async () => {
+    const harness = createHarness();
+    await harness.backend.startUi(spec("sender-a"));
+    harness.storageRemovals.length = 0;
+    harness.store.deactivatedKeys.length = 0;
+    harness.store.pruneCalls = 0;
+    harness.vm.failStop = true;
+
+    harness.session.emit("fatal", new Error("injected Guest boundary loss"));
+    await vi.waitFor(async () => {
+      expect(await harness.backend.status()).toMatchObject({
+        available: false,
+        restartRequired: true,
+      });
+    });
+
+    const failure = await rejectionOf(harness.backend.retireApp("weather"));
+    expect(failure).toBeInstanceOf(CapsuleRestartRequiredError);
+    expect(harness.store.deactivatedKeys).toEqual([]);
+    expect(harness.storageRemovals).toEqual([]);
+    expect(harness.store.pruneCalls).toBe(0);
+    expect(harness.store.activation).toBeDefined();
+  });
+
+  test("reconstructs fresh-process activation ownership and evicts stale residue before new admission", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lamarck-capsule-fresh-host-"));
+    try {
+      const stateDirectory = join(root, "state");
+      const cacheDirectory = join(root, "cache");
+      const artifactRoot = join(root, "artifacts");
+      const packageRoot = join(cacheDirectory, "packages");
+      const dependencyRoot = join(cacheDirectory, "dependencies");
+      const ownerKey = appKey("weather");
+      const staleOwner = "f".repeat(64);
+      const managedRoots = [
+        stateDirectory,
+        packageRoot,
+        dependencyRoot,
+        join(artifactRoot, "cas"),
+      ];
+      const initialBudget = new CapsuleStorageBudget({
+        roots: managedRoots,
+        aggregateBytes: 1_024,
+        perAppBytes: 1_024,
+        filesystemReserveBytes: 0,
+        dependencies: { availableBytes: async () => 1_000_000 },
+      });
+      const initialStore = new HostArtifactStore(artifactRoot, { storageBudget: initialBudget });
+      const activeBytes = Buffer.from("durable last-known-good artifact");
+      const activeIdentity = contentIdentity(activeBytes);
+      const activeArtifact = await initialStore.receive(
+        ownerKey,
+        activeIdentity.digest,
+        activeIdentity.bytes,
+        Readable.from([activeBytes]),
+      );
+      await initialStore.activate(ownerKey, activeArtifact, {
+        packageDigest: PACKAGE_A,
+        imageDigest: IMAGE,
+        installDigest: INSTALL,
+        dependencyDigest: DEPENDENCY,
+      });
+      const staleBytes = Buffer.from("unreferenced artifact residue");
+      const staleIdentity = contentIdentity(staleBytes);
+      const staleArtifact = await initialStore.receive(
+        staleOwner,
+        staleIdentity.digest,
+        staleIdentity.bytes,
+        Readable.from([staleBytes]),
+      );
+      const stalePackage = join(packageRoot, ownerKey, "stale.snapshot");
+      const staleDependency = join(dependencyRoot, ownerKey, "stale.tgz");
+      await mkdir(join(packageRoot, ownerKey), { recursive: true });
+      await mkdir(join(dependencyRoot, ownerKey), { recursive: true });
+      await writeFile(stalePackage, Buffer.alloc(19, 1));
+      await writeFile(staleDependency, Buffer.alloc(23, 2));
+
+      const admissionBytes = 17;
+      let freshBudget!: CapsuleStorageBudget;
+      let reachedAdmission = false;
+      const lifecycleEvents: string[] = [];
+      const vm = new FakeVm(lifecycleEvents);
+      const system = new FakeSystemStreamServer();
+      const session = new FakeSession(system, lifecycleEvents);
+      const backend = new MacOsCapsuleBackend({
+        helperPath: join(root, "helper"),
+        releaseResourcesRoot: join(root, "resources"),
+        stateDirectory,
+        cacheDirectory,
+        artifactRoot,
+        systemStreamServer: system as unknown as SystemStreamServer,
+        dependencies: {
+          hostPlatform: "darwin",
+          exists: () => true,
+          loadRelease: async () => guestRelease(),
+          launchVm: () => vm as never,
+          createSession: () => session as never,
+          storageBudget: (roots) => {
+            freshBudget = new CapsuleStorageBudget({
+              roots,
+              aggregateBytes: activeIdentity.bytes + admissionBytes,
+              perAppBytes: activeIdentity.bytes + admissionBytes,
+              filesystemReserveBytes: 0,
+              dependencies: { availableBytes: async () => 1_000_000 },
+            });
+            return stateNeutralBudget(freshBudget);
+          },
+          artifactStore: (path, budget) => new HostArtifactStore(path, { storageBudget: budget }),
+          snapshot: async ({ ownerKey: snapshotOwner, storageBudget }) => {
+            expect(snapshotOwner).toBe(ownerKey);
+            expect(await exists(stalePackage)).toBe(false);
+            expect(await exists(staleDependency)).toBe(false);
+            expect(await exists(staleArtifact.path)).toBe(false);
+            expect(await readFile(activeArtifact.path)).toEqual(activeBytes);
+            expect(await freshBudget.snapshot()).toMatchObject({
+              usedBytes: activeIdentity.bytes,
+              ownerUsedBytes: { [ownerKey]: activeIdentity.bytes },
+            });
+            const reservation = await storageBudget!.reserve({
+              owner: ownerKey,
+              scope: "package-snapshot",
+              bytes: admissionBytes,
+            });
+            reachedAdmission = true;
+            await reservation.release();
+            throw new Error("stop after verified fresh-process admission");
+          },
+          manifestDigest: async () => MANIFEST_AUTHORITY,
+          installInput: async () => ({
+            digest: INSTALL as `sha256:${string}`,
+            warmEligible: true,
+          }),
+          dependencies: async () => { throw new Error("dependency resolution was not expected"); },
+          opaqueId: () => "A".repeat(22),
+          nonce: () => 42,
+        },
+      });
+
+      await expect(backend.startUi({
+        ...spec("sender-a"),
+        packageDir: join(root, "workspace", "apps", "weather"),
+      })).rejects.toThrow("stop after verified fresh-process admission");
+      expect(reachedAdmission).toBe(true);
+      expect(await freshBudget.snapshot()).toMatchObject({
+        usedBytes: activeIdentity.bytes,
+        reservedBytes: 0,
+        ownerUsedBytes: { [ownerKey]: activeIdentity.bytes },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retireApp removes only reconstructable App caches and is not user-facing archive", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lamarck-capsule-retire-files-"));
+    try {
+      const workspace = join(root, "workspace");
+      const stateDirectory = join(root, "state");
+      const cacheDirectory = join(root, "cache");
+      const artifactRoot = join(root, "artifacts");
+      const packageRoot = join(cacheDirectory, "packages");
+      const dependencyRoot = join(cacheDirectory, "dependencies");
+      const ownerKey = appKey("weather");
+      const otherOwner = appKey("notes");
+      const managedRoots = [
+        stateDirectory,
+        packageRoot,
+        dependencyRoot,
+        join(artifactRoot, "cas"),
+      ];
+      const initialBudget = new CapsuleStorageBudget({
+        roots: managedRoots,
+        aggregateBytes: 1_048_576,
+        perAppBytes: 1_048_576,
+        filesystemReserveBytes: 0,
+        dependencies: { availableBytes: async () => 10_000_000 },
+      });
+      const initialStore = new HostArtifactStore(artifactRoot, { storageBudget: initialBudget });
+      const appArtifactBytes = Buffer.alloc(64, 7);
+      const appArtifactIdentity = contentIdentity(appArtifactBytes);
+      const appArtifact = await initialStore.receive(
+        ownerKey,
+        appArtifactIdentity.digest,
+        appArtifactIdentity.bytes,
+        Readable.from([appArtifactBytes]),
+      );
+      await initialStore.activate(ownerKey, appArtifact, {
+        packageDigest: PACKAGE_A,
+        imageDigest: IMAGE,
+        installDigest: INSTALL,
+        dependencyDigest: DEPENDENCY,
+      });
+      const otherArtifactBytes = Buffer.from("other App LKG");
+      const otherArtifactIdentity = contentIdentity(otherArtifactBytes);
+      const otherArtifact = await initialStore.receive(
+        otherOwner,
+        otherArtifactIdentity.digest,
+        otherArtifactIdentity.bytes,
+        Readable.from([otherArtifactBytes]),
+      );
+      await initialStore.activate(otherOwner, otherArtifact, {
+        packageDigest: PACKAGE_B,
+        imageDigest: IMAGE,
+        installDigest: INSTALL,
+        dependencyDigest: DEPENDENCY,
+      });
+
+      const workspaceApp = join(workspace, "apps", "weather", "manifest.json");
+      const d0d2Database = join(workspace, ".lamarck", "data.db");
+      const d1Document = join(workspace, "pages", "retirement-sentinel.md");
+      await mkdir(join(workspace, "apps", "weather"), { recursive: true });
+      await mkdir(join(workspace, ".lamarck"), { recursive: true });
+      await mkdir(join(workspace, "pages"), { recursive: true });
+      const immutableSentinels = new Map<string, Buffer>([
+        [workspaceApp, Buffer.from('{"manifestVersion":1,"id":"weather"}\n')],
+        [d0d2Database, Buffer.from("D0 and D2 durable database sentinel")],
+        [d1Document, Buffer.from("# D1 working-tree sentinel\n")],
+      ]);
+      for (const [path, bytes] of immutableSentinels) await writeFile(path, bytes);
+
+      let freshBudget!: CapsuleStorageBudget;
+      let freshStore!: HostArtifactStore;
+      const lifecycleEvents: string[] = [];
+      const vm = new FakeVm(lifecycleEvents);
+      const system = new FakeSystemStreamServer();
+      const session = new FakeSession(system, lifecycleEvents);
+      const backend = new MacOsCapsuleBackend({
+        helperPath: join(root, "helper"),
+        releaseResourcesRoot: join(root, "resources"),
+        stateDirectory,
+        cacheDirectory,
+        artifactRoot,
+        systemStreamServer: system as unknown as SystemStreamServer,
+        dependencies: {
+          hostPlatform: "darwin",
+          exists: () => true,
+          loadRelease: async () => guestRelease(),
+          launchVm: () => vm as never,
+          createSession: () => session as never,
+          storageBudget: (roots) => {
+            freshBudget = new CapsuleStorageBudget({
+              roots,
+              aggregateBytes: 1_048_576,
+              perAppBytes: 1_048_576,
+              filesystemReserveBytes: 0,
+              dependencies: { availableBytes: async () => 10_000_000 },
+            });
+            return stateNeutralBudget(freshBudget);
+          },
+          artifactStore: (path, budget) => {
+            freshStore = new HostArtifactStore(path, { storageBudget: budget });
+            return freshStore;
+          },
+          snapshot: async () => snapshot(PACKAGE_A, Buffer.from("package")),
+          manifestDigest: async () => MANIFEST_AUTHORITY,
+          installInput: async () => ({
+            digest: INSTALL as `sha256:${string}`,
+            warmEligible: true,
+          }),
+          dependencies: async () => { throw new Error("warm activation should not resolve dependencies"); },
+          opaqueId: (() => {
+            let id = 0;
+            return () => `${"A".repeat(20)}${String(id++).padStart(2, "0")}`;
+          })(),
+          nonce: () => 42,
+        },
+      });
+      await backend.startUi({
+        ...spec("sender-a"),
+        packageDir: join(workspace, "apps", "weather"),
+      });
+
+      const stateDisk = join(stateDirectory, "state.raw");
+      const appPackageCache = join(packageRoot, ownerKey, "app.snapshot");
+      const appDependencyCache = join(dependencyRoot, ownerKey, "app.tgz");
+      const otherPackageCache = join(packageRoot, otherOwner, "other.snapshot");
+      const otherDependencyCache = join(dependencyRoot, otherOwner, "other.tgz");
+      await mkdir(join(packageRoot, ownerKey), { recursive: true });
+      await mkdir(join(dependencyRoot, ownerKey), { recursive: true });
+      await mkdir(join(packageRoot, otherOwner), { recursive: true });
+      await mkdir(join(dependencyRoot, otherOwner), { recursive: true });
+      await writeFile(stateDisk, Buffer.from("shared disposable VM state sentinel"));
+      await writeFile(appPackageCache, Buffer.from("retire package cache"));
+      await writeFile(appDependencyCache, Buffer.from("retire dependency cache"));
+      await writeFile(otherPackageCache, Buffer.from("keep package cache"));
+      await writeFile(otherDependencyCache, Buffer.from("keep dependency cache"));
+      immutableSentinels.set(stateDisk, await readFile(stateDisk));
+
+      await backend.retireApp("weather");
+      await backend.stopAll();
+
+      expect(session.stoppedApps).toHaveLength(1);
+      expect(await exists(appPackageCache)).toBe(false);
+      expect(await exists(appDependencyCache)).toBe(false);
+      expect(await freshStore.active(ownerKey)).toBeUndefined();
+      expect(await freshStore.find(appArtifactIdentity.digest, appArtifactIdentity.bytes))
+        .toBeUndefined();
+      expect(await readFile(otherPackageCache)).toEqual(Buffer.from("keep package cache"));
+      expect(await readFile(otherDependencyCache)).toEqual(Buffer.from("keep dependency cache"));
+      expect(await freshStore.active(otherOwner)).toMatchObject({
+        artifact: otherArtifactIdentity,
+        packageDigest: PACKAGE_B,
+      });
+      for (const [path, bytes] of immutableSentinels) {
+        expect(await readFile(path)).toEqual(bytes);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("escalates unexpected-exit cleanup failure to the whole Guest boundary", async () => {
     const harness = createHarness();
     const uiLost = vi.fn();
@@ -513,6 +1094,8 @@ describe("MacOsCapsuleBackend orchestration", () => {
 function spec(sender: string) {
   return {
     appId: "weather",
+    manifestGeneration: 1,
+    manifestDigest: MANIFEST_AUTHORITY,
     packageDir: "/workspace/apps/weather",
     command: ["npm", "run", "start"],
     port: 3_000,
@@ -520,23 +1103,48 @@ function spec(sender: string) {
   };
 }
 
+async function rejectionOf(operation: Promise<unknown>): Promise<Error> {
+  try {
+    await operation;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+  throw new Error("Expected operation to reject");
+}
+
 function createHarness(overrides: { opaqueId?: () => string } = {}) {
-  const vm = new FakeVm();
+  const lifecycleEvents: string[] = [];
+  const vm = new FakeVm(lifecycleEvents);
+  let staleStateResiduePresent = true;
+  vm.onCancelStatePreparation = () => { staleStateResiduePresent = false; };
   const storageEvents: string[] = [];
-  vm.beforeStart = () => storageEvents.push("startGuest");
+  const storageRemovals: Array<{ path: string; recursive: boolean }> = [];
+  vm.beforeStart = () => {
+    storageEvents.push("startGuest");
+    lifecycleEvents.push("vm.start");
+  };
   const system = new FakeSystemStreamServer();
-  const session = new FakeSession(system);
-  const store = new FakeArtifactStore();
+  const session = new FakeSession(system, lifecycleEvents);
+  const store = new FakeArtifactStore(lifecycleEvents);
   let packageDigest: string = PACKAGE_A;
   let installDigest: string = INSTALL;
   let installWarmEligible = true;
+  let dependencyDigest: string = DEPENDENCY;
+  let dependencyBytes = Buffer.byteLength("dependency");
+  let manifestDigest: string = MANIFEST_AUTHORITY;
   let id = 0;
-  const dependencies = vi.fn(async (): Promise<NpmDependencyBundle> => ({
-    format: "npm-dependency-bundle-v1",
-    snapshot: snapshot(DEPENDENCY, Buffer.from("dependency")),
-    entries: 1,
-    tarballBytes: 10,
-  }));
+  const dependencies = vi.fn(async (): Promise<NpmDependencyBundle> => {
+    lifecycleEvents.push("dependency.planned");
+    return {
+      format: "npm-dependency-bundle-v1",
+      snapshot: {
+        ...snapshot(dependencyDigest, Buffer.from("dependency")),
+        bytes: dependencyBytes,
+      },
+      entries: 1,
+      tarballBytes: 10,
+    };
+  });
   const release = guestRelease();
   const options: MacOsCapsuleBackendOptions = {
     helperPath: "/Applications/Lamarck.app/Contents/Helpers/capsule-vm",
@@ -552,6 +1160,7 @@ function createHarness(overrides: { opaqueId?: () => string } = {}) {
       launchVm: () => vm as never,
       createSession: () => session as never,
       snapshot: async () => snapshot(packageDigest, Buffer.from(`package:${packageDigest}`)),
+      manifestDigest: async () => manifestDigest as `sha256:${string}`,
       installInput: async () => ({
         digest: installDigest as `sha256:${string}`,
         warmEligible: installWarmEligible,
@@ -567,9 +1176,27 @@ function createHarness(overrides: { opaqueId?: () => string } = {}) {
             release: async () => { storageEvents.push("release"); },
           };
         },
+        reserveStateDisk: async ({ additionalPhysicalBytes, path }) => {
+          storageEvents.push(`reserve:${additionalPhysicalBytes}:${path}`);
+          return {
+            commit: async () => { storageEvents.push("settle"); },
+            reconcileFailure: async () => { storageEvents.push("reconcileFailure"); },
+            release: async () => { storageEvents.push("release"); },
+          };
+        },
+        reconcileStateDisk: async ({ existingPhysicalBytes, path }) => {
+          storageEvents.push(`reconcile:${existingPhysicalBytes}:${path}`);
+        },
         claim: async () => {},
         unclaim: async () => {},
-        remove: async () => 0,
+        remove: async (path, removeOptions) => {
+          if (staleStateResiduePresent) {
+            throw new Error("stale state residue reached non-state storage admission");
+          }
+          storageRemovals.push({ path, recursive: removeOptions?.recursive === true });
+          if (store.trackRetirementLifecycle) lifecycleEvents.push("cache.removed");
+          return 0;
+        },
       }),
       opaqueId: overrides.opaqueId
         ?? (() => `${"A".repeat(20)}${String(id++).padStart(2, "0")}`),
@@ -585,12 +1212,20 @@ function createHarness(overrides: { opaqueId?: () => string } = {}) {
     store,
     dependencies,
     storageEvents,
+    storageRemovals,
+    lifecycleEvents,
     get packageDigest() { return packageDigest; },
     set packageDigest(value: string) { packageDigest = value; },
     get installDigest() { return installDigest; },
     set installDigest(value: string) { installDigest = value; },
     get installWarmEligible() { return installWarmEligible; },
     set installWarmEligible(value: boolean) { installWarmEligible = value; },
+    get dependencyDigest() { return dependencyDigest; },
+    set dependencyDigest(value: string) { dependencyDigest = value; },
+    get manifestDigest() { return manifestDigest; },
+    set manifestDigest(value: string) { manifestDigest = value; },
+    get dependencyBytes() { return dependencyBytes; },
+    set dependencyBytes(value: number) { dependencyBytes = value; },
   };
 }
 
@@ -601,14 +1236,35 @@ class FakeVm extends EventEmitter {
   failStop = false;
   badArchitecture = false;
   beforeStart: (() => void) | undefined;
+  onCancelStatePreparation: (() => void) | undefined;
   private stopBarrier: Promise<void> | undefined;
   private settleStop: (() => void) | undefined;
 
+  constructor(private readonly lifecycleEvents: string[]) { super(); }
+
   async probe() { return { virtualizationSupported: true }; }
 
-  async startGuest() {
+  async prepareState(options: { stateDiskBytes: number }) {
+    return {
+      preparationId: `01234567-89ab-4def-8123-${String(this.startCalls).padStart(12, "0")}`,
+      stateDiskBytes: options.stateDiskBytes,
+      existingPhysicalBytes: 0,
+      additionalPhysicalBytes: options.stateDiskBytes,
+      peakPhysicalBytes: options.stateDiskBytes,
+    };
+  }
+
+  async cancelStatePreparation() {
+    this.lifecycleEvents.push("state.prepare.cancelled");
+    this.onCancelStatePreparation?.();
+  }
+
+  readonly startDescriptors: Array<Record<string, unknown>> = [];
+
+  async startGuest(descriptor: Record<string, unknown>) {
     this.beforeStart?.();
     this.startCalls += 1;
+    this.startDescriptors.push({ ...descriptor });
     this.listenerCountsAtStart = {
       stream: this.listenerCount("stream"),
       event: this.listenerCount("event"),
@@ -625,10 +1281,15 @@ class FakeVm extends EventEmitter {
 
   async stopGuest() {
     this.stopCalls += 1;
+    this.lifecycleEvents.push("helper.stop.begin");
     if (this.stopBarrier) await this.stopBarrier;
     if (this.failStop) throw new Error("VZ stop was not confirmed");
+    this.lifecycleEvents.push("helper.stop.confirmed");
   }
-  close() {}
+  close() {
+    this.lifecycleEvents.push("helper.close");
+    this.removeAllListeners();
+  }
 
   blockStop(): void {
     this.stopBarrier = new Promise<void>((resolve) => { this.settleStop = resolve; });
@@ -699,6 +1360,8 @@ class FakeSession extends EventEmitter {
   readonly workloadPorts = new Map<string, number>();
   readonly workloadApps = new Map<string, string>();
   buildStarts = 0;
+  artifactOutHostReceipts = 0;
+  artifactOutHostHalfCloses = 0;
   failNextReady = false;
   failNextExport = false;
   failAppStop = false;
@@ -707,7 +1370,13 @@ class FakeSession extends EventEmitter {
   holdBuild = false;
   failNextWarmBuild = false;
   failBeforeOperation: string | undefined;
+  failNextDataStreamKind: StreamKind | undefined;
+  holdArtifactOutHostFinal = false;
+  failNextArtifactReceiptWrite = false;
+  failImportReleaseForKind: "package" | "dependency" | "artifact" | undefined;
+  loseBoundaryOnDataStreamFailure = false;
   sdkWasAttachedAtStart = false;
+  trackRetirementLifecycle = false;
   private ticket = 0;
   private eventSeq = 0;
   private heldBuild: { reject(error: Error): void } | undefined;
@@ -716,12 +1385,15 @@ class FakeSession extends EventEmitter {
   private currentInstallDigest = INSTALL;
   private currentWarmBuild = false;
 
-  constructor(private readonly system: FakeSystemStreamServer) { super(); }
+  constructor(
+    private readonly system: FakeSystemStreamServer,
+    private readonly lifecycleEvents: string[],
+  ) { super(); }
 
   async waitUntilReady() {}
 
   issueTicket(options: FakeTicket) {
-    const ticket = `ticket-${this.ticket++}`;
+    const ticket = String(this.ticket++).padStart(43, "T");
     this.tickets.set(ticket, options);
     return { ticket };
   }
@@ -731,7 +1403,15 @@ class FakeSession extends EventEmitter {
   }
 
   acceptDataStream() {}
-  close() { this.emit("close"); }
+  close() {
+    this.lifecycleEvents.push("session.close");
+    this.emit("close");
+    this.removeAllListeners();
+  }
+
+  cacheBlob(kind: "package" | "dependency" | "artifact", digest: string): void {
+    this.guestCache.add(`${kind}:${digest}`);
+  }
 
   emitLatestWorkloadExit() {
     const [workloadHandle, appHandle] = [...this.workloadApps.entries()].at(-1)!;
@@ -774,6 +1454,10 @@ class FakeSession extends EventEmitter {
       }
       case "blob.import.release": {
         this.releasedImports.push({ ...body });
+        if (this.failImportReleaseForKind === body.blobKind) {
+          this.failImportReleaseForKind = undefined;
+          throw new Error(`injected ${body.blobKind} import release failure`);
+        }
         return { released: this.removeImport(body.blobHandle) };
       }
       case "build.prepare":
@@ -865,6 +1549,7 @@ class FakeSession extends EventEmitter {
       case "app.stop":
         if (this.failAppStop) throw new Error("teardown failed");
         this.stoppedApps.push(body.appHandle);
+        if (this.trackRetirementLifecycle) this.lifecycleEvents.push("guest.app.stopped");
         return { stopped: true };
       case "viewer.attach": return { ready: true };
       case "vm.drain": return { drained: true };
@@ -876,7 +1561,20 @@ class FakeSession extends EventEmitter {
     const binding = this.tickets.get(ticket);
     if (!binding || binding.kind !== kind) throw new Error("unknown fake ticket");
     this.tickets.delete(ticket);
-    const stream = new PassThrough();
+    if (this.failNextDataStreamKind === kind) {
+      this.failNextDataStreamKind = undefined;
+      const error = new Error(`injected ${kind} DATA failure`);
+      if (this.loseBoundaryOnDataStreamFailure) this.emit("fatal", error);
+      throw error;
+    }
+    const stream = kind === "artifact-out"
+      ? new Duplex({
+          allowHalfOpen: true,
+          autoDestroy: false,
+          read() {},
+        })
+      : new PassThrough({ allowHalfOpen: true, autoDestroy: false });
+    stream.on("error", () => {});
     if (kind === "package-in" || kind === "dependency-in" || kind === "artifact-in") {
       const pending = this.imports.get(ticket)!;
       stream.on("data", () => {});
@@ -890,10 +1588,75 @@ class FakeSession extends EventEmitter {
       });
     } else if (kind === "artifact-out") {
       const descriptor = this.descriptor();
+      let exportFailed = false;
+      let adoptionReceiptReceived = false;
+      const decoder = new JsonFrameDecoder(MAX_ARTIFACT_ADOPTION_RECEIPT_BYTES);
+      Object.defineProperty(stream, "_write", {
+        configurable: true,
+        value: (
+          chunk: Buffer,
+          _encoding: BufferEncoding,
+          callback: (error?: Error | null) => void,
+        ) => {
+          if (this.failNextArtifactReceiptWrite) {
+            this.failNextArtifactReceiptWrite = false;
+            callback(new Error("injected artifact adoption receipt write failure"));
+            return;
+          }
+          try {
+            for (const value of decoder.push(chunk)) {
+              if (adoptionReceiptReceived) {
+                throw new Error("fake Guest received duplicate artifact adoption receipts");
+              }
+              const receipt = parseArtifactAdoptionReceipt(value);
+              if (
+                receipt.sessionId !== SESSION_ID
+                || receipt.ticket !== ticket
+                || receipt.digest !== descriptor.digest
+                || receipt.bytes !== descriptor.bytes
+              ) {
+                throw new Error("fake Guest received a mismatched artifact adoption receipt");
+              }
+              adoptionReceiptReceived = true;
+              this.artifactOutHostReceipts += 1;
+              this.lifecycleEvents.push("artifact.host.receipt");
+            }
+            callback();
+          } catch (error) {
+            callback(error instanceof Error ? error : new Error(String(error)));
+          }
+        },
+      });
+      Object.defineProperty(stream, "_final", {
+        configurable: true,
+        value: (callback: (error?: Error | null) => void) => {
+          if (this.holdArtifactOutHostFinal) return;
+          try {
+            decoder.end();
+            if (!adoptionReceiptReceived) {
+              throw new Error("fake Guest expected exactly one artifact adoption receipt");
+            }
+            this.artifactOutHostHalfCloses += 1;
+            this.lifecycleEvents.push("artifact.host.fin");
+            if (!exportFailed) {
+              this.guestEvent("blob.exported", {
+                blobHandle: binding.appHandle,
+                digest: descriptor.digest,
+                bytes: descriptor.bytes,
+              });
+            }
+            callback();
+          } catch (error) {
+            callback(error instanceof Error ? error : new Error(String(error)));
+          }
+        },
+      });
       queueMicrotask(() => {
         if (this.failNextExport) {
           this.failNextExport = false;
-          stream.end(Buffer.alloc(descriptor.bytes, 7));
+          exportFailed = true;
+          stream.push(Buffer.alloc(descriptor.bytes, 7));
+          stream.push(null);
           this.guestEvent("blob.failed", {
             blobHandle: binding.appHandle,
             digest: descriptor.digest,
@@ -902,17 +1665,18 @@ class FakeSession extends EventEmitter {
           });
           return;
         }
-        stream.end(Buffer.alloc(descriptor.bytes, 7));
-        this.guestEvent("blob.exported", {
-          blobHandle: binding.appHandle,
-          digest: descriptor.digest,
-          bytes: descriptor.bytes,
-        });
+        stream.push(Buffer.alloc(descriptor.bytes, 7));
+        stream.push(null);
       });
     }
     return {
       stream,
-      prelude: { kind },
+      prelude: {
+        protocolVersion: CAPSULE_PROTOCOL_VERSION,
+        sessionId: SESSION_ID,
+        ticket,
+        kind,
+      },
       binding,
     } as never;
   }
@@ -948,8 +1712,8 @@ class FakeSession extends EventEmitter {
 
   private guestEvent(type: GuestEvent["type"], body: JsonValue) {
     this.emit("event", {
-      v: 1,
-      sessionId: "S".repeat(43),
+      v: CAPSULE_PROTOCOL_VERSION,
+      sessionId: SESSION_ID,
       kind: "event",
       eventSeq: ++this.eventSeq,
       type,
@@ -963,6 +1727,12 @@ class FakeArtifactStore {
   activation: (HostArtifactActivation & { packageDigest: `sha256:${string}` }) | undefined;
   afterNextActivation: (() => void) | undefined;
   failNextFind = false;
+  failNextReceiveAfterDrain = false;
+  readonly deactivatedKeys: string[] = [];
+  pruneCalls = 0;
+  trackRetirementLifecycle = false;
+
+  constructor(private readonly lifecycleEvents: string[]) {}
 
   async active() { return this.activation; }
   async find(digest: string) {
@@ -983,8 +1753,13 @@ class FakeArtifactStore {
     for await (const chunk of source) chunks.push(Buffer.from(chunk));
     const bytes = Buffer.concat(chunks);
     if (bytes.byteLength !== expectedBytes) throw new Error("fake artifact size mismatch");
+    if (this.failNextReceiveAfterDrain) {
+      this.failNextReceiveAfterDrain = false;
+      throw new Error("injected artifact verification failure");
+    }
     const artifact = hostArtifact(digest as `sha256:${string}`, bytes);
     this.cas.set(digest, artifact);
+    this.lifecycleEvents.push("artifact.cas.committed");
     return artifact;
   }
 
@@ -1015,8 +1790,16 @@ class FakeArtifactStore {
     afterActivation?.();
   }
 
-  async deactivate() { this.activation = undefined; }
-  async pruneUnreferenced() { return 0; }
+  async deactivate(appKey: string) {
+    this.deactivatedKeys.push(appKey);
+    this.activation = undefined;
+    if (this.trackRetirementLifecycle) this.lifecycleEvents.push("artifact.deactivated");
+  }
+  async pruneUnreferenced() {
+    this.pruneCalls += 1;
+    if (this.trackRetirementLifecycle) this.lifecycleEvents.push("artifact.pruned");
+    return 0;
+  }
 }
 
 function snapshot(digest: string, bytes: Buffer): CapsuleTreeSnapshot {
@@ -1039,6 +1822,43 @@ function hostArtifact(digest: `sha256:${string}`, bytes: Buffer): HostArtifact {
   };
 }
 
+function appKey(appId: string): string {
+  return createHash("sha256").update(appId, "utf8").digest("hex");
+}
+
+function contentIdentity(bytes: Buffer): { digest: `sha256:${string}`; bytes: number } {
+  return {
+    digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+    bytes: bytes.byteLength,
+  };
+}
+
+function stateNeutralBudget(budget: CapsuleStorageBudget): CapsuleStorageBudgetLike {
+  return {
+    reserve: (options) => budget.reserve(options),
+    reserveFile: (options) => budget.reserveFile(options),
+    reserveStateDisk: async () => ({
+      commit: async () => {},
+      reconcileFailure: async () => {},
+      release: async () => {},
+    }),
+    reconcileStateDisk: async () => {},
+    claim: (options) => budget.claim(options),
+    unclaim: (options) => budget.unclaim(options),
+    remove: (path, options) => budget.remove(path, options),
+  };
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 function guestRelease(): LoadedCapsuleGuestRelease {
   return {
     descriptor: {} as never,
@@ -1055,11 +1875,13 @@ function guestRelease(): LoadedCapsuleGuestRelease {
       expectedArchitecture: "arm64",
       expectedSupervisorVersion: "0.1.0",
       expectedFeatures: [
+        "artifact-adoption-receipt-v1",
         "artifact-erofs-v1",
         "build-v1",
         "oci-policy-v1",
         "sdk-uds-v1",
         "tickets-v1",
+        "vsock-record-v2",
         "warm-rebuild-v1",
       ],
     },

@@ -3,6 +3,8 @@ import { Duplex, Readable } from "node:stream";
 import {
   type BlobTransferPolicy,
   CAPSULE_PROTOCOL_VERSION,
+  createCapsuleBuildStoragePlan,
+  createCapsuleRuntimeStoragePlan,
   JsonFrameDecoder,
   MAX_CONTROL_FRAME_BYTES,
   RuncContainmentError,
@@ -25,6 +27,7 @@ import {
   GuestResourceAdmission,
   type GuestResourceAdmissionLike,
 } from "../src/resource-admission";
+import type { GuestProtocolStream } from "../src/lvrm-duplex";
 import { BoundedTtlTombstones, CapsuleGuestSupervisor } from "../src/supervisor";
 
 const BOOT_ID = "B".repeat(22);
@@ -85,6 +88,67 @@ describe("Capsule Guest supervisor data routing", () => {
       body: { blobHandle: BLOB, digest: DIGEST, bytes: 3 },
     });
     expect(harness.received).toEqual([Buffer.from("abc")]);
+  });
+
+  test("does not report an import before the underlying dual-CLOSE commit", async () => {
+    const protocolClose = controllablePromise();
+    const harness = await createHarness({
+      blobPresent: false,
+      dataProtocolClosePromise: protocolClose.promise,
+    });
+    await harness.request("blob.import.prepare", {
+      blobHandle: BLOB,
+      blobKind: "package",
+      format: "capsule-tree-v1",
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    data.end(Buffer.concat([
+      encodeJsonFrame(dataPrelude(SDK_TICKET, "package-in")),
+      Buffer.from("abc"),
+    ]));
+
+    await eventually(() => expect(harness.received).toEqual([Buffer.from("abc")]));
+    expect(harness.inbox.count((value) => eventType(value) === "blob.imported")).toBe(0);
+    protocolClose.resolve();
+
+    await expect(
+      harness.inbox.next((value) => eventType(value) === "blob.imported"),
+    ).resolves.toMatchObject({
+      body: { blobHandle: BLOB, digest: DIGEST, bytes: 3 },
+    });
+  });
+
+  test("keeps the import deadline active while dual-CLOSE is pending", async () => {
+    const protocolClose = controllablePromise();
+    const harness = await createHarness({
+      blobPresent: false,
+      dataProtocolClosePromise: protocolClose.promise,
+      blobTransferPolicy: {
+        idleTimeoutMs: 15,
+        baseDeadlineMs: 100,
+        minimumBytesPerSecond: 1024 * 1024,
+      },
+    });
+    await harness.request("blob.import.prepare", {
+      blobHandle: BLOB,
+      blobKind: "package",
+      format: "capsule-tree-v1",
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    data.end(Buffer.concat([
+      encodeJsonFrame(dataPrelude(SDK_TICKET, "package-in")),
+      Buffer.from("abc"),
+    ]));
+
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain("idle deadline");
+    expect(harness.inbox.count((value) => eventType(value) === "blob.imported")).toBe(0);
   });
 
   test("lets an attached import make byte progress beyond the ticket TTL", async () => {
@@ -204,6 +268,314 @@ describe("Capsule Guest supervisor data routing", () => {
     expect(failed.body.message).toContain(sourceError.message);
     await delay(20);
     expect(harness.inbox.count((value) => eventType(value) === "blob.failed")).toBe(1);
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+  });
+
+  test("exports the exact artifact after its adoption receipt and explicit Host FIN", async () => {
+    const harness = await createHarness({ blobPresent: true });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    const output = collectUntilReadableEnd(data);
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+
+    expect(await output).toEqual(Buffer.from("abc"));
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+    expect(harness.blobs.releaseExpected).not.toHaveBeenCalledWith(expect.objectContaining({
+      referenceId: `export:${BLOB}`,
+    }));
+    data.end(encodeJsonFrame(artifactAdoptionReceipt()));
+    const exported = await harness.inbox.next((value) => eventType(value) === "blob.exported");
+    expect(exported).toMatchObject({
+      v: CAPSULE_PROTOCOL_VERSION,
+      sessionId: SESSION_ID,
+      body: { blobHandle: BLOB, digest: DIGEST, bytes: 3 },
+    });
+    expect(data.writableEnded).toBe(true);
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(1);
+    expect(harness.inbox.count((value) => eventType(value) === "blob.failed")).toBe(0);
+  });
+
+  test("does not release an export before the underlying dual-CLOSE commit", async () => {
+    const protocolClose = controllablePromise();
+    const harness = await createHarness({
+      blobPresent: true,
+      dataProtocolClosePromise: protocolClose.promise,
+    });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    const output = collectUntilReadableEnd(data);
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+    expect(await output).toEqual(Buffer.from("abc"));
+    data.end(encodeJsonFrame(artifactAdoptionReceipt()));
+
+    await delay(10);
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+    expect(harness.blobs.releaseExpected).not.toHaveBeenCalledWith(expect.objectContaining({
+      referenceId: `export:${BLOB}`,
+    }));
+    protocolClose.resolve();
+
+    await expect(
+      harness.inbox.next((value) => eventType(value) === "blob.exported"),
+    ).resolves.toMatchObject({
+      body: { blobHandle: BLOB, digest: DIGEST, bytes: 3 },
+    });
+  });
+
+  test("rejects a clean Host FIN without a durable artifact adoption receipt", async () => {
+    const harness = await createHarness({ blobPresent: true });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    const output = collectUntilReadableEnd(data);
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+
+    expect(await output).toEqual(Buffer.from("abc"));
+    data.end();
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain("without an artifact adoption receipt");
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+  });
+
+  test.each([
+    ["session", { sessionId: "O".repeat(43) }],
+    ["ticket", { ticket: "J".repeat(43) }],
+    ["digest", { digest: `sha256:${"c".repeat(64)}` }],
+    ["byte count", { bytes: 4 }],
+  ])("rejects an artifact adoption receipt bound to another %s", async (_field, overrides) => {
+    const harness = await createHarness({ blobPresent: true });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    const output = collectUntilReadableEnd(data);
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+
+    expect(await output).toEqual(Buffer.from("abc"));
+    data.end(encodeJsonFrame(artifactAdoptionReceipt(overrides)));
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain("does not match this one-use export");
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+  });
+
+  test("fails and releases the exact export reference when receipt arrives without Host FIN", async () => {
+    const harness = await createHarness({
+      blobPresent: true,
+      blobTransferPolicy: {
+        idleTimeoutMs: 15,
+        baseDeadlineMs: 100,
+        minimumBytesPerSecond: 1024 * 1024,
+      },
+    });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    const output = collectUntilReadableEnd(data);
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+
+    expect(await output).toEqual(Buffer.from("abc"));
+    data.write(encodeJsonFrame(artifactAdoptionReceipt()));
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain("idle deadline");
+    expect(harness.blobs.releaseExpected).toHaveBeenCalledWith(expect.objectContaining({
+      referenceId: `export:${BLOB}`,
+    }));
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+  });
+
+  test("rejects an adoption receipt coalesced before verified Guest output and Guest FIN", async () => {
+    const harness = await createHarness({ blobPresent: true });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    data.write(Buffer.concat([
+      encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")),
+      encodeJsonFrame(artifactAdoptionReceipt()),
+    ]));
+
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain(
+      "adoption receipt arrived before verified Guest output and Guest FIN",
+    );
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+  });
+
+  test("rejects a Host FIN observed before verified Guest output and Guest FIN flush", async () => {
+    const harness = await createHarness({ blobPresent: true });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    const output = collectUntilReadableEnd(data);
+    data.end(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+
+    expect(await output).toEqual(Buffer.from("abc"));
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain("Host FIN arrived before verified Guest output");
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+  });
+
+  test("does not report export completion before a slow DATA writer, receipt, and Host FIN", async () => {
+    const harness = await createHarness({
+      blobPresent: true,
+      dataGuestWriteDelayMs: 12,
+      openBlob: async () => Readable.from([
+        Buffer.from("a"),
+        Buffer.from("b"),
+        Buffer.from("c"),
+      ]),
+    });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    const output = collectUntilReadableEnd(data);
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+
+    await delay(8);
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+    expect(await output).toEqual(Buffer.from("abc"));
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+    data.end(encodeJsonFrame(artifactAdoptionReceipt()));
+    await harness.inbox.next((value) => eventType(value) === "blob.exported");
+  });
+
+  test("rejects a short artifact without ambiguous adoption", async () => {
+    const harness = await createHarness({
+      blobPresent: true,
+      openBlob: async () => Readable.from(Buffer.from("ab")),
+    });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain("ended at 2 bytes; expected 3");
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+  });
+
+  test("rejects a Host write failure without reporting export completion", async () => {
+    const harness = await createHarness({
+      blobPresent: true,
+      dataGuestWriteDelayMs: 12,
+      openBlob: async () => Readable.from([
+        Buffer.from("a"),
+        Buffer.from("b"),
+        Buffer.from("c"),
+      ]),
+    });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+    data.destroy();
+
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain("peer is closed");
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+  });
+
+  test("reports a failed exact-reference release instead of an ambiguous export success", async () => {
+    const releaseError = new Error("exact export reference release failed");
+    const harness = await createHarness({ blobPresent: true });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    harness.blobs.releaseExpected.mockRejectedValueOnce(releaseError);
+    const data = await harness.dialer.nextHostSocket();
+    const output = collectUntilReadableEnd(data);
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+    expect(await output).toEqual(Buffer.from("abc"));
+    data.end(encodeJsonFrame(artifactAdoptionReceipt()));
+
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain(releaseError.message);
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+  });
+
+  test("reports a missing exact export reference instead of an ambiguous export success", async () => {
+    const harness = await createHarness({ blobPresent: true });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    harness.blobs.releaseExpected.mockResolvedValueOnce(false);
+    const data = await harness.dialer.nextHostSocket();
+    const output = collectUntilReadableEnd(data);
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+    expect(await output).toEqual(Buffer.from("abc"));
+    data.end(encodeJsonFrame(artifactAdoptionReceipt()));
+
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain("exact artifact export reference is missing");
+    expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
+  });
+
+  test("rejects a late CAS digest failure after bytes were written without reporting success", async () => {
+    const digestError = new Error("CAS blob digest changed while streaming");
+    const harness = await createHarness({
+      blobPresent: true,
+      openBlob: async () => Readable.from((async function* () {
+        yield Buffer.from("abc");
+        throw digestError;
+      })()),
+    });
+    await harness.request("blob.export.prepare", {
+      blobHandle: BLOB,
+      digest: DIGEST,
+      bytes: 3,
+      streamTicket: SDK_TICKET,
+    });
+    const data = await harness.dialer.nextHostSocket();
+    data.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "artifact-out")));
+
+    const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(failed.body.message).toContain(digestError.message);
     expect(harness.inbox.count((value) => eventType(value) === "blob.exported")).toBe(0);
   });
 
@@ -386,6 +758,47 @@ describe("Capsule Guest supervisor data routing", () => {
       mappedHostUid: 100_000,
       mappedHostGid: 200_000,
     })).toMatchObject({ ok: true });
+  });
+
+  test("does not acknowledge App stop when its exact artifact reference is missing", async () => {
+    const harness = await createHarness({ blobPresent: true });
+    expect(await harness.request("app.prepare", {
+      appHandle: APP,
+      artifactDigest: DIGEST,
+      mappedHostUid: 100_000,
+      mappedHostGid: 200_000,
+    })).toMatchObject({ ok: true });
+    harness.blobs.releaseExpected.mockResolvedValueOnce(false);
+
+    expect(await harness.request("app.stop", { appHandle: APP })).toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining("exact App artifact reference is missing") },
+    });
+    const internals = harness.supervisor as unknown as {
+      appBlobReferences: Map<string, unknown>;
+      retiredApps: BoundedTtlTombstones;
+    };
+    expect(internals.appBlobReferences.has(APP)).toBe(true);
+    expect(internals.retiredApps.has(APP)).toBe(false);
+  });
+
+  test("does not let vm.drain hide a missing exact App artifact reference", async () => {
+    const harness = await createHarness({ blobPresent: true });
+    expect(await harness.request("app.prepare", {
+      appHandle: APP,
+      artifactDigest: DIGEST,
+      mappedHostUid: 100_000,
+      mappedHostGid: 200_000,
+    })).toMatchObject({ ok: true });
+    harness.blobs.releaseExpected.mockResolvedValueOnce(false);
+
+    expect(await harness.request("vm.drain", {})).toMatchObject({
+      ok: false,
+      error: {
+        message: expect.stringContaining("Guest drain was not authoritative"),
+      },
+    });
+    expect(harness.blobs.releaseAll).not.toHaveBeenCalled();
   });
 
   test("expires unconsumed tickets and their pending side-map records", async () => {
@@ -985,6 +1398,8 @@ async function createHarness(options: {
   ticketTtlMs?: number;
   blobTransferPolicy?: Partial<BlobTransferPolicy>;
   openBlob?: () => Promise<Readable>;
+  dataGuestWriteDelayMs?: number;
+  dataProtocolClosePromise?: Promise<void>;
 }) {
   const received: Buffer[] = [];
   const blobs = {
@@ -1019,7 +1434,10 @@ async function createHarness(options: {
     }),
   };
   const runc = new FakeRuncDriver();
-  const dialer = new FakeDataDialer();
+  const dialer = new FakeDataDialer(
+    options.dataGuestWriteDelayMs ?? 0,
+    options.dataProtocolClosePromise,
+  );
   const supervisor = new CapsuleGuestSupervisor({
     bootId: BOOT_ID,
     imageDigest: IMAGE,
@@ -1057,7 +1475,27 @@ async function createHarness(options: {
   const request = async (op: HostOperation, body: JsonValue) => {
     requestSequence += 1;
     const requestId = String(requestSequence).padStart(22, "R");
-    const objectBody = isRecord(body) ? body : {};
+    const objectBody: Record<string, any> = isRecord(body)
+      ? body as Record<string, any>
+      : {};
+    const runtimeStorage = op === "app.prepare"
+      ? createCapsuleRuntimeStoragePlan(
+          typeof objectBody.artifactBytes === "number" ? objectBody.artifactBytes : 3,
+        )
+      : undefined;
+    const buildStorage = op === "build.prepare"
+      ? objectBody.dependencyBytes !== undefined
+        ? createCapsuleBuildStoragePlan({
+            mode: "cold",
+            packageBytes: objectBody.packageBytes as number,
+            dependencyBytes: objectBody.dependencyBytes as number,
+          })
+        : createCapsuleBuildStoragePlan({
+            mode: "warm",
+            packageBytes: objectBody.packageBytes as number,
+            baseArtifactBytes: objectBody.baseArtifactBytes as number,
+          })
+      : undefined;
     const authenticatedBody = op === "blob.import.prepare"
       ? { ownerKey: OWNER, ...objectBody }
       : op === "blob.export.prepare"
@@ -1067,9 +1505,18 @@ async function createHarness(options: {
               ownerKey: OWNER,
               artifactBytes: 3,
               artifactBlobHandle: BLOB,
+              storagePlanVersion: runtimeStorage!.version,
+              scratchBytes: runtimeStorage!.scratchBytes,
               ...objectBody,
             }
-          : body;
+          : op === "build.prepare"
+            ? {
+                storagePlanVersion: buildStorage!.version,
+                scratchBytes: buildStorage!.scratchBytes,
+                artifactOutputBytes: buildStorage!.artifactOutputBytes,
+                ...objectBody,
+              }
+            : body;
     const value = {
       v: CAPSULE_PROTOCOL_VERSION,
       sessionId: SESSION_ID,
@@ -1139,10 +1586,18 @@ class FakeDataDialer implements GuestDataDialer {
     reject(error: Error): void;
   } | undefined;
 
+  constructor(
+    private readonly guestWriteDelayMs: number,
+    private readonly guestProtocolClosePromise?: Promise<void>,
+  ) {}
+
   async open(): Promise<void> {
     if (this.closed) throw new Error("dialer closed");
     this.openCount += 1;
-    const pair = await socketPair();
+    const pair = await socketPair({
+      guestWriteDelayMs: this.guestWriteDelayMs,
+      guestProtocolClosePromise: this.guestProtocolClosePromise,
+    });
     this.supervisor.attachData(pair.guest);
     const waiter = this.waiters.shift();
     if (waiter) waiter(pair.host);
@@ -1264,14 +1719,21 @@ class FrameInbox {
   }
 }
 
-async function socketPair(): Promise<{ guest: Socket; host: Socket }> {
-  const guestMemory = new MemorySocket();
-  const hostMemory = new MemorySocket();
+async function socketPair(options: {
+  guestWriteDelayMs?: number;
+  hostWriteDelayMs?: number;
+  guestProtocolClosePromise?: Promise<void>;
+} = {}): Promise<{ guest: Socket & GuestProtocolStream; host: Socket }> {
+  const guestMemory = new MemorySocket(
+    options.guestWriteDelayMs ?? 0,
+    options.guestProtocolClosePromise,
+  );
+  const hostMemory = new MemorySocket(options.hostWriteDelayMs ?? 0);
   guestMemory.peer = hostMemory;
   hostMemory.peer = guestMemory;
   guestMemory.on("error", () => undefined);
   hostMemory.on("error", () => undefined);
-  const guest = guestMemory as unknown as Socket;
+  const guest = guestMemory as unknown as Socket & GuestProtocolStream;
   const host = hostMemory as unknown as Socket;
   cleanup.push(() => {
     host.destroy();
@@ -1285,8 +1747,11 @@ class MemorySocket extends Duplex {
   private idleTimeoutMs = 0;
   private idleTimer: NodeJS.Timeout | undefined;
 
-  constructor() {
-    super({ allowHalfOpen: true });
+  constructor(
+    private readonly writeDelayMs = 0,
+    private readonly protocolClosePromise = Promise.resolve(),
+  ) {
+    super({ allowHalfOpen: true, autoDestroy: false });
   }
 
   setNoDelay(): this {
@@ -1300,6 +1765,35 @@ class MemorySocket extends Duplex {
     return this;
   }
 
+  async waitForProtocolClose(): Promise<void> {
+    if (this.destroyed) {
+      throw new Error("memory protocol stream closed before its close commit");
+    }
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        this.off("error", onError);
+        this.off("close", onClose);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onError = (error: Error) => finish(error);
+      const onClose = () => finish(new Error(
+        "memory protocol stream closed before its close commit",
+      ));
+      this.once("error", onError);
+      this.once("close", onClose);
+      void this.protocolClosePromise.then(
+        () => finish(),
+        (error: unknown) => finish(
+          error instanceof Error ? error : new Error(String(error)),
+        ),
+      );
+    });
+  }
+
   override _read(): void {}
 
   override _write(
@@ -1311,10 +1805,18 @@ class MemorySocket extends Duplex {
       callback(new Error("memory socket peer is closed"));
       return;
     }
-    this.refreshIdleTimer();
-    this.peer.refreshIdleTimer();
-    this.peer.push(Buffer.from(chunk as Uint8Array));
-    callback();
+    const deliver = () => {
+      if (!this.peer || this.peer.destroyed) {
+        callback(new Error("memory socket peer is closed"));
+        return;
+      }
+      this.refreshIdleTimer();
+      this.peer.refreshIdleTimer();
+      this.peer.push(Buffer.from(chunk as Uint8Array));
+      callback();
+    };
+    if (this.writeDelayMs > 0) setTimeout(deliver, this.writeDelayMs);
+    else deliver();
   }
 
   override _final(callback: (error?: Error | null) => void): void {
@@ -1337,8 +1839,54 @@ class MemorySocket extends Duplex {
   }
 }
 
+async function collectUntilReadableEnd(socket: Socket): Promise<Buffer> {
+  return await new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const onData = (chunk: Buffer) => chunks.push(Buffer.from(chunk));
+    const onEnd = () => finish();
+    const onError = (error: Error) => finish(error);
+    const onClose = () => {
+      if (!socket.readableEnded) finish(new Error("DATA socket closed before a clean Guest FIN"));
+    };
+    const finish = (error?: Error) => {
+      socket.off("data", onData);
+      socket.off("end", onEnd);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+      if (error) reject(error);
+      else resolve(Buffer.concat(chunks));
+    };
+    socket.on("data", onData);
+    socket.once("end", onEnd);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+    socket.resume();
+  });
+}
+
 function dataPrelude(ticket: string, kind: string) {
   return { protocolVersion: CAPSULE_PROTOCOL_VERSION, sessionId: SESSION_ID, ticket, kind };
+}
+
+function artifactAdoptionReceipt(
+  overrides: Partial<{
+    type: "artifact.adopted";
+    protocolVersion: typeof CAPSULE_PROTOCOL_VERSION;
+    sessionId: string;
+    ticket: string;
+    digest: string;
+    bytes: number;
+  }> = {},
+) {
+  return {
+    type: "artifact.adopted" as const,
+    protocolVersion: CAPSULE_PROTOCOL_VERSION,
+    sessionId: SESSION_ID,
+    ticket: SDK_TICKET,
+    digest: DIGEST,
+    bytes: 3,
+    ...overrides,
+  };
 }
 
 function eventType(value: unknown): unknown {
@@ -1377,4 +1925,15 @@ async function eventuallyAsync(assertion: () => Promise<void>): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   }
+}
+
+function controllablePromise(): {
+  promise: Promise<void>;
+  resolve(): void;
+} {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }

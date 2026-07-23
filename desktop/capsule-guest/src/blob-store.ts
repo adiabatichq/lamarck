@@ -295,7 +295,7 @@ export class GuestBlobStore {
   async importLocalFile(
     kind: ImportedBlobKind,
     path: string,
-    options: BlobReferenceOptions & { signal?: AbortSignal },
+    options: BlobReferenceOptions & { signal?: AbortSignal; maximumBytes?: number },
   ): Promise<{ digest: string; bytes: number; path: string; reused: boolean }> {
     const signal = options.signal;
     throwIfAborted(signal);
@@ -308,6 +308,14 @@ export class GuestBlobStore {
       }
       const bytes = Number(before.size);
       assertBlobBytes(bytes);
+      if (options.maximumBytes !== undefined) {
+        assertBlobBytes(options.maximumBytes);
+        if (bytes > options.maximumBytes) {
+          throw new BlobIntegrityError(
+            `local artifact exceeds its ${options.maximumBytes} byte storage-plan ceiling`,
+          );
+        }
+      }
       const digest = await hashOpenFile(handle, bytes, "sha256", signal);
       const afterHash = await handle.stat({ bigint: true });
       assertStableIdentity(before, afterHash, "local artifact changed while hashing");

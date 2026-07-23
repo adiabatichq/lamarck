@@ -22,8 +22,9 @@ start() {
 	type="$(blkid -s TYPE -o value "$device" 2>/dev/null || true)"
 	if [ -z "$type" ]; then
 		# The Host physically reserves every byte of state.raw before VZ
-		# attachment. Never issue whole-device discard while formatting: a
-		# virtio discard may punch those reserved Host blocks back into holes.
+		# attachment. Never issue whole-device discard while formatting.
+		# VZ may still translate filesystem zero ranges into APFS holes; the
+		# Host materializes those zero-valued ranges before the next attachment.
 		mkfs.ext4 -F -m 0 -E nodiscard -L LAMARCK_STATE "$device"
 		type=ext4
 	fi

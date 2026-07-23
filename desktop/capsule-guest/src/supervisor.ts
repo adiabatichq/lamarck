@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Socket } from "node:net";
-import { pipeline } from "node:stream/promises";
+import type { Readable } from "node:stream";
 import {
   blobTransferAbsoluteDeadlineMs,
   CAPSULE_PROTOCOL_VERSION,
@@ -8,17 +7,20 @@ import {
   GuestHandshake,
   JsonFrameDecoder,
   LinuxRuncDriver,
+  MAX_ARTIFACT_ADOPTION_RECEIPT_BYTES,
   StateTransitionError,
   TicketError,
   TicketRegistry,
   createOciBundlePlan,
   createSupervisorState,
   encodeJsonFrame,
+  parseArtifactAdoptionReceipt,
   parseHostRequestForSession,
   transitionSupervisor,
   type ConsumedTicketBinding,
   type BlobTransferPolicy,
   type AppPrepareBody,
+  type ArtifactAdoptionReceipt,
   type BuildPrepareBody,
   type ControlResponse,
   type GuestArchitecture,
@@ -38,6 +40,7 @@ import { VsockDataDialer, type GuestDataDialer } from "./data-dialer";
 import { readDataStreamPrelude } from "./data-prelude";
 import { GuestResourceManager } from "./resource-manager";
 import { GuestContainmentError } from "./containment-error";
+import type { GuestProtocolStream } from "./lvrm-duplex";
 import {
   UNBOUNDED_GUEST_RESOURCE_ADMISSION,
   type GuestResourceAdmissionLike,
@@ -110,8 +113,8 @@ interface AppBlobReference {
 
 interface WorkloadRecord {
   body: WorkloadPrepareBody;
-  sdk?: { socket: Socket; binding: ConsumedTicketBinding };
-  logs?: { socket: Socket; binding: ConsumedTicketBinding };
+  sdk?: { socket: GuestProtocolStream; binding: ConsumedTicketBinding };
+  logs?: { socket: GuestProtocolStream; binding: ConsumedTicketBinding };
   execution?: RuncExecution;
   exit?: Promise<void>;
   readiness?: Promise<void>;
@@ -138,8 +141,8 @@ export class CapsuleGuestSupervisor {
   private readonly ticketTtlMs: number;
   private readonly blobTransferPolicy: BlobTransferPolicy;
   private state: SupervisorState;
-  private control: Socket | undefined;
-  private readonly dataSockets = new Set<Socket>();
+  private control: GuestProtocolStream | undefined;
+  private readonly dataSockets = new Set<GuestProtocolStream>();
   private readonly pendingImports = new Map<string, PendingImport>();
   private readonly pendingExports = new Map<string, PendingExport>();
   private readonly buildBlobReferences = new Map<string, BuildBlobReferences>();
@@ -152,7 +155,7 @@ export class CapsuleGuestSupervisor {
   private readonly workloads = new Map<string, WorkloadRecord>();
   private readonly workloadLocks = new Map<string, Promise<void>>();
   private readonly viewerTickets = new Map<string, { appHandle: string; workloadHandle: string; port: number }>();
-  private readonly viewerSockets = new Map<string, Set<Socket>>();
+  private readonly viewerSockets = new Map<string, Set<GuestProtocolStream>>();
   private readonly ticketWaiters = new Map<string, Set<Deferred<void>>>();
   private readonly ticketExpiryTimers = new Map<string, NodeJS.Timeout>();
   private readonly forbiddenTickets = new BoundedTtlTombstones(
@@ -181,11 +184,13 @@ export class CapsuleGuestSupervisor {
       architecture: options.architecture,
       supervisorVersion: options.supervisorVersion,
       features: [
+        "artifact-adoption-receipt-v1",
         "artifact-erofs-v1",
         "build-v1",
         "oci-policy-v1",
         "sdk-uds-v1",
         "tickets-v1",
+        "vsock-record-v2",
         "warm-rebuild-v1",
       ],
     });
@@ -199,7 +204,7 @@ export class CapsuleGuestSupervisor {
     this.blobTransferPolicy = normalizeBlobTransferPolicy(options.blobTransferPolicy);
   }
 
-  attachControl(socket: Socket): void {
+  attachControl(socket: GuestProtocolStream): void {
     if (this.control || this.sessionFaulted || this.handshake.state !== "waiting-initialize") {
       socket.destroy(new Error("Guest accepts exactly one image-bound control session"));
       return;
@@ -230,7 +235,7 @@ export class CapsuleGuestSupervisor {
     });
   }
 
-  attachData(socket: Socket): void {
+  attachData(socket: GuestProtocolStream): void {
     if (this.handshake.state !== "ready" || this.sessionFaulted) {
       socket.destroy(new Error("Guest data plane is unavailable before initialization"));
       return;
@@ -1015,13 +1020,16 @@ export class CapsuleGuestSupervisor {
     this.retireAppRecords(appHandle, workloads);
     const artifactReference = this.appBlobReferences.get(appHandle);
     if (artifactReference) {
-      await this.options.blobs.releaseExpected({
+      const released = await this.options.blobs.releaseExpected({
         ownerKey: artifactReference.ownerKey,
         referenceId: `app:${appHandle}:artifact`,
         kind: "artifact",
         digest: artifactReference.artifactDigest,
         bytes: artifactReference.artifactBytes,
       });
+      if (!released) {
+        throw new Error("exact App artifact reference is missing after authoritative stop");
+      }
     }
     this.appBlobReferences.delete(appHandle);
     this.retiredApps.add(appHandle);
@@ -1064,10 +1072,13 @@ export class CapsuleGuestSupervisor {
           )),
         )
       : [];
-    const appResults = await Promise.allSettled([(async () => {
-      await Promise.allSettled(apps.map(async (handle) => this.stopApp(handle)));
-      await this.options.resources.drain();
-    })()]);
+    const appStopResults = await Promise.allSettled(
+      apps.map(async (handle) => this.stopApp(handle)),
+    );
+    // Aggregate teardown still runs after an individual App stop fails, but
+    // it cannot erase that failure: missing exact artifact ownership is not
+    // made authoritative merely because the cgroup/mount registry drained.
+    const appDrainResults = await Promise.allSettled([this.options.resources.drain()]);
     const failures = [
       ...preparationResults,
       ...(this.fatalBuildPreparation === undefined
@@ -1075,7 +1086,8 @@ export class CapsuleGuestSupervisor {
         : [{ status: "rejected" as const, reason: this.fatalBuildPreparation }]),
       ...buildResults,
       ...buildReferenceResults,
-      ...appResults,
+      ...appStopResults,
+      ...appDrainResults,
     ]
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => result.reason);
@@ -1091,7 +1103,7 @@ export class CapsuleGuestSupervisor {
     this.appBlobReferences.clear();
   }
 
-  private async routeDataSocket(socket: Socket): Promise<void> {
+  private async routeDataSocket(socket: GuestProtocolStream): Promise<void> {
     const prelude = await readDataStreamPrelude(socket);
     if (prelude.sessionId !== this.handshake.sessionId) throw new Error("data stream belongs to another session");
     const binding = await this.consumeTicketEventually(prelude.ticket, prelude.kind);
@@ -1107,18 +1119,21 @@ export class CapsuleGuestSupervisor {
           socket,
           pending.bytes,
           this.blobTransferPolicy,
-          async () => await this.options.blobs.receive(
-            pending.kind,
-            pending.digest,
-            pending.bytes,
-            socket,
-            {
-              ownerKey: pending.ownerKey,
-              referenceId: `import:${pending.blobHandle}`,
-            },
-          ),
+          async () => {
+            await this.options.blobs.receive(
+              pending.kind,
+              pending.digest,
+              pending.bytes,
+              socket,
+              {
+                ownerKey: pending.ownerKey,
+                referenceId: `import:${pending.blobHandle}`,
+              },
+            );
+            await endSocketWriteDirection(socket);
+            await socket.waitForProtocolClose();
+          },
         );
-        socket.end();
         this.finishBlob(pending, "blob.imported");
       } catch (error) {
         this.finishBlob(pending, "blob.failed", boundedMessage(error));
@@ -1131,18 +1146,58 @@ export class CapsuleGuestSupervisor {
       if (!pending) throw new Error("export ticket has no prepared artifact");
       this.pendingExports.delete(prelude.ticket);
       pending.phase = "attached";
+      // Observe the Host direction before the first artifact byte is written.
+      // Otherwise a FIN which arrived with the prelude could be mistaken for
+      // the post-CAS adoption proof once Guest output has completed.
+      const hostFin = trackArtifactHostFin(socket, {
+        type: "artifact.adopted",
+        protocolVersion: CAPSULE_PROTOCOL_VERSION,
+        sessionId: prelude.sessionId,
+        ticket: prelude.ticket,
+        digest: pending.digest,
+        bytes: pending.bytes,
+      });
+      let transferError: Error | undefined;
       try {
         await withBlobTransferDeadline(socket, pending.bytes, this.blobTransferPolicy, async () => {
           const source = await this.options.blobs.open("artifact", pending.digest);
-          await pipeline(source, socket);
+          await exportArtifactToDataSocket(
+            source,
+            socket,
+            pending.bytes,
+            () => hostFin.markGuestFinQueued(),
+          );
+          hostFin.markGuestFinFlushed();
+          // The Host sends an exact adoption receipt and then its directional
+          // FIN only after it has observed our FIN, verified the exact
+          // bytes/digest, and durably committed the CAS entry. The explicit
+          // Host FIN ends the readable direction; overall operation success
+          // still waits for LVRM's subsequent dual-CLOSE commit. Keep the
+          // transfer deadline active through every signal: a bare physical
+          // EOF, FIN without CLOSE, or RESET can never release the export
+          // reference or emit blob.exported.
+          await hostFin.promise;
+          await socket.waitForProtocolClose();
         });
-        this.finishBlob(pending, "blob.exported");
       } catch (error) {
-        this.finishBlob(pending, "blob.failed", boundedMessage(error));
-        throw error;
+        transferError = error instanceof Error ? error : new Error(String(error));
       } finally {
-        await this.releaseExportReference(pending);
+        hostFin.cancel();
       }
+      let releaseError: Error | undefined;
+      try {
+        await this.releaseExportReference(pending);
+      } catch (error) {
+        releaseError = error instanceof Error ? error : new Error(String(error));
+      }
+      if (transferError || releaseError) {
+        const failure = transferError && releaseError
+          ? new AggregateError([transferError, releaseError], "artifact export and exact-reference release failed")
+          : transferError ?? releaseError!;
+        this.finishBlob(pending, "blob.failed", boundedMessage(failure));
+        throw failure;
+      }
+      this.finishBlob(pending, "blob.exported");
       return;
     }
     if (prelude.kind === "sdk" || prelude.kind === "logs") {
@@ -1561,13 +1616,14 @@ export class CapsuleGuestSupervisor {
   }
 
   private async releaseExportReference(pending: PendingExport): Promise<void> {
-    await this.options.blobs.releaseExpected({
+    const released = await this.options.blobs.releaseExpected({
       ownerKey: pending.ownerKey,
       referenceId: `export:${pending.blobHandle}`,
       kind: "artifact",
       digest: pending.digest,
       bytes: pending.bytes,
     });
+    if (!released) throw new Error("exact artifact export reference is missing");
   }
 
   private retireAppRecords(
@@ -1767,7 +1823,7 @@ function boundedPositiveInteger(value: number | undefined, fallback: number, max
 }
 
 async function withBlobTransferDeadline<T>(
-  socket: Socket,
+  socket: GuestProtocolStream,
   bytes: number,
   policy: BlobTransferPolicy,
   operation: () => Promise<T>,
@@ -1790,6 +1846,242 @@ async function withBlobTransferDeadline<T>(
     socket.setTimeout(0);
     socket.off("timeout", onIdle);
   }
+}
+
+/**
+ * Streams one already-authenticated artifact over only the Guest -> Host
+ * direction of a DATA socket. A DATA socket is a full duplex authority: the
+ * Host's write-half ending after the prelude must not truncate this direction.
+ * The caller separately waits for the bound adoption receipt, directional
+ * Host FIN, and LVRM normal-close commit after this function flushes Guest FIN.
+ *
+ * The CAS source performs its final identity and digest checks when iteration
+ * completes. Consequently the clean FIN is sent only after the source has
+ * completed those checks and the authenticated byte length is exact. Any
+ * source, length, or socket-write failure destroys the transport instead of
+ * presenting an ambiguous successful half-close.
+ *
+ * @internal Exported for focused protocol contract tests.
+ */
+export async function exportArtifactToDataSocket(
+  source: Readable,
+  socket: GuestProtocolStream,
+  expectedBytes: number,
+  onGuestFinQueued: () => void = () => {},
+): Promise<void> {
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0) {
+    throw new Error("artifact export byte length is outside the protocol limit");
+  }
+  let writtenBytes = 0;
+  try {
+    for await (const rawChunk of source) {
+      const chunk = Buffer.from(rawChunk.buffer, rawChunk.byteOffset, rawChunk.byteLength);
+      if (chunk.byteLength === 0) continue;
+      writtenBytes += chunk.byteLength;
+      if (writtenBytes > expectedBytes) {
+        throw new Error("artifact DATA stream exceeded its authenticated byte length");
+      }
+      await writeSocketChunk(socket, chunk);
+    }
+    if (writtenBytes !== expectedBytes) {
+      throw new Error(
+        `artifact DATA stream ended at ${writtenBytes} bytes; expected ${expectedBytes}`,
+      );
+    }
+    onGuestFinQueued();
+    await endSocketWriteDirection(socket);
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    if (!source.destroyed) source.destroy(failure);
+    if (!socket.destroyed) socket.destroy(failure);
+    throw failure;
+  }
+}
+
+interface ArtifactHostFinTracker {
+  readonly promise: Promise<void>;
+  markGuestFinQueued(): void;
+  markGuestFinFlushed(): void;
+  cancel(): void;
+}
+
+function trackArtifactHostFin(
+  socket: GuestProtocolStream,
+  expectedReceipt: ArtifactAdoptionReceipt,
+): ArtifactHostFinTracker {
+  let guestFinQueued = false;
+  let guestFinFlushed = false;
+  let receiptReceived = false;
+  let hostFinReceived = false;
+  let settled = false;
+  let resolvePromise!: () => void;
+  let rejectPromise!: (error: Error) => void;
+  const decoder = new JsonFrameDecoder(MAX_ARTIFACT_ADOPTION_RECEIPT_BYTES);
+
+  const cleanup = () => {
+    socket.off("data", onData);
+    socket.off("end", onEnd);
+    socket.off("error", onError);
+    socket.off("close", onClose);
+  };
+  const finish = (error?: Error) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    if (error) rejectPromise(error);
+    else resolvePromise();
+  };
+  const maybeFinish = () => {
+    if (guestFinFlushed && receiptReceived && hostFinReceived) finish();
+  };
+  const onData = (chunk: Buffer) => {
+    if (chunk.byteLength === 0 || settled) return;
+    if (!guestFinQueued) {
+      finish(new Error(
+        "Host artifact adoption receipt arrived before verified Guest output and Guest FIN",
+      ));
+      return;
+    }
+    try {
+      for (const value of decoder.push(chunk)) {
+        if (receiptReceived) {
+          throw new Error("Host sent more than one artifact adoption receipt");
+        }
+        const receipt = parseArtifactAdoptionReceipt(value);
+        if (
+          receipt.sessionId !== expectedReceipt.sessionId
+          || receipt.ticket !== expectedReceipt.ticket
+          || receipt.digest !== expectedReceipt.digest
+          || receipt.bytes !== expectedReceipt.bytes
+        ) {
+          throw new Error(
+            "Host artifact adoption receipt does not match this one-use export",
+          );
+        }
+        receiptReceived = true;
+        maybeFinish();
+      }
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
+  };
+  const onEnd = () => {
+    if (!guestFinQueued) {
+      finish(new Error("Host FIN arrived before verified Guest output and Guest FIN"));
+      return;
+    }
+    try {
+      decoder.end();
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    if (!receiptReceived) {
+      finish(new Error("Host FIN arrived without an artifact adoption receipt"));
+      return;
+    }
+    hostFinReceived = true;
+    maybeFinish();
+  };
+  const onError = (error: Error) => finish(error);
+  const onClose = () => {
+    if (socket.readableEnded) onEnd();
+    else finish(new Error("Host closed the artifact DATA stream without a clean FIN"));
+  };
+  const promise = new Promise<void>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  // Early FIN/error is deliberately observed before the output loop awaits the
+  // promise. Keep that rejection handled until the ordered adoption gate joins
+  // it after Guest FIN.
+  void promise.catch(() => undefined);
+
+  socket.on("data", onData);
+  socket.once("end", onEnd);
+  socket.once("error", onError);
+  socket.once("close", onClose);
+  if (socket.readableEnded) onEnd();
+  else if (socket.destroyed || !socket.readable) {
+    finish(new Error("Host closed the artifact DATA stream without a clean FIN"));
+  } else {
+    const buffered = socket.read();
+    if (buffered !== null) onData(Buffer.from(buffered));
+    if (!settled) socket.resume();
+  }
+
+  return {
+    promise,
+    markGuestFinQueued: () => {
+      guestFinQueued = true;
+    },
+    markGuestFinFlushed: () => {
+      guestFinFlushed = true;
+      maybeFinish();
+    },
+    cancel: () => finish(new Error("artifact Host-FIN tracking was cancelled")),
+  };
+}
+
+async function writeSocketChunk(socket: GuestProtocolStream, chunk: Buffer): Promise<void> {
+  if (socket.destroyed || !socket.writable || socket.writableEnded) {
+    throw new Error("Host closed the artifact DATA stream before Guest output completed");
+  }
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error | null) => {
+      if (settled) return;
+      settled = true;
+      socket.off("error", onError);
+      socket.off("close", onClose);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onError = (error: Error) => finish(error);
+    const onClose = () => finish(new Error(
+      "artifact DATA stream closed before a queued Guest write completed",
+    ));
+    socket.once("error", onError);
+    socket.once("close", onClose);
+    try {
+      socket.write(chunk, finish);
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
+async function endSocketWriteDirection(socket: GuestProtocolStream): Promise<void> {
+  if (socket.destroyed) throw new Error("artifact DATA stream closed before Guest FIN");
+  if (socket.writableFinished) return;
+  if (socket.writableEnded) {
+    throw new Error("artifact DATA stream write direction ended before Guest FIN was confirmed");
+  }
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      socket.off("finish", onFinish);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onFinish = () => finish();
+    const onError = (error: Error) => finish(error);
+    const onClose = () => finish(new Error(
+      "artifact DATA stream closed before Guest FIN was confirmed",
+    ));
+    socket.once("finish", onFinish);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+    try {
+      socket.end();
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
 }
 
 function deferred<T>(): Deferred<T> {

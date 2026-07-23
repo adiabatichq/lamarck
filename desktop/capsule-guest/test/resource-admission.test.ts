@@ -1,4 +1,8 @@
 import { describe, expect, test } from "vitest";
+import {
+  createCapsuleBuildStoragePlan,
+  createCapsuleRuntimeStoragePlan,
+} from "@lamarck/capsule";
 import { GuestResourceAdmission } from "../src/resource-admission";
 
 describe("Guest-wide resource admission", () => {
@@ -44,5 +48,44 @@ describe("Guest-wide resource admission", () => {
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
     expect(admission.snapshot().reservedDiskBytes).toBe(60);
+  });
+
+  test("admits exactly the shared plan for a replacement Build beside a live Runtime", async () => {
+    const buildPlan = createCapsuleBuildStoragePlan({
+      mode: "cold",
+      packageBytes: 64 * 1024 * 1024,
+      dependencyBytes: 64 * 1024 * 1024,
+    });
+    const runtimePlan = createCapsuleRuntimeStoragePlan(128 * 1024 * 1024);
+    const inputBytes = 128 * 1024 * 1024;
+    const total = runtimePlan.scratchBytes
+      + inputBytes
+      + buildPlan.scratchBytes
+      + buildPlan.artifactOutputBytes;
+    const admission = new GuestResourceAdmission({
+      diskBudgetBytes: total,
+      memoryBudgetBytes: 1,
+    });
+    const liveApp = await admission.reserve("app:live", {
+      diskBytes: runtimePlan.scratchBytes,
+    });
+    const inputs = await admission.reserve("blob:inputs", { diskBytes: inputBytes });
+    const build = await admission.reserve("build:replacement", {
+      diskBytes: buildPlan.scratchBytes,
+    });
+    const output = await admission.reserve("blob:output", {
+      diskBytes: buildPlan.artifactOutputBytes,
+    });
+
+    expect(admission.snapshot().reservedDiskBytes).toBe(total);
+    await expect(admission.reserve("build:overcommit", {
+      diskBytes: 64 * 1024 * 1024,
+    })).rejects.toMatchObject({ code: "CAPSULE_RESOURCE_EXHAUSTED" });
+
+    output.release();
+    build.release();
+    inputs.release();
+    liveApp.release();
+    expect(admission.snapshot().reservations).toBe(0);
   });
 });

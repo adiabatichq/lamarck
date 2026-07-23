@@ -32,7 +32,9 @@ describe("Host blob source cancellation", () => {
     };
     const transfer = startBlobTransfer(destination, 1, new AbortController().signal, FAST_POLICY);
     const writing = writeIterable(destination, source, transfer.signal, transfer.progress);
-    const rejected = expect(writing).rejects.toThrow("idle deadline");
+    const rejected = expect(writing).rejects.toThrow(
+      "idle deadline (0/1 bytes observed; phase=data)",
+    );
 
     await vi.advanceTimersByTimeAsync(6);
     await rejected;
@@ -50,10 +52,26 @@ describe("Host blob source cancellation", () => {
         // A stalled source never reaches this branch.
       }
     })();
-    const rejected = expect(consuming).rejects.toThrow("idle deadline");
+    const rejected = expect(consuming).rejects.toThrow(
+      "idle deadline (0/1 bytes observed; phase=data)",
+    );
 
     await vi.advanceTimersByTimeAsync(6);
     await rejected;
     expect(source.destroyed).toBe(true);
+  });
+
+  test("reports partial byte progress when the next DATA window stalls", async () => {
+    vi.useFakeTimers();
+    const transport = new PassThrough();
+    transport.on("error", () => {});
+    const transfer = startBlobTransfer(transport, 2, new AbortController().signal, FAST_POLICY);
+    transfer.progress(1);
+
+    await vi.advanceTimersByTimeAsync(6);
+    expect(transfer.signal.aborted).toBe(true);
+    expect(transfer.signal.reason).toMatchObject({
+      message: "Host blob DATA stream made no byte progress before its idle deadline (1/2 bytes observed; phase=data)",
+    });
   });
 });

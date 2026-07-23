@@ -1,8 +1,7 @@
 import { readFile, statfs } from "node:fs/promises";
+import { CAPSULE_GUEST_FILESYSTEM_RESERVE_BYTES } from "@lamarck/capsule";
 
 const MEBIBYTE = 1024 * 1024;
-const GIBIBYTE = 1024 * MEBIBYTE;
-const DEFAULT_DISK_RESERVE_BYTES = 2 * GIBIBYTE;
 const MINIMUM_MEMORY_RESERVE_BYTES = 256 * MEBIBYTE;
 
 export interface GuestResourceRequest {
@@ -80,7 +79,7 @@ export class GuestResourceAdmission implements GuestResourceAdmissionLike {
       await readFile(options.meminfoPath ?? "/proc/meminfo", "utf8"),
     );
     const diskReserveBytes = boundedReserve(
-      options.diskReserveBytes ?? DEFAULT_DISK_RESERVE_BYTES,
+      options.diskReserveBytes ?? CAPSULE_GUEST_FILESYSTEM_RESERVE_BYTES,
       "diskReserveBytes",
     );
     const memoryReserveBytes = boundedReserve(

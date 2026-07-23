@@ -1,8 +1,8 @@
 import { MAX_DATA_PRELUDE_BYTES, parseDataStreamPrelude, type DataStreamPrelude } from "@lamarck/capsule";
-import type { Socket } from "node:net";
+import type { GuestProtocolStream } from "./lvrm-duplex";
 
 export async function readDataStreamPrelude(
-  socket: Socket,
+  socket: GuestProtocolStream,
   timeoutMs = 10_000,
 ): Promise<DataStreamPrelude> {
   return await new Promise((resolve, reject) => {

@@ -19,7 +19,17 @@ interface Window {
     chooseWorkspacePath(): Promise<{ path: string | null }>;
     setWorkspacePath(path: string): Promise<{ path: string }>;
     onOpenLauncher(callback: () => void): () => void;
-    openAppViewer(appId: string): Promise<{ viewerId: string }>;
+    openAppViewer(appId: string): Promise<
+      | { ok: true; viewerId: string }
+      | {
+          ok: false;
+          error: {
+            code: "CAPSULE_RESTART_REQUIRED" | "APP_VIEWER_OPEN_FAILED";
+            message: string;
+            restartRequired: boolean;
+          };
+        }
+    >;
     setAppViewerBounds(
       viewerId: string,
       bounds: { x: number; y: number; width: number; height: number },

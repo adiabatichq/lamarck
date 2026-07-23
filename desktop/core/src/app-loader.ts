@@ -1,7 +1,13 @@
-import { mkdir, readdir, readFile, rename, stat } from "fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, readdir, rename, stat } from "fs/promises";
 import { join } from "path";
 import { validateDocId } from "./doc-id";
 import type { DocOp } from "./guard-types";
+import {
+  APP_MANIFEST_MAX_BYTES,
+  digestNormalizedAppManifest,
+  type AppManifestDigest,
+} from "../../capsule/src/app-manifest-authority";
 
 // App Loader — scans apps/ directory, reads manifests, builds registry.
 
@@ -37,6 +43,8 @@ export type AppWorkloadIdentity =
 
 export interface LoadedApp {
   manifest: AppManifest;
+  /** Digest of the exact normalized authority-bearing manifest snapshot. */
+  manifestDigest: AppManifestDigest;
   dir: string;
 }
 
@@ -56,6 +64,8 @@ const RUNTIME_FIELDS = new Set(["ui", "services", "jobs"]);
 const UI_FIELDS = new Set(["command", "port"]);
 const WORKLOAD_FIELDS = new Set(["command"]);
 const PERMISSION_FIELDS = new Set(["docs", "tables"]);
+const MANIFEST_SETTLE_ATTEMPTS = 3;
+const MANIFEST_SETTLE_DELAY_MS = 20;
 
 export function sourceForAppUi(appId: string): string {
   return sourceForAppWorkload(appId, { kind: "ui" });
@@ -78,34 +88,21 @@ export async function loadApps(appsDir: string): Promise<AppRegistry> {
   let entries;
   try {
     entries = await readdir(appsDir, { withFileTypes: true });
-  } catch {
-    // apps/ doesn't exist yet — that's fine
-    return createRegistry(apps);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      // apps/ doesn't exist yet — that's fine
+      return createRegistry(apps);
+    }
+    throw error;
   }
 
-  for (const entry of entries) {
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
     if (!entry.isDirectory()) continue;
 
     const appDir = join(appsDir, entry.name);
     const manifestPath = join(appDir, "manifest.json");
 
-    let raw: string;
-    try {
-      raw = await readFile(manifestPath, "utf8");
-    } catch {
-      console.warn(`[app-loader] Skipping ${entry.name}: could not read manifest.json`);
-      continue;
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      console.warn(`[app-loader] Skipping ${entry.name}: manifest.json is not valid JSON`);
-      continue;
-    }
-
-    const validation = validateManifest(parsed, entry.name);
+    const validation = await loadSettledManifest(manifestPath, entry.name);
     if (!validation.ok) {
       console.warn(`[app-loader] Skipping ${entry.name}: ${validation.error}`);
       continue;
@@ -113,11 +110,140 @@ export async function loadApps(appsDir: string): Promise<AppRegistry> {
 
     apps.set(validation.manifest.id, {
       manifest: validation.manifest,
+      manifestDigest: digestNormalizedAppManifest(validation.manifest),
       dir: appDir,
     });
   }
 
   return createRegistry(apps);
+}
+
+/**
+ * External editors and coding agents may replace an App manifest while Core
+ * is scanning the Workspace. Read one stable file identity and give a brief
+ * in-place write a bounded chance to settle; only a complete validated
+ * snapshot can become a new authority generation.
+ */
+async function loadSettledManifest(
+  path: string,
+  directoryName: string,
+): Promise<ValidationResult> {
+  for (let attempt = 0; attempt < MANIFEST_SETTLE_ATTEMPTS; attempt += 1) {
+    try {
+      const raw = await readStableManifest(path);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        if (attempt + 1 < MANIFEST_SETTLE_ATTEMPTS) {
+          await delay(MANIFEST_SETTLE_DELAY_MS);
+          continue;
+        }
+        return invalid("manifest.json is not valid JSON");
+      }
+      const validation = validateManifest(parsed, directoryName);
+      // A complete but semantically invalid manifest is an authoritative
+      // fail-closed state, not a transient snapshot to keep retrying.
+      return validation;
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        return invalid("could not read manifest.json");
+      }
+      if (isNodeError(error, "ELOOP") || error instanceof InvalidManifestFileError) {
+        return invalid(error instanceof Error ? error.message : String(error));
+      }
+      if (!(error instanceof UnstableManifestReadError)) {
+        // I/O and authority failures such as EIO/EACCES must abort the whole
+        // scan. The caller builds a candidate registry before retiring the
+        // previous generation, so propagating here preserves the LKG registry
+        // and its still-valid capabilities instead of silently dropping an
+        // App from a partial filesystem observation.
+        throw error;
+      }
+      if (attempt + 1 >= MANIFEST_SETTLE_ATTEMPTS) throw error;
+    }
+    if (attempt + 1 < MANIFEST_SETTLE_ATTEMPTS) await delay(MANIFEST_SETTLE_DELAY_MS);
+  }
+  throw new Error("manifest.json did not settle");
+}
+
+async function readStableManifest(path: string): Promise<string> {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile()) throw new InvalidManifestFileError("manifest.json is not a regular file");
+    if (before.size < 1n || before.size > BigInt(APP_MANIFEST_MAX_BYTES)) {
+      throw new InvalidManifestFileError(
+        `manifest.json must be between 1 and ${APP_MANIFEST_MAX_BYTES} bytes`,
+      );
+    }
+    const bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeNs !== after.mtimeNs
+      || before.ctimeNs !== after.ctimeNs
+      || BigInt(bytes.byteLength) !== after.size
+    ) {
+      throw new UnstableManifestReadError("manifest.json changed while it was being read");
+    }
+
+    // fstat only proves that the inode pinned by `handle` stayed stable. An
+    // editor may atomically rename a replacement over manifest.json while the
+    // old inode remains readable through that descriptor, so reopen the
+    // no-follow pathname and require it to still resolve to the same identity.
+    let pathnameHandle;
+    try {
+      pathnameHandle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        throw new UnstableManifestReadError(
+          "manifest.json was replaced while it was being read",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    try {
+      const pathname = await pathnameHandle.stat({ bigint: true });
+      if (!pathname.isFile()) {
+        throw new InvalidManifestFileError("manifest.json is not a regular file");
+      }
+      if (
+        after.dev !== pathname.dev
+        || after.ino !== pathname.ino
+        || after.size !== pathname.size
+        || after.mtimeNs !== pathname.mtimeNs
+        || after.ctimeNs !== pathname.ctimeNs
+      ) {
+        throw new UnstableManifestReadError("manifest.json was replaced while it was being read");
+      }
+    } finally {
+      await pathnameHandle.close();
+    }
+
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new InvalidManifestFileError("manifest.json is not valid UTF-8");
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+class InvalidManifestFileError extends Error {}
+
+class UnstableManifestReadError extends Error {}
+
+function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error && error.code === code;
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 }
 
 // Archive (not delete): retire an app by moving its folder — git history and

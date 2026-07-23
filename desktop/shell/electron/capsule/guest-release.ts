@@ -3,7 +3,7 @@ import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, posix, resolve, sep } from "node:path";
 import type { GuestArchitecture } from "../../../capsule/src/protocol/types";
 import { validateArtifactDigest } from "../../../capsule/src/protocol/validate";
-import type { CapsuleVmGuestImage } from "../capsule-vm/launcher";
+import type { CapsuleVmGuestImageBase } from "../capsule-vm/launcher";
 
 export const CAPSULE_GUEST_RELEASE_DESCRIPTOR_FILE = "capsule-guest-release.json";
 
@@ -14,8 +14,8 @@ const MEMORY_ALIGNMENT_BYTES = 1024 * 1024;
 
 export interface CapsuleGuestReleaseDescriptor {
   schemaVersion: 1;
-  vmWireVersion: 1;
-  guestProtocolVersion: 1;
+  vmWireVersion: 2;
+  guestProtocolVersion: 2;
   architecture: GuestArchitecture;
   bundleRelativePath: string;
   manifestDigest: string;
@@ -41,7 +41,7 @@ export interface CapsuleGuestRuntimeExpectation {
 
 export interface LoadedCapsuleGuestRelease {
   descriptor: CapsuleGuestReleaseDescriptor;
-  vmImage: CapsuleVmGuestImage;
+  vmImage: CapsuleVmGuestImageBase;
   handshake: {
     expectedImageDigest: string;
     expectedArchitecture: GuestArchitecture;
@@ -258,8 +258,8 @@ function parseDescriptor(source: string): CapsuleGuestReleaseDescriptor {
   ]);
 
   literal(object.schemaVersion, 1, "$.schemaVersion");
-  literal(object.vmWireVersion, 1, "$.vmWireVersion");
-  literal(object.guestProtocolVersion, 1, "$.guestProtocolVersion");
+  literal(object.vmWireVersion, 2, "$.vmWireVersion");
+  literal(object.guestProtocolVersion, 2, "$.guestProtocolVersion");
   const architecture = stringEnum(object.architecture, ["arm64", "x64"] as const, "$.architecture");
   const bundleRelativePath = canonicalRelativePath(object.bundleRelativePath, "$.bundleRelativePath");
   const manifestDigest = validatedDigest(object.manifestDigest, "$.manifestDigest");
@@ -273,8 +273,17 @@ function parseDescriptor(source: string): CapsuleGuestReleaseDescriptor {
     /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/,
   );
   const features = canonicalFeatures(object.features);
+  if (!features.includes("artifact-adoption-receipt-v1")) {
+    invalid(
+      "$.features",
+      "required artifact adoption receipt feature artifact-adoption-receipt-v1 is missing",
+    );
+  }
   if (!features.includes("warm-rebuild-v1")) {
     invalid("$.features", "required Host Build feature warm-rebuild-v1 is missing");
+  }
+  if (!features.includes("vsock-record-v2")) {
+    invalid("$.features", "required explicit vsock relay feature vsock-record-v2 is missing");
   }
   literal(object.runtimeAbi, "capsule-node-v1", "$.runtimeAbi");
   const nodeVersion = patternedString(
@@ -302,8 +311,8 @@ function parseDescriptor(source: string): CapsuleGuestReleaseDescriptor {
 
   return {
     schemaVersion: 1,
-    vmWireVersion: 1,
-    guestProtocolVersion: 1,
+    vmWireVersion: 2,
+    guestProtocolVersion: 2,
     architecture,
     bundleRelativePath,
     manifestDigest,

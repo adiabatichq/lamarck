@@ -17,7 +17,11 @@ import {
 } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { AppPrepareBody } from "@lamarck/capsule";
-import { validateArtifactDigest, validateOpaqueId } from "@lamarck/capsule";
+import {
+  requireCapsuleRuntimeStoragePlan,
+  validateArtifactDigest,
+  validateOpaqueId,
+} from "@lamarck/capsule";
 import type { Duplex } from "node:stream";
 import { GuestBlobStore } from "./blob-store";
 import { DEFAULT_GUEST_PATHS, type GuestFilesystemPaths } from "./config";
@@ -193,6 +197,7 @@ export interface ResourceManagerOptions {
 
 export interface ResourceManagerOperations {
   isMountPoint(path: string): Promise<boolean>;
+  createVolume(options: Parameters<typeof createBoundedVolume>[0]): Promise<void>;
   destroyVolume(options: Parameters<typeof destroyBoundedVolume>[0]): Promise<void>;
 }
 
@@ -404,6 +409,7 @@ export class GuestResourceManager {
   private readonly umountBinary: string;
   private readonly admission: GuestResourceAdmissionLike;
   private readonly isMountPoint: ResourceManagerOperations["isMountPoint"];
+  private readonly createVolume: ResourceManagerOperations["createVolume"];
   private readonly destroyVolume: ResourceManagerOperations["destroyVolume"];
   private readonly apps = new Map<string, PreparedApp>();
   private readonly appLeases = new Map<string, GuestResourceLease>();
@@ -422,6 +428,7 @@ export class GuestResourceManager {
     this.umountBinary = options.umountBinary ?? "/bin/umount";
     this.admission = options.admission ?? UNBOUNDED_GUEST_RESOURCE_ADMISSION;
     this.isMountPoint = options.operations?.isMountPoint ?? isMountPoint;
+    this.createVolume = options.operations?.createVolume ?? createBoundedVolume;
     this.destroyVolume = options.operations?.destroyVolume ?? destroyBoundedVolume;
     this.artifactMountRegistry = options.artifactMountRegistry ?? new ArtifactMountRegistry({
       maxMounts: options.maxArtifactMounts,
@@ -440,12 +447,17 @@ export class GuestResourceManager {
   async prepareApp(body: AppPrepareBody): Promise<Readonly<PreparedApp>> {
     const appHandle = validateOpaqueId(body.appHandle, "appHandle");
     const artifactDigest = validateArtifactDigest(body.artifactDigest, "artifactDigest");
+    const storage = requireCapsuleRuntimeStoragePlan(body.artifactBytes, {
+      version: body.storagePlanVersion,
+      scratchBytes: body.scratchBytes,
+    });
     const existing = this.apps.get(appHandle);
     if (existing) {
       if (
         existing.artifactDigest === artifactDigest
         && existing.mappedHostUid === body.mappedHostUid
         && existing.mappedHostGid === body.mappedHostGid
+        && existing.scratchBytes === storage.scratchBytes
       ) return existing;
       throw new Error(`App handle ${appHandle} cannot be rebound`);
     }
@@ -466,7 +478,7 @@ export class GuestResourceManager {
       runtimeRoot,
       netnsPath,
       cgroupPath,
-      scratchBytes: body.scratchBytes ?? 1024 * 1024 * 1024,
+      scratchBytes: storage.scratchBytes,
       scratchImage,
     };
 
@@ -488,7 +500,7 @@ export class GuestResourceManager {
       const merged = `${runtimeRoot}/merged`;
       const home = `${runtimeRoot}/home`;
       const run = `${runtimeRoot}/run`;
-      await createBoundedVolume({
+      await this.createVolume({
         imagePath: scratchImage,
         mountPath: runtimeRoot,
         bytes: app.scratchBytes,

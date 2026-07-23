@@ -8,6 +8,7 @@ import {
 
 const FORGED_APP_ID_HEADER = "x-lamarck-app-id";
 const FORGED_BRIDGE_TOKEN_HEADER = "x-lamarck-bridge-token";
+const MANIFEST_DIGEST = `sha256:${"a".repeat(64)}` as const;
 
 const secrets = {
   coreToken: "core-secret",
@@ -27,7 +28,7 @@ function authorization(
   writeTables: string[] = [],
   docGrants: string[] = [],
 ): AppAuthorizationSnapshot {
-  return { manifestGeneration, writeTables, docGrants };
+  return { manifestGeneration, manifestDigest: MANIFEST_DIGEST, writeTables, docGrants };
 }
 
 describe("auth", () => {
@@ -67,6 +68,7 @@ describe("auth", () => {
       channelId: appA.channelId,
       authorization: {
         manifestGeneration: 1,
+        manifestDigest: MANIFEST_DIGEST,
         writeTables: ["notes"],
         docGrants: ["apps/app-a/"],
       },

@@ -3,10 +3,13 @@ import Foundation
 
 public enum CapsuleVmProtocol {
     public static let magic = Data([0x4c, 0x43, 0x56, 0x4d]) // LCVM
-    public static let version: UInt16 = 1
+    public static let version: UInt16 = 2
     public static let headerByteCount = 16
     public static let maximumPayloadByteCount = 1_048_576
     public static let streamChunkByteCount = 64 * 1024
+    public static let initialStreamWindowByteCount = 256 * 1024
+    public static let maximumWindowUpdateByteCount = initialStreamWindowByteCount
+    public static let maximumResetPayloadByteCount = 4 * 1024
     public static let maximumOpenStreamCount = 64
 
     public static let minimumRequestStreamID: UInt32 = 1
@@ -31,7 +34,10 @@ public enum CapsuleVmFrameKind: UInt16, CaseIterable, Sendable {
     case response = 2
     case event = 3
     case streamData = 4
-    case streamEnd = 5
+    case streamFin = 5
+    case streamWindowUpdate = 6
+    case streamReset = 7
+    case streamResetAck = 8
 }
 
 public struct CapsuleVmFrame: Equatable, Sendable {
@@ -61,13 +67,79 @@ public struct CapsuleVmProtocolError: Error, Equatable, CustomStringConvertible,
 }
 
 public enum CapsuleVmFrameCodec {
-    public static func encode(_ frame: CapsuleVmFrame) throws -> Data {
+    public static func windowUpdatePayload(byteCount: Int) throws -> Data {
+        guard byteCount > 0,
+              byteCount <= CapsuleVmProtocol.maximumWindowUpdateByteCount,
+              let value = UInt32(exactly: byteCount) else {
+            throw CapsuleVmProtocolError(
+                code: "invalid_window_update",
+                message: "WINDOW_UPDATE credit must be between 1 and \(CapsuleVmProtocol.maximumWindowUpdateByteCount) bytes"
+            )
+        }
+        var payload = Data(capacity: MemoryLayout<UInt32>.size)
+        append(value, to: &payload)
+        return payload
+    }
+
+    public static func windowUpdateByteCount(from payload: Data) throws -> Int {
+        guard payload.count == MemoryLayout<UInt32>.size else {
+            throw CapsuleVmProtocolError(
+                code: "invalid_window_update",
+                message: "WINDOW_UPDATE payload must be exactly four bytes"
+            )
+        }
+        let value = readUInt32(payload, offset: 0)
+        guard value > 0,
+              value <= UInt32(CapsuleVmProtocol.maximumWindowUpdateByteCount) else {
+            throw CapsuleVmProtocolError(
+                code: "invalid_window_update",
+                message: "WINDOW_UPDATE credit must be between 1 and \(CapsuleVmProtocol.maximumWindowUpdateByteCount) bytes"
+            )
+        }
+        return Int(value)
+    }
+
+    public static func validate(_ frame: CapsuleVmFrame) throws {
         guard frame.payload.count <= CapsuleVmProtocol.maximumPayloadByteCount else {
             throw CapsuleVmProtocolError(
                 code: "payload_too_large",
                 message: "Frame payload exceeds \(CapsuleVmProtocol.maximumPayloadByteCount) bytes"
             )
         }
+
+        switch frame.kind {
+        case .request, .response, .event:
+            break
+        case .streamData:
+            guard !frame.payload.isEmpty,
+                  frame.payload.count <= CapsuleVmProtocol.streamChunkByteCount else {
+                throw CapsuleVmProtocolError(
+                    code: "invalid_stream_data",
+                    message: "DATA payload must be between 1 and \(CapsuleVmProtocol.streamChunkByteCount) bytes"
+                )
+            }
+        case .streamWindowUpdate:
+            _ = try windowUpdateByteCount(from: frame.payload)
+        case .streamFin, .streamResetAck:
+            guard frame.payload.isEmpty else {
+                throw CapsuleVmProtocolError(
+                    code: "invalid_stream_terminal",
+                    message: "\(frame.kind) payload must be empty"
+                )
+            }
+        case .streamReset:
+            guard !frame.payload.isEmpty,
+                  frame.payload.count <= CapsuleVmProtocol.maximumResetPayloadByteCount else {
+                throw CapsuleVmProtocolError(
+                    code: "invalid_stream_reset",
+                    message: "RESET payload must be between 1 and \(CapsuleVmProtocol.maximumResetPayloadByteCount) bytes"
+                )
+            }
+        }
+    }
+
+    public static func encode(_ frame: CapsuleVmFrame) throws -> Data {
+        try validate(frame)
 
         var encoded = Data(capacity: CapsuleVmProtocol.headerByteCount + frame.payload.count)
         encoded.append(CapsuleVmProtocol.magic)
@@ -118,8 +190,10 @@ public enum CapsuleVmFrameCodec {
         let payload = data.subdata(
             in: CapsuleVmProtocol.headerByteCount..<frameByteCount
         )
+        let frame = CapsuleVmFrame(kind: kind, streamID: streamID, payload: payload)
+        try validate(frame)
         return (
-            CapsuleVmFrame(kind: kind, streamID: streamID, payload: payload),
+            frame,
             frameByteCount
         )
     }

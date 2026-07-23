@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, test } from "vitest";
 import { HostArtifactStore } from "./artifact-store";
+import { CapsuleStorageBudget } from "./storage-budget";
 
 const roots: string[] = [];
 
@@ -28,6 +29,16 @@ function identity(bytes: Buffer) {
     digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const,
     bytes: bytes.byteLength,
   };
+}
+
+function storageBudget(root: string): CapsuleStorageBudget {
+  return new CapsuleStorageBudget({
+    roots: [root],
+    aggregateBytes: 1_024,
+    perAppBytes: 1_024,
+    filesystemReserveBytes: 0,
+    dependencies: { availableBytes: async () => 1_000_000 },
+  });
 }
 
 describe("HostArtifactStore", () => {
@@ -63,6 +74,199 @@ describe("HostArtifactStore", () => {
     await expect(store.receive(OWNER, expected.digest, expected.bytes, Readable.from([Buffer.alloc(bytes.length)])))
       .rejects.toThrow("digest mismatch");
     expect(await store.find(expected.digest, expected.bytes)).toBeUndefined();
+  });
+
+  test("accepts concurrent identical exports while storing one CAS object and claiming both owners", async () => {
+    const root = join(
+      tmpdir(),
+      `lamarck-artifact-${process.pid}-${Math.random().toString(16).slice(2)}`,
+    );
+    roots.push(root);
+    const budget = storageBudget(root);
+    const store = new HostArtifactStore(root, { storageBudget: budget });
+    const bytes = Buffer.from("same verified export from two Builds");
+    const expected = identity(bytes);
+    const secondOwner = "b".repeat(64);
+    let releaseSources!: () => void;
+    const sourceGate = new Promise<void>((resolve) => {
+      releaseSources = resolve;
+    });
+    let sourcesReady = 0;
+    let bothSourcesReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      bothSourcesReady = resolve;
+    });
+    const source = async function* () {
+      sourcesReady += 1;
+      if (sourcesReady === 2) bothSourcesReady();
+      await sourceGate;
+      yield bytes;
+    };
+
+    const first = store.receive(OWNER, expected.digest, expected.bytes, source());
+    const second = store.receive(secondOwner, expected.digest, expected.bytes, source());
+    await ready;
+    releaseSources();
+    await expect(Promise.all([first, second])).resolves.toMatchObject([expected, expected]);
+
+    const hex = expected.digest.slice("sha256:".length);
+    const entries = await readdir(join(root, "cas", "sha256", hex.slice(0, 2)));
+    expect(entries).toEqual([hex]);
+    expect(await budget.snapshot()).toMatchObject({
+      usedBytes: expected.bytes,
+      reservedBytes: 0,
+      reservations: 0,
+      ownerUsedBytes: {
+        [OWNER]: expected.bytes,
+        [secondOwner]: expected.bytes,
+      },
+    });
+  });
+
+  test("retains the winner reservation and quarantines publication when temporary cleanup fails", async () => {
+    const root = join(
+      tmpdir(),
+      `lamarck-artifact-${process.pid}-${Math.random().toString(16).slice(2)}`,
+    );
+    roots.push(root);
+    const budget = storageBudget(root);
+    const store = new HostArtifactStore(root, {
+      storageBudget: budget,
+      artifactWriter: {
+        removeTemporary: async () => {
+          throw new Error("injected winner unlink failure");
+        },
+      },
+    });
+    const bytes = Buffer.from("winner cleanup must remain reserved");
+    const expected = identity(bytes);
+
+    await expect(store.receive(OWNER, expected.digest, expected.bytes, Readable.from([bytes])))
+      .rejects.toThrow("injected winner unlink failure");
+    expect(await budget.snapshot()).toMatchObject({
+      usedBytes: 0,
+      reservedBytes: expected.bytes,
+      reservations: 1,
+      ownerUsedBytes: {},
+      ownerReservedBytes: { [OWNER]: expected.bytes },
+    });
+    await expect(store.find(expected.digest, expected.bytes)).rejects.toThrow("quarantined");
+  });
+
+  test("retains a loser reservation and never claims its owner when temporary cleanup fails", async () => {
+    const root = join(
+      tmpdir(),
+      `lamarck-artifact-${process.pid}-${Math.random().toString(16).slice(2)}`,
+    );
+    roots.push(root);
+    const budget = storageBudget(root);
+    let removals = 0;
+    const store = new HostArtifactStore(root, {
+      storageBudget: budget,
+      artifactWriter: {
+        removeTemporary: async (path) => {
+          removals += 1;
+          if (removals === 2) throw new Error("injected loser unlink failure");
+          await rm(path, { force: true });
+        },
+      },
+    });
+    const bytes = Buffer.from("loser cleanup must remain reserved");
+    const expected = identity(bytes);
+    const secondOwner = "b".repeat(64);
+
+    await store.receive(OWNER, expected.digest, expected.bytes, Readable.from([bytes]));
+    await expect(store.receive(secondOwner, expected.digest, expected.bytes, Readable.from([bytes])))
+      .rejects.toThrow("injected loser unlink failure");
+    expect(await budget.snapshot()).toMatchObject({
+      usedBytes: expected.bytes,
+      reservedBytes: expected.bytes,
+      reservations: 1,
+      ownerUsedBytes: { [OWNER]: expected.bytes },
+      ownerReservedBytes: { [secondOwner]: expected.bytes },
+    });
+  });
+
+  test("keeps same-digest losers behind winner durability and fails them cleanly on ambiguity", async () => {
+    const root = join(
+      tmpdir(),
+      `lamarck-artifact-${process.pid}-${Math.random().toString(16).slice(2)}`,
+    );
+    roots.push(root);
+    const budget = storageBudget(root);
+    let winnerPublished!: () => void;
+    const published = new Promise<void>((resolve) => {
+      winnerPublished = resolve;
+    });
+    let failWinner!: () => void;
+    const failureGate = new Promise<void>((resolve) => {
+      failWinner = resolve;
+    });
+    const store = new HostArtifactStore(root, {
+      storageBudget: budget,
+      artifactWriter: {
+        afterPublication: async (isWinner) => {
+          if (!isWinner) return;
+          winnerPublished();
+          await failureGate;
+          throw new Error("injected winner accounting boundary failure");
+        },
+      },
+    });
+    const bytes = Buffer.from("same digest publication boundary");
+    const expected = identity(bytes);
+    const secondOwner = "b".repeat(64);
+
+    const winner = store.receive(OWNER, expected.digest, expected.bytes, Readable.from([bytes]));
+    await published;
+    const loser = store.receive(secondOwner, expected.digest, expected.bytes, Readable.from([bytes]));
+    failWinner();
+    const results = await Promise.allSettled([winner, loser]);
+
+    expect(results.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+    expect(await budget.snapshot()).toMatchObject({
+      usedBytes: 0,
+      reservedBytes: expected.bytes,
+      reservations: 1,
+      ownerUsedBytes: {},
+      ownerReservedBytes: { [OWNER]: expected.bytes },
+    });
+    const hex = expected.digest.slice("sha256:".length);
+    expect(await readdir(join(root, "cas", "sha256", hex.slice(0, 2)))).toEqual([hex]);
+  });
+
+  test("does not expose a hard-link winner to reads before durability and accounting", async () => {
+    let winnerPublished!: () => void;
+    const published = new Promise<void>((resolve) => {
+      winnerPublished = resolve;
+    });
+    let releaseWinner!: () => void;
+    const publicationGate = new Promise<void>((resolve) => {
+      releaseWinner = resolve;
+    });
+    const { store } = fixture({
+      artifactWriter: {
+        afterPublication: async (isWinner) => {
+          if (!isWinner) return;
+          winnerPublished();
+          await publicationGate;
+        },
+      },
+    });
+    const bytes = Buffer.from("reads wait for committed publication");
+    const expected = identity(bytes);
+    const receive = store.receive(OWNER, expected.digest, expected.bytes, Readable.from([bytes]));
+    await published;
+    let readSettled = false;
+    const read = store.find(expected.digest, expected.bytes).finally(() => {
+      readSettled = true;
+    });
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(readSettled).toBe(false);
+    releaseWinner();
+    await expect(receive).resolves.toMatchObject(expected);
+    await expect(read).resolves.toMatchObject(expected);
   });
 
   test("persists exact V2 install and dependency provenance while still reading V1 pointers", async () => {

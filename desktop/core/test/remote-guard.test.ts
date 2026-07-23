@@ -82,6 +82,7 @@ describe("RemoteGuard capability binding", () => {
       const registry = new AppCapabilityRegistry();
       const issued = registry.issue("focus", "ui", {
         manifestGeneration: 1,
+        manifestDigest: `sha256:${"a".repeat(64)}`,
         writeTables: [],
         docGrants: [],
       });

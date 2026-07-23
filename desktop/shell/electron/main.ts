@@ -30,6 +30,7 @@ import {
   type ReloadedBrowserBinding,
 } from "./capsule/manager";
 import { MacOsCapsuleBackend } from "./capsule/macos-backend";
+import { isCapsuleRestartRequiredError } from "./capsule/backend";
 import { SystemBroker } from "./capsule/system-broker";
 import { SystemStreamServer } from "./capsule/system-stream";
 import { createViewerGateway, type ViewerGatewayBinding } from "./capsule/viewer-gateway";
@@ -121,6 +122,7 @@ interface AppViewerSessionState {
 }
 
 const appViewers = new Map<string, AppViewerRecord>();
+const appArchiveOperations = new Map<string, Promise<{ ok: true; id: string }>>();
 const appViewerSessions = new Map<string, AppViewerSessionState>();
 const appViewerLifecycle = new ViewerLifecycleCoordinator();
 const configuredAppWebContents = new WeakSet<WebContents>();
@@ -141,13 +143,27 @@ const systemBroker = new SystemBroker({
   },
 });
 const systemStreamServer = new SystemStreamServer(systemBroker, { unbindOnClose: false });
-const capsuleStateRoot = join(app.getPath("userData"), "capsule");
+const capsuleCacheNamespace = app.getVersion().includes("-alpha")
+  ? "ai.lamarck.desktop.alpha"
+  : app.isPackaged
+    ? "ai.lamarck.desktop"
+    : "ai.lamarck.desktop.dev";
+// Capsule state is fully reconstructable from the selected Workspace and the
+// signed Guest release. Keep it in the macOS cache domain; the Workspace path
+// is user-owned data and must never become a child of a disposable Host root.
+const capsuleCacheRoot = join(
+  app.getPath("home"),
+  "Library",
+  "Caches",
+  capsuleCacheNamespace,
+  "Capsule",
+);
 const capsuleBackend = new MacOsCapsuleBackend({
   helperPath: CAPSULE_VM_HELPER,
   releaseResourcesRoot: join(__dirname, "native", "capsule-guest"),
-  stateDirectory: join(capsuleStateRoot, "vm"),
-  cacheDirectory: join(capsuleStateRoot, "cache"),
-  artifactRoot: join(capsuleStateRoot, "artifacts"),
+  stateDirectory: join(capsuleCacheRoot, "vm"),
+  cacheDirectory: join(capsuleCacheRoot, "cache"),
+  artifactRoot: join(capsuleCacheRoot, "artifacts"),
   systemStreamServer,
 });
 const capsuleManager = new CapsuleManager({
@@ -1251,18 +1267,42 @@ async function stopAppViewers(appId: string): Promise<void> {
   if (failures.length > 0) throw new AggregateError(failures, `Could not stop App "${appId}"`);
 }
 
-async function archiveAppFromHost(appId: string): Promise<{ ok: true; id: string }> {
+function archiveAppFromHost(appId: string): Promise<{ ok: true; id: string }> {
   if (!/^[a-z0-9][a-z0-9-]*$/.test(appId)) throw new Error("Invalid App id");
-  await stopAppViewers(appId);
-  await capsuleManager.stopApp(appId);
-  const response = await fetch(`${coreBaseUrl()}/api/apps/${encodeURIComponent(appId)}/archive`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${CORE_TOKEN}` },
+  const existing = appArchiveOperations.get(appId);
+  if (existing) return existing;
+
+  // This fence is established synchronously and remains active through the
+  // Core move, so an open/reload cannot race the retirement boundary.
+  capsuleManager.beginAppRetirement(appId);
+  let tracked!: Promise<{ ok: true; id: string }>;
+  const operation = (async () => {
+    try {
+      await stopAppViewers(appId);
+      await capsuleManager.retireApp(appId);
+      const response = await fetch(`${coreBaseUrl()}/api/apps/${encodeURIComponent(appId)}/archive`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${CORE_TOKEN}` },
+      });
+      const body = await response.json().catch(() => ({})) as {
+        ok?: boolean;
+        id?: string;
+        error?: string;
+      };
+      if (!response.ok) throw new Error(body.error ?? `Core returned HTTP ${response.status}`);
+      if (body.ok !== true || body.id !== appId) {
+        throw new Error("Core returned an invalid archive response");
+      }
+      return { ok: true as const, id: body.id };
+    } finally {
+      capsuleManager.finishAppRetirement(appId);
+    }
   });
-  const body = await response.json().catch(() => ({})) as { ok?: boolean; id?: string; error?: string };
-  if (!response.ok) throw new Error(body.error ?? `Core returned HTTP ${response.status}`);
-  if (body.ok !== true || body.id !== appId) throw new Error("Core returned an invalid archive response");
-  return { ok: true, id: body.id };
+  tracked = operation().finally(() => {
+    if (appArchiveOperations.get(appId) === tracked) appArchiveOperations.delete(appId);
+  });
+  appArchiveOperations.set(appId, tracked);
+  return tracked;
 }
 
 function detachAllAppWebContents(): void {
@@ -1445,9 +1485,23 @@ app.whenReady().then(async () => {
       return { path };
     });
   });
-  ipcMain.handle("app-viewer:open", (event, appId: string) => {
+  ipcMain.handle("app-viewer:open", async (event, appId: string) => {
     requireShellIpc(event);
-    return openAppViewer(event.sender, appId);
+    try {
+      const opened = await openAppViewer(event.sender, appId);
+      return { ok: true as const, viewerId: opened.viewerId };
+    } catch (error) {
+      return {
+        ok: false as const,
+        error: {
+          code: isCapsuleRestartRequiredError(error)
+            ? "CAPSULE_RESTART_REQUIRED"
+            : "APP_VIEWER_OPEN_FAILED",
+          message: errorMessage(error),
+          restartRequired: isCapsuleRestartRequiredError(error),
+        },
+      };
+    }
   });
   ipcMain.on("app-viewer:bounds", (event, payload: {
     viewerId: string;

@@ -19,6 +19,9 @@ rm -rf "$work"
 mkdir -p "$work/source" "$work/home" "$work/npm-cache"
 cp -a "$snapshot/." "$work/source/"
 cd "$work/source"
+HOME="$work/home" node \
+	"$work/source/desktop/capsule-guest/scripts/verify-guest-node-closure.mjs" \
+	"$work/source"
 HOME="$work/home" npm ci \
 	--workspace @lamarck/capsule-guest \
 	--include-workspace-root=false \

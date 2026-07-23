@@ -332,6 +332,27 @@ async function runCapsuleCoreGuard(): Promise<void> {
     coreOutput = captureChildOutput(coreProcess);
     await waitForCoreService(coreProcess, coreOrigin, coreToken, coreOutput);
 
+    const appRegistry = await hostJson(
+      coreOrigin,
+      coreToken,
+      "/api/apps",
+      {},
+    ) as {
+      apps?: Array<{
+        id?: unknown;
+        manifestGeneration?: unknown;
+        manifestDigest?: unknown;
+      }>;
+    };
+    const appAuthority = appRegistry.apps?.find((app) => app.id === "app-a");
+    assert.ok(
+      appAuthority
+        && typeof appAuthority.manifestGeneration === "number"
+        && Number.isSafeInteger(appAuthority.manifestGeneration)
+        && appAuthority.manifestGeneration >= 1
+        && typeof appAuthority.manifestDigest === "string",
+      "Core did not publish exact app-a manifest authority",
+    );
     const capability = await hostJson(
       coreOrigin,
       coreToken,
@@ -339,7 +360,12 @@ async function runCapsuleCoreGuard(): Promise<void> {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ appId: "app-a", workload: "ui" }),
+        body: JSON.stringify({
+          appId: "app-a",
+          workload: "ui",
+          manifestGeneration: appAuthority.manifestGeneration,
+          manifestDigest: appAuthority.manifestDigest,
+        }),
       },
     ) as { capability: string; channelId: string };
     broker = new SystemBroker({

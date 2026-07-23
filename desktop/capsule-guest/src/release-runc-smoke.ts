@@ -9,6 +9,7 @@ import {
 import { createServer, connect, type Server, type Socket } from "node:net";
 import {
   createOciBundlePlan,
+  createCapsuleRuntimeStoragePlan,
   generateOpaqueId,
   LinuxRuncDriver,
   TicketRegistry,
@@ -73,7 +74,6 @@ const SDK_SOCKET = `${SMOKE_ROOT}/sdk.sock`;
 const ARTIFACT_SOURCE = `${SMOKE_ROOT}/artifact-source`;
 const ARTIFACT_IMAGE = `${SMOKE_ROOT}/artifact.erofs`;
 const ARTIFACT_REFERENCE = "release-runc-smoke:artifact";
-const SCRATCH_BYTES = 64 * 1024 * 1024;
 
 export const RELEASE_RUNC_SMOKE_WORKLOAD_SOURCE = `
 import { writeFileSync } from "node:fs";
@@ -204,6 +204,7 @@ export async function runReleaseRuncSmoke(): Promise<void> {
       ownerKey,
       referenceId: ARTIFACT_REFERENCE,
     });
+    const storage = createCapsuleRuntimeStoragePlan(imported.bytes);
     await resources.prepareApp({
       ownerKey,
       appHandle,
@@ -212,7 +213,8 @@ export async function runReleaseRuncSmoke(): Promise<void> {
       artifactBlobHandle: ARTIFACT_REFERENCE,
       mappedHostUid: 100_000,
       mappedHostGid: 200_000,
-      scratchBytes: SCRATCH_BYTES,
+      storagePlanVersion: storage.version,
+      scratchBytes: storage.scratchBytes,
     });
     appPrepared = true;
 

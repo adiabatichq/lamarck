@@ -2,6 +2,7 @@ const UINT32_MAX = 0xffff_ffff;
 
 export const MAX_CONTROL_FRAME_BYTES = 256 * 1024;
 export const MAX_DATA_PRELUDE_BYTES = 4 * 1024;
+export const MAX_ARTIFACT_ADOPTION_RECEIPT_BYTES = 4 * 1024;
 
 export type ProtocolCodecErrorCode =
   | "FRAME_INVALID_LIMIT"

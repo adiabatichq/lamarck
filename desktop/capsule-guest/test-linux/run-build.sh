@@ -99,7 +99,7 @@ install -m 0755 /usr/local/libexec/lamarck-offline-npm.mjs \
 install -m 0755 /usr/local/libexec/lamarck-build-policy-probe \
 	"$build_rootfs/usr/libexec/lamarck-build-policy-probe"
 
-# The 512 MiB test volume is deliberately below the production 8 GiB ceiling,
+# The 512 MiB test volume is deliberately below the production 2 GiB ceiling,
 # but exercises the same ext4 loop mount and proves writes cannot escape it.
 rm -rf "$build_root"
 truncate -s 536870912 "$scratch"

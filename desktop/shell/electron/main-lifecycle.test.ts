@@ -17,3 +17,13 @@ describe("Shell window lifecycle", () => {
     expect(handler).not.toContain("webContents");
   });
 });
+
+describe("Shell Host configuration", () => {
+  test("selects the Alpha Capsule cache before checking packaged layout", () => {
+    expect(mainSource).toContain(`const capsuleCacheNamespace = app.getVersion().includes("-alpha")
+  ? "ai.lamarck.desktop.alpha"
+  : app.isPackaged
+    ? "ai.lamarck.desktop"
+    : "ai.lamarck.desktop.dev";`);
+  });
+});

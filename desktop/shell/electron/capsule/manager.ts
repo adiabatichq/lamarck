@@ -6,11 +6,18 @@ import type {
   CapsuleBackendStatus,
   CapsuleUiLostEvent,
 } from "./backend";
+import { CapsuleRestartRequiredError } from "./backend";
+import {
+  APP_MANIFEST_DIGEST_PATTERN,
+  type AppManifestDigest,
+} from "../../../capsule/src/app-manifest-authority";
 
 const APP_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 
 interface AppInfo {
   id: string;
+  manifestGeneration: number;
+  manifestDigest: AppManifestDigest;
   runtime: {
     ui?: { command: string[]; port: number };
     services?: Record<string, { command: string[] }>;
@@ -21,6 +28,8 @@ interface AppInfo {
 interface IssuedCapability {
   capability: string;
   channelId: string;
+  manifestGeneration: number;
+  manifestDigest: AppManifestDigest;
 }
 
 export interface OpenedAppViewer {
@@ -99,6 +108,7 @@ export class CapsuleManager {
   readonly #rebuildOperations = new Map<string, Promise<unknown>>();
   readonly #pendingUiOperations = new Map<string, PendingUiOperation>();
   readonly #stopOperations = new Map<string, Promise<void>>();
+  readonly #retireOperations = new Map<string, Promise<void>>();
   readonly #stoppingApps = new Set<string>();
   #stoppingAll = false;
   #generation = 0;
@@ -158,13 +168,15 @@ export class CapsuleManager {
   ): Promise<OpenedAppViewer> {
     const status = await this.#backend.status();
     if (!status.available) {
-      throw new Error(`App Capsule unavailable: ${status.reason ?? status.backend}`);
+      const message = `App Capsule unavailable: ${status.reason ?? status.backend}`;
+      if (status.restartRequired) throw new CapsuleRestartRequiredError(message);
+      throw new Error(message);
     }
 
     const app = await this.#loadApp(appId);
     this.#assertSupportedRuntime(app);
     if (!app.runtime.ui) throw new Error(`App "${appId}" does not declare a UI workload`);
-    const runtimeIssued = await this.#issueCapability(appId, "ui");
+    const runtimeIssued = await this.#issueCapability(appId, "ui", app);
     const runtimeSenderId = `capsule_${randomBytes(24).toString("base64url")}`;
     try {
       this.#bindSystemSender(runtimeSenderId, runtimeIssued);
@@ -188,6 +200,8 @@ export class CapsuleManager {
     try {
       const instance = await this.#backend.startUi({
         appId,
+        manifestGeneration: app.manifestGeneration,
+        manifestDigest: app.manifestDigest,
         packageDir: join(this.#workspacePath(), "apps", appId),
         command: [...app.runtime.ui.command],
         port: app.runtime.ui.port,
@@ -199,7 +213,7 @@ export class CapsuleManager {
       if (generation !== this.#generation) {
         throw new Error("App Capsule launch was cancelled");
       }
-      browserIssued = await this.#issueCapability(appId, "ui");
+      browserIssued = await this.#issueCapability(appId, "ui", app);
       pending.browserIssued = browserIssued;
       // The backend loss callback can mutate this record while the capability
       // request is awaiting even though TypeScript cannot observe that alias.
@@ -291,8 +305,8 @@ export class CapsuleManager {
     const app = await this.#loadApp(viewer.appId);
     this.#assertSupportedRuntime(app);
     if (!app.runtime.ui) throw new Error(`App "${viewer.appId}" does not declare a UI workload`);
-    const runtimeIssued = await this.#issueCapability(viewer.appId, "ui");
-    const browserIssued = await this.#issueCapability(viewer.appId, "ui").catch(async (error) => {
+    const runtimeIssued = await this.#issueCapability(viewer.appId, "ui", app);
+    const browserIssued = await this.#issueCapability(viewer.appId, "ui", app).catch(async (error) => {
       await this.#revokeCapability(runtimeIssued.channelId).catch(() => {});
       throw error;
     });
@@ -321,6 +335,8 @@ export class CapsuleManager {
       }
       replacement = await this.#backend.replaceUi(viewer.instanceId, {
         appId: viewer.appId,
+        manifestGeneration: app.manifestGeneration,
+        manifestDigest: app.manifestDigest,
         packageDir: join(this.#workspacePath(), "apps", viewer.appId),
         command: [...app.runtime.ui.command],
         port: app.runtime.ui.port,
@@ -380,11 +396,12 @@ export class CapsuleManager {
     if (!APP_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
     const existing = this.#stopOperations.get(appId);
     if (existing) return existing;
-    this.#stoppingApps.add(appId);
+    const ownsFence = !this.#stoppingApps.has(appId);
+    if (ownsFence) this.#stoppingApps.add(appId);
     this.#generation += 1;
     let tracked: Promise<void>;
     tracked = this.#stopApp(appId).finally(() => {
-      this.#stoppingApps.delete(appId);
+      if (ownsFence) this.#stoppingApps.delete(appId);
       if (this.#stopOperations.get(appId) === tracked) this.#stopOperations.delete(appId);
     });
     this.#stopOperations.set(appId, tracked);
@@ -412,6 +429,64 @@ export class CapsuleManager {
     if (failures.length > 0) throw new AggregateError(failures, `Could not stop App "${appId}"`);
   }
 
+  /** Establishes a synchronous fence which remains held across Core archive. */
+  beginAppRetirement(appId: string): void {
+    if (!APP_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    if (this.#stoppingAll) throw new Error("App Capsule is stopping");
+    if (this.#stoppingApps.has(appId)) throw new Error(`App "${appId}" is stopping`);
+    this.#stoppingApps.add(appId);
+    this.#generation += 1;
+  }
+
+  /** Releases the fence after Core either commits or rejects the archive. */
+  finishAppRetirement(appId: string): void {
+    this.#stoppingApps.delete(appId);
+  }
+
+  retireApp(appId: string): Promise<void> {
+    if (!APP_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    if (!this.#stoppingApps.has(appId)) {
+      throw new Error(`App "${appId}" retirement fence is not active`);
+    }
+    const existing = this.#retireOperations.get(appId);
+    if (existing) return existing;
+    let tracked: Promise<void>;
+    tracked = this.#retireApp(appId).finally(() => {
+      if (this.#retireOperations.get(appId) === tracked) this.#retireOperations.delete(appId);
+    });
+    this.#retireOperations.set(appId, tracked);
+    return tracked;
+  }
+
+  async #retireApp(appId: string): Promise<void> {
+    const pending = [
+      this.#openingOperations.get(appId),
+      this.#rebuildOperations.get(appId),
+      this.#stopOperations.get(appId),
+    ].filter((operation): operation is Promise<unknown> => operation !== undefined);
+    const viewers = [...this.#viewers.values()].filter((viewer) => viewer.appId === appId);
+    for (const viewer of viewers) {
+      this.#viewers.delete(viewer.viewerId);
+      this.#unbindSystemSender(viewer.runtimeSenderId);
+    }
+
+    // Start both fail-closed actions immediately. retireApp() synchronously
+    // aborts queued/in-flight backend launches before it returns its promise;
+    // Core revocation concurrently cuts off any already issued Host channel.
+    // The retirement fence remains held until both and every cancelled launch
+    // have settled.
+    const revoke = this.#revokeAppCapabilities(appId);
+    const backend = this.#backend.retireApp(appId);
+    const [revokeResult, backendResult] = await Promise.allSettled([revoke, backend]);
+    await Promise.allSettled(pending);
+    const failures = [revokeResult, backendResult]
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `Could not retire App "${appId}"`);
+    }
+  }
+
   async stopAll(): Promise<void> {
     if (this.#stoppingAll) return;
     this.#stoppingAll = true;
@@ -421,6 +496,7 @@ export class CapsuleManager {
         ...this.#openingOperations.values(),
         ...this.#rebuildOperations.values(),
         ...this.#stopOperations.values(),
+        ...this.#retireOperations.values(),
       ]);
       const viewers = [...this.#viewers.values()];
       this.#viewers.clear();
@@ -461,7 +537,13 @@ export class CapsuleManager {
     causes.push(...results
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => result.reason));
-    throw new AggregateError(causes, "App Capsule backend boundary was lost");
+    const primary = errorMessage(causes[0]);
+    throw new AggregateError(
+      causes,
+      primary
+        ? `App Capsule backend boundary was lost: ${primary}`
+        : "App Capsule backend boundary was lost",
+    );
   }
 
   #handleUnexpectedUiLoss(event: CapsuleUiLostEvent): void {
@@ -637,15 +719,41 @@ export class CapsuleManager {
     const body = await response.json() as { apps?: AppInfo[] };
     const app = body.apps?.find((candidate) => candidate.id === appId);
     if (!app) throw new Error(`App not found: ${appId}`);
+    if (
+      !Number.isSafeInteger(app.manifestGeneration)
+      || app.manifestGeneration < 1
+      || !APP_MANIFEST_DIGEST_PATTERN.test(app.manifestDigest)
+    ) {
+      throw new Error("Core returned invalid App manifest authority");
+    }
     return app;
   }
 
-  async #issueCapability(appId: string, workload: "ui"): Promise<IssuedCapability> {
+  async #issueCapability(
+    appId: string,
+    workload: "ui",
+    authority: Pick<AppInfo, "manifestGeneration" | "manifestDigest">,
+  ): Promise<IssuedCapability> {
     const response = await this.#hostRequest("/api/app-runtime/channels", {
       method: "POST",
-      body: JSON.stringify({ appId, workload }),
+      body: JSON.stringify({
+        appId,
+        workload,
+        manifestGeneration: authority.manifestGeneration,
+        manifestDigest: authority.manifestDigest,
+      }),
     });
-    return await response.json() as IssuedCapability;
+    const issued = await response.json() as Partial<IssuedCapability>;
+    if (
+      typeof issued.capability !== "string"
+      || typeof issued.channelId !== "string"
+      || issued.manifestGeneration !== authority.manifestGeneration
+      || issued.manifestDigest !== authority.manifestDigest
+      || !APP_MANIFEST_DIGEST_PATTERN.test(issued.manifestDigest)
+    ) {
+      throw new Error("Core returned a capability for a different App manifest authority");
+    }
+    return issued as IssuedCapability;
   }
 
   async #revokeCapability(channelId: string): Promise<void> {
@@ -669,4 +777,8 @@ export class CapsuleManager {
     const body = await response.json().catch(() => ({})) as { error?: string };
     throw new Error(body.error ?? `Core returned HTTP ${response.status}`);
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : error === undefined ? "" : String(error);
 }

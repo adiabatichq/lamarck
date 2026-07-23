@@ -7,7 +7,9 @@ import {
 } from "../src/protocol/blob-transfer";
 import { GuestHandshake, HandshakeError } from "../src/protocol/handshake";
 import { TicketError, TicketRegistry } from "../src/protocol/tickets";
+import { CAPSULE_PROTOCOL_VERSION } from "../src/protocol/types";
 import {
+  parseArtifactAdoptionReceipt,
   parseControlResponse,
   parseDataStreamPrelude,
   parseHostInitialize,
@@ -52,7 +54,7 @@ describe("Capsule protocol validation", () => {
     });
     expect(handshake.hello()).toEqual({
       type: "guest.hello",
-      protocolVersion: 1,
+      protocolVersion: CAPSULE_PROTOCOL_VERSION,
       bootId: BOOT_ID,
       imageDigest: IMAGE_DIGEST,
       supervisorVersion: "0.1.0",
@@ -61,7 +63,7 @@ describe("Capsule protocol validation", () => {
     });
     expect(handshake.initialize(initialization())).toEqual({
       type: "guest.ready",
-      protocolVersion: 1,
+      protocolVersion: CAPSULE_PROTOCOL_VERSION,
       bootId: BOOT_ID,
       sessionId: SESSION_ID,
     });
@@ -149,13 +151,13 @@ describe("Capsule protocol validation", () => {
 
   test("strictly validates stream preludes and responses", () => {
     expect(parseDataStreamPrelude({
-      protocolVersion: 1,
+      protocolVersion: CAPSULE_PROTOCOL_VERSION,
       sessionId: SESSION_ID,
       ticket: SDK_TICKET,
       kind: "sdk",
     })).toMatchObject({ kind: "sdk", ticket: SDK_TICKET });
     expect(() => parseDataStreamPrelude({
-      protocolVersion: 1,
+      protocolVersion: CAPSULE_PROTOCOL_VERSION,
       sessionId: SESSION_ID,
       ticket: SDK_TICKET,
       kind: "sdk",
@@ -165,7 +167,7 @@ describe("Capsule protocol validation", () => {
     );
 
     expect(parseControlResponse({
-      v: 1,
+      v: CAPSULE_PROTOCOL_VERSION,
       sessionId: SESSION_ID,
       kind: "response",
       requestId: REQUEST_ID,
@@ -174,9 +176,46 @@ describe("Capsule protocol validation", () => {
     })).toMatchObject({ ok: false });
   });
 
+  test("binds an artifact adoption receipt to one exact DATA stream and artifact", () => {
+    expect(parseArtifactAdoptionReceipt({
+      type: "artifact.adopted",
+      protocolVersion: CAPSULE_PROTOCOL_VERSION,
+      sessionId: SESSION_ID,
+      ticket: SDK_TICKET,
+      digest: IMAGE_DIGEST,
+      bytes: 3,
+    })).toEqual({
+      type: "artifact.adopted",
+      protocolVersion: CAPSULE_PROTOCOL_VERSION,
+      sessionId: SESSION_ID,
+      ticket: SDK_TICKET,
+      digest: IMAGE_DIGEST,
+      bytes: 3,
+    });
+    expect(() => parseArtifactAdoptionReceipt({
+      type: "artifact.adopted",
+      protocolVersion: CAPSULE_PROTOCOL_VERSION,
+      sessionId: SESSION_ID,
+      ticket: SDK_TICKET,
+      digest: IMAGE_DIGEST,
+      bytes: 3,
+      blobHandle: BLOB_HANDLE,
+    })).toThrowError(expect.objectContaining<Partial<ProtocolValidationError>>({
+      code: "PROTOCOL_UNKNOWN_FIELD",
+    }));
+    expect(() => parseArtifactAdoptionReceipt({
+      type: "artifact.adopted",
+      protocolVersion: CAPSULE_PROTOCOL_VERSION,
+      sessionId: OTHER_SESSION_ID,
+      ticket: SDK_TICKET,
+      digest: IMAGE_DIGEST,
+      bytes: 0,
+    })).toThrowError(/bytes/);
+  });
+
   test("keeps import and export ownership schemas exact and distinct", () => {
     const base = {
-      v: 1,
+      v: CAPSULE_PROTOCOL_VERSION,
       sessionId: SESSION_ID,
       kind: "request",
       requestId: REQUEST_ID,
@@ -229,7 +268,7 @@ describe("Capsule protocol validation", () => {
 
   test("validates cold and warm Build inputs as mutually exclusive exact tuples", () => {
     const base = {
-      v: 1 as const,
+      v: CAPSULE_PROTOCOL_VERSION,
       sessionId: SESSION_ID,
       kind: "request" as const,
       requestId: REQUEST_ID,
@@ -245,6 +284,9 @@ describe("Capsule protocol validation", () => {
       installDigest: IMAGE_DIGEST,
       mappedHostUid: 131_072,
       mappedHostGid: 196_608,
+      storagePlanVersion: 1,
+      scratchBytes: 1024 * 1024 * 1024,
+      artifactOutputBytes: 256 * 1024 * 1024,
       timeoutMs: 60_000,
       resources: {
         memoryBytes: 512 * 1024 * 1024,
@@ -293,8 +335,65 @@ describe("Capsule protocol validation", () => {
     })).toThrowError(/mutually exclusive/);
     expect(() => parseHostRequest({
       ...base,
-      body: { ...body, installDigest: "not-a-digest" },
+      body: {
+        ...body,
+        installDigest: "not-a-digest",
+        dependencyDigest: IMAGE_DIGEST,
+        dependencyBytes: 3,
+        dependencyBlobHandle: "C".repeat(22),
+      },
     })).toThrowError(/installDigest/);
+    expect(() => parseHostRequest({
+      ...base,
+      body: {
+        ...body,
+        dependencyDigest: IMAGE_DIGEST,
+        dependencyBytes: 3,
+        dependencyBlobHandle: "C".repeat(22),
+        scratchBytes: 2 * 1024 * 1024 * 1024,
+      },
+    })).toThrowError(/storage plan does not match/);
+    expect(() => parseHostRequest({
+      ...base,
+      body: {
+        ...body,
+        dependencyDigest: IMAGE_DIGEST,
+        dependencyBytes: 3,
+        dependencyBlobHandle: "C".repeat(22),
+        storagePlanVersion: 2,
+      },
+    })).toThrowError(expect.objectContaining<Partial<ProtocolValidationError>>({
+      code: "PROTOCOL_UNSUPPORTED_VERSION",
+    }));
+  });
+
+  test("requires the canonical private Runtime storage plan", () => {
+    const base = {
+      v: CAPSULE_PROTOCOL_VERSION,
+      sessionId: SESSION_ID,
+      kind: "request",
+      requestId: REQUEST_ID,
+      op: "app.prepare",
+      body: {
+        ownerKey: OWNER_KEY,
+        appHandle: APP_HANDLE,
+        artifactDigest: IMAGE_DIGEST,
+        artifactBytes: 3,
+        artifactBlobHandle: BLOB_HANDLE,
+        mappedHostUid: 131_072,
+        mappedHostGid: 196_608,
+        storagePlanVersion: 1,
+        scratchBytes: 512 * 1024 * 1024,
+      },
+    };
+    expect(parseHostRequest(base)).toMatchObject({
+      op: "app.prepare",
+      body: { storagePlanVersion: 1, scratchBytes: 512 * 1024 * 1024 },
+    });
+    expect(() => parseHostRequest({
+      ...base,
+      body: { ...base.body, scratchBytes: 1024 * 1024 * 1024 },
+    })).toThrow(/Runtime storage plan does not match/);
   });
 });
 
@@ -377,7 +476,7 @@ describe("single-use stream tickets", () => {
 function initialization() {
   return {
     type: "host.initialize",
-    protocolVersion: 1,
+    protocolVersion: CAPSULE_PROTOCOL_VERSION,
     sessionId: SESSION_ID,
     expectedImageDigest: IMAGE_DIGEST,
     maxControlFrameBytes: MAX_CONTROL_FRAME_BYTES,
@@ -386,7 +485,7 @@ function initialization() {
 
 function workloadPrepareRequest() {
   return {
-    v: 1,
+    v: CAPSULE_PROTOCOL_VERSION,
     sessionId: SESSION_ID,
     kind: "request",
     requestId: REQUEST_ID,

@@ -113,8 +113,8 @@ await writeExclusive(join(bundle, "compliance-manifest.ed25519"), complianceSign
 
 const release = {
   schemaVersion: 1,
-  vmWireVersion: 1,
-  guestProtocolVersion: 1,
+  vmWireVersion: 2,
+  guestProtocolVersion: 2,
   architecture: ARCHITECTURE,
   bundleRelativePath: BUNDLE_NAME,
   manifestDigest: imageDigest,

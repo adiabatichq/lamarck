@@ -5,16 +5,23 @@ import type {
   CapsuleUiInstance,
   CapsuleUiSpec,
 } from "./backend";
+import { CapsuleRestartRequiredError } from "./backend";
 import { CapsuleManager } from "./manager";
+
+const MANIFEST_GENERATION = 7;
+const MANIFEST_DIGEST = `sha256:${"a".repeat(64)}`;
+const OTHER_MANIFEST_DIGEST = `sha256:${"b".repeat(64)}`;
 
 class FakeBackend implements CapsuleBackend {
   starts: CapsuleUiSpec[] = [];
   stops: string[] = [];
   appStops: string[] = [];
+  appRetires: string[] = [];
   replacements: Array<{ instanceId: string; spec: CapsuleUiSpec }> = [];
   stopAllCalls = 0;
   failStopUi = false;
   rebuildGate: Promise<void> | undefined;
+  retireGate: Promise<void> | undefined;
   loseReplacementBeforeReturn = false;
   boundaryLostHandler: ((error: unknown) => void) | undefined;
   uiLostHandler: ((event: { instanceId: string; appId: string; error: Error }) => void) | undefined;
@@ -48,10 +55,17 @@ class FakeBackend implements CapsuleBackend {
     if (this.failStopUi) throw new Error("stop failed");
   }
   async stopApp(appId: string) { this.appStops.push(appId); }
+  async retireApp(appId: string) {
+    this.appRetires.push(appId);
+    await this.retireGate;
+  }
   async stopAll() { this.stopAllCalls += 1; }
 }
 
-function createFetch(runtimeByApp: Record<string, unknown> = {}) {
+function createFetch(
+  runtimeByApp: Record<string, unknown> = {},
+  options: { issuedManifestDigest?: string } = {},
+) {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   let issued = 0;
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -61,17 +75,26 @@ function createFetch(runtimeByApp: Record<string, unknown> = {}) {
       return Response.json({
         apps: ["app-a", "app-b"].map((id) => ({
           id,
+          manifestGeneration: MANIFEST_GENERATION,
+          manifestDigest: MANIFEST_DIGEST,
           runtime: runtimeByApp[id]
             ?? { ui: { command: ["npm", "run", "start"], port: 3000 } },
         })),
       });
     }
     if (url.endsWith("/api/app-runtime/channels") && init?.method === "POST") {
-      const appId = (JSON.parse(String(init.body)) as { appId: string }).appId;
+      const request = JSON.parse(String(init.body)) as {
+        appId: string;
+        manifestGeneration: number;
+        manifestDigest: string;
+      };
+      const { appId } = request;
       issued += 1;
       return Response.json({
         capability: `secret-capability-${appId}-${issued}`,
         channelId: `channel-${appId}-${issued}`,
+        manifestGeneration: request.manifestGeneration,
+        manifestDigest: options.issuedManifestDigest ?? request.manifestDigest,
       });
     }
     if (url.includes("/api/app-runtime/channels/channel-") && init?.method === "DELETE") {
@@ -90,6 +113,15 @@ function systemBindings() {
     bindSystemSender: vi.fn(),
     unbindSystemSender: vi.fn(),
   };
+}
+
+async function rejectionOf(operation: Promise<unknown>): Promise<Error> {
+  try {
+    await operation;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+  throw new Error("Expected operation to reject");
 }
 
 describe("CapsuleManager", () => {
@@ -113,6 +145,8 @@ describe("CapsuleManager", () => {
     });
     expect(backend.starts).toEqual([{
       appId: "app-a",
+      manifestGeneration: MANIFEST_GENERATION,
+      manifestDigest: MANIFEST_DIGEST,
       packageDir: "/workspace/apps/app-a",
       command: ["npm", "run", "start"],
       port: 3000,
@@ -122,6 +156,35 @@ describe("CapsuleManager", () => {
     for (const call of calls) {
       expect(new Headers(call.init?.headers).get("Authorization")).toBe("Bearer host-token");
     }
+  });
+
+  test("does not launch when Core cannot issue the exact manifest authority", async () => {
+    const backend = new FakeBackend();
+    const { fetch, calls } = createFetch({}, {
+      issuedManifestDigest: OTHER_MANIFEST_DIGEST,
+    });
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+
+    await expect(manager.openViewer("app-a", 7))
+      .rejects.toThrow("different App manifest authority");
+    expect(backend.starts).toEqual([]);
+    const issuance = calls.find((call) => (
+      call.url.endsWith("/api/app-runtime/channels")
+      && call.init?.method === "POST"
+    ));
+    expect(JSON.parse(String(issuance?.init?.body))).toEqual({
+      appId: "app-a",
+      workload: "ui",
+      manifestGeneration: MANIFEST_GENERATION,
+      manifestDigest: MANIFEST_DIGEST,
+    });
   });
 
   test("binds close to the owner and revokes the exact Core channel", async () => {
@@ -155,6 +218,7 @@ describe("CapsuleManager", () => {
         async openUiStream() { throw new Error("must not stream"); },
         async stopUi() {},
         async stopApp() {},
+        async retireApp() {},
         async stopAll() {},
       },
       workspacePath: () => "/workspace",
@@ -165,6 +229,29 @@ describe("CapsuleManager", () => {
     });
 
     await expect(manager.openViewer("app-a", 7)).rejects.toThrow("no verified image");
+    expect(calls).toEqual([]);
+  });
+
+  test("preserves a typed restart-required backend state", async () => {
+    const backend = new FakeBackend();
+    backend.status = async () => ({
+      available: false,
+      backend: "test",
+      reason: "VM stop was not confirmed",
+      restartRequired: true,
+    });
+    const { fetch, calls } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+
+    await expect(manager.openViewer("app-a", 7))
+      .rejects.toBeInstanceOf(CapsuleRestartRequiredError);
     expect(calls).toEqual([]);
   });
 
@@ -203,9 +290,9 @@ describe("CapsuleManager", () => {
     const viewerB = await manager.openViewer("app-b", 8);
     backend.failStopUi = true;
 
-    await expect(manager.closeViewer(viewerA.viewerId, 7)).rejects.toThrow(
-      "backend boundary was lost",
-    );
+    const failure = await rejectionOf(manager.closeViewer(viewerA.viewerId, 7));
+    expect(failure.message).toContain("backend boundary was lost");
+    expect(failure.message).toContain("stop failed");
 
     expect(onBackendBoundaryLost).toHaveBeenCalledOnce();
     expect(backend.stopAllCalls).toBe(1);
@@ -465,6 +552,40 @@ describe("CapsuleManager", () => {
     expect(backend.appStops).toEqual(["app-a"]);
   });
 
+  test("holds one retirement fence across teardown and blocks new App generations", async () => {
+    const backend = new FakeBackend();
+    let releaseRetirement!: () => void;
+    backend.retireGate = new Promise<void>((resolve) => { releaseRetirement = resolve; });
+    const { fetch, calls } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+
+    manager.beginAppRetirement("app-a");
+    await expect(manager.openViewer("app-a", 7)).rejects.toThrow("active viewer");
+    await expect(manager.reloadApp("app-a")).rejects.toThrow("stopping");
+
+    const first = manager.retireApp("app-a");
+    const duplicate = manager.retireApp("app-a");
+    expect(duplicate).toBe(first);
+    await vi.waitFor(() => expect(backend.appRetires).toEqual(["app-a"]));
+    expect(calls.some((call) => (
+      call.url.endsWith("/api/app-runtime/apps/app-a/channels")
+      && call.init?.method === "DELETE"
+    ))).toBe(true);
+
+    releaseRetirement();
+    await first;
+    await expect(manager.openViewer("app-a", 7)).rejects.toThrow("active viewer");
+    manager.finishAppRetirement("app-a");
+    await expect(manager.openViewer("app-a", 7)).resolves.toMatchObject({ appId: "app-a" });
+  });
+
   test("rotates runtime and browser channels before replacing a live UI", async () => {
     const backend = new FakeBackend();
     const { fetch, calls } = createFetch();
@@ -493,6 +614,8 @@ describe("CapsuleManager", () => {
       instanceId: "instance-app-a",
       spec: {
         appId: "app-a",
+        manifestGeneration: MANIFEST_GENERATION,
+        manifestDigest: MANIFEST_DIGEST,
         packageDir: "/workspace/apps/app-a",
         command: ["npm", "run", "start"],
         port: 3000,

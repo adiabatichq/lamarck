@@ -11,10 +11,15 @@ interface AppRuntimeViewProps {
 
 const MAX_OPEN_ATTEMPTS = 4;
 
+interface ViewerOpenFailure {
+  message: string;
+  restartRequired: boolean;
+}
+
 export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRuntimeViewProps) {
   const hostElement = useRef<HTMLDivElement>(null);
   const [viewerId, setViewerId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ViewerOpenFailure | null>(null);
   const [takingLong, setTakingLong] = useState(false);
   const [retryKey, setRetryKey] = useState(0);
 
@@ -33,6 +38,13 @@ export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRu
       try {
         const result = await window.lamarckHost?.openAppViewer(appId);
         if (!result) throw new Error("App Capsule Host is unavailable");
+        if (!result.ok) {
+          setError({
+            message: result.error.message,
+            restartRequired: result.error.restartRequired,
+          });
+          return;
+        }
         openedViewerId = result.viewerId;
         if (cancelled) {
           window.lamarckHost?.setAppViewerBounds(result.viewerId, zeroBounds());
@@ -47,7 +59,7 @@ export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRu
           retryTimer = window.setTimeout(() => void open(attempt + 1), attempt * 140);
           return;
         }
-        setError(message);
+        setError({ message, restartRequired: false });
       }
     }
 
@@ -106,8 +118,12 @@ export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRu
           <span className={styles.errorCode}>VIEWER / FAILED</span>
           <AppMark appId={appId} name={appName} size="large" muted />
           <h1>{appName} could not open.</h1>
-          <p>{error}</p>
-          <button type="button" onClick={() => setRetryKey((key) => key + 1)}>Retry App</button>
+          <p>{error.message}</p>
+          {error.restartRequired ? (
+            <p>Quit and reopen Lamarck before trying this App again.</p>
+          ) : (
+            <button type="button" onClick={() => setRetryKey((key) => key + 1)}>Retry App</button>
+          )}
         </div>
       ) : !viewerId ? (
         <div className={styles.launchPlate}>

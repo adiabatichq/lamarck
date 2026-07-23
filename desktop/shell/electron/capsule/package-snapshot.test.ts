@@ -31,8 +31,11 @@ import {
   readCapsuleTreeSelection,
   type CapsulePackageSnapshot,
 } from "./package-snapshot";
+import { CapsuleStorageBudget } from "./storage-budget";
 
 const temporaryRoots: string[] = [];
+const OWNER_A = "a".repeat(64);
+const OWNER_B = "b".repeat(64);
 
 afterEach(async () => {
   await Promise.allSettled(temporaryRoots.splice(0).map((path) => rm(path, {
@@ -284,6 +287,80 @@ describe("capsule-tree-v1 package snapshots", () => {
     expect(await readdir(cacheDir)).toEqual([`${snapshots[0]!.digest.slice("sha256:".length)}.tree`]);
   });
 
+  test("retains snapshot reservation and never claims success when winner cleanup fails", async () => {
+    const { packageDir, cacheDir } = await fixture();
+    await writeFile(join(packageDir, "index.js"), "console.log('cleanup');\n");
+    const budget = snapshotBudget(cacheDir);
+
+    await expect(createCapsulePackageSnapshot({
+      packageDir,
+      cacheDir,
+      ownerKey: OWNER_A,
+      storageBudget: budget,
+      snapshotWriter: {
+        removeTemporary: async () => {
+          throw new Error("injected snapshot unlink failure");
+        },
+      },
+    })).rejects.toThrow("injected snapshot unlink failure");
+
+    const accounting = await budget.snapshot();
+    expect(accounting.usedBytes).toBe(0);
+    expect(accounting.reservedBytes).toBeGreaterThan(0);
+    expect(accounting.reservations).toBe(1);
+    expect(accounting.ownerUsedBytes).toEqual({});
+    expect(accounting.ownerReservedBytes[OWNER_A]).toBe(accounting.reservedBytes);
+  });
+
+  test("keeps same-digest snapshot losers behind winner durability and fails them cleanly", async () => {
+    const { packageDir, cacheDir } = await fixture();
+    await writeFile(join(packageDir, "index.js"), "console.log('boundary');\n");
+    const budget = snapshotBudget(cacheDir);
+    let winnerPublished!: () => void;
+    const published = new Promise<void>((resolve) => {
+      winnerPublished = resolve;
+    });
+    let failWinner!: () => void;
+    const failureGate = new Promise<void>((resolve) => {
+      failWinner = resolve;
+    });
+    const writer = {
+      afterPublication: async (isWinner: boolean) => {
+        if (!isWinner) return;
+        winnerPublished();
+        await failureGate;
+        throw new Error("injected snapshot publication boundary failure");
+      },
+    };
+
+    const winner = createCapsulePackageSnapshot({
+      packageDir,
+      cacheDir,
+      ownerKey: OWNER_A,
+      storageBudget: budget,
+      snapshotWriter: writer,
+    });
+    await published;
+    const loser = createCapsulePackageSnapshot({
+      packageDir,
+      cacheDir,
+      ownerKey: OWNER_B,
+      storageBudget: budget,
+      snapshotWriter: writer,
+    });
+    failWinner();
+    const results = await Promise.allSettled([winner, loser]);
+
+    expect(results.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+    const accounting = await budget.snapshot();
+    expect(accounting.usedBytes).toBe(0);
+    expect(accounting.reservations).toBe(1);
+    expect(accounting.ownerUsedBytes).toEqual({});
+    expect(accounting.ownerReservedBytes[OWNER_A]).toBe(accounting.reservedBytes);
+    expect(accounting.ownerReservedBytes[OWNER_B]).toBeUndefined();
+    expect((await readdir(cacheDir)).filter((name) => name.endsWith(".tree"))).toHaveLength(1);
+  });
+
   test("fails closed and cleans up when a source file changes during serialization", async () => {
     const { packageDir, cacheDir } = await fixture();
     const source = join(packageDir, "large.bin");
@@ -440,6 +517,16 @@ async function fixture(): Promise<{ root: string; packageDir: string; cacheDir: 
   const cacheDir = join(root, "cache");
   await mkdir(packageDir);
   return { root, packageDir, cacheDir };
+}
+
+function snapshotBudget(cacheDir: string): CapsuleStorageBudget {
+  return new CapsuleStorageBudget({
+    roots: [cacheDir],
+    aggregateBytes: 1024 * 1024,
+    perAppBytes: 1024 * 1024,
+    filesystemReserveBytes: 0,
+    dependencies: { availableBytes: async () => 1024 * 1024 * 1024 },
+  });
 }
 
 function compareUtf8(left: string, right: string): number {

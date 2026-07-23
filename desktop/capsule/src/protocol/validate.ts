@@ -1,7 +1,19 @@
 import { MAX_CONTROL_FRAME_BYTES } from "./codec";
 import {
+  CAPSULE_ARTIFACT_OUTPUT_MAX_BYTES,
+  CAPSULE_ARTIFACT_OUTPUT_MIN_BYTES,
+  CAPSULE_BUILD_SCRATCH_MAX_BYTES,
+  CAPSULE_BUILD_SCRATCH_MIN_BYTES,
+  CAPSULE_RUNTIME_SCRATCH_MAX_BYTES,
+  CAPSULE_RUNTIME_SCRATCH_MIN_BYTES,
+  CAPSULE_STORAGE_PLAN_VERSION,
+  requireCapsuleBuildStoragePlan,
+  requireCapsuleRuntimeStoragePlan,
+} from "../storage-plan";
+import {
   CAPSULE_PROTOCOL_VERSION,
   type AppPrepareBody,
+  type ArtifactAdoptionReceipt,
   type AppStopBody,
   type BlobExportPrepareBody,
   type BlobImportPrepareBody,
@@ -139,6 +151,27 @@ export function parseDataStreamPrelude(value: unknown): DataStreamPrelude {
       ] as const,
       "$.kind",
     ),
+  };
+}
+
+export function parseArtifactAdoptionReceipt(value: unknown): ArtifactAdoptionReceipt {
+  const object = exactObject(value, "$", [
+    "type",
+    "protocolVersion",
+    "sessionId",
+    "ticket",
+    "digest",
+    "bytes",
+  ]);
+  literal(object.type, "artifact.adopted", "$.type");
+  protocolVersion(object.protocolVersion, "$.protocolVersion");
+  return {
+    type: "artifact.adopted",
+    protocolVersion: CAPSULE_PROTOCOL_VERSION,
+    sessionId: sessionId(object.sessionId, "$.sessionId"),
+    ticket: streamTicket(object.ticket, "$.ticket"),
+    digest: artifactDigest(object.digest, "$.digest"),
+    bytes: boundedInteger(object.bytes, "$.bytes", 1, 8 * 1024 * 1024 * 1024),
   };
 }
 
@@ -325,19 +358,33 @@ function parseAppPrepareBody(value: unknown): AppPrepareBody {
     "artifactBlobHandle",
     "mappedHostUid",
     "mappedHostGid",
-  ], ["scratchBytes"]);
-  const scratchBytes = object.scratchBytes === undefined
-    ? undefined
-    : boundedInteger(object.scratchBytes, "$.body.scratchBytes", 16 * 1024 * 1024, 16 * 1024 * 1024 * 1024);
+    "storagePlanVersion",
+    "scratchBytes",
+  ]);
+  storagePlanVersion(object.storagePlanVersion, "$.body.storagePlanVersion");
+  const artifactBytes = boundedInteger(
+    object.artifactBytes,
+    "$.body.artifactBytes",
+    1,
+    8 * 1024 * 1024 * 1024,
+  );
+  const scratchBytes = boundedInteger(
+    object.scratchBytes,
+    "$.body.scratchBytes",
+    CAPSULE_RUNTIME_SCRATCH_MIN_BYTES,
+    CAPSULE_RUNTIME_SCRATCH_MAX_BYTES,
+  );
+  requireRuntimeStoragePlan(artifactBytes, scratchBytes, "$.body.scratchBytes");
   return {
     ownerKey: appOwnerKey(object.ownerKey, "$.body.ownerKey"),
     appHandle: opaqueId(object.appHandle, "$.body.appHandle"),
     artifactDigest: artifactDigest(object.artifactDigest, "$.body.artifactDigest"),
-    artifactBytes: boundedInteger(object.artifactBytes, "$.body.artifactBytes", 1, 8 * 1024 * 1024 * 1024),
+    artifactBytes,
     artifactBlobHandle: opaqueId(object.artifactBlobHandle, "$.body.artifactBlobHandle"),
     mappedHostUid: validateMappedHostId(object.mappedHostUid, "$.body.mappedHostUid"),
     mappedHostGid: validateMappedHostId(object.mappedHostGid, "$.body.mappedHostGid"),
-    ...(scratchBytes === undefined ? {} : { scratchBytes }),
+    storagePlanVersion: CAPSULE_STORAGE_PLAN_VERSION,
+    scratchBytes,
   };
 }
 
@@ -426,6 +473,9 @@ function parseBuildPrepareBody(value: unknown): BuildPrepareBody {
     "installDigest",
     "mappedHostUid",
     "mappedHostGid",
+    "storagePlanVersion",
+    "scratchBytes",
+    "artifactOutputBytes",
     "timeoutMs",
     "resources",
   ], [
@@ -445,59 +495,104 @@ function parseBuildPrepareBody(value: unknown): BuildPrepareBody {
   if (object.dependencyDigest !== undefined && object.baseArtifactDigest !== undefined) {
     invalid("$.body.baseArtifactDigest", "cold dependency input and warm base are mutually exclusive");
   }
+  storagePlanVersion(object.storagePlanVersion, "$.body.storagePlanVersion");
+  const packageBytes = boundedInteger(
+    object.packageBytes,
+    "$.body.packageBytes",
+    1,
+    8 * 1024 * 1024 * 1024,
+  );
+  const dependency = object.dependencyDigest === undefined
+    && object.dependencyBytes === undefined
+    && object.dependencyBlobHandle === undefined
+    ? undefined
+    : object.dependencyDigest !== undefined
+      && object.dependencyBytes !== undefined
+      && object.dependencyBlobHandle !== undefined
+      ? {
+          dependencyDigest: artifactDigest(object.dependencyDigest, "$.body.dependencyDigest"),
+          dependencyBytes: boundedInteger(
+            object.dependencyBytes,
+            "$.body.dependencyBytes",
+            1,
+            8 * 1024 * 1024 * 1024,
+          ),
+          dependencyBlobHandle: opaqueId(
+            object.dependencyBlobHandle,
+            "$.body.dependencyBlobHandle",
+          ),
+        }
+      : invalid(
+          "$.body.dependencyBytes",
+          "dependency digest, bytes, and blob handle must appear together",
+        );
+  const base = object.baseArtifactDigest === undefined
+    && object.baseArtifactBytes === undefined
+    && object.baseArtifactBlobHandle === undefined
+    && object.baseDependencyDigest === undefined
+    ? undefined
+    : object.baseArtifactDigest !== undefined
+      && object.baseArtifactBytes !== undefined
+      && object.baseArtifactBlobHandle !== undefined
+      && object.baseDependencyDigest !== undefined
+      ? {
+          baseArtifactDigest: artifactDigest(
+            object.baseArtifactDigest,
+            "$.body.baseArtifactDigest",
+          ),
+          baseArtifactBytes: boundedInteger(
+            object.baseArtifactBytes,
+            "$.body.baseArtifactBytes",
+            1,
+            8 * 1024 * 1024 * 1024,
+          ),
+          baseArtifactBlobHandle: opaqueId(
+            object.baseArtifactBlobHandle,
+            "$.body.baseArtifactBlobHandle",
+          ),
+          baseDependencyDigest: artifactDigest(
+            object.baseDependencyDigest,
+            "$.body.baseDependencyDigest",
+          ),
+        }
+      : invalid(
+          "$.body.baseArtifactBytes",
+          "base artifact and dependency provenance must appear together",
+        );
+  const scratchBytes = boundedInteger(
+    object.scratchBytes,
+    "$.body.scratchBytes",
+    CAPSULE_BUILD_SCRATCH_MIN_BYTES,
+    CAPSULE_BUILD_SCRATCH_MAX_BYTES,
+  );
+  const artifactOutputBytes = boundedInteger(
+    object.artifactOutputBytes,
+    "$.body.artifactOutputBytes",
+    CAPSULE_ARTIFACT_OUTPUT_MIN_BYTES,
+    CAPSULE_ARTIFACT_OUTPUT_MAX_BYTES,
+  );
+  requireBuildStoragePlan({
+    mode: dependency === undefined ? "warm" : "cold",
+    packageBytes,
+    ...(dependency === undefined
+      ? { baseArtifactBytes: base?.baseArtifactBytes }
+      : { dependencyBytes: dependency.dependencyBytes }),
+  }, scratchBytes, artifactOutputBytes);
   return {
     ownerKey: appOwnerKey(object.ownerKey, "$.body.ownerKey"),
     appHandle: opaqueId(object.appHandle, "$.body.appHandle"),
     buildHandle: opaqueId(object.buildHandle, "$.body.buildHandle"),
     packageDigest: artifactDigest(object.packageDigest, "$.body.packageDigest"),
-    packageBytes: boundedInteger(object.packageBytes, "$.body.packageBytes", 1, 8 * 1024 * 1024 * 1024),
+    packageBytes,
     packageBlobHandle: opaqueId(object.packageBlobHandle, "$.body.packageBlobHandle"),
     installDigest: artifactDigest(object.installDigest, "$.body.installDigest"),
-    ...(object.dependencyDigest === undefined
-      && object.dependencyBytes === undefined
-      && object.dependencyBlobHandle === undefined
-      ? {}
-      : object.dependencyDigest !== undefined
-        && object.dependencyBytes !== undefined
-        && object.dependencyBlobHandle !== undefined
-        ? {
-            dependencyDigest: artifactDigest(object.dependencyDigest, "$.body.dependencyDigest"),
-            dependencyBytes: boundedInteger(object.dependencyBytes, "$.body.dependencyBytes", 1, 8 * 1024 * 1024 * 1024),
-            dependencyBlobHandle: opaqueId(object.dependencyBlobHandle, "$.body.dependencyBlobHandle"),
-          }
-        : invalid("$.body.dependencyBytes", "dependency digest, bytes, and blob handle must appear together")),
-    ...(object.baseArtifactDigest === undefined
-      && object.baseArtifactBytes === undefined
-      && object.baseArtifactBlobHandle === undefined
-      && object.baseDependencyDigest === undefined
-      ? {}
-      : object.baseArtifactDigest !== undefined
-        && object.baseArtifactBytes !== undefined
-        && object.baseArtifactBlobHandle !== undefined
-        && object.baseDependencyDigest !== undefined
-        ? {
-            baseArtifactDigest: artifactDigest(object.baseArtifactDigest, "$.body.baseArtifactDigest"),
-            baseArtifactBytes: boundedInteger(
-              object.baseArtifactBytes,
-              "$.body.baseArtifactBytes",
-              1,
-              8 * 1024 * 1024 * 1024,
-            ),
-            baseArtifactBlobHandle: opaqueId(
-              object.baseArtifactBlobHandle,
-              "$.body.baseArtifactBlobHandle",
-            ),
-            baseDependencyDigest: artifactDigest(
-              object.baseDependencyDigest,
-              "$.body.baseDependencyDigest",
-            ),
-          }
-        : invalid(
-            "$.body.baseArtifactBytes",
-            "base artifact and dependency provenance must appear together",
-          )),
+    ...(dependency === undefined ? {} : dependency),
+    ...(base === undefined ? {} : base),
     mappedHostUid: validateMappedHostId(object.mappedHostUid, "$.body.mappedHostUid"),
     mappedHostGid: validateMappedHostId(object.mappedHostGid, "$.body.mappedHostGid"),
+    storagePlanVersion: CAPSULE_STORAGE_PLAN_VERSION,
+    scratchBytes,
+    artifactOutputBytes,
     timeoutMs: boundedInteger(object.timeoutMs, "$.body.timeoutMs", 1_000, 10 * 60_000),
     resources: {
       memoryBytes: boundedInteger(resources.memoryBytes, "$.body.resources.memoryBytes", 64 * 1024 * 1024, 8 * 1024 * 1024 * 1024),
@@ -505,6 +600,55 @@ function parseBuildPrepareBody(value: unknown): BuildPrepareBody {
       cpuQuotaMicros: boundedInteger(resources.cpuQuotaMicros, "$.body.resources.cpuQuotaMicros", 1_000, 6_400_000),
     },
   };
+}
+
+function requireBuildStoragePlan(
+  raw: {
+    mode: "cold" | "warm";
+    packageBytes: number;
+    dependencyBytes?: number;
+    baseArtifactBytes?: number;
+  },
+  scratchBytes: number,
+  artifactOutputBytes: number,
+): void {
+  try {
+    if (raw.mode === "cold" && raw.dependencyBytes !== undefined) {
+      requireCapsuleBuildStoragePlan(
+        { mode: "cold", packageBytes: raw.packageBytes, dependencyBytes: raw.dependencyBytes },
+        { version: CAPSULE_STORAGE_PLAN_VERSION, scratchBytes, artifactOutputBytes },
+      );
+      return;
+    }
+    if (raw.mode === "warm" && raw.baseArtifactBytes !== undefined) {
+      requireCapsuleBuildStoragePlan(
+        { mode: "warm", packageBytes: raw.packageBytes, baseArtifactBytes: raw.baseArtifactBytes },
+        { version: CAPSULE_STORAGE_PLAN_VERSION, scratchBytes, artifactOutputBytes },
+      );
+      return;
+    }
+    invalid("$.body", "Build requires exactly one dependency or warm base input");
+  } catch (error) {
+    invalid(
+      "$.body.scratchBytes",
+      error instanceof Error ? error.message : "invalid Build storage plan",
+    );
+  }
+}
+
+function requireRuntimeStoragePlan(
+  artifactBytes: number,
+  scratchBytes: number,
+  path: string,
+): void {
+  try {
+    requireCapsuleRuntimeStoragePlan(artifactBytes, {
+      version: CAPSULE_STORAGE_PLAN_VERSION,
+      scratchBytes,
+    });
+  } catch (error) {
+    invalid(path, error instanceof Error ? error.message : "invalid Runtime storage plan");
+  }
 }
 
 function parseBuildStartBody(value: unknown): BuildStartBody {
@@ -615,6 +759,19 @@ function protocolVersion(value: unknown, path: string): asserts value is typeof 
       "PROTOCOL_UNSUPPORTED_VERSION",
       path,
       `expected protocol version ${CAPSULE_PROTOCOL_VERSION}`,
+    );
+  }
+}
+
+function storagePlanVersion(
+  value: unknown,
+  path: string,
+): asserts value is typeof CAPSULE_STORAGE_PLAN_VERSION {
+  if (value !== CAPSULE_STORAGE_PLAN_VERSION) {
+    throw new ProtocolValidationError(
+      "PROTOCOL_UNSUPPORTED_VERSION",
+      path,
+      `expected storage plan version ${CAPSULE_STORAGE_PLAN_VERSION}`,
     );
   }
 }

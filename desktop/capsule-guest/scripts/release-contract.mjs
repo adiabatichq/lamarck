@@ -14,11 +14,13 @@ export const RELEASE_DESCRIPTOR_FILE = "capsule-guest-release.json";
 export const ARCHITECTURE = "arm64";
 export const BUNDLE_NAME = `capsule-guest-${ARCHITECTURE}`;
 export const EXPECTED_FEATURES = Object.freeze([
+  "artifact-adoption-receipt-v1",
   "artifact-erofs-v1",
   "build-v1",
   "oci-policy-v1",
   "sdk-uds-v1",
   "tickets-v1",
+  "vsock-record-v2",
   "warm-rebuild-v1",
 ]);
 
@@ -255,7 +257,7 @@ function exactReleaseDescriptor(value) {
     "features", "runtimeAbi", "nodeVersion", "nodeModulesAbi", "libc", "cpuCount",
     "memorySizeBytes", "stateFormatVersion",
   ]);
-  if (object.schemaVersion !== 1 || object.vmWireVersion !== 1 || object.guestProtocolVersion !== 1) {
+  if (object.schemaVersion !== 1 || object.vmWireVersion !== 2 || object.guestProtocolVersion !== 2) {
     throw new Error("unsupported Guest release descriptor version");
   }
   if (object.architecture !== ARCHITECTURE || object.bundleRelativePath !== BUNDLE_NAME) {

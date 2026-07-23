@@ -1,7 +1,7 @@
 import { mkdir, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BuildPrepareBody } from "@lamarck/capsule";
+import { createCapsuleBuildStoragePlan, type BuildPrepareBody } from "@lamarck/capsule";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { GuestBlobStore } from "../src/blob-store";
 import {
@@ -200,9 +200,22 @@ describe("Guest Build lifecycle authority", () => {
 });
 
 describe("Guest Build parser and iterator bounds", () => {
+  test("recomputes the storage plan before observing Guest blobs", async () => {
+    const has = vi.fn(async () => true);
+    const manager = new GuestBuildManager(
+      { has } as unknown as GuestBlobStore,
+      { imageDigest: IMAGE },
+    );
+    const body = buildBody(buildHandle(29_999));
+    body.scratchBytes += 64 * 1024 * 1024;
+    expect(() => manager.prepare(body)).toThrow(/storage plan does not match/);
+    expect(has).not.toHaveBeenCalled();
+  });
+
   test("charges the fixed supervisor-memory floor even for a small cgroup request", () => {
     const body = buildBody(buildHandle(30_000));
     body.resources.memoryBytes = 64 * 1024 * 1024;
+    expect(buildAdmissionRequest(body).diskBytes).toBe(body.scratchBytes);
     expect(buildAdmissionRequest(body).memoryBytes).toBe(BUILD_MEMORY_ADMISSION_FLOOR_BYTES);
     body.resources.memoryBytes = BUILD_MEMORY_ADMISSION_FLOOR_BYTES * 2;
     expect(buildAdmissionRequest(body).memoryBytes).toBe(BUILD_MEMORY_ADMISSION_FLOOR_BYTES * 2);
@@ -301,6 +314,11 @@ function internals(manager: GuestBuildManager) {
 }
 
 function buildBody(buildHandleValue: string): BuildPrepareBody {
+  const storage = createCapsuleBuildStoragePlan({
+    mode: "cold",
+    packageBytes: 1,
+    dependencyBytes: 1,
+  });
   return {
     ownerKey: "a".repeat(64),
     appHandle: APP,
@@ -309,8 +327,14 @@ function buildBody(buildHandleValue: string): BuildPrepareBody {
     packageBytes: 1,
     packageBlobHandle: "L".repeat(22),
     installDigest: INSTALL,
+    dependencyDigest: `sha256:${"e".repeat(64)}`,
+    dependencyBytes: 1,
+    dependencyBlobHandle: "C".repeat(22),
     mappedHostUid: 100_000,
     mappedHostGid: 200_000,
+    storagePlanVersion: storage.version,
+    scratchBytes: storage.scratchBytes,
+    artifactOutputBytes: storage.artifactOutputBytes,
     timeoutMs: 60_000,
     resources: {
       memoryBytes: 512 * 1024 * 1024,

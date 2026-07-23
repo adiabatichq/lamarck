@@ -45,28 +45,19 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
         switch frame.kind {
         case .request:
             try acceptRequest(frame)
-        case .streamData, .streamEnd:
+        case .streamData, .streamWindowUpdate, .streamFin, .streamReset, .streamResetAck:
             guard CapsuleVmProtocol.isHelperStreamID(frame.streamID) else {
                 throw CapsuleVmProtocolError(
                     code: "invalid_stream_id",
                     message: "Host stream frame did not use a helper-originated stream ID"
                 )
             }
-            if frame.kind == .streamData,
-               frame.payload.count > CapsuleVmProtocol.streamChunkByteCount {
-                throw CapsuleVmStreamMuxError.chunkTooLarge(frame.payload.count)
-            }
-            if frame.kind == .streamEnd, frame.payload.count > 4 * 1_024 {
-                throw CapsuleVmProtocolError(
-                    code: "invalid_stream_end",
-                    message: "Host stream end payload exceeds its bounded limit"
-                )
-            }
+            try CapsuleVmFrameCodec.validate(frame)
             try session.acceptHostStreamFrame(frame)
         case .response, .event:
             throw CapsuleVmProtocolError(
                 code: "unexpected_frame_kind",
-                message: "Host may send request, streamData, or streamEnd frames only"
+                message: "Host may send request or LCVM v2 stream frames only"
             )
         }
     }
@@ -133,6 +124,55 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
                                 "imageDigest": guest.imageDigest,
                                 "architecture": guest.architecture == .arm64 ? "arm64" : "x86_64",
                             ]
+                        )
+                    case .failure(let error):
+                        self.respondFailure(streamID: frame.streamID, error: error)
+                    }
+                }
+
+            case "prepareState":
+                guard let params = request.params else {
+                    throw CapsuleVmCommandError(
+                        code: "state_preparation_required",
+                        message: "Preparing the Capsule VM state disk requires an exact descriptor"
+                    )
+                }
+                let descriptor = try parseStatePreparationDescriptor(params)
+                session.prepareState(descriptor: descriptor) { [weak self] result in
+                    guard let self else { return }
+                    switch result {
+                    case .success(let prepared):
+                        self.respondSuccess(
+                            streamID: frame.streamID,
+                            result: [
+                                "preparationId": prepared.preparationID,
+                                "stateDiskBytes": prepared.requirements.stateDiskBytes,
+                                "existingPhysicalBytes": prepared.requirements.existingPhysicalBytes,
+                                "additionalPhysicalBytes": prepared.requirements.additionalPhysicalBytes,
+                                "peakPhysicalBytes": prepared.requirements.peakPhysicalBytes,
+                            ]
+                        )
+                    case .failure(let error):
+                        self.respondFailure(streamID: frame.streamID, error: error)
+                    }
+                }
+
+            case "cancelStatePreparation":
+                guard let params = request.params,
+                      Set(params.keys) == ["preparationId"],
+                      let id = canonicalPreparationID(params["preparationId"]) else {
+                    throw CapsuleVmCommandError(
+                        code: "state_preparation_required",
+                        message: "Cancelling state preparation requires its canonical opaque ID"
+                    )
+                }
+                session.cancelStatePreparation(id: id) { [weak self] result in
+                    guard let self else { return }
+                    switch result {
+                    case .success:
+                        self.respondSuccess(
+                            streamID: frame.streamID,
+                            result: ["state": "cancelled"]
                         )
                     case .failure(let error):
                         self.respondFailure(streamID: frame.streamID, error: error)
@@ -254,7 +294,7 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
     private func parseStartDescriptor(_ params: [String: Any]) throws -> CapsuleVmStartDescriptor {
         let expectedKeys: Set<String> = [
             "imageBundlePath",
-            "stateDirectory",
+            "statePreparationId",
             "expectedManifestDigest",
             "manifestPublicKey",
             "cpuCount",
@@ -267,10 +307,10 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
             )
         }
         guard let imagePath = absolutePath(params["imageBundlePath"]),
-              let statePath = absolutePath(params["stateDirectory"]) else {
+              let statePreparationID = canonicalPreparationID(params["statePreparationId"]) else {
             throw CapsuleVmCommandError(
                 code: "guest_image_required",
-                message: "Guest image and state paths must be absolute"
+                message: "Guest image path and state preparation ID are required"
             )
         }
         guard let digest = params["expectedManifestDigest"] as? String,
@@ -304,9 +344,29 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
                 expectedArchitecture: .currentHost,
                 pinnedPublicKey: publicKey
             ),
-            stateDirectoryURL: URL(fileURLWithPath: statePath, isDirectory: true),
+            statePreparationID: statePreparationID,
             cpuCount: cpuCount,
             memorySize: memorySize
+        )
+    }
+
+    private func parseStatePreparationDescriptor(
+        _ params: [String: Any]
+    ) throws -> CapsuleVmStatePreparationDescriptor {
+        guard Set(params.keys) == ["stateDirectory", "stateDiskBytes"],
+              let statePath = absolutePath(params["stateDirectory"]),
+              let stateDiskBytes = exactUInt64(params["stateDiskBytes"]),
+              stateDiskBytes >= CapsuleVmStateDiskManager.minimumSize,
+              stateDiskBytes <= CapsuleVmStateDiskManager.maximumSize,
+              stateDiskBytes.isMultiple(of: CapsuleVmStateDiskManager.sizeAlignment) else {
+            throw CapsuleVmCommandError(
+                code: "state_preparation_required",
+                message: "State preparation requires an absolute path and bounded aligned size"
+            )
+        }
+        return CapsuleVmStatePreparationDescriptor(
+            stateDirectoryURL: URL(fileURLWithPath: statePath, isDirectory: true),
+            stateDiskBytes: stateDiskBytes
         )
     }
 
@@ -342,6 +402,8 @@ private func mapError(_ error: Error) -> CapsuleVmCommandError {
             code = "virtualization_unavailable"
         case .startCancelled:
             code = "start_cancelled"
+        case .statePreparationUnavailable:
+            code = "state_preparation_unavailable"
         default:
             code = "invalid_vm_state"
         }
@@ -359,6 +421,14 @@ private func absolutePath(_ value: Any?) -> String? {
           !path.contains("\0"),
           path.utf8.count <= 4 * 1_024 else { return nil }
     return path
+}
+
+private func canonicalPreparationID(_ value: Any?) -> String? {
+    guard let value = value as? String,
+          value.utf8.count == 36,
+          let uuid = UUID(uuidString: value),
+          uuid.uuidString.lowercased() == value else { return nil }
+    return value
 }
 
 private func isLowercaseSHA256(_ value: String) -> Bool {

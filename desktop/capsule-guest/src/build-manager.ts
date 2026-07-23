@@ -25,6 +25,7 @@ import {
   MAX_INSTALL_NPMRC_BYTES,
   MAX_INSTALL_PACKAGE_JSON_BYTES,
   MAX_INSTALL_PACKAGE_LOCK_BYTES,
+  requireCapsuleBuildStoragePlan,
   validateArtifactDigest,
   validateOpaqueId,
   type BuildOciPlanInput,
@@ -58,7 +59,6 @@ import {
 } from "./dependency-bundle";
 import type { ArtifactMountLease, ArtifactMountRegistry } from "./resource-manager";
 
-const BUILD_DISK_BYTES = 8 * 1024 * 1024 * 1024;
 const SYSTEM_PROTOCOL_VERSION = 1;
 export const BUILD_MEMORY_ADMISSION_FLOOR_BYTES = 2 * 1024 * 1024 * 1024;
 /** Build identities are never recycled inside one verified Guest boot. */
@@ -194,6 +194,7 @@ export class GuestBuildManager {
 
   prepare(body: BuildPrepareBody): Promise<void> {
     this.assertAcceptingBuilds();
+    requireBuildStoragePlan(body);
     const buildHandle = validateOpaqueId(body.buildHandle, "buildHandle");
     const appHandle = validateOpaqueId(body.appHandle, "appHandle");
     validateArtifactDigest(body.packageDigest, "packageDigest");
@@ -355,7 +356,7 @@ export class GuestBuildManager {
       await this.volumeOperations.create({
         imagePath: volumeImage,
         mountPath: root,
-        bytes: BUILD_DISK_BYTES,
+        bytes: record.body.scratchBytes,
         label: `LBUILD${buildKey.slice(2, 9).toUpperCase()}`,
         signal: controller.signal,
       });
@@ -530,9 +531,23 @@ export class GuestBuildManager {
         warmRequested ? { readonlyNodeModules: true } : undefined,
       );
       throwIfAborted(controller.signal);
+      const sealedDetails = await lstat(output);
+      if (
+        !sealedDetails.isFile()
+        || sealedDetails.isSymbolicLink()
+        || sealedDetails.size < 1
+      ) {
+        throw new Error("Build sealer did not emit a regular artifact");
+      }
+      if (sealedDetails.size > record.body.artifactOutputBytes) {
+        throw new Error(
+          `sealed artifact ${sealedDetails.size} bytes exceeds the ${record.body.artifactOutputBytes} byte Build output ceiling`,
+        );
+      }
       const imported = await this.blobs.importLocalFile("artifact", output, {
         ownerKey: record.body.ownerKey,
         referenceId: `build:${buildHandle}:output`,
+        maximumBytes: record.body.artifactOutputBytes,
         signal: controller.signal,
       });
       throwIfAborted(controller.signal);
@@ -809,8 +824,9 @@ export function buildAdmissionRequest(body: BuildPrepareBody): {
   diskBytes: number;
   memoryBytes: number;
 } {
+  const storage = requireBuildStoragePlan(body);
   return {
-    diskBytes: BUILD_DISK_BYTES,
+    diskBytes: storage.scratchBytes,
     // Metadata validation and sealing execute in the trusted supervisor,
     // outside the Build cgroup. Charge the production 2 GiB floor even if a
     // malformed Host request asks for a smaller container limit.
@@ -819,6 +835,29 @@ export function buildAdmissionRequest(body: BuildPrepareBody): {
       BUILD_MEMORY_ADMISSION_FLOOR_BYTES,
     ),
   };
+}
+
+function requireBuildStoragePlan(body: BuildPrepareBody) {
+  const supplied = {
+    version: body.storagePlanVersion,
+    scratchBytes: body.scratchBytes,
+    artifactOutputBytes: body.artifactOutputBytes,
+  };
+  if (body.dependencyBytes !== undefined && body.baseArtifactBytes === undefined) {
+    return requireCapsuleBuildStoragePlan({
+      mode: "cold",
+      packageBytes: body.packageBytes,
+      dependencyBytes: body.dependencyBytes,
+    }, supplied);
+  }
+  if (body.baseArtifactBytes !== undefined && body.dependencyBytes === undefined) {
+    return requireCapsuleBuildStoragePlan({
+      mode: "warm",
+      packageBytes: body.packageBytes,
+      baseArtifactBytes: body.baseArtifactBytes,
+    }, supplied);
+  }
+  throw new Error("Build requires exactly one authenticated dependency or warm base input");
 }
 
 async function removeBuildCgroupTree(path: string): Promise<void> {

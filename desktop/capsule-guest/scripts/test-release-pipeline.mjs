@@ -27,6 +27,7 @@ import {
 } from "./build-snapshot.mjs";
 import { readDockerImageId } from "./docker-image-id.mjs";
 import { publishGuestReleaseNoReplace } from "./publish-guest-release.mjs";
+import { verifyGuestNodeClosure } from "./verify-guest-node-closure.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const scripts = join(repo, "desktop", "capsule-guest", "scripts");
@@ -171,6 +172,12 @@ try {
   );
   const javascriptBuild = await readFile(join(scripts, "build-js-inside.sh"), "utf8");
   assert(
+    javascriptBuild.includes("verify-guest-node-closure.mjs")
+      && javascriptBuild.indexOf("verify-guest-node-closure.mjs")
+        < javascriptBuild.indexOf("npm ci"),
+    "Guest JavaScript build does not verify its selected Node closure before npm ci",
+  );
+  assert(
     !javascriptBuild.includes("@lamarck/system")
       && !javascriptBuild.includes("system-sdk"),
     "Guest JavaScript build still compiles or exports the App System SDK",
@@ -180,6 +187,35 @@ try {
       && !BUILD_SNAPSHOT_DIRECTORIES.some((path) => path.startsWith("desktop/system-sdk/")),
     "Guest build snapshot still includes App System SDK source",
   );
+  assert(
+    JSON.stringify(await verifyGuestNodeClosure(repo, { runtimeVersion: "24.10.0" }))
+      === JSON.stringify(["desktop/capsule", "desktop/capsule-guest"]),
+    "current Guest workspace closure is not exact",
+  );
+  const nodeClosureFixture = join(root, "guest-node-closure");
+  await createGuestNodeClosureFixture(nodeClosureFixture);
+  assert(
+    JSON.stringify(await verifyGuestNodeClosure(
+      nodeClosureFixture,
+      { runtimeVersion: "24.10.0" },
+    )) === JSON.stringify(["desktop/capsule", "desktop/capsule-guest"]),
+    "valid Guest Node closure fixture was rejected",
+  );
+  const capsuleManifestPath = join(nodeClosureFixture, "desktop/capsule/package.json");
+  const capsuleManifest = JSON.parse(await readFile(capsuleManifestPath, "utf8"));
+  capsuleManifest.engines.node = ">=24.12.0";
+  await writeFile(capsuleManifestPath, `${JSON.stringify(capsuleManifest)}\n`);
+  await expectReject(
+    verifyGuestNodeClosure(nodeClosureFixture, { runtimeVersion: "24.10.0" }),
+    /does not accept pinned Node/,
+  );
+  capsuleManifest.engines.node = ">=24.10.0";
+  await writeFile(capsuleManifestPath, `${JSON.stringify(capsuleManifest)}\n`);
+  const coreManifestPath = join(nodeClosureFixture, "desktop/core/package.json");
+  const coreManifest = JSON.parse(await readFile(coreManifestPath, "utf8"));
+  coreManifest.engines.node = ">=99.0.0";
+  await writeFile(coreManifestPath, `${JSON.stringify(coreManifest)}\n`);
+  await verifyGuestNodeClosure(nodeClosureFixture, { runtimeVersion: "24.10.0" });
   const postBuild = await readFile(join(
     repo,
     "desktop/capsule-guest/buildroot/board/lamarck/arm64/post-build.sh",
@@ -541,6 +577,47 @@ async function createProjectFixture(root) {
     const destination = join(root, path, "fixture.txt");
     await mkdir(dirname(destination), { recursive: true });
     await writeFile(destination, `${path}\n`);
+  }
+}
+
+async function createGuestNodeClosureFixture(root) {
+  const packages = {
+    "desktop/capsule": {
+      name: "@lamarck/capsule",
+      version: "0.1.0",
+      engines: { node: ">=24.10.0" },
+    },
+    "desktop/capsule-guest": {
+      name: "@lamarck/capsule-guest",
+      version: "0.1.0",
+      engines: { node: ">=24.10.0" },
+      dependencies: { "@lamarck/capsule": "0.1.0" },
+    },
+    "desktop/core": {
+      name: "@lamarck/core",
+      version: "0.1.0",
+      engines: { node: ">=24.12.0" },
+    },
+  };
+  await mkdir(root, { recursive: true });
+  await writeFile(join(root, "package.json"), `${JSON.stringify({
+    name: "fixture",
+    version: "0.1.0",
+    workspaces: Object.keys(packages),
+  })}\n`);
+  await writeFile(join(root, "package-lock.json"), `${JSON.stringify({
+    name: "fixture",
+    version: "0.1.0",
+    lockfileVersion: 3,
+    packages: {
+      "": { name: "fixture", version: "0.1.0" },
+      ...packages,
+    },
+  })}\n`);
+  for (const [workspace, manifest] of Object.entries(packages)) {
+    const path = join(root, workspace, "package.json");
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `${JSON.stringify(manifest)}\n`);
   }
 }
 

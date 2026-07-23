@@ -1,4 +1,8 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  APP_MANIFEST_DIGEST_PATTERN,
+  type AppManifestDigest,
+} from "../../capsule/src/app-manifest-authority";
 
 export const APP_CAPABILITY_HEADER = "x-lamarck-app-capability";
 
@@ -11,6 +15,7 @@ export type HostAuthContext = Readonly<{ kind: "host" }>;
 
 export type AppAuthorizationSnapshot = Readonly<{
   manifestGeneration: number;
+  manifestDigest: AppManifestDigest;
   writeTables: readonly string[];
   docGrants: readonly string[];
 }>;
@@ -32,6 +37,8 @@ export interface AuthSecrets {
 export type IssuedAppCapability = Readonly<{
   capability: string;
   channelId: string;
+  manifestGeneration: number;
+  manifestDigest: AppManifestDigest;
 }>;
 
 interface StoredChannel {
@@ -123,7 +130,12 @@ export class AppCapabilityRegistry {
     this.#channelsByDigest.set(digest, channel);
     this.#channelsById.set(channelId, channel);
 
-    return Object.freeze({ capability, channelId });
+    return Object.freeze({
+      capability,
+      channelId,
+      manifestGeneration: frozenAuthorization.manifestGeneration,
+      manifestDigest: frozenAuthorization.manifestDigest,
+    });
   }
 
   admit(capability: string): AuthAdmission | null {
@@ -280,6 +292,9 @@ function freezeAuthorizationSnapshot(
   ) {
     throw new Error("manifestGeneration must be a positive safe integer");
   }
+  if (!APP_MANIFEST_DIGEST_PATTERN.test(authorization.manifestDigest)) {
+    throw new Error("manifestDigest must be a canonical sha256 digest");
+  }
   if (
     !Array.isArray(authorization.writeTables)
     || authorization.writeTables.some((table) => typeof table !== "string")
@@ -290,6 +305,7 @@ function freezeAuthorizationSnapshot(
   }
   return Object.freeze({
     manifestGeneration: authorization.manifestGeneration,
+    manifestDigest: authorization.manifestDigest,
     writeTables: Object.freeze([...authorization.writeTables]),
     docGrants: Object.freeze([...authorization.docGrants]),
   });

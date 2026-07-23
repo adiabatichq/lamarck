@@ -23,6 +23,7 @@ let testRoot = "";
 let workspace = "";
 let coreEntry = "";
 let guardEntry = "";
+let manifestFaultControl = "";
 let coreOrigin = "";
 let coreProcess: ChildProcess | undefined;
 let guardProcess: ChildProcess | undefined;
@@ -35,6 +36,7 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     workspace = join(testRoot, "workspace");
     coreEntry = fileURLToPath(new URL("../dist/core.mjs", import.meta.url));
     guardEntry = fileURLToPath(new URL("../dist/guard-service.cjs", import.meta.url));
+    manifestFaultControl = join(testRoot, "manifest-read-fault");
     await Promise.all([
       mkdir(join(workspace, ".lamarck"), { recursive: true }),
       writeAppManifest("app-a", ["app_a_items"]),
@@ -55,12 +57,23 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
 
     const corePort = await reservePort();
     coreOrigin = `http://127.0.0.1:${corePort}`;
-    coreProcess = spawn(process.execPath, [coreEntry, workspace], {
+    const manifestFaultPreload = fileURLToPath(new URL(
+      "../test-node/manifest-read-fault-preload.mjs",
+      import.meta.url,
+    ));
+    coreProcess = spawn(process.execPath, ["--import", manifestFaultPreload, coreEntry, workspace], {
       env: {
         ...process.env,
         LAMARCK_CORE_TOKEN: CORE_TOKEN,
         LAMARCK_GUARD_ORIGIN: `http://127.0.0.1:${guardPort}`,
         LAMARCK_GUARD_TOKEN: GUARD_TOKEN,
+        LAMARCK_TEST_MANIFEST_READ_FAULT_CONTROL: manifestFaultControl,
+        LAMARCK_TEST_MANIFEST_READ_FAULT_TARGET: join(
+          workspace,
+          "apps",
+          "app-a",
+          "manifest.json",
+        ),
         HOST: "127.0.0.1",
         PORT: String(corePort),
       },
@@ -181,6 +194,80 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
       broker.unbindAll();
     }
   }, 30_000);
+
+  test.each(["EIO", "EACCES"] as const)(
+    "preserves the prior registry generation and capability when manifest refresh fails with %s",
+    async (code) => {
+      const existing = await issueCapability("app-a");
+      const authority = {
+        manifestGeneration: existing.manifestGeneration,
+        manifestDigest: existing.manifestDigest,
+      };
+
+      try {
+        await writeFile(manifestFaultControl, code, "utf8");
+        const failedRefresh = await fetch(`${coreOrigin}/api/apps`, {
+          headers: { Authorization: `Bearer ${CORE_TOKEN}` },
+        });
+        expect(failedRefresh.status).toBe(500);
+        await expect(failedRefresh.json()).resolves.toEqual({
+          error: `injected manifest ${code}`,
+        });
+
+        // The failed candidate scan must not retire the generation that was
+        // already published or revoke capabilities issued from it.
+        expect((await appQuery(existing.capability, "SELECT 1 AS ok")).status).toBe(200);
+        await expect(appAuthority("app-a")).resolves.toEqual(authority);
+        await expect(issueCapability("app-a")).resolves.toMatchObject(authority);
+      } finally {
+        await rm(manifestFaultControl, { force: true });
+      }
+    },
+  );
+
+  test("discovers a directly-created App without revoking unchanged capabilities", async () => {
+    const existing = await issueCapability("app-a");
+
+    // An unchanged Shell poll must not retire the currently issued manifest
+    // generation.
+    await hostRequest("/api/apps");
+    const beforeChange = await appQuery(existing.capability, "SELECT 1 AS ok");
+    expect(beforeChange.status).toBe(200);
+
+    await writeAppManifest("app-c", []);
+    const refreshed = await hostRequest("/api/apps") as { apps: Array<{ id: string }> };
+    expect(refreshed.apps.map(({ id }) => id)).toContain("app-c");
+
+    // Publishing a changed registry retires the old authority snapshot.
+    const afterChange = await appQuery(existing.capability, "SELECT 1 AS ok");
+    expect(afterChange.status).toBe(401);
+    await expect(issueCapability("app-c")).resolves.toMatchObject({
+      capability: expect.any(String),
+      channelId: expect.any(String),
+    });
+  });
+
+  test("rejects stale authority when manifest changes between discovery and issuance", async () => {
+    const stale = await appAuthority("app-a");
+    await writeAppManifest("app-a", ["app_a_items", "app_b_items"]);
+
+    const response = await fetch(`${coreOrigin}/api/app-runtime/channels`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${CORE_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ appId: "app-a", workload: "ui", ...stale }),
+    });
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: "App manifest authority changed; refresh and retry",
+    });
+    const current = await appAuthority("app-a");
+    expect(current.manifestDigest).not.toBe(stale.manifestDigest);
+    await expect(issueCapability("app-a")).resolves.toMatchObject(current);
+  });
 });
 
 async function writeAppManifest(appId: string, tables: string[]): Promise<void> {
@@ -219,12 +306,50 @@ function seedDataDatabase(): void {
 async function issueCapability(appId: string): Promise<{
   capability: string;
   channelId: string;
+  manifestGeneration: number;
+  manifestDigest: string;
 }> {
+  const authority = await appAuthority(appId);
   return await hostRequest("/api/app-runtime/channels", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ appId, workload: "ui" }),
-  }) as { capability: string; channelId: string };
+    body: JSON.stringify({ appId, workload: "ui", ...authority }),
+  }) as {
+    capability: string;
+    channelId: string;
+    manifestGeneration: number;
+    manifestDigest: string;
+  };
+}
+
+async function appAuthority(appId: string): Promise<{
+  manifestGeneration: number;
+  manifestDigest: string;
+}> {
+  const body = await hostRequest("/api/apps") as {
+    apps: Array<{
+      id: string;
+      manifestGeneration: number;
+      manifestDigest: string;
+    }>;
+  };
+  const app = body.apps.find((candidate) => candidate.id === appId);
+  if (!app) throw new Error(`App not found: ${appId}`);
+  return {
+    manifestGeneration: app.manifestGeneration,
+    manifestDigest: app.manifestDigest,
+  };
+}
+
+async function appQuery(capability: string, sql: string): Promise<Response> {
+  return await fetch(`${coreOrigin}/api/query`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-lamarck-app-capability": capability,
+    },
+    body: JSON.stringify({ sql, params: [] }),
+  });
 }
 
 async function hostRequest(path: string, init: RequestInit = {}): Promise<unknown> {

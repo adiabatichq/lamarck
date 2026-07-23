@@ -6,12 +6,15 @@ import {
   CAPSULE_VM_HELPER_STREAM_ID_MIN,
   CAPSULE_VM_MAX_PAYLOAD_BYTES,
   CAPSULE_VM_REQUEST_STREAM_ID_MAX,
+  CAPSULE_VM_STREAM_WINDOW_BYTES,
   CapsuleVmFrameDecoder,
   CapsuleVmFrameKind,
   CapsuleVmProtocolError,
   decodeCapsuleVmEvent,
+  decodeCapsuleVmWindowUpdate,
   encodeCapsuleVmFrame,
   encodeCapsuleVmJson,
+  encodeCapsuleVmWindowUpdate,
   isHelperStreamId,
   isRequestStreamId,
 } from "./protocol";
@@ -24,7 +27,7 @@ describe("Capsule VM framed protocol", () => {
       payload: encodeCapsuleVmJson({ method: "probe" }),
     });
     const second = encodeCapsuleVmFrame({
-      kind: CapsuleVmFrameKind.StreamEnd,
+      kind: CapsuleVmFrameKind.Fin,
       streamId: 2,
       payload: new Uint8Array(),
     });
@@ -39,7 +42,7 @@ describe("Capsule VM framed protocol", () => {
     expect(frames).toHaveLength(2);
     expect(frames[0].streamId).toBe(1);
     expect(frames[1]).toEqual({
-      kind: CapsuleVmFrameKind.StreamEnd,
+      kind: CapsuleVmFrameKind.Fin,
       streamId: 2,
       payload: new Uint8Array(),
     });
@@ -54,7 +57,32 @@ describe("Capsule VM framed protocol", () => {
     });
 
     expect(Buffer.from(encoded).toString("hex")).toBe(
-      "4c43564d000100010000002a000000027b7d",
+      "4c43564d000200010000002a000000027b7d",
+    );
+  });
+
+  test("fixes all v2 frame kinds across languages", () => {
+    expect(CapsuleVmFrameKind).toMatchObject({
+      Request: 1,
+      Response: 2,
+      Event: 3,
+      Data: 4,
+      Fin: 5,
+      WindowUpdate: 6,
+      Reset: 7,
+      ResetAck: 8,
+    });
+  });
+
+  test("uses a strict four-byte positive WINDOW_UPDATE", () => {
+    expect(Buffer.from(encodeCapsuleVmWindowUpdate(CAPSULE_VM_STREAM_WINDOW_BYTES)).toString("hex"))
+      .toBe("00040000");
+    expect(decodeCapsuleVmWindowUpdate(encodeCapsuleVmWindowUpdate(17))).toBe(17);
+    expectProtocolError(() => decodeCapsuleVmWindowUpdate(new Uint8Array(3)), "invalid_window_update");
+    expectProtocolError(() => decodeCapsuleVmWindowUpdate(new Uint8Array(4)), "invalid_window_update");
+    expectProtocolError(
+      () => encodeCapsuleVmWindowUpdate(CAPSULE_VM_STREAM_WINDOW_BYTES + 1),
+      "invalid_window_update",
     );
   });
 
@@ -64,7 +92,7 @@ describe("Capsule VM framed protocol", () => {
       streamId: 1,
       payload: new Uint8Array(),
     });
-    bytes[5] = 2;
+    bytes[5] = 1;
 
     const decoder = new CapsuleVmFrameDecoder();
     expectProtocolError(() => decoder.push(bytes), "unsupported_version");

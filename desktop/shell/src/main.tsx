@@ -24,9 +24,14 @@ if (import.meta.env.DEV && !window.lamarckHost) {
     chooseWorkspacePath: async () => ({ path: null }),
     setWorkspacePath: async (path: string) => ({ path }),
     onOpenLauncher: () => () => {},
-    openAppViewer: async () => {
-      throw new Error("App Capsules are available only in the Lamarck desktop Host.");
-    },
+    openAppViewer: async () => ({
+      ok: false as const,
+      error: {
+        code: "APP_VIEWER_OPEN_FAILED" as const,
+        message: "App Capsules are available only in the Lamarck desktop Host.",
+        restartRequired: false,
+      },
+    }),
     setAppViewerBounds: () => {},
     closeAppViewer: async () => ({ ok: true as const }),
     reloadAppRuntime: async () => ({ active: false }),

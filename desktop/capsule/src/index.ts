@@ -1,5 +1,6 @@
 export * from "./drivers";
 export * from "./artifact/tree-format";
+export * from "./app-manifest-authority";
 export * from "./build/install-input";
 export * from "./oci/plan";
 export * from "./oci/build-plan";
@@ -11,3 +12,4 @@ export * from "./protocol/tickets";
 export * from "./protocol/types";
 export * from "./protocol/validate";
 export * from "./state/supervisor-state";
+export * from "./storage-plan";

@@ -1,11 +1,13 @@
 import { Readable } from "node:stream";
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CAPSULE_TREE_MAGIC,
+  CAPSULE_ARTIFACT_OUTPUT_MIN_BYTES,
   encodeCapsuleTreeHeader,
   encodeCapsuleTreePath,
+  createCapsuleBuildStoragePlan,
   evaluateNpmInstallInput,
   type BuildPrepareBody,
 } from "@lamarck/capsule";
@@ -96,12 +98,21 @@ describe("dependency-stable Guest warm Build", () => {
     expect(fixture.registry.snapshot()).toEqual({ mounts: 1, references: 1 });
     await expect(fixture.manager.drain()).rejects.toBeInstanceOf(BuildContainmentError);
   });
+
+  test("rejects a sealed artifact beyond the planned ceiling before Guest CAS import", async () => {
+    const fixture = await createWarmFixture({ oversizedOutput: true });
+    await fixture.manager.prepare(fixture.body);
+    await expect(fixture.manager.start(APP, BUILD)).rejects.toThrow(/Build output ceiling/);
+    expect(fixture.importLocalFile).not.toHaveBeenCalled();
+    expect(fixture.registry.snapshot()).toEqual({ mounts: 0, references: 0 });
+  });
 });
 
 async function createWarmFixture(options: {
   includeNodeModules?: boolean;
   failAttachContainment?: boolean;
   failDetach?: boolean;
+  oversizedOutput?: boolean;
 } = {}) {
   const root = join(
     tmpdir(),
@@ -140,7 +151,7 @@ async function createWarmFixture(options: {
   });
   const runner = { run: vi.fn() };
   const sealer: ArtifactSealer = {
-    seal: vi.fn(async (workspace, _output, _signal, sealOptions) => {
+    seal: vi.fn(async (workspace, output, _signal, sealOptions) => {
       events.push("seal");
       expect(sealOptions).toEqual({ readonlyNodeModules: true });
       expect(await readFile(join(workspace, "source.js"), "utf8")).toBe("new-source");
@@ -150,19 +161,30 @@ async function createWarmFixture(options: {
       )).toBe("sealed-dependency");
       await expect(readFile(join(workspace, "old-source.js")))
         .rejects.toMatchObject({ code: "ENOENT" });
+      if (options.oversizedOutput) {
+        const artifact = await open(output, "w", 0o600);
+        try {
+          await artifact.truncate(CAPSULE_ARTIFACT_OUTPUT_MIN_BYTES + 1);
+        } finally {
+          await artifact.close();
+        }
+      } else {
+        await writeFile(output, Buffer.alloc(4_096));
+      }
       return { fileCount: 5 };
     }),
   };
+  const importLocalFile = vi.fn(async () => ({
+    digest: `sha256:${"e".repeat(64)}`,
+    bytes: 4_096,
+  }));
   const blobs = {
     has: vi.fn(async () => true),
     open: vi.fn(async (kind: string) => {
       if (kind !== "package") throw new Error(`unexpected blob kind ${kind}`);
       return Readable.from([packageTree]);
     }),
-    importLocalFile: vi.fn(async () => ({
-      digest: `sha256:${"e".repeat(64)}`,
-      bytes: 4_096,
-    })),
+    importLocalFile,
   } as unknown as GuestBlobStore;
   const manager = new GuestBuildManager(blobs, {
     imageDigest: IMAGE,
@@ -186,7 +208,14 @@ async function createWarmFixture(options: {
       },
     },
     volumeOperations: {
-      create: async ({ mountPath }) => { await mkdir(mountPath, { recursive: true }); },
+      create: async ({ mountPath, bytes }) => {
+        expect(bytes).toBe(createCapsuleBuildStoragePlan({
+          mode: "warm",
+          packageBytes: packageTree.byteLength,
+          baseArtifactBytes: 4_096,
+        }).scratchBytes);
+        await mkdir(mountPath, { recursive: true });
+      },
       destroy: async ({ mountPath }) => {
         events.push("volume-destroy");
         await rm(mountPath, { recursive: true, force: true });
@@ -207,10 +236,16 @@ async function createWarmFixture(options: {
     registry,
     runner,
     sealer,
+    importLocalFile,
   };
 }
 
 function warmBody(packageBytes: number, installDigest: string): BuildPrepareBody {
+  const storage = createCapsuleBuildStoragePlan({
+    mode: "warm",
+    packageBytes,
+    baseArtifactBytes: 4_096,
+  });
   return {
     ownerKey: "f".repeat(64),
     appHandle: APP,
@@ -225,6 +260,9 @@ function warmBody(packageBytes: number, installDigest: string): BuildPrepareBody
     baseDependencyDigest: DEPENDENCY,
     mappedHostUid: 131_072,
     mappedHostGid: 196_608,
+    storagePlanVersion: storage.version,
+    scratchBytes: storage.scratchBytes,
+    artifactOutputBytes: storage.artifactOutputBytes,
     timeoutMs: 60_000,
     resources: {
       memoryBytes: 512 * 1024 * 1024,

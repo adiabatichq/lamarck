@@ -14,7 +14,14 @@ import { fileURLToPath } from "node:url";
 
 const PINNED_NODE = "24.18.0";
 const PINNED_NPM = "11.16.0";
-const ENGINES_FLOOR = ">=24.12.0";
+const HOST_ENGINES_FLOOR = ">=24.12.0";
+const GUEST_NODE = "24.10.0";
+const GUEST_ENGINES_FLOOR = ">=24.10.0";
+const GUEST_RUNTIME_WORKSPACES = new Set([
+  "desktop/capsule",
+  "desktop/capsule-guest",
+  "desktop/system-sdk",
+]);
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const failures = [];
@@ -52,17 +59,39 @@ for (const relative of ["scripts/macos-release-source.mjs", "scripts/build-macos
   check(text.includes(`"${PINNED_NPM}"`), `${relative} does not pin npm ${PINNED_NPM}`);
 }
 
-// package.json toolchain metadata must agree with the pin and the floor.
+// Host tooling follows Electron's Node pin. Code that is deliberately shipped
+// into the Linux Guest has a separate, exact release pin and must advertise a
+// compatible floor without weakening the Host-only packages' real minimum.
 const rootPackage = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+const rootLock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8"));
 check(
   rootPackage.packageManager === `npm@${PINNED_NPM}`,
   `package.json packageManager ${rootPackage.packageManager} is not npm@${PINNED_NPM}`,
 );
 for (const workspace of [".", ...rootPackage.workspaces]) {
   const manifest = JSON.parse(readFileSync(join(root, workspace, "package.json"), "utf8"));
+  const locked = rootLock.packages?.[workspace === "." ? "" : workspace];
+  const expectedFloor = GUEST_RUNTIME_WORKSPACES.has(workspace)
+    ? GUEST_ENGINES_FLOOR
+    : HOST_ENGINES_FLOOR;
   check(
-    manifest.engines?.node === ENGINES_FLOOR,
-    `${workspace}: engines.node ${manifest.engines?.node ?? "(missing)"} is not ${ENGINES_FLOOR}`,
+    manifest.engines?.node === expectedFloor,
+    `${workspace}: engines.node ${manifest.engines?.node ?? "(missing)"} is not ${expectedFloor}`,
+  );
+  check(
+    locked?.engines?.node === expectedFloor,
+    `package-lock ${workspace}: engines.node ${locked?.engines?.node ?? "(missing)"} is not ${expectedFloor}`,
+  );
+}
+
+for (const [relative, literal] of [
+  ["desktop/capsule-guest/scripts/build-js-inside.sh", `v${GUEST_NODE}`],
+  ["desktop/capsule-guest/buildroot/package/node24-bin/node24-bin.mk", GUEST_NODE],
+  ["desktop/capsule-guest/scripts/release-contract.mjs", `"${GUEST_NODE}"`],
+]) {
+  check(
+    readFileSync(join(root, relative), "utf8").includes(literal),
+    `${relative} does not pin the Guest runtime to Node ${GUEST_NODE}`,
   );
 }
 
@@ -93,4 +122,7 @@ if (failures.length > 0) {
   for (const failure of failures) console.error(`[toolchain] ${failure}`);
   process.exit(1);
 }
-console.log(`[toolchain] All pins agree on Node ${PINNED_NODE} / npm ${PINNED_NPM} (floor ${ENGINES_FLOOR})`);
+console.log(
+  `[toolchain] Host pins agree on Node ${PINNED_NODE} / npm ${PINNED_NPM}; `
+  + `Guest contracts accept pinned Node ${GUEST_NODE}`,
+);

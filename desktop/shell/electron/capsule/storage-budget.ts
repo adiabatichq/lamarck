@@ -8,7 +8,7 @@ import {
   rm,
   statfs,
 } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 const GIBIBYTE = 1024 * 1024 * 1024;
 
@@ -17,7 +17,6 @@ export const CAPSULE_STORAGE_POLICY = Object.freeze({
   aggregateBytes: 64 * GIBIBYTE,
   perAppBytes: 24 * GIBIBYTE,
   filesystemReserveBytes: 4 * GIBIBYTE,
-  vmStateDiskBytes: 16 * GIBIBYTE,
 });
 
 export type CapsuleStorageScope =
@@ -45,6 +44,15 @@ export interface CapsuleStorageFileReservation {
   release(): Promise<void>;
 }
 
+export interface CapsuleStateDiskReservation {
+  /** Commits only a complete, fully allocated requested state disk. */
+  commit(): Promise<void>;
+  /** Reconciles actual usage after a failed helper start attempt. */
+  reconcileFailure(): Promise<void>;
+  /** Releases only before the helper consumes the preparation. */
+  release(): Promise<void>;
+}
+
 export interface CapsuleStorageBudgetSnapshot {
   readonly aggregateBytes: number;
   readonly perAppBytes: number;
@@ -67,6 +75,19 @@ export interface CapsuleStorageBudgetLike {
     path: string;
     bytes: number;
   }): Promise<CapsuleStorageFileReservation>;
+  reserveStateDisk(options: {
+    owner: "host";
+    path: string;
+    stateDiskBytes: number;
+    existingPhysicalBytes: number;
+    additionalPhysicalBytes: number;
+    peakPhysicalBytes: number;
+  }): Promise<CapsuleStateDiskReservation>;
+  reconcileStateDisk(options: {
+    owner: "host";
+    path: string;
+    existingPhysicalBytes: number;
+  }): Promise<void>;
   claim(options: {
     owner: string;
     scope: CapsuleStorageScope;
@@ -176,32 +197,7 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
     const owner = validateOwner(options.owner);
     const scope = validateScope(options.scope);
     const bytes = positiveBytes(options.bytes, "reservation bytes");
-    const id = await this.#locked(async () => {
-      const roots = await this.#prepare();
-      const ownerUsed = this.#ownerUsed.get(owner) ?? 0;
-      const ownerReserved = this.#ownerReserved.get(owner) ?? 0;
-      if (this.#usedBytes + this.#reservedBytes + bytes > this.#aggregateBytes) {
-        throw new CapsuleStorageAdmissionError(
-          `Capsule ${scope} admission exceeds the shared ${this.#aggregateBytes} byte quota`,
-        );
-      }
-      if (isAppOwner(owner) && ownerUsed + ownerReserved + bytes > this.#perAppBytes) {
-        throw new CapsuleStorageAdmissionError(
-          `Capsule ${scope} admission exceeds App ${owner}'s ${this.#perAppBytes} byte quota`,
-        );
-      }
-      const available = await this.#dependencies.availableBytes(roots[0]!);
-      if (available < this.#filesystemReserveBytes + this.#reservedBytes + bytes) {
-        throw new CapsuleStorageAdmissionError(
-          `Capsule ${scope} admission would consume the fixed Host filesystem reserve`,
-        );
-      }
-      const next = this.#nextReservation++;
-      this.#reservations.set(next, { owner, scope, bytes });
-      this.#reservedBytes += bytes;
-      this.#ownerReserved.set(owner, ownerReserved + bytes);
-      return next;
-    });
+    const id = await this.#beginReservation(owner, scope, bytes);
 
     let finished = false;
     return Object.freeze({
@@ -222,6 +218,48 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
         finished = true;
       },
     });
+  }
+
+  async #beginReservation(
+    owner: string,
+    scope: CapsuleStorageScope,
+    bytes: number,
+  ): Promise<number> {
+    return await this.#locked(async () => {
+      const roots = await this.#prepare();
+      return await this.#admitReservationLocked(owner, scope, bytes, roots[0]!);
+    });
+  }
+
+  async #admitReservationLocked(
+    owner: string,
+    scope: CapsuleStorageScope,
+    bytes: number,
+    filesystemRoot: string,
+  ): Promise<number> {
+    const ownerUsed = this.#ownerUsed.get(owner) ?? 0;
+    const ownerReserved = this.#ownerReserved.get(owner) ?? 0;
+    if (this.#usedBytes + this.#reservedBytes + bytes > this.#aggregateBytes) {
+      throw new CapsuleStorageAdmissionError(
+        `Capsule ${scope} admission exceeds the shared ${this.#aggregateBytes} byte quota`,
+      );
+    }
+    if (isAppOwner(owner) && ownerUsed + ownerReserved + bytes > this.#perAppBytes) {
+      throw new CapsuleStorageAdmissionError(
+        `Capsule ${scope} admission exceeds App ${owner}'s ${this.#perAppBytes} byte quota`,
+      );
+    }
+    const available = await this.#dependencies.availableBytes(filesystemRoot);
+    if (available < this.#filesystemReserveBytes + this.#reservedBytes + bytes) {
+      throw new CapsuleStorageAdmissionError(
+        `Capsule ${scope} admission would consume the fixed Host filesystem reserve`,
+      );
+    }
+    const next = this.#nextReservation++;
+    this.#reservations.set(next, { owner, scope, bytes });
+    this.#reservedBytes += bytes;
+    this.#ownerReserved.set(owner, ownerReserved + bytes);
+    return next;
   }
 
   async reserveFile(options: {
@@ -276,6 +314,183 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
         await reservation.release();
         settled = true;
       },
+    });
+  }
+
+  async reserveStateDisk(options: {
+    owner: "host";
+    path: string;
+    stateDiskBytes: number;
+    existingPhysicalBytes: number;
+    additionalPhysicalBytes: number;
+    peakPhysicalBytes: number;
+  }): Promise<CapsuleStateDiskReservation> {
+    const owner = validateOwner(options.owner);
+    const requestedPath = resolve(options.path);
+    const path = resolve(await realpath(dirname(requestedPath)), basename(requestedPath));
+    const stateDiskBytes = positiveBytes(options.stateDiskBytes, "stateDiskBytes");
+    const existingPhysicalBytes = nonnegativeBytes(
+      options.existingPhysicalBytes,
+      "existingPhysicalBytes",
+    );
+    const additionalPhysicalBytes = nonnegativeBytes(
+      options.additionalPhysicalBytes,
+      "additionalPhysicalBytes",
+    );
+    const peakPhysicalBytes = nonnegativeBytes(
+      options.peakPhysicalBytes,
+      "peakPhysicalBytes",
+    );
+    if (existingPhysicalBytes + additionalPhysicalBytes !== peakPhysicalBytes) {
+      throw new CapsuleStorageAdmissionError(
+        "VM helper state-disk peak does not equal its existing plus additional bytes",
+      );
+    }
+
+    const creatingPath = resolve(dirname(path), ".state.raw.creating");
+    let reservationId: number | undefined;
+    await this.#locked(async () => {
+      const roots = await this.#prepare();
+      this.#assertManaged(path);
+      this.#assertManaged(creatingPath);
+
+      // The helper has already validated and reconciled this fixed residue
+      // while retaining state.raw.lock. Electron only reconciles its ledger;
+      // it never deletes or resizes either state-disk path.
+      if (await safeRegularFileUsage(creatingPath) !== undefined) {
+        throw new CapsuleStorageAdmissionError(
+          "VM helper reported state preparation while its temporary disk still exists",
+        );
+      }
+      this.#replaceFileChargeLocked(creatingPath, undefined);
+
+      const actual = await safeRegularFileUsage(path);
+      if ((actual?.physicalBytes ?? 0) !== existingPhysicalBytes) {
+        throw new CapsuleStorageAdmissionError(
+          "VM helper state-disk preparation does not match Host physical usage",
+        );
+      }
+      this.#replaceFileChargeLocked(
+        path,
+        actual ? { bytes: existingPhysicalBytes, owners: new Set([owner]) } : undefined,
+      );
+      if (additionalPhysicalBytes > 0) {
+        reservationId = await this.#admitReservationLocked(
+          owner,
+          "vm-state",
+          additionalPhysicalBytes,
+          roots[0]!,
+        );
+      }
+    });
+
+    const requireNoCreatingResidue = async () => {
+      if (await safeRegularFileUsage(creatingPath) !== undefined) {
+        throw new CapsuleStorageAdmissionError(
+          "VM state reservation cannot settle while its temporary disk exists",
+        );
+      }
+    };
+    let settled = false;
+    return Object.freeze({
+      commit: async () => {
+        if (settled) return;
+        await requireNoCreatingResidue();
+        const actual = await safeRegularFileUsage(path);
+        if (!actual || actual.logicalBytes !== stateDiskBytes) {
+          throw new CapsuleStorageAdmissionError(
+            "VM helper did not publish the admitted state disk",
+          );
+        }
+        if (actual.physicalBytes < stateDiskBytes
+          || actual.physicalBytes > peakPhysicalBytes) {
+          throw new CapsuleStorageAdmissionError(
+            "VM helper state disk is not fully allocated within its admitted physical peak",
+          );
+        }
+        await this.#settleStateDiskReservation(
+          reservationId,
+          path,
+          { bytes: actual.physicalBytes, owners: new Set([owner]) },
+        );
+        settled = true;
+      },
+      reconcileFailure: async () => {
+        if (settled) return;
+        await requireNoCreatingResidue();
+        const actual = await safeRegularFileUsage(path);
+        if (actual && actual.logicalBytes !== stateDiskBytes
+          && actual.physicalBytes !== existingPhysicalBytes) {
+          throw new CapsuleStorageAdmissionError(
+            "Failed VM start left an unexpected state disk",
+          );
+        }
+        if ((actual?.physicalBytes ?? 0) > peakPhysicalBytes) {
+          throw new CapsuleStorageAdmissionError(
+            "Failed VM start exceeded its admitted state-disk physical peak",
+          );
+        }
+        await this.#settleStateDiskReservation(
+          reservationId,
+          path,
+          actual
+            ? { bytes: actual.physicalBytes, owners: new Set([owner]) }
+            : undefined,
+        );
+        settled = true;
+      },
+      release: async () => {
+        if (settled) return;
+        await requireNoCreatingResidue();
+        const actual = await safeRegularFileUsage(path);
+        if ((actual?.physicalBytes ?? 0) !== existingPhysicalBytes) {
+          throw new CapsuleStorageAdmissionError(
+            "VM state reservation cannot be released after disk mutation",
+          );
+        }
+        await this.#settleStateDiskReservation(
+          reservationId,
+          path,
+          actual ? { bytes: existingPhysicalBytes, owners: new Set([owner]) } : undefined,
+        );
+        settled = true;
+      },
+    });
+  }
+
+  async reconcileStateDisk(options: {
+    owner: "host";
+    path: string;
+    existingPhysicalBytes: number;
+  }): Promise<void> {
+    const owner = validateOwner(options.owner);
+    const requestedPath = resolve(options.path);
+    const path = resolve(await realpath(dirname(requestedPath)), basename(requestedPath));
+    const existingPhysicalBytes = nonnegativeBytes(
+      options.existingPhysicalBytes,
+      "existingPhysicalBytes",
+    );
+    const creatingPath = resolve(dirname(path), ".state.raw.creating");
+    await this.#locked(async () => {
+      await this.#prepare();
+      this.#assertManaged(path);
+      this.#assertManaged(creatingPath);
+      if (await safeRegularFileUsage(creatingPath) !== undefined) {
+        throw new CapsuleStorageAdmissionError(
+          "VM helper reported state reconciliation while its temporary disk still exists",
+        );
+      }
+      this.#replaceFileChargeLocked(creatingPath, undefined);
+      const actual = await safeRegularFileUsage(path);
+      if ((actual?.physicalBytes ?? 0) !== existingPhysicalBytes) {
+        throw new CapsuleStorageAdmissionError(
+          "VM helper state reconciliation does not match Host physical usage",
+        );
+      }
+      this.#replaceFileChargeLocked(
+        path,
+        actual ? { bytes: existingPhysicalBytes, owners: new Set([owner]) } : undefined,
+      );
     });
   }
 
@@ -383,6 +598,40 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
         (this.#ownerUsed.get(reservation.owner) ?? 0) + persistedBytes,
       );
     });
+  }
+
+  async #settleStateDiskReservation(
+    id: number | undefined,
+    path: string,
+    charge: FileCharge | undefined,
+  ): Promise<void> {
+    await this.#locked(async () => {
+      if (id !== undefined) {
+        const reservation = this.#reservations.get(id);
+        if (!reservation || reservation.owner !== "host" || reservation.scope !== "vm-state") {
+          throw new Error("Capsule VM state reservation disappeared");
+        }
+        this.#reservations.delete(id);
+        this.#reservedBytes -= reservation.bytes;
+        this.#debitReserved(reservation.owner, reservation.bytes);
+      }
+      this.#replaceFileChargeLocked(path, charge);
+    });
+  }
+
+  #replaceFileChargeLocked(path: string, next: FileCharge | undefined): void {
+    const prior = this.#files.get(path);
+    if (prior) {
+      this.#files.delete(path);
+      this.#usedBytes -= prior.bytes;
+      for (const owner of prior.owners) this.#debitOwner(owner, prior.bytes);
+    }
+    if (!next) return;
+    this.#files.set(path, next);
+    this.#usedBytes += next.bytes;
+    for (const owner of next.owners) {
+      this.#ownerUsed.set(owner, (this.#ownerUsed.get(owner) ?? 0) + next.bytes);
+    }
   }
 
   async #prepare(): Promise<readonly string[]> {
@@ -543,6 +792,33 @@ async function safeRegularFileSize(path: string): Promise<number | undefined> {
       throw new CapsuleStorageAdmissionError("Capsule fixed storage path is not a regular single-link file");
     }
     return nonnegativeBytes(Number(details.size), "fixed storage file bytes");
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return undefined;
+    throw error;
+  }
+}
+
+async function safeRegularFileUsage(path: string): Promise<{
+  logicalBytes: number;
+  physicalBytes: number;
+} | undefined> {
+  try {
+    const details = await lstat(path, { bigint: true });
+    if (!details.isFile() || details.isSymbolicLink() || details.nlink !== 1n) {
+      throw new CapsuleStorageAdmissionError(
+        "Capsule fixed storage path is not a regular single-link file",
+      );
+    }
+    const physical = details.blocks * 512n;
+    if (physical < 0n || physical > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new CapsuleStorageAdmissionError(
+        "Capsule fixed storage physical usage is outside the supported range",
+      );
+    }
+    return {
+      logicalBytes: nonnegativeBytes(Number(details.size), "fixed storage file bytes"),
+      physicalBytes: nonnegativeBytes(Number(physical), "fixed storage physical bytes"),
+    };
   } catch (error) {
     if (isNodeError(error, "ENOENT")) return undefined;
     throw error;

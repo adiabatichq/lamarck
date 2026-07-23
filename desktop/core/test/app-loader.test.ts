@@ -10,9 +10,11 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "fs";
+import { open } from "fs/promises";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -86,8 +88,33 @@ describe("App Loader", () => {
 
     expect(registry.apps.size).toBe(1);
     expect(app?.manifest).toEqual(manifest);
+    expect(app?.manifestDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
     expect(registry.getTableGrants("test-app")).toEqual(["my_table"]);
     expect(registry.getTableGrants("unknown-app")).toEqual([]);
+  });
+
+  test("derives one deterministic digest from the normalized authority manifest", async () => {
+    const manifest = validManifest("authority");
+    manifest.permissions.tables = ["reviews"];
+    writeApp("authority", manifest);
+    const first = (await loadApps(appsDir)).apps.get("authority")!;
+
+    writeFileSync(join(appsDir, "authority", "manifest.json"), JSON.stringify({
+      permissions: { tables: ["reviews"], docs: [] },
+      runtime: { ui: { port: 3000, command: ["npm", "run", "start"] } },
+      name: "authority",
+      id: "authority",
+      manifestVersion: 1,
+    }));
+    const reordered = (await loadApps(appsDir)).apps.get("authority")!;
+    expect(reordered.manifestDigest).toBe(first.manifestDigest);
+
+    writeFileSync(join(appsDir, "authority", "manifest.json"), JSON.stringify({
+      ...manifest,
+      permissions: { docs: [], tables: [] },
+    }));
+    expect((await loadApps(appsDir)).apps.get("authority")?.manifestDigest)
+      .not.toBe(first.manifestDigest);
   });
 
   test("keeps bundled App templates valid under the V1 loader", async () => {
@@ -281,6 +308,87 @@ describe("App Loader", () => {
 
     expect((await loadApps(appsDir)).apps.size).toBe(0);
     expect((await loadApps(join(workspace, "nonexistent"))).apps.size).toBe(0);
+  });
+
+  test("propagates apps directory read errors other than ENOENT", async () => {
+    const notADirectory = join(workspace, "not-a-directory");
+    writeFileSync(notADirectory, "not a directory");
+
+    await expect(loadApps(notADirectory)).rejects.toMatchObject({ code: "ENOTDIR" });
+  });
+
+  test("propagates per-manifest I/O and authority errors instead of publishing a partial registry", async () => {
+    const manifestPath = join(writeApp("keep-authority"), "manifest.json");
+    const probe = await open(manifestPath, "r");
+    type FileHandlePrototype = {
+      readFile(this: FileHandlePrototype): Promise<Buffer>;
+    };
+    const prototype = Object.getPrototypeOf(probe) as FileHandlePrototype;
+    const originalReadFile = prototype.readFile;
+    await probe.close();
+
+    for (const code of ["EIO", "EACCES"] as const) {
+      prototype.readFile = async function () {
+        throw Object.assign(new Error(`injected ${code}`), { code });
+      };
+      try {
+        await expect(loadApps(appsDir)).rejects.toMatchObject({ code });
+      } finally {
+        prototype.readFile = originalReadFile;
+      }
+    }
+  });
+
+  test("publishes only a settled manifest snapshot during an in-place write", async () => {
+    const appDir = join(appsDir, "settling");
+    const manifestPath = join(appDir, "manifest.json");
+    mkdirSync(appDir);
+    writeFileSync(manifestPath, "{");
+
+    const loading = loadApps(appsDir);
+    const replacement = setTimeout(() => {
+      writeFileSync(manifestPath, JSON.stringify(validManifest("settling")));
+    }, 5);
+    const registry = await loading.finally(() => clearTimeout(replacement));
+
+    expect(registry.apps.get("settling")?.manifest).toEqual(validManifest("settling"));
+  });
+
+  test("retries when manifest.json is atomically replaced after reading the old inode", async () => {
+    const appDir = join(appsDir, "atomic-replace");
+    const manifestPath = join(appDir, "manifest.json");
+    const replacementPath = join(appDir, ".manifest.next");
+    const oldManifest = { ...validManifest("atomic-replace"), name: "Old snapshot" };
+    const newManifest = { ...validManifest("atomic-replace"), name: "New snapshot" };
+    mkdirSync(appDir);
+    writeFileSync(manifestPath, JSON.stringify(oldManifest));
+    writeFileSync(replacementPath, JSON.stringify(newManifest));
+
+    const probe = await open(manifestPath, "r");
+    type FileHandlePrototype = {
+      readFile(this: FileHandlePrototype): Promise<Buffer>;
+    };
+    const prototype = Object.getPrototypeOf(probe) as FileHandlePrototype;
+    const originalReadFile = prototype.readFile;
+    await probe.close();
+
+    let replaced = false;
+    prototype.readFile = async function () {
+      const bytes = await originalReadFile.call(this);
+      if (!replaced) {
+        replaced = true;
+        renameSync(replacementPath, manifestPath);
+      }
+      return bytes;
+    };
+
+    try {
+      const registry = await loadApps(appsDir);
+      expect(replaced).toBe(true);
+      expect(registry.apps.get("atomic-replace")?.manifest).toEqual(newManifest);
+    } finally {
+      prototype.readFile = originalReadFile;
+    }
   });
 
   test("archiveApp moves the app out of apps and the registry", async () => {

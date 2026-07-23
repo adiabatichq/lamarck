@@ -5,7 +5,7 @@ import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Duplex, PassThrough } from "node:stream";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { GuestBlobStore } from "../src/blob-store";
 import type { GuestFilesystemPaths } from "../src/config";
 import { GuestContainmentError } from "../src/containment-error";
@@ -137,6 +137,25 @@ describe("App viewer proxy ownership", () => {
 });
 
 describe("artifact mount ownership", () => {
+  test("recomputes Runtime scratch before observing the imported artifact", async () => {
+    const has = vi.fn(async () => true);
+    const manager = new GuestResourceManager({ has } as unknown as GuestBlobStore, {
+      manageOwnership: false,
+    });
+    await expect(manager.prepareApp({
+      ownerKey: "a".repeat(64),
+      appHandle: APP,
+      artifactDigest: DIGEST_A,
+      artifactBytes: 1,
+      artifactBlobHandle: "L".repeat(22),
+      mappedHostUid: 100_000,
+      mappedHostGid: 200_000,
+      storagePlanVersion: 1,
+      scratchBytes: 1024 * 1024 * 1024,
+    })).rejects.toThrow(/Runtime storage plan does not match/);
+    expect(has).not.toHaveBeenCalled();
+  });
+
   test("single-flights concurrent same-digest acquire and unmounts only after the final release", async () => {
     let allowMount!: () => void;
     const mountGate = new Promise<void>((resolve) => {
@@ -230,6 +249,9 @@ describe("artifact mount ownership", () => {
       artifactMountRegistry: registry,
       operations: {
         isMountPoint: async () => false,
+        createVolume: async () => {
+          throw new Error("injected Runtime volume creation failure");
+        },
         destroyVolume: async ({ imagePath, mountPath }) => {
           await rm(mountPath, { recursive: true, force: true });
           await rm(imagePath, { force: true });
@@ -245,10 +267,9 @@ describe("artifact mount ownership", () => {
         artifactBlobHandle: "L".repeat(22),
         mappedHostUid: 100_000,
         mappedHostGid: 200_000,
-        // Protocol V1 still accepts this value, while the ext4 implementation
-        // rejects it before executing a privileged formatter or mount.
-        scratchBytes: 16 * 1024 * 1024,
-      })).rejects.toThrow(/bounded volume size/);
+        storagePlanVersion: 1,
+        scratchBytes: 512 * 1024 * 1024,
+      })).rejects.toThrow(/injected Runtime volume creation failure/);
       expect(runtimePresentAtRelease).toBe(false);
       expect(registry.snapshot()).toEqual({ mounts: 0, references: 0 });
     } finally {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -14,6 +14,23 @@ afterEach(async () => {
 });
 
 describe("CAS disk admission", () => {
+  test("rejects a local sealed output above its plan ceiling before CAS admission", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lamarck-cas-local-ceiling-"));
+    roots.push(root);
+    const admission = new GuestResourceAdmission({ diskBudgetBytes: 100, memoryBudgetBytes: 1 });
+    const blobs = new GuestBlobStore(join(root, "cas"), { admission });
+    const source = join(root, "artifact.erofs");
+    await writeFile(source, "abc", { mode: 0o400 });
+
+    await expect(blobs.importLocalFile("artifact", source, {
+      ownerKey: OWNER_A,
+      referenceId: "build:output",
+      maximumBytes: 2,
+    })).rejects.toThrow(/storage-plan ceiling/);
+    expect(blobs.snapshot()).toMatchObject({ blobs: 0, references: 0 });
+    expect(admission.snapshot()).toMatchObject({ reservedDiskBytes: 0, reservations: 0 });
+  });
+
   test("retains durable CAS bytes and does not double-charge a cache hit", async () => {
     const root = await mkdtemp(join(tmpdir(), "lamarck-cas-admission-"));
     roots.push(root);

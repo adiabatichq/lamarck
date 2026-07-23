@@ -30,7 +30,7 @@ try {
   try {
     // Match CapsuleVmStateDiskManager.defaultSize. This remains a sparse Host
     // file but gives the supervisor the same admission headroom as a VZ boot.
-    await stateHandle.truncate(16 * 1024 * 1024 * 1024);
+    await stateHandle.truncate(8 * 1024 * 1024 * 1024);
   } finally {
     await stateHandle.close();
   }

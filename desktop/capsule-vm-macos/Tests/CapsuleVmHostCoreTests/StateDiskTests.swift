@@ -8,14 +8,13 @@ import Testing
 private enum SparseStateDiskManager {
     static let fileName = CapsuleVmHostCore.CapsuleVmStateDiskManager.fileName
     static let leaseFileName = CapsuleVmHostCore.CapsuleVmStateDiskManager.leaseFileName
-    static let defaultSize = CapsuleVmHostCore.CapsuleVmStateDiskManager.defaultSize
     static let minimumSize = CapsuleVmHostCore.CapsuleVmStateDiskManager.minimumSize
     static let maximumSize = CapsuleVmHostCore.CapsuleVmStateDiskManager.maximumSize
     static let sizeAlignment = CapsuleVmHostCore.CapsuleVmStateDiskManager.sizeAlignment
 
     static func acquire(
         in directoryURL: URL,
-        size: UInt64 = defaultSize
+        size: UInt64
     ) throws -> CapsuleVmStateDiskLease {
         try CapsuleVmHostCore.CapsuleVmStateDiskManager.acquireForTesting(
             in: directoryURL,
@@ -44,6 +43,7 @@ private typealias CapsuleVmStateDiskManager = SparseStateDiskManager
     #expect((metadata.st_mode & 0o077) == 0)
     #expect(UInt64(metadata.st_size) == CapsuleVmStateDiskManager.minimumSize)
     #expect(UInt64(metadata.st_blocks) * 512 < CapsuleVmStateDiskManager.minimumSize)
+    let originalInode = metadata.st_ino
     try lease.validateForAttachment()
     try lease.release()
 
@@ -52,7 +52,80 @@ private typealias CapsuleVmStateDiskManager = SparseStateDiskManager
         size: CapsuleVmStateDiskManager.minimumSize
     )
     #expect(reopened.disk.url == disk.url)
+    #expect(Darwin.lstat(reopened.disk.url.path, &metadata) == 0)
+    #expect(metadata.st_ino == originalInode)
     try reopened.release()
+}
+
+@Test func validSizeChangeAtomicallyReplacesDisposableStateUnderStableLease() throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let oldSize = CapsuleVmStateDiskManager.minimumSize
+    let newSize = oldSize + CapsuleVmStateDiskManager.sizeAlignment
+
+    let original = try CapsuleVmStateDiskManager.acquire(in: directory, size: oldSize)
+    let marker = Data("old-state".utf8)
+    let markerHandle = try FileHandle(forWritingTo: original.disk.url)
+    try markerHandle.write(contentsOf: marker)
+    try markerHandle.synchronize()
+    try markerHandle.close()
+    var originalMetadata = stat()
+    #expect(Darwin.lstat(original.disk.url.path, &originalMetadata) == 0)
+    try original.release()
+
+    let replacement = try CapsuleVmStateDiskManager.acquire(in: directory, size: newSize)
+    var replacementMetadata = stat()
+    #expect(Darwin.lstat(replacement.disk.url.path, &replacementMetadata) == 0)
+    #expect(UInt64(replacementMetadata.st_size) == newSize)
+    #expect(replacementMetadata.st_ino != originalMetadata.st_ino)
+    let replacementHandle = try FileHandle(forReadingFrom: replacement.disk.url)
+    let prefix = try replacementHandle.read(upToCount: marker.count)
+    try replacementHandle.close()
+    #expect(prefix == Data(repeating: 0, count: marker.count))
+    #expect(!FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent(".state.raw.creating").path
+    ))
+    try replacement.release()
+}
+
+@Test func replacementAllocationFailurePreservesExistingStateExactly() throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let oldSize = CapsuleVmStateDiskManager.minimumSize
+    let newSize = oldSize + CapsuleVmStateDiskManager.sizeAlignment
+    let original = try CapsuleVmStateDiskManager.acquire(in: directory, size: oldSize)
+    let marker = Data("keep-this-state".utf8)
+    let handle = try FileHandle(forWritingTo: original.disk.url)
+    try handle.write(contentsOf: marker)
+    try handle.synchronize()
+    try handle.close()
+    var before = stat()
+    #expect(Darwin.lstat(original.disk.url.path, &before) == 0)
+    let stateURL = original.disk.url
+    try original.release()
+
+    let impossible = CapsuleVmStateDiskAllocationPolicy(
+        hostReserveBytes: UInt64.max,
+        requiresPhysicalAllocation: true
+    )
+    #expect(throws: CapsuleVmStateDiskError.insufficientHostCapacity) {
+        try CapsuleVmHostCore.CapsuleVmStateDiskManager.acquireForTesting(
+            in: directory,
+            size: newSize,
+            allocationPolicy: impossible
+        )
+    }
+
+    var after = stat()
+    #expect(Darwin.lstat(stateURL.path, &after) == 0)
+    #expect(after.st_ino == before.st_ino)
+    #expect(UInt64(after.st_size) == oldSize)
+    let preserved = try FileHandle(forReadingFrom: stateURL)
+    #expect(try preserved.read(upToCount: marker.count) == marker)
+    try preserved.close()
+    #expect(!FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent(".state.raw.creating").path
+    ))
 }
 
 @Test func productionPolicyPhysicallyReservesBackingBlocksAndPreservesHostReserve() throws {
@@ -91,21 +164,99 @@ private typealias CapsuleVmStateDiskManager = SparseStateDiskManager
     }
 }
 
-@Test func productionAcquireRejectsLegacySparseStateBeforeAttachment() throws {
+@Test func productionPolicyMaterializesLogicalHolesBeforeAttachment() throws {
     let directory = try temporaryStateDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
-    let sparse = try SparseStateDiskManager.acquire(
-        in: directory,
-        size: SparseStateDiskManager.minimumSize
+    let path = directory.appendingPathComponent("repair.raw")
+    let descriptor = Darwin.open(
+        path.path,
+        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        S_IRUSR | S_IWUSR
     )
-    try sparse.release()
+    #expect(descriptor >= 0)
+    guard descriptor >= 0 else { return }
+    defer { _ = Darwin.close(descriptor) }
 
-    #expect(throws: CapsuleVmStateDiskError.allocationFailed) {
-        try CapsuleVmHostCore.CapsuleVmStateDiskManager.acquire(
-            in: directory,
-            size: SparseStateDiskManager.minimumSize
-        )
+    let bytes: UInt64 = 8 * 1_024 * 1_024
+    let policy = CapsuleVmStateDiskAllocationPolicy(
+        hostReserveBytes: 0,
+        requiresPhysicalAllocation: true
+    )
+    try policy.prepareNewFile(descriptor: descriptor, size: bytes)
+
+    let sentinelA = [UInt8](repeating: 0xa5, count: 4_096)
+    let sentinelB = [UInt8](repeating: 0x5a, count: 4_096)
+    #expect(sentinelA.withUnsafeBytes {
+        Darwin.pwrite(descriptor, $0.baseAddress, $0.count, 0)
+    } == sentinelA.count)
+    #expect(sentinelB.withUnsafeBytes {
+        Darwin.pwrite(descriptor, $0.baseAddress, $0.count, 6 * 1_024 * 1_024)
+    } == sentinelB.count)
+
+    var firstHole = fpunchhole_t(
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: 2 * 1_024 * 1_024,
+        fp_length: 1 * 1_024 * 1_024
+    )
+    var secondHole = fpunchhole_t(
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: 4 * 1_024 * 1_024,
+        fp_length: 1 * 1_024 * 1_024
+    )
+    #expect(Darwin.fcntl(descriptor, F_PUNCHHOLE, &firstHole) == 0)
+    #expect(Darwin.fcntl(descriptor, F_PUNCHHOLE, &secondHole) == 0)
+
+    var sparseMetadata = stat()
+    #expect(Darwin.fstat(descriptor, &sparseMetadata) == 0)
+    let sparseBlocks = sparseMetadata.st_blocks
+
+    let impossible = CapsuleVmStateDiskAllocationPolicy(
+        hostReserveBytes: UInt64.max,
+        requiresPhysicalAllocation: true
+    )
+    #expect(throws: CapsuleVmStateDiskError.insufficientHostCapacity) {
+        try impossible.prepareExistingFile(descriptor: descriptor, size: bytes)
     }
+    var rejectedMetadata = stat()
+    #expect(Darwin.fstat(descriptor, &rejectedMetadata) == 0)
+    #expect(rejectedMetadata.st_blocks == sparseBlocks)
+
+    try policy.prepareExistingFile(descriptor: descriptor, size: bytes)
+    try policy.validateFile(descriptor: descriptor, size: bytes)
+
+    var repairedMetadata = stat()
+    #expect(Darwin.fstat(descriptor, &repairedMetadata) == 0)
+    #expect(UInt64(repairedMetadata.st_blocks) * 512 >= bytes)
+
+    var readA = [UInt8](repeating: 0, count: sentinelA.count)
+    var readB = [UInt8](repeating: 0, count: sentinelB.count)
+    var repairedHole = [UInt8](repeating: 0xff, count: 4_096)
+    #expect(readA.withUnsafeMutableBytes {
+        Darwin.pread(descriptor, $0.baseAddress, $0.count, 0)
+    } == readA.count)
+    #expect(readB.withUnsafeMutableBytes {
+        Darwin.pread(descriptor, $0.baseAddress, $0.count, 6 * 1_024 * 1_024)
+    } == readB.count)
+    #expect(repairedHole.withUnsafeMutableBytes {
+        Darwin.pread(descriptor, $0.baseAddress, $0.count, 2 * 1_024 * 1_024)
+    } == repairedHole.count)
+    #expect(readA == sentinelA)
+    #expect(readB == sentinelB)
+    #expect(repairedHole.allSatisfy { $0 == 0 })
+
+    let replacement = [UInt8](repeating: 0x3c, count: 1 * 1_024 * 1_024)
+    #expect(replacement.withUnsafeBytes {
+        Darwin.pwrite(descriptor, $0.baseAddress, $0.count, 2 * 1_024 * 1_024)
+    } == replacement.count)
+    #expect(Darwin.fsync(descriptor) == 0)
+    var rewrittenMetadata = stat()
+    #expect(Darwin.fstat(descriptor, &rewrittenMetadata) == 0)
+    #expect(rewrittenMetadata.st_blocks <= repairedMetadata.st_blocks)
+
+    try policy.prepareExistingFile(descriptor: descriptor, size: bytes)
+    try policy.validateFile(descriptor: descriptor, size: bytes)
 }
 
 @Test func rejectsUnboundedOrUnalignedStateDiskSizes() throws {
@@ -121,7 +272,8 @@ private typealias CapsuleVmStateDiskManager = SparseStateDiskManager
             try CapsuleVmStateDiskManager.acquire(in: directory, size: size)
         }
     }
-    #expect(CapsuleVmStateDiskManager.defaultSize == 16 * 1_024 * 1_024 * 1_024)
+    #expect(CapsuleVmStateDiskManager.minimumSize == 4 * 1_024 * 1_024 * 1_024)
+    #expect(CapsuleVmStateDiskManager.sizeAlignment == 64 * 1_024 * 1_024)
 }
 
 @Test func exclusiveLeaseRejectsConcurrentOwnerAndKeepsStableSidecar() throws {
@@ -136,6 +288,7 @@ private typealias CapsuleVmStateDiskManager = SparseStateDiskManager
         try CapsuleVmStateDiskManager.acquire(
             in: directory,
             size: CapsuleVmStateDiskManager.minimumSize
+                + CapsuleVmStateDiskManager.sizeAlignment
         )
     }
     try first.release()
@@ -375,7 +528,7 @@ private typealias CapsuleVmStateDiskManager = SparseStateDiskManager
     let sizeHandle = try FileHandle(forWritingTo: sizedDisk.url)
     try sizeHandle.truncate(
         atOffset: CapsuleVmStateDiskManager.minimumSize
-            + CapsuleVmStateDiskManager.sizeAlignment
+            + 1
     )
     try sizeHandle.close()
     #expect(throws: CapsuleVmStateDiskError.fileSizeMismatch) {
@@ -430,7 +583,7 @@ private typealias CapsuleVmStateDiskManager = SparseStateDiskManager
     let directory = try temporaryStateDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let pending = directory.appendingPathComponent(".state.raw.creating")
-    #expect(FileManager.default.createFile(atPath: pending.path, contents: Data("partial".utf8)))
+    #expect(FileManager.default.createFile(atPath: pending.path, contents: Data()))
     #expect(Darwin.chmod(pending.path, 0o600) == 0)
 
     let lease = try CapsuleVmStateDiskManager.acquire(
@@ -439,6 +592,123 @@ private typealias CapsuleVmStateDiskManager = SparseStateDiskManager
     )
     #expect(!FileManager.default.fileExists(atPath: pending.path))
     try lease.release()
+}
+
+@Test func preparationHoldsStableLeaseAndReportsExactPeakBeforeMutation() throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let size = CapsuleVmStateDiskManager.minimumSize
+
+    let preparation = try CapsuleVmHostCore.CapsuleVmStateDiskManager.prepare(
+        in: directory,
+        size: size
+    )
+    #expect(preparation.requirements == CapsuleVmStateDiskPreparationRequirements(
+        stateDiskBytes: size,
+        existingPhysicalBytes: 0,
+        additionalPhysicalBytes: size,
+        peakPhysicalBytes: size
+    ))
+    #expect(!FileManager.default.fileExists(
+        atPath: directory.appendingPathComponent(CapsuleVmStateDiskManager.fileName).path
+    ))
+    #expect(throws: CapsuleVmStateDiskError.leaseUnavailable) {
+        try CapsuleVmStateDiskManager.acquire(in: directory, size: size)
+    }
+
+    try preparation.cancel()
+    let recovered = try CapsuleVmStateDiskManager.acquire(in: directory, size: size)
+    try recovered.release()
+}
+
+@Test func preparationIsOneUseAndConsumesTheSameHeldLease() throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let size = CapsuleVmStateDiskManager.minimumSize
+    let preparation = try CapsuleVmHostCore.CapsuleVmStateDiskManager.prepareForTesting(
+        in: directory,
+        size: size
+    )
+
+    let lease = try preparation.consume()
+    #expect(!preparation.isActive)
+    #expect(throws: CapsuleVmStateDiskError.leaseNotHeld) {
+        try preparation.consume()
+    }
+    #expect(throws: CapsuleVmStateDiskError.leaseUnavailable) {
+        try CapsuleVmStateDiskManager.acquire(in: directory, size: size)
+    }
+    try lease.release()
+}
+
+@Test func preparationRefusesUnrecognizedCreatingResidueWithoutDeletingIt() throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let pending = directory.appendingPathComponent(".state.raw.creating")
+    let residue = Data("not-a-known-state-disk-stage".utf8)
+    #expect(FileManager.default.createFile(atPath: pending.path, contents: residue))
+    #expect(Darwin.chmod(pending.path, 0o600) == 0)
+
+    #expect(throws: CapsuleVmStateDiskError.fileSizeMismatch) {
+        try CapsuleVmHostCore.CapsuleVmStateDiskManager.prepare(
+            in: directory,
+            size: CapsuleVmStateDiskManager.minimumSize
+        )
+    }
+    #expect(try Data(contentsOf: pending) == residue)
+}
+
+@Test func sessionPreparationTimeoutReleasesItsHeldLease() async throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let session = CapsuleVmVirtualMachineSession(
+        emitter: RecordingCapsuleVmFrameEmitter(),
+        statePreparationTTL: 0.02
+    )
+    let prepared: CapsuleVmPreparedState = try await withCheckedThrowingContinuation {
+        continuation in
+        session.prepareState(
+            descriptor: CapsuleVmStatePreparationDescriptor(
+                stateDirectoryURL: directory,
+                stateDiskBytes: CapsuleVmStateDiskManager.minimumSize
+            )
+        ) { continuation.resume(with: $0) }
+    }
+    #expect(!prepared.preparationID.isEmpty)
+    try await Task.sleep(for: .milliseconds(100))
+
+    let recovered = try CapsuleVmStateDiskManager.acquire(
+        in: directory,
+        size: CapsuleVmStateDiskManager.minimumSize
+    )
+    try recovered.release()
+}
+
+@Test func sessionStopCancelsPendingStatePreparation() async throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let session = CapsuleVmVirtualMachineSession(
+        emitter: RecordingCapsuleVmFrameEmitter(),
+        statePreparationTTL: 10
+    )
+    let _: CapsuleVmPreparedState = try await withCheckedThrowingContinuation {
+        continuation in
+        session.prepareState(
+            descriptor: CapsuleVmStatePreparationDescriptor(
+                stateDirectoryURL: directory,
+                stateDiskBytes: CapsuleVmStateDiskManager.minimumSize
+            )
+        ) { continuation.resume(with: $0) }
+    }
+    try await withCheckedThrowingContinuation { continuation in
+        session.stop { continuation.resume(with: $0) }
+    } as Void
+
+    let recovered = try CapsuleVmStateDiskManager.acquire(
+        in: directory,
+        size: CapsuleVmStateDiskManager.minimumSize
+    )
+    try recovered.release()
 }
 
 private func temporaryStateDirectory() throws -> URL {

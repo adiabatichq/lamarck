@@ -1,7 +1,12 @@
 import { createServer as createHttpServer, get as httpGet } from "node:http";
 import { connect as netConnect } from "node:net";
+import { Duplex } from "node:stream";
 import { afterEach, describe, expect, test } from "vitest";
-import { createViewerGateway, type ViewerGatewayBinding } from "./viewer-gateway";
+import {
+  attachViewerBridge,
+  createViewerGateway,
+  type ViewerGatewayBinding,
+} from "./viewer-gateway";
 
 const closers: Array<() => Promise<void>> = [];
 
@@ -80,7 +85,81 @@ describe("App viewer gateway", () => {
     const echoed = await readUntil(socket, "ping");
     expect(echoed).toContain("ping");
   });
+
+  test("leaves a normal bilateral Guest close to directional FIN lifecycle", async () => {
+    let guest: RecordingGuestStream | undefined;
+    const gateway = await createViewerGateway({
+      instanceId: "instance-1",
+      originHost: "0123456789abcdef.localhost",
+      transport: {
+        openUiStream: async () => {
+          guest = new RecordingGuestStream(true);
+          return guest;
+        },
+      },
+    });
+    closers.push(() => gateway.close());
+
+    const response = await proxyGet(gateway, "/normal-close");
+    expect(response.status).toBe(200);
+    expect(response.body).toBe("viewer response");
+    await waitFor(() => guest?.readableEnded && guest.writableFinished);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(guest?.destroyErrors).toEqual([]);
+  });
+
+  test("destroys a premature Guest bridge close with an explicit error", async () => {
+    const socket = new RecordingGuestStream(false);
+    const guest = new RecordingGuestStream(false);
+    attachViewerBridge(socket, guest);
+    socket.emit("close", false);
+
+    const error = await waitFor(() => guest.destroyErrors[0]);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain("before both byte directions completed");
+  });
 });
+
+class RecordingGuestStream extends Duplex {
+  readonly destroyErrors: Array<Error | undefined> = [];
+  #request = Buffer.alloc(0);
+  #responded = false;
+
+  constructor(private readonly respond: boolean) {
+    super({ allowHalfOpen: true, autoDestroy: false });
+  }
+
+  _read(): void {}
+
+  _write(
+    chunk: Buffer,
+    _encoding: BufferEncoding,
+    callback: (error?: Error | null) => void,
+  ): void {
+    this.#request = Buffer.concat([this.#request, chunk]);
+    callback();
+    if (!this.respond || this.#responded || !this.#request.includes("\r\n\r\n")) return;
+    this.#responded = true;
+    this.push(Buffer.from(
+      "HTTP/1.1 200 OK\r\n"
+      + "Content-Type: text/plain\r\n"
+      + "Content-Length: 15\r\n"
+      + "Connection: close\r\n"
+      + "\r\n"
+      + "viewer response",
+    ));
+    this.push(null);
+  }
+
+  _final(callback: (error?: Error | null) => void): void {
+    callback();
+  }
+
+  override destroy(error?: Error): this {
+    this.destroyErrors.push(error);
+    return super.destroy(error);
+  }
+}
 
 async function createGateway(upstreamPort: number): Promise<ViewerGatewayBinding> {
   const gateway = await createViewerGateway({
@@ -98,15 +177,9 @@ function proxyGet(
   gateway: ViewerGatewayBinding,
   path: string,
 ): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string }> {
-  const proxy = new URL(gateway.proxyUrl);
-  const target = new URL(path, gateway.viewerUrl).toString();
+  const request = beginProxyGet(gateway, path);
   return new Promise((resolve, reject) => {
-    const request = httpGet({
-      host: proxy.hostname,
-      port: Number(proxy.port),
-      path: target,
-      headers: { host: new URL(gateway.viewerUrl).host },
-    }, (response) => {
+    request.once("response", (response) => {
       const chunks: Buffer[] = [];
       response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
       response.on("end", () => resolve({
@@ -116,6 +189,20 @@ function proxyGet(
       }));
     });
     request.once("error", reject);
+  });
+}
+
+function beginProxyGet(
+  gateway: ViewerGatewayBinding,
+  path: string,
+): ReturnType<typeof httpGet> {
+  const proxy = new URL(gateway.proxyUrl);
+  const target = new URL(path, gateway.viewerUrl).toString();
+  return httpGet({
+    host: proxy.hostname,
+    port: Number(proxy.port),
+    path: target,
+    headers: { host: new URL(gateway.viewerUrl).host },
   });
 }
 
@@ -175,4 +262,13 @@ function listen(server: import("node:http").Server): Promise<number> {
 function closeServer(server: import("node:http").Server): Promise<void> {
   if (!server.listening) return Promise.resolve();
   return new Promise((resolve) => server.close(() => resolve()));
+}
+
+async function waitFor<T>(operation: () => T | undefined | false): Promise<Exclude<T, undefined | false>> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const value = operation();
+    if (value !== undefined && value !== false) return value as Exclude<T, undefined | false>;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error("Timed out waiting for test condition");
 }

@@ -1,11 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { lstat, mkdir, readFile, rm, chmod } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createServer, type Server } from "node:net";
 import { validateArtifactDigest } from "@lamarck/capsule";
 import { GuestBlobStore } from "./blob-store";
 import { recoverGuestEphemeralState } from "./boot-recovery";
 import { GuestBuildManager } from "./build-manager";
 import { DEFAULT_GUEST_PATHS, GUEST_ROOT } from "./config";
+import { LvrmDuplex } from "./lvrm-duplex";
 import { GuestResourceAdmission } from "./resource-admission";
 import { GuestResourceManager } from "./resource-manager";
 import { CapsuleGuestSupervisor } from "./supervisor";
@@ -63,8 +64,8 @@ export async function startGuestSupervisor(): Promise<void> {
   await mkdir("/run/lamarck", { recursive: true, mode: 0o700 });
   await removeStaleSocket(CONTROL_SOCKET);
   await removeStaleSocket(DATA_SOCKET);
-  const control = createServer((socket) => supervisor.attachControl(socket));
-  const data = createServer((socket) => supervisor.attachData(socket));
+  const control = createGuestControlServer(supervisor);
+  const data = createGuestDataServer(supervisor);
   await Promise.all([
     listenUnix(control, CONTROL_SOCKET),
     listenUnix(data, DATA_SOCKET),
@@ -77,6 +78,30 @@ export async function startGuestSupervisor(): Promise<void> {
   };
   process.once("SIGTERM", terminate);
   process.once("SIGINT", terminate);
+}
+
+/**
+ * The native relay preserves LVRM v2 DATA/FIN/RESET/CLOSE records in both
+ * directions on each accepted Unix socket. The adapter validates, unwraps,
+ * and frames those records; `allowHalfOpen` ensures physical EOF cannot
+ * implicitly complete either independent direction.
+ */
+export function createGuestControlServer(
+  supervisor: Pick<CapsuleGuestSupervisor, "attachControl">,
+): Server {
+  return createServer(
+    { allowHalfOpen: true },
+    (socket) => supervisor.attachControl(new LvrmDuplex(socket)),
+  );
+}
+
+export function createGuestDataServer(
+  supervisor: Pick<CapsuleGuestSupervisor, "attachData">,
+): Server {
+  return createServer(
+    { allowHalfOpen: true },
+    (socket) => supervisor.attachData(new LvrmDuplex(socket)),
+  );
 }
 
 async function removeStaleSocket(path: string): Promise<void> {

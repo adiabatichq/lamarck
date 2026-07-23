@@ -15,7 +15,7 @@ import Testing
     let object = try responseObject(response)
     #expect(object["ok"] as? Bool == true)
     let result = try #require(object["result"] as? [String: Any])
-    #expect(result["protocolVersion"] as? Int == 1)
+    #expect(result["protocolVersion"] as? Int == 2)
     #expect(result["virtualizationSupported"] is Bool)
 }
 
@@ -40,6 +40,37 @@ import Testing
     #expect(session.startDescriptors.isEmpty)
 }
 
+@Test func commandServicePreparesAndCancelsOneUseStateLease() throws {
+    let emitter = RecordingCapsuleVmFrameEmitter()
+    let session = FakeCapsuleVmSession()
+    let service = CapsuleVmCommandService(session: session, emitter: emitter)
+
+    try service.accept(requestFrame(
+        streamID: 30,
+        object: ["method": "prepareState", "params": validStatePreparationParams()]
+    ))
+    let descriptor = try #require(session.statePreparationDescriptors.first)
+    #expect(descriptor.stateDiskBytes == 8 * 1_024 * 1_024 * 1_024)
+    let prepared = try responseObject(try #require(emitter.frames.last))
+    let result = try #require(prepared["result"] as? [String: Any])
+    #expect(result["preparationId"] as? String == session.preparationID)
+    #expect(result["existingPhysicalBytes"] as? UInt64 == 1_024)
+    #expect(result["additionalPhysicalBytes"] as? UInt64 == 2_048)
+    #expect(result["peakPhysicalBytes"] as? UInt64 == 3_072)
+
+    try service.accept(requestFrame(
+        streamID: 31,
+        object: [
+            "method": "cancelStatePreparation",
+            "params": ["preparationId": session.preparationID],
+        ]
+    ))
+    #expect(session.cancelledPreparationIDs == [session.preparationID])
+    let cancelled = try responseObject(try #require(emitter.frames.last))
+    let cancelledResult = try #require(cancelled["result"] as? [String: Any])
+    #expect(cancelledResult["state"] as? String == "cancelled")
+}
+
 @Test func commandServiceStartsAndStopsThroughStatefulSession() throws {
     let emitter = RecordingCapsuleVmFrameEmitter()
     let session = FakeCapsuleVmSession()
@@ -54,6 +85,7 @@ import Testing
     let descriptor = try #require(session.startDescriptors.first)
     #expect(descriptor.trustedImage.expectedManifestDigest == params["expectedManifestDigest"] as? String)
     #expect(descriptor.trustedImage.pinnedPublicKey == Data(repeating: 7, count: 32))
+    #expect(descriptor.statePreparationID == "01234567-89ab-4def-8123-456789abcdef")
     #expect(descriptor.cpuCount == 2)
     #expect(descriptor.memorySize == 1_073_741_824)
 
@@ -112,6 +144,29 @@ import Testing
     #expect(session.startDescriptors.isEmpty)
 }
 
+@Test func commandServiceRequiresBoundedAlignedStateDiskBytes() throws {
+    let emitter = RecordingCapsuleVmFrameEmitter()
+    let session = FakeCapsuleVmSession()
+    let service = CapsuleVmCommandService(session: session, emitter: emitter)
+    let invalidValues: [UInt64] = [
+        CapsuleVmStateDiskManager.minimumSize - 1,
+        CapsuleVmStateDiskManager.minimumSize + 1,
+        CapsuleVmStateDiskManager.maximumSize + CapsuleVmStateDiskManager.sizeAlignment,
+    ]
+
+    for (index, value) in invalidValues.enumerated() {
+        var params = validStatePreparationParams()
+        params["stateDiskBytes"] = value
+        try service.accept(requestFrame(
+            streamID: UInt32(20 + index),
+            object: ["method": "prepareState", "params": params]
+        ))
+        let error = try responseError(try #require(emitter.frames.last))
+        #expect(error["code"] as? String == "state_preparation_required")
+    }
+    #expect(session.statePreparationDescriptors.isEmpty)
+}
+
 @Test func commandServiceRejectsDuplicatePendingRequestAndSuppressesAfterShutdown() throws {
     let emitter = RecordingCapsuleVmFrameEmitter()
     let session = FakeCapsuleVmSession()
@@ -156,7 +211,7 @@ import Testing
             payload: Data()
         ))
     }
-    #expect(throws: CapsuleVmStreamMuxError.self) {
+    #expect(throws: CapsuleVmProtocolError.self) {
         try service.accept(CapsuleVmFrame(
             kind: .streamData,
             streamID: CapsuleVmProtocol.minimumHelperStreamID,
@@ -167,6 +222,9 @@ import Testing
 
 private final class FakeCapsuleVmSession: CapsuleVmSessionControlling, @unchecked Sendable {
     var state: CapsuleVmLifecycleState = .idle
+    let preparationID = "01234567-89ab-4def-8123-456789abcdef"
+    var statePreparationDescriptors: [CapsuleVmStatePreparationDescriptor] = []
+    var cancelledPreparationIDs: [String] = []
     var startDescriptors: [CapsuleVmStartDescriptor] = []
     var streamFrames: [CapsuleVmFrame] = []
     var stopCount = 0
@@ -174,6 +232,30 @@ private final class FakeCapsuleVmSession: CapsuleVmSessionControlling, @unchecke
     private var heldStart: CapsuleVmStartCompletion?
 
     func currentState() -> CapsuleVmLifecycleState { state }
+
+    func prepareState(
+        descriptor: CapsuleVmStatePreparationDescriptor,
+        completion: @escaping CapsuleVmPrepareStateCompletion
+    ) {
+        statePreparationDescriptors.append(descriptor)
+        completion(.success(CapsuleVmPreparedState(
+            preparationID: preparationID,
+            requirements: CapsuleVmStateDiskPreparationRequirements(
+                stateDiskBytes: descriptor.stateDiskBytes,
+                existingPhysicalBytes: 1_024,
+                additionalPhysicalBytes: 2_048,
+                peakPhysicalBytes: 3_072
+            )
+        )))
+    }
+
+    func cancelStatePreparation(
+        id: String,
+        completion: @escaping CapsuleVmCancelStateCompletion
+    ) {
+        cancelledPreparationIDs.append(id)
+        completion(.success(()))
+    }
 
     func start(
         descriptor: CapsuleVmStartDescriptor,
@@ -225,11 +307,18 @@ private func requestFrame(streamID: UInt32, object: [String: Any]) -> CapsuleVmF
 private func validStartParams() -> [String: Any] {
     [
         "imageBundlePath": "/Applications/Lamarck.app/Contents/Resources/capsule-guest",
-        "stateDirectory": "/Users/test/Library/Application Support/Lamarck/capsule-vm",
+        "statePreparationId": "01234567-89ab-4def-8123-456789abcdef",
         "expectedManifestDigest": "sha256:\(String(repeating: "a", count: 64))",
         "manifestPublicKey": Data(repeating: 7, count: 32).base64EncodedString(),
         "cpuCount": 2,
         "memorySizeBytes": 1_073_741_824,
+    ]
+}
+
+private func validStatePreparationParams() -> [String: Any] {
+    [
+        "stateDirectory": "/Users/test/Library/Application Support/Lamarck/capsule-vm",
+        "stateDiskBytes": 8 * 1_024 * 1_024 * 1_024,
     ]
 }
 

@@ -1,8 +1,11 @@
-export const CAPSULE_VM_PROTOCOL_VERSION = 1;
+export const CAPSULE_VM_PROTOCOL_VERSION = 2;
 export const CAPSULE_VM_HEADER_BYTES = 16;
 export const CAPSULE_VM_MAX_PAYLOAD_BYTES = 1_048_576;
 export const CAPSULE_VM_STREAM_CHUNK_BYTES = 64 * 1024;
+export const CAPSULE_VM_STREAM_WINDOW_BYTES = 256 * 1024;
 export const CAPSULE_VM_MAX_OPEN_STREAMS = 64;
+export const CAPSULE_VM_MAX_PENDING_REQUESTS = 64;
+export const CAPSULE_VM_MAX_RESET_TOMBSTONES = 1_024;
 
 export const CAPSULE_VM_REQUEST_STREAM_ID_MIN = 1;
 export const CAPSULE_VM_REQUEST_STREAM_ID_MAX = 0x7fff_ffff;
@@ -18,16 +21,22 @@ export enum CapsuleVmFrameKind {
   Request = 1,
   Response = 2,
   Event = 3,
-  StreamData = 4,
-  StreamEnd = 5,
+  Data = 4,
+  Fin = 5,
+  WindowUpdate = 6,
+  Reset = 7,
+  ResetAck = 8,
 }
 
 const VALID_KINDS = new Set<number>([
   CapsuleVmFrameKind.Request,
   CapsuleVmFrameKind.Response,
   CapsuleVmFrameKind.Event,
-  CapsuleVmFrameKind.StreamData,
-  CapsuleVmFrameKind.StreamEnd,
+  CapsuleVmFrameKind.Data,
+  CapsuleVmFrameKind.WindowUpdate,
+  CapsuleVmFrameKind.Fin,
+  CapsuleVmFrameKind.Reset,
+  CapsuleVmFrameKind.ResetAck,
 ]);
 
 export interface CapsuleVmFrame {
@@ -186,6 +195,30 @@ export function decodeCapsuleVmJson(payload: Uint8Array): unknown {
   }
 }
 
+/** WINDOW_UPDATE is a fixed four-byte, big-endian positive credit delta. */
+export function encodeCapsuleVmWindowUpdate(creditBytes: number): Uint8Array {
+  assertWindowCredit(creditBytes);
+  const payload = new Uint8Array(4);
+  new DataView(payload.buffer).setUint32(0, creditBytes, false);
+  return payload;
+}
+
+export function decodeCapsuleVmWindowUpdate(payload: Uint8Array): number {
+  if (payload.byteLength !== 4) {
+    throw new CapsuleVmProtocolError(
+      "invalid_window_update",
+      "WINDOW_UPDATE payload must be exactly four bytes",
+    );
+  }
+  const creditBytes = new DataView(
+    payload.buffer,
+    payload.byteOffset,
+    payload.byteLength,
+  ).getUint32(0, false);
+  assertWindowCredit(creditBytes);
+  return creditBytes;
+}
+
 export function decodeCapsuleVmEvent(payload: Uint8Array): CapsuleVmEvent {
   const value = decodeCapsuleVmJson(payload);
   if (!isPlainObject(value) || typeof value.type !== "string") {
@@ -266,6 +299,16 @@ export function isHelperStreamId(value: number): boolean {
 function assertUint32(value: unknown, name: string): asserts value is number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
     throw new CapsuleVmProtocolError("invalid_uint32", `${name} must be a uint32`);
+  }
+}
+
+function assertWindowCredit(value: unknown): asserts value is number {
+  if (typeof value !== "number" || !Number.isInteger(value)
+    || value < 1 || value > CAPSULE_VM_STREAM_WINDOW_BYTES) {
+    throw new CapsuleVmProtocolError(
+      "invalid_window_update",
+      `WINDOW_UPDATE credit must be between 1 and ${CAPSULE_VM_STREAM_WINDOW_BYTES} bytes`,
+    );
   }
 }
 

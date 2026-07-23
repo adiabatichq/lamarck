@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, stat, truncate, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtemp } from "node:fs/promises";
@@ -152,5 +152,172 @@ describe("Host-wide Capsule storage admission", () => {
     expect((await budget.snapshot()).reservedBytes).toBe(10);
     await reservation.release();
     expect(await budget.snapshot()).toMatchObject({ usedBytes: 10, reservedBytes: 0 });
+  });
+
+  test("accounts an exact helper-side fixed-file replacement without Electron unlinking it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "capsule-budget-replace-"));
+    const state = join(root, "state.raw");
+    await writeFile(state, Buffer.alloc(10));
+    const existingPhysicalBytes = Number((await stat(state, { bigint: true })).blocks * 512n);
+    const stateDiskBytes = 8 * 1024;
+    const budget = new CapsuleStorageBudget({
+      roots: [root],
+      aggregateBytes: 32 * 1024,
+      perAppBytes: 32 * 1024,
+      filesystemReserveBytes: 0,
+      dependencies: { availableBytes: async () => 100_000 },
+    });
+
+    const replacement = await budget.reserveStateDisk({
+      owner: "host",
+      path: state,
+      stateDiskBytes,
+      existingPhysicalBytes,
+      additionalPhysicalBytes: stateDiskBytes,
+      peakPhysicalBytes: existingPhysicalBytes + stateDiskBytes,
+    });
+    expect(await budget.snapshot()).toMatchObject({
+      usedBytes: existingPhysicalBytes,
+      reservedBytes: stateDiskBytes,
+    });
+
+    // This rename stands in for the Swift helper's lock-held atomic
+    // publication. CapsuleStorageBudget only admits and reconciles it.
+    const priorInode = (await stat(state)).ino;
+    const staged = join(root, ".state.raw.creating");
+    await writeFile(staged, Buffer.alloc(stateDiskBytes));
+    await rename(staged, state);
+    expect((await stat(state)).ino).not.toBe(priorInode);
+    await replacement.commit();
+    const replacementPhysicalBytes = Number((await stat(state, { bigint: true })).blocks * 512n);
+    expect(await budget.snapshot()).toMatchObject({
+      usedBytes: replacementPhysicalBytes,
+      reservedBytes: 0,
+      ownerUsedBytes: { host: replacementPhysicalBytes },
+    });
+  });
+
+  test("reconciles helper-removed creating residue before exact peak admission", async () => {
+    const root = await mkdtemp(join(tmpdir(), "capsule-budget-state-residue-"));
+    const state = join(root, "state.raw");
+    const staged = join(root, ".state.raw.creating");
+    await writeFile(state, Buffer.alloc(4 * 1024));
+    await writeFile(staged, Buffer.alloc(8 * 1024));
+    const existingPhysicalBytes = Number((await stat(state, { bigint: true })).blocks * 512n);
+    const budget = new CapsuleStorageBudget({
+      roots: [root],
+      aggregateBytes: 32 * 1024,
+      perAppBytes: 32 * 1024,
+      filesystemReserveBytes: 0,
+      dependencies: { availableBytes: async () => 100_000 },
+    });
+
+    // Force startup discovery while the prior helper residue still exists,
+    // then model the new helper's lock-held validated reconciliation.
+    expect((await budget.snapshot()).usedBytes).toBeGreaterThan(existingPhysicalBytes);
+    await unlink(staged);
+
+    const reservation = await budget.reserveStateDisk({
+      owner: "host",
+      path: state,
+      stateDiskBytes: 8 * 1024,
+      existingPhysicalBytes,
+      additionalPhysicalBytes: 8 * 1024,
+      peakPhysicalBytes: existingPhysicalBytes + 8 * 1024,
+    });
+    expect(await budget.snapshot()).toMatchObject({
+      usedBytes: existingPhysicalBytes,
+      reservedBytes: 8 * 1024,
+    });
+    await reservation.release();
+  });
+
+  test("reconcile-only startup does not reserve an unused replacement", async () => {
+    const root = await mkdtemp(join(tmpdir(), "capsule-budget-state-reconcile-only-"));
+    const state = join(root, "state.raw");
+    await writeFile(state, Buffer.alloc(16 * 1024));
+    const existingPhysicalBytes = Number((await stat(state, { bigint: true })).blocks * 512n);
+    let freeSpaceChecks = 0;
+    const budget = new CapsuleStorageBudget({
+      roots: [root],
+      aggregateBytes: existingPhysicalBytes + 1,
+      perAppBytes: existingPhysicalBytes + 1,
+      filesystemReserveBytes: 0,
+      dependencies: {
+        availableBytes: async () => {
+          freeSpaceChecks += 1;
+          return 0;
+        },
+      },
+    });
+
+    await budget.reconcileStateDisk({
+      owner: "host",
+      path: state,
+      existingPhysicalBytes,
+    });
+    expect(freeSpaceChecks).toBe(0);
+    expect(await budget.snapshot()).toMatchObject({
+      usedBytes: existingPhysicalBytes,
+      reservedBytes: 0,
+    });
+  });
+
+  test("separates strict successful commit from failed-attempt reconciliation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "capsule-budget-state-outcome-"));
+    const state = join(root, "state.raw");
+    const stateDiskBytes = 8 * 1024;
+    const budget = new CapsuleStorageBudget({
+      roots: [root],
+      aggregateBytes: 32 * 1024,
+      perAppBytes: 32 * 1024,
+      filesystemReserveBytes: 0,
+      dependencies: { availableBytes: async () => 100_000 },
+    });
+    const reservation = await budget.reserveStateDisk({
+      owner: "host",
+      path: state,
+      stateDiskBytes,
+      existingPhysicalBytes: 0,
+      additionalPhysicalBytes: stateDiskBytes,
+      peakPhysicalBytes: stateDiskBytes,
+    });
+
+    await expect(reservation.commit()).rejects.toThrow("did not publish");
+    await writeFile(state, Buffer.from([1]));
+    await truncate(state, stateDiskBytes);
+    await expect(reservation.commit()).rejects.toThrow("not fully allocated");
+    await reservation.reconcileFailure();
+    expect(await budget.snapshot()).toMatchObject({ reservedBytes: 0 });
+  });
+
+  test("never settles a state reservation while creating residue remains", async () => {
+    const root = await mkdtemp(join(tmpdir(), "capsule-budget-state-temp-"));
+    const state = join(root, "state.raw");
+    const staged = join(root, ".state.raw.creating");
+    const stateDiskBytes = 8 * 1024;
+    const budget = new CapsuleStorageBudget({
+      roots: [root],
+      aggregateBytes: 32 * 1024,
+      perAppBytes: 32 * 1024,
+      filesystemReserveBytes: 0,
+      dependencies: { availableBytes: async () => 100_000 },
+    });
+    const reservation = await budget.reserveStateDisk({
+      owner: "host",
+      path: state,
+      stateDiskBytes,
+      existingPhysicalBytes: 0,
+      additionalPhysicalBytes: stateDiskBytes,
+      peakPhysicalBytes: stateDiskBytes,
+    });
+    await writeFile(staged, Buffer.alloc(stateDiskBytes));
+
+    await expect(reservation.commit()).rejects.toThrow("temporary disk exists");
+    await expect(reservation.reconcileFailure()).rejects.toThrow("temporary disk exists");
+    await expect(reservation.release()).rejects.toThrow("temporary disk exists");
+    expect((await budget.snapshot()).reservedBytes).toBe(stateDiskBytes);
+    await unlink(staged);
+    await reservation.release();
   });
 });

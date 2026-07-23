@@ -19,6 +19,7 @@ import {
 import {
   normalizeCapsuleStorageError,
   type CapsuleStorageBudgetLike,
+  type CapsuleStorageReservation,
 } from "./storage-budget";
 
 export const NPM_DEPENDENCY_BUNDLE_FORMAT = "npm-dependency-bundle-v1" as const;
@@ -72,6 +73,23 @@ interface CasTarball {
   readonly modifiedNs: bigint;
 }
 
+interface NpmDependencyWriterDependencies {
+  removeTemporary(path: string): Promise<void>;
+  syncDirectory(path: string): Promise<void>;
+  afterPublication(published: boolean): Promise<void>;
+}
+
+const DEFAULT_DEPENDENCY_WRITER_DEPENDENCIES: NpmDependencyWriterDependencies = {
+  async removeTemporary(path) {
+    await rm(path, { force: true });
+  },
+  syncDirectory,
+  async afterPublication() {},
+};
+
+const TARBALL_PUBLICATION_TAILS = new Map<string, Promise<void>>();
+const TARBALL_PUBLICATION_QUARANTINE = new Map<string, Error>();
+
 const DEFAULT_LIMITS: NpmDependencyBrokerLimits = Object.freeze({
   lockBytes: 16 * 1024 * 1024,
   packages: 50_000,
@@ -89,6 +107,8 @@ export async function createNpmDependencyBundle(options: {
   limits?: Partial<NpmDependencyBrokerLimits>;
   ownerKey?: string;
   storageBudget?: CapsuleStorageBudgetLike;
+  /** Deterministic managed-writer seams; production uses unlink(2) and directory fsync. */
+  dependencyWriter?: Partial<NpmDependencyWriterDependencies>;
 }): Promise<NpmDependencyBundle> {
   const limits = normalizeLimits(options.limits);
   throwIfAborted(options.signal);
@@ -112,6 +132,7 @@ export async function createNpmDependencyBundle(options: {
     options.signal,
     options.ownerKey,
     options.storageBudget,
+    dependencyWriter(options.dependencyWriter),
   );
 
   const manifestEntries: DependencyManifestEntry[] = tarballs.map((tarball) => ({
@@ -170,6 +191,12 @@ function normalizeLimits(input: Partial<NpmDependencyBrokerLimits> | undefined):
     throw new Error("npm dependency tarballBytes cannot exceed totalBytes");
   }
   return Object.freeze(value);
+}
+
+function dependencyWriter(
+  overrides: Partial<NpmDependencyWriterDependencies> | undefined,
+): NpmDependencyWriterDependencies {
+  return { ...DEFAULT_DEPENDENCY_WRITER_DEPENDENCIES, ...overrides };
 }
 
 function assertLimit(name: string, value: number, minimum: number, maximum: number): void {
@@ -393,6 +420,7 @@ async function loadTarballsConcurrently(
   parentSignal: AbortSignal | undefined,
   ownerKey: string | undefined,
   storageBudget: CapsuleStorageBudgetLike | undefined,
+  writer: NpmDependencyWriterDependencies,
 ): Promise<CasTarball[]> {
   if (typeof fetchImpl !== "function") throw new Error("npm dependency fetch implementation is unavailable");
   const operation = new AbortController();
@@ -418,6 +446,7 @@ async function loadTarballsConcurrently(
           operation.signal,
           ownerKey,
           storageBudget,
+          writer,
         );
       } catch (error) {
         if (firstError === undefined) firstError = error;
@@ -448,22 +477,27 @@ async function loadTarball(
   signal: AbortSignal,
   ownerKey: string | undefined,
   storageBudget: CapsuleStorageBudgetLike | undefined,
+  writer: NpmDependencyWriterDependencies,
 ): Promise<CasTarball> {
   throwIfAborted(signal);
   const finalPath = join(cacheDir, `${locked.digestHex}.tgz`);
-  const cached = await verifyCachedTarball(finalPath, locked, limits.tarballBytes);
-  if (cached) {
-    budget.reserve(cached.bytes);
-    if (ownerKey && storageBudget) {
-      await storageBudget.claim({
-        owner: ownerKey,
-        scope: "dependency-cache",
-        path: cached.path,
-        bytes: cached.bytes,
-      });
+  const cached = await withTarballPublicationLock(finalPath, async () => {
+    assertTarballPublicationAvailable(finalPath);
+    const candidate = await verifyCachedTarball(finalPath, locked, limits.tarballBytes);
+    if (candidate) {
+      budget.reserve(candidate.bytes);
+      if (ownerKey && storageBudget) {
+        await storageBudget.claim({
+          owner: ownerKey,
+          scope: "dependency-cache",
+          path: candidate.path,
+          bytes: candidate.bytes,
+        });
+      }
     }
-    return cached;
-  }
+    return candidate;
+  });
+  if (cached) return cached;
 
   const request = childTimeoutSignal(signal, limits.requestTimeoutMs);
   let response: Response | undefined;
@@ -491,32 +525,17 @@ async function loadTarball(
           bytes: contentLength,
         })
       : undefined;
-    let published = false;
-    try {
-      published = await downloadTarball(
-        response,
-        finalPath,
-        locked,
-        contentLength,
-        request.signal,
-      );
-      await reservation?.commit(published ? contentLength : 0, published ? finalPath : undefined);
-      if (ownerKey && storageBudget) {
-        await storageBudget.claim({
-          owner: ownerKey,
-          scope: "dependency-cache",
-          path: finalPath,
-          bytes: contentLength,
-        });
-      }
-    } catch (error) {
-      if (published) {
-        if (storageBudget) await storageBudget.remove(finalPath).catch(() => {});
-        else await rm(finalPath, { force: true }).catch(() => {});
-      }
-      await reservation?.release().catch(() => {});
-      throw normalizeCapsuleStorageError(error, "npm dependency cache storage is full");
-    }
+    await downloadTarball(
+      response,
+      finalPath,
+      locked,
+      contentLength,
+      request.signal,
+      reservation,
+      ownerKey,
+      storageBudget,
+      writer,
+    );
     completed = true;
   } finally {
     if (!completed && response?.body && !response.body.locked) {
@@ -561,16 +580,26 @@ async function downloadTarball(
   locked: LockedTarball,
   expectedBytes: number,
   signal: AbortSignal,
-): Promise<boolean> {
+  reservation: CapsuleStorageReservation | undefined,
+  ownerKey: string | undefined,
+  storageBudget: CapsuleStorageBudgetLike | undefined,
+  writer: NpmDependencyWriterDependencies,
+): Promise<void> {
   const temporaryPath = join(
     dirname(finalPath),
     `.download-${process.pid}-${randomBytes(12).toString("hex")}.tmp`,
   );
-  const output = await open(
-    temporaryPath,
-    constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
-    0o600,
-  );
+  let output: Awaited<ReturnType<typeof open>>;
+  try {
+    output = await open(
+      temporaryPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+      0o600,
+    );
+  } catch (error) {
+    await reservation?.release();
+    throw normalizeCapsuleStorageError(error, "npm dependency cache storage is full");
+  }
   const hash = createHash("sha512");
   let bytes = 0;
   const reader = response.body!.getReader();
@@ -593,44 +622,141 @@ async function downloadTarball(
     await output.sync();
     await output.chmod(0o400);
   } catch (error) {
-    await reader.cancel(error).catch(() => {});
-    await output.close().catch(() => {});
-    await rm(temporaryPath, { force: true }).catch(() => {});
-    throw error;
+    const failures: unknown[] = [error];
+    try {
+      await reader.cancel(error);
+    } catch (cancelError) {
+      failures.push(cancelError);
+    }
+    try {
+      await output.close();
+    } catch (closeError) {
+      failures.push(closeError);
+    }
+    try {
+      await removeTarballTemporaryDurably(temporaryPath, dirname(finalPath), writer);
+    } catch (cleanupError) {
+      failures.push(cleanupError);
+      const failure = combinedDependencyWriterError("npm tarball temporary cleanup failed", failures);
+      TARBALL_PUBLICATION_QUARANTINE.set(finalPath, failure);
+      throw normalizeCapsuleStorageError(failure, "npm dependency cache cleanup failed");
+    }
+    await reservation?.release();
+    throw normalizeCapsuleStorageError(
+      combinedDependencyWriterError("npm tarball write failed", failures),
+      "npm dependency cache storage is full",
+    );
   } finally {
     reader.releaseLock();
   }
   try {
     await output.close();
   } catch (error) {
-    await rm(temporaryPath, { force: true }).catch(() => {});
-    throw error;
-  }
-  let published = false;
-  try {
     try {
-      await link(temporaryPath, finalPath);
-      published = true;
-    } catch (error) {
-      if (!isNodeError(error, "EEXIST")) throw error;
-      const existing = await verifyCachedTarball(finalPath, locked, expectedBytes);
-      if (!existing || existing.bytes !== expectedBytes) {
-        throw new Error("npm tarball CAS collision");
+      await removeTarballTemporaryDurably(temporaryPath, dirname(finalPath), writer);
+    } catch (cleanupError) {
+      const failure = combinedDependencyWriterError(
+        "npm tarball temporary cleanup failed",
+        [error, cleanupError],
+      );
+      TARBALL_PUBLICATION_QUARANTINE.set(finalPath, failure);
+      throw normalizeCapsuleStorageError(failure, "npm dependency cache cleanup failed");
+    }
+    await reservation?.release();
+    throw normalizeCapsuleStorageError(error, "npm dependency cache storage is full");
+  }
+
+  let published = false;
+  let cleanupAttempted = false;
+  let cleanupConfirmed = false;
+  try {
+    await withTarballPublicationLock(finalPath, async () => {
+      assertTarballPublicationAvailable(finalPath);
+      let publicationError: unknown;
+      try {
+        await link(temporaryPath, finalPath);
+        published = true;
+      } catch (error) {
+        if (!isNodeError(error, "EEXIST")) {
+          publicationError = error;
+        } else {
+          try {
+            const existing = await verifyCachedTarball(finalPath, locked, expectedBytes);
+            if (!existing || existing.bytes !== expectedBytes) {
+              throw new Error("npm tarball CAS collision");
+            }
+          } catch (winnerError) {
+            publicationError = winnerError;
+          }
+        }
+      }
+      if (publicationError === undefined) {
+        try {
+          await writer.afterPublication(published);
+        } catch (error) {
+          publicationError = error;
+        }
+      }
+
+      cleanupAttempted = true;
+      try {
+        await removeTarballTemporaryDurably(temporaryPath, dirname(finalPath), writer);
+        cleanupConfirmed = true;
+      } catch (cleanupError) {
+        const failure = combinedDependencyWriterError(
+          "npm tarball temporary cleanup failed",
+          publicationError === undefined
+            ? [cleanupError]
+            : [publicationError, cleanupError],
+        );
+        TARBALL_PUBLICATION_QUARANTINE.set(finalPath, failure);
+        throw failure;
+      }
+      if (publicationError !== undefined) {
+        if (published) {
+          TARBALL_PUBLICATION_QUARANTINE.set(finalPath, asDependencyWriterError(publicationError));
+        }
+        throw publicationError;
+      }
+
+      try {
+        await reservation?.commit(
+          published ? expectedBytes : 0,
+          published ? finalPath : undefined,
+        );
+        if (ownerKey && storageBudget) {
+          await storageBudget.claim({
+            owner: ownerKey,
+            scope: "dependency-cache",
+            path: finalPath,
+            bytes: expectedBytes,
+          });
+        }
+      } catch (error) {
+        if (published) {
+          TARBALL_PUBLICATION_QUARANTINE.set(finalPath, asDependencyWriterError(error));
+        }
+        throw error;
+      }
+    });
+  } catch (error) {
+    if (!cleanupAttempted) {
+      try {
+        cleanupAttempted = true;
+        await removeTarballTemporaryDurably(temporaryPath, dirname(finalPath), writer);
+        cleanupConfirmed = true;
+      } catch (cleanupError) {
+        const failure = combinedDependencyWriterError(
+          "npm tarball temporary cleanup failed",
+          [error, cleanupError],
+        );
+        TARBALL_PUBLICATION_QUARANTINE.set(finalPath, failure);
+        throw normalizeCapsuleStorageError(failure, "npm dependency cache cleanup failed");
       }
     }
-  } finally {
-    await rm(temporaryPath, { force: true }).catch(() => {});
+    if (!published && cleanupConfirmed) await reservation?.release();
+    throw normalizeCapsuleStorageError(error, "npm dependency cache publication failed");
   }
-  try {
-    await syncDirectory(dirname(finalPath));
-  } catch (error) {
-    if (published) {
-      await rm(finalPath, { force: true }).catch(() => {});
-      await syncDirectory(dirname(finalPath)).catch(() => {});
-    }
-    throw error;
-  }
-  return published;
 }
 
 async function verifyCachedTarball(
@@ -829,6 +955,53 @@ async function syncDirectory(path: string): Promise<void> {
   } finally {
     await directory.close();
   }
+}
+
+async function removeTarballTemporaryDurably(
+  path: string,
+  directory: string,
+  writer: NpmDependencyWriterDependencies,
+): Promise<void> {
+  await writer.removeTemporary(path);
+  await writer.syncDirectory(directory);
+}
+
+async function withTarballPublicationLock<T>(
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const prior = TARBALL_PUBLICATION_TAILS.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolvePromise) => {
+    release = resolvePromise;
+  });
+  TARBALL_PUBLICATION_TAILS.set(key, current);
+  await prior;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (TARBALL_PUBLICATION_TAILS.get(key) === current) {
+      TARBALL_PUBLICATION_TAILS.delete(key);
+    }
+  }
+}
+
+function assertTarballPublicationAvailable(path: string): void {
+  const quarantined = TARBALL_PUBLICATION_QUARANTINE.get(path);
+  if (quarantined) {
+    throw new Error("npm tarball publication is quarantined", { cause: quarantined });
+  }
+}
+
+function asDependencyWriterError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+function combinedDependencyWriterError(message: string, errors: readonly unknown[]): Error {
+  return errors.length === 1
+    ? asDependencyWriterError(errors[0])
+    : new AggregateError(errors, message);
 }
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {

@@ -22,7 +22,13 @@ import {
   type WorkingTreeConflictResolution,
 } from "./working-tree";
 import { WorkingTreeStateStore } from "./working-tree-state";
-import { archiveApp, loadApps, sourceForAppWorkload, type AppWorkloadIdentity } from "./app-loader";
+import {
+  archiveApp,
+  loadApps,
+  sourceForAppWorkload,
+  type AppRegistry,
+  type AppWorkloadIdentity,
+} from "./app-loader";
 import {
   ConnectorScheduler,
   ConnectorLifecycleConflictError,
@@ -67,6 +73,7 @@ import {
   parseRequestedWorkload,
 } from "./app-runtime-policy";
 import { createAppPackageJson, createAppPackageLock } from "./app-scaffold";
+import { APP_MANIFEST_DIGEST_PATTERN } from "../../capsule/src/app-manifest-authority";
 
 // Lamarck — HTTP server entry point
 // All routes go through here. Guard is the only write path.
@@ -140,7 +147,7 @@ const connectorScheduler = new ConnectorScheduler({
 });
 let registry = await loadApps(appsDir);
 let appManifestGeneration = 1;
-let appRegistryReload: Promise<void> | null = null;
+let appRegistryTail: Promise<void> = Promise.resolve();
 const workingTree = new WorkingTree({
   guard,
   pagesDir,
@@ -238,27 +245,49 @@ function guardForRequest(auth: AuthContext, opts?: {
 }
 
 async function reloadAppRegistry(): Promise<void> {
-  if (appRegistryReload) return appRegistryReload;
-
-  const retiredGeneration = appManifestGeneration;
-  const reload = (async () => {
+  return enqueueAppRegistryUpdate(async () => {
+    const candidate = await loadApps(appsDir);
+    const retiredGeneration = appManifestGeneration;
     // invalidateManifestGeneration closes admissions synchronously before its
     // first await, then drains requests already admitted under that snapshot.
     await appCapabilities.invalidateManifestGeneration(retiredGeneration);
-    const nextRegistry = await loadApps(appsDir);
-    registry = nextRegistry;
+    registry = candidate;
     appManifestGeneration = retiredGeneration + 1;
-  })();
-  appRegistryReload = reload;
-  try {
-    await reload;
-  } finally {
-    if (appRegistryReload === reload) appRegistryReload = null;
-  }
+  });
 }
 
-async function waitForAppRegistryReload(): Promise<void> {
-  if (appRegistryReload) await appRegistryReload;
+async function refreshAppRegistryIfChanged(): Promise<void> {
+  return enqueueAppRegistryUpdate(async () => {
+    const candidate = await loadApps(appsDir);
+    if (sameAppManifests(registry, candidate)) return;
+
+    const retiredGeneration = appManifestGeneration;
+    await appCapabilities.invalidateManifestGeneration(retiredGeneration);
+    // The loader returns a stable, fully validated snapshot. Publish that
+    // exact snapshot after the old capability generation is closed rather
+    // than scanning again and racing a later partial write.
+    registry = candidate;
+    appManifestGeneration = retiredGeneration + 1;
+  });
+}
+
+function enqueueAppRegistryUpdate(update: () => Promise<void>): Promise<void> {
+  const operation = appRegistryTail.then(update);
+  // Keep the serialization tail usable after an individual scan fails while
+  // returning the real failure to the request that initiated that scan.
+  appRegistryTail = operation.catch(() => {});
+  return operation;
+}
+
+function sameAppManifests(left: AppRegistry, right: AppRegistry): boolean {
+  if (left.apps.size !== right.apps.size) return false;
+  for (const [appId, app] of left.apps) {
+    const candidate = right.apps.get(appId);
+    if (!candidate || app.manifestDigest !== candidate.manifestDigest) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function parseAppWorkload(workload: AppWorkload): AppWorkloadIdentity {
@@ -1073,18 +1102,40 @@ const server = await serve<{ cwd: string }>({
       // -- Apps --
       if (path === "/api/app-runtime/channels" && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const body = await readBody<{ appId?: unknown; workload?: unknown }>(req);
+        const body = await readBody<{
+          appId?: unknown;
+          workload?: unknown;
+          manifestGeneration?: unknown;
+          manifestDigest?: unknown;
+        }>(req);
         const workload = parseRequestedWorkload(body.workload);
-        if (typeof body.appId !== "string" || !workload) {
-          return json({ error: "appId and a valid workload are required" }, 400);
+        if (
+          typeof body.appId !== "string"
+          || !workload
+          || !Number.isSafeInteger(body.manifestGeneration)
+          || Number(body.manifestGeneration) < 1
+          || typeof body.manifestDigest !== "string"
+          || !APP_MANIFEST_DIGEST_PATTERN.test(body.manifestDigest)
+        ) {
+          return json({ error: "appId, workload, and manifest authority are required" }, 400);
         }
-        await waitForAppRegistryReload();
+        // Re-scan immediately before issuance. The caller's generation and
+        // digest must still name this exact authority snapshot; a later file
+        // edit is caught again by the Capsule package-snapshot verifier.
+        await refreshAppRegistryIfChanged();
         const app = registry.apps.get(body.appId);
         if (!app || !isDeclaredWorkload(app.manifest, workload)) {
           return json({ error: "unknown App or undeclared workload" }, 404);
         }
+        if (
+          body.manifestGeneration !== appManifestGeneration
+          || body.manifestDigest !== app.manifestDigest
+        ) {
+          return json({ error: "App manifest authority changed; refresh and retry" }, 409);
+        }
         return json(appCapabilities.issue(body.appId, workload, {
           manifestGeneration: appManifestGeneration,
+          manifestDigest: app.manifestDigest,
           writeTables: registry.getTableGrants(body.appId),
           docGrants: appDocGrants(body.appId, app.manifest.permissions.docs),
         }));
@@ -1106,12 +1157,18 @@ const server = await serve<{ cwd: string }>({
       }
 
       if (path === "/api/apps" && method === "GET") {
+        // The Workspace is intentionally editable outside Lamarck. A coding
+        // agent may create an App directory directly, so make this read an
+        // authoritative semantic rescan without revoking unchanged Apps.
+        await refreshAppRegistryIfChanged();
         const apps = [...registry.apps.values()].map((a) => ({
           manifestVersion: a.manifest.manifestVersion,
           id: a.manifest.id,
           name: a.manifest.name,
           runtime: a.manifest.runtime,
           permissions: a.manifest.permissions,
+          manifestGeneration: appManifestGeneration,
+          manifestDigest: a.manifestDigest,
         }));
         return json({ apps });
       }
@@ -1165,7 +1222,6 @@ const server = await serve<{ cwd: string }>({
             tables: [],
           },
         };
-        await writeFile(join(appDir, "manifest.json"), JSON.stringify(manifest, null, 2));
         await writeFile(
           join(appDir, "package.json"),
           createAppPackageJson(id),
@@ -1192,6 +1248,11 @@ const server = await serve<{ cwd: string }>({
         } catch (err) {
           console.warn(`[lamarck] Could not initialize git for ${id}:`, err);
         }
+
+        // Publish the authority-bearing manifest last. A failed composition
+        // therefore remains invisible rather than exposing a valid manifest
+        // whose runtime files are only partially written.
+        await writeFile(join(appDir, "manifest.json"), JSON.stringify(manifest, null, 2));
 
         // Reloading invalidates every channel issued from the prior manifest
         // generation before the new App becomes visible.

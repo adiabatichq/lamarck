@@ -23,8 +23,12 @@ import {
   NPM_DEPENDENCY_BUNDLE_FORMAT,
   type NpmDependencyBrokerLimits,
 } from "./dependency-broker";
+import { CapsuleStorageBudget } from "./storage-budget";
 
 const temporaryRoots: string[] = [];
+const OWNER_A = "a".repeat(64);
+const OWNER_B = "b".repeat(64);
+const OWNER_C = "c".repeat(64);
 
 afterEach(async () => {
   await Promise.allSettled(temporaryRoots.splice(0).map((path) => rm(path, {
@@ -106,6 +110,123 @@ describe("Host npm dependency broker", () => {
     expect(noNetwork).not.toHaveBeenCalled();
     expect(second.snapshot.digest).toBe(first.snapshot.digest);
     expect(second.snapshot.bytes).toBe(first.snapshot.bytes);
+  });
+
+  test("retains tarball reservation and never claims success when winner cleanup fails", async () => {
+    const fixture = await createFixture();
+    const body = Buffer.from("dependency cleanup boundary");
+    const dependency = locked("cleanup", "1.0.0", body);
+    const snapshot = await snapshotLock(fixture, lock([{
+      path: "node_modules/cleanup",
+      ...dependency,
+    }]));
+    const budget = dependencyBudget(fixture.brokerCache);
+
+    await expect(createNpmDependencyBundle({
+      packageSnapshot: snapshot,
+      cacheDir: fixture.brokerCache,
+      fetch: (async () => response(body)) as typeof globalThis.fetch,
+      ownerKey: OWNER_A,
+      storageBudget: budget,
+      dependencyWriter: {
+        removeTemporary: async () => {
+          throw new Error("injected tarball unlink failure");
+        },
+      },
+    })).rejects.toThrow("injected tarball unlink failure");
+
+    expect(await budget.snapshot()).toMatchObject({
+      usedBytes: 0,
+      reservedBytes: body.byteLength,
+      reservations: 1,
+      ownerUsedBytes: {},
+      ownerReservedBytes: { [OWNER_A]: body.byteLength },
+    });
+  });
+
+  test("keeps same-digest tarball losers behind winner durability and fails them cleanly", async () => {
+    const fixture = await createFixture();
+    const body = Buffer.from("dependency publication boundary");
+    const dependency = locked("boundary", "1.0.0", body);
+    const snapshot = await snapshotLock(fixture, lock([{
+      path: "node_modules/boundary",
+      ...dependency,
+    }]));
+    const budget = dependencyBudget(fixture.brokerCache);
+    let fetches = 0;
+    let bothFetched!: () => void;
+    const fetched = new Promise<void>((resolve) => {
+      bothFetched = resolve;
+    });
+    let releaseFetches!: () => void;
+    const fetchGate = new Promise<void>((resolve) => {
+      releaseFetches = resolve;
+    });
+    const fetchMock = async () => {
+      fetches += 1;
+      if (fetches === 2) bothFetched();
+      await fetchGate;
+      return response(body);
+    };
+    let winnerPublished!: () => void;
+    const published = new Promise<void>((resolve) => {
+      winnerPublished = resolve;
+    });
+    let failWinner!: () => void;
+    const failureGate = new Promise<void>((resolve) => {
+      failWinner = resolve;
+    });
+    const writer = {
+      afterPublication: async (isWinner: boolean) => {
+        if (!isWinner) return;
+        winnerPublished();
+        await failureGate;
+        throw new Error("injected tarball publication boundary failure");
+      },
+    };
+    const first = createNpmDependencyBundle({
+      packageSnapshot: snapshot,
+      cacheDir: fixture.brokerCache,
+      fetch: fetchMock as typeof globalThis.fetch,
+      ownerKey: OWNER_A,
+      storageBudget: budget,
+      dependencyWriter: writer,
+    });
+    const second = createNpmDependencyBundle({
+      packageSnapshot: snapshot,
+      cacheDir: fixture.brokerCache,
+      fetch: fetchMock as typeof globalThis.fetch,
+      ownerKey: OWNER_B,
+      storageBudget: budget,
+      dependencyWriter: writer,
+    });
+    await fetched;
+    releaseFetches();
+    await published;
+    const cacheReader = createNpmDependencyBundle({
+      packageSnapshot: snapshot,
+      cacheDir: fixture.brokerCache,
+      fetch: (async () => {
+        throw new Error("quarantined publication must not fetch");
+      }) as typeof globalThis.fetch,
+      ownerKey: OWNER_C,
+      storageBudget: budget,
+      dependencyWriter: writer,
+    });
+    failWinner();
+    const results = await Promise.allSettled([first, second, cacheReader]);
+
+    expect(results.map((result) => result.status)).toEqual(["rejected", "rejected", "rejected"]);
+    const accounting = await budget.snapshot();
+    expect(accounting.usedBytes).toBe(0);
+    expect(accounting.reservedBytes).toBe(body.byteLength);
+    expect(accounting.reservations).toBe(1);
+    expect(accounting.ownerUsedBytes).toEqual({});
+    expect(Object.values(accounting.ownerReservedBytes)).toEqual([body.byteLength]);
+    expect(accounting.ownerUsedBytes[OWNER_C]).toBeUndefined();
+    expect(accounting.ownerReservedBytes[OWNER_C]).toBeUndefined();
+    expect((await readdir(join(fixture.brokerCache, "tarballs")))
+      .filter((name) => name.endsWith(".tgz"))).toHaveLength(1);
   });
 
   test("omits canonical package-local links from the registry bundle", async () => {
@@ -608,6 +729,16 @@ async function createFixture(): Promise<Fixture> {
     snapshotCache: join(root, "snapshot-cache"),
     brokerCache: join(root, "broker-cache"),
   };
+}
+
+function dependencyBudget(cacheDir: string): CapsuleStorageBudget {
+  return new CapsuleStorageBudget({
+    roots: [cacheDir],
+    aggregateBytes: 1024 * 1024,
+    perAppBytes: 1024 * 1024,
+    filesystemReserveBytes: 0,
+    dependencies: { availableBytes: async () => 1024 * 1024 * 1024 },
+  });
 }
 
 async function snapshotLock(fixture: Fixture, value: unknown | Buffer): Promise<CapsuleTreeSnapshot> {

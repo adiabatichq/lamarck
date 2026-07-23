@@ -1,5 +1,10 @@
 import { describe, expect, test } from "vitest";
-import type { GuestEvent, GuestEventType, JsonValue } from "../../../capsule/src/protocol/types";
+import {
+  CAPSULE_PROTOCOL_VERSION,
+  type GuestEvent,
+  type GuestEventType,
+  type JsonValue,
+} from "../../../capsule/src/protocol/types";
 import {
   CapsuleGuestResultError,
   correlateBlobExportedEvent,
@@ -240,7 +245,7 @@ function expectation(): BuildDescriptorExpectation {
 
 function event(type: GuestEventType, body: unknown): GuestEvent {
   return {
-    v: 1,
+    v: CAPSULE_PROTOCOL_VERSION,
     sessionId: SESSION,
     kind: "event",
     eventSeq: 1,

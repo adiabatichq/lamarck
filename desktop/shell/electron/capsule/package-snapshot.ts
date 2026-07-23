@@ -65,6 +65,23 @@ export interface CapsuleTreeSnapshot {
 
 export type CapsulePackageSnapshot = CapsuleTreeSnapshot;
 
+interface CapsuleSnapshotWriterDependencies {
+  removeTemporary(path: string): Promise<void>;
+  syncDirectory(path: string): Promise<void>;
+  afterPublication(published: boolean): Promise<void>;
+}
+
+const DEFAULT_SNAPSHOT_WRITER_DEPENDENCIES: CapsuleSnapshotWriterDependencies = {
+  async removeTemporary(path) {
+    await rm(path, { force: true });
+  },
+  syncDirectory,
+  async afterPublication() {},
+};
+
+const SNAPSHOT_PUBLICATION_TAILS = new Map<string, Promise<void>>();
+const SNAPSHOT_PUBLICATION_QUARANTINE = new Map<string, Error>();
+
 export type CapsuleVirtualTreeEntry =
   | {
       readonly type: "directory";
@@ -86,6 +103,8 @@ export async function createCapsulePackageSnapshot(options: {
   cacheDir: string;
   ownerKey?: string;
   storageBudget?: CapsuleStorageBudgetLike;
+  /** Deterministic managed-writer seams; production uses unlink(2) and directory fsync. */
+  snapshotWriter?: Partial<CapsuleSnapshotWriterDependencies>;
 }): Promise<CapsulePackageSnapshot> {
   const packageDir = resolve(options.packageDir);
   const packageInfo = await lstat(packageDir, { bigint: true });
@@ -100,7 +119,7 @@ export async function createCapsulePackageSnapshot(options: {
   const entries = await collectEntries(packageDir, canonicalRoot, packageInfo);
   return writeCapsuleTreeSnapshot(entries, canonicalCache, async () => {
     await assertTreeStable(packageDir, packageInfo, entries);
-  }, storageOptions(options));
+  }, storageOptions(options), snapshotWriter(options.snapshotWriter));
 }
 
 /**
@@ -113,10 +132,18 @@ export async function createCapsuleVirtualTreeSnapshot(options: {
   ownerKey?: string;
   storageBudget?: CapsuleStorageBudgetLike;
   storageScope?: "package-snapshot" | "dependency-cache";
+  /** Deterministic managed-writer seams; production uses unlink(2) and directory fsync. */
+  snapshotWriter?: Partial<CapsuleSnapshotWriterDependencies>;
 }): Promise<CapsuleTreeSnapshot> {
   const entries = normalizeVirtualEntries(options.entries);
   const canonicalCache = await prepareSnapshotCache(options.cacheDir);
-  return writeCapsuleTreeSnapshot(entries, canonicalCache, undefined, storageOptions(options));
+  return writeCapsuleTreeSnapshot(
+    entries,
+    canonicalCache,
+    undefined,
+    storageOptions(options),
+    snapshotWriter(options.snapshotWriter),
+  );
 }
 
 /**
@@ -267,6 +294,7 @@ async function writeCapsuleTreeSnapshot(
     budget: CapsuleStorageBudgetLike;
     scope: "package-snapshot" | "dependency-cache";
   },
+  writer: CapsuleSnapshotWriterDependencies = DEFAULT_SNAPSHOT_WRITER_DEPENDENCIES,
 ): Promise<CapsuleTreeSnapshot> {
   const expectedBytes = encodedTreeBytes(entries);
   let reservation: CapsuleStorageReservation | undefined;
@@ -323,15 +351,41 @@ async function writeCapsuleTreeSnapshot(
     await output.sync();
     await output.chmod(0o400);
   } catch (error) {
-    await output.close().catch(() => {});
-    await rm(temporaryPath, { force: true }).catch(() => {});
+    const failures: unknown[] = [error];
+    try {
+      await output.close();
+    } catch (closeError) {
+      failures.push(closeError);
+    }
+    try {
+      await removeSnapshotTemporaryDurably(temporaryPath, canonicalCache, writer);
+    } catch (cleanupError) {
+      failures.push(cleanupError);
+      throw normalizeCapsuleStorageError(
+        combinedManagedWriterError("Capsule package snapshot cleanup failed", failures),
+        "Capsule package snapshot cleanup failed",
+      );
+    }
     await reservation?.release();
-    throw normalizeCapsuleStorageError(error, "Capsule package snapshot storage is full");
+    throw normalizeCapsuleStorageError(
+      combinedManagedWriterError("Capsule package snapshot write failed", failures),
+      "Capsule package snapshot storage is full",
+    );
   }
   try {
     await output.close();
   } catch (error) {
-    await rm(temporaryPath, { force: true }).catch(() => {});
+    try {
+      await removeSnapshotTemporaryDurably(temporaryPath, canonicalCache, writer);
+    } catch (cleanupError) {
+      throw normalizeCapsuleStorageError(
+        combinedManagedWriterError(
+          "Capsule package snapshot cleanup failed",
+          [error, cleanupError],
+        ),
+        "Capsule package snapshot cleanup failed",
+      );
+    }
     await reservation?.release();
     throw normalizeCapsuleStorageError(error, "Capsule package snapshot storage is full");
   }
@@ -339,57 +393,106 @@ async function writeCapsuleTreeSnapshot(
   const hex = hash.digest("hex");
   const finalPath = join(canonicalCache, `${hex}.tree`);
   let published = false;
-  let publicationError: unknown;
+  let cleanupAttempted = false;
+  let cleanupConfirmed = false;
   try {
-    try {
-      // link(2) publishes without replacing an existing content-addressed object.
-      // rename(2) would silently clobber the winner on POSIX.
-      await link(temporaryPath, finalPath);
-      published = true;
-    } catch (error) {
-      if (!isNodeError(error, "EEXIST")) throw error;
-      await assertCasFile(finalPath, bytes, hex);
-    }
-  } catch (error) {
-    publicationError = error;
-  } finally {
-    await rm(temporaryPath, { force: true }).catch(() => {});
-  }
-  if (publicationError !== undefined) {
-    await reservation?.release();
-    throw normalizeCapsuleStorageError(
-      publicationError,
-      "Capsule package snapshot publication failed",
-    );
-  }
-  try {
-    await syncDirectory(canonicalCache);
-    await reservation?.commit(published ? bytes : 0, published ? finalPath : undefined);
-    if (storage) {
-      await storage.budget.claim({
-        owner: storage.ownerKey,
-        scope: storage.scope,
-        path: finalPath,
-        bytes,
-      });
-    }
-  } catch (error) {
-    if (published) {
-      if (storage) await storage.budget.remove(finalPath).catch(() => {});
-      else await rm(finalPath, { force: true }).catch(() => {});
-    }
-    await reservation?.release().catch(() => {});
-    throw normalizeCapsuleStorageError(error, "Capsule package snapshot accounting failed");
-  }
+    return await withSnapshotPublicationLock(finalPath, async () => {
+      const quarantined = SNAPSHOT_PUBLICATION_QUARANTINE.get(finalPath);
+      if (quarantined) {
+        throw new Error("Capsule package snapshot publication is quarantined", {
+          cause: quarantined,
+        });
+      }
+      let publicationError: unknown;
+      try {
+        // link(2) publishes without replacing an existing content-addressed object.
+        // rename(2) would silently clobber the winner on POSIX.
+        await link(temporaryPath, finalPath);
+        published = true;
+      } catch (error) {
+        if (!isNodeError(error, "EEXIST")) {
+          publicationError = error;
+        } else {
+          try {
+            await assertCasFile(finalPath, bytes, hex);
+          } catch (winnerError) {
+            publicationError = winnerError;
+          }
+        }
+      }
+      if (publicationError === undefined) {
+        try {
+          await writer.afterPublication(published);
+        } catch (error) {
+          publicationError = error;
+        }
+      }
 
-  return Object.freeze({
-    format: CAPSULE_TREE_FORMAT,
-    digest: `sha256:${hex}` as const,
-    bytes,
-    entries: entries.length,
-    path: finalPath,
-    createReadStream: () => openCasReadStream(finalPath),
-  });
+      cleanupAttempted = true;
+      try {
+        await removeSnapshotTemporaryDurably(temporaryPath, canonicalCache, writer);
+        cleanupConfirmed = true;
+      } catch (cleanupError) {
+        const failure = combinedManagedWriterError(
+          "Capsule package snapshot cleanup failed",
+          publicationError === undefined
+            ? [cleanupError]
+            : [publicationError, cleanupError],
+        );
+        SNAPSHOT_PUBLICATION_QUARANTINE.set(finalPath, failure);
+        throw failure;
+      }
+      if (publicationError !== undefined) {
+        if (published) {
+          SNAPSHOT_PUBLICATION_QUARANTINE.set(finalPath, asManagedWriterError(publicationError));
+        }
+        throw publicationError;
+      }
+
+      try {
+        await reservation?.commit(published ? bytes : 0, published ? finalPath : undefined);
+        if (storage) {
+          await storage.budget.claim({
+            owner: storage.ownerKey,
+            scope: storage.scope,
+            path: finalPath,
+            bytes,
+          });
+        }
+      } catch (error) {
+        if (published) {
+          SNAPSHOT_PUBLICATION_QUARANTINE.set(finalPath, asManagedWriterError(error));
+        }
+        throw error;
+      }
+
+      return Object.freeze({
+        format: CAPSULE_TREE_FORMAT,
+        digest: `sha256:${hex}` as const,
+        bytes,
+        entries: entries.length,
+        path: finalPath,
+        createReadStream: () => openCasReadStream(finalPath),
+      });
+    });
+  } catch (error) {
+    if (!cleanupAttempted) {
+      try {
+        cleanupAttempted = true;
+        await removeSnapshotTemporaryDurably(temporaryPath, canonicalCache, writer);
+        cleanupConfirmed = true;
+      } catch (cleanupError) {
+        const failure = combinedManagedWriterError(
+          "Capsule package snapshot cleanup failed",
+          [error, cleanupError],
+        );
+        SNAPSHOT_PUBLICATION_QUARANTINE.set(finalPath, failure);
+        throw normalizeCapsuleStorageError(failure, "Capsule package snapshot cleanup failed");
+      }
+    }
+    if (!published && cleanupConfirmed) await reservation?.release();
+    throw normalizeCapsuleStorageError(error, "Capsule package snapshot publication failed");
+  }
 }
 
 function storageOptions(options: {
@@ -410,6 +513,52 @@ function storageOptions(options: {
     budget: options.storageBudget,
     scope: options.storageScope ?? "package-snapshot",
   };
+}
+
+function snapshotWriter(
+  overrides: Partial<CapsuleSnapshotWriterDependencies> | undefined,
+): CapsuleSnapshotWriterDependencies {
+  return { ...DEFAULT_SNAPSHOT_WRITER_DEPENDENCIES, ...overrides };
+}
+
+async function removeSnapshotTemporaryDurably(
+  path: string,
+  directory: string,
+  writer: CapsuleSnapshotWriterDependencies,
+): Promise<void> {
+  await writer.removeTemporary(path);
+  await writer.syncDirectory(directory);
+}
+
+async function withSnapshotPublicationLock<T>(
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const prior = SNAPSHOT_PUBLICATION_TAILS.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolvePromise) => {
+    release = resolvePromise;
+  });
+  SNAPSHOT_PUBLICATION_TAILS.set(key, current);
+  await prior;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (SNAPSHOT_PUBLICATION_TAILS.get(key) === current) {
+      SNAPSHOT_PUBLICATION_TAILS.delete(key);
+    }
+  }
+}
+
+function asManagedWriterError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+function combinedManagedWriterError(message: string, errors: readonly unknown[]): Error {
+  return errors.length === 1
+    ? asManagedWriterError(errors[0])
+    : new AggregateError(errors, message);
 }
 
 function encodedTreeBytes(entries: readonly TreeEntry[]): number {

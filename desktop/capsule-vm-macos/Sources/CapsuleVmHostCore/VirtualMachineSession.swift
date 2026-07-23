@@ -8,6 +8,10 @@ public enum CapsuleVmLifecycleState: String, Equatable, Sendable {
     case stopping
     case stopped
     case failed
+
+    var acceptsHostStreamFrames: Bool {
+        self == .starting || self == .running || self == .stopping
+    }
 }
 
 public enum CapsuleVmLifecycleError: Error, Equatable, CustomStringConvertible, Sendable {
@@ -17,6 +21,7 @@ public enum CapsuleVmLifecycleError: Error, Equatable, CustomStringConvertible, 
     case missingSocketDevice
     case virtualMachineFailed(String)
     case sessionUnavailable
+    case statePreparationUnavailable
 
     public var description: String {
         switch self {
@@ -32,6 +37,8 @@ public enum CapsuleVmLifecycleError: Error, Equatable, CustomStringConvertible, 
             return "Capsule VM failed: \(message)"
         case .sessionUnavailable:
             return "Capsule VM stream session is not running"
+        case .statePreparationUnavailable:
+            return "Capsule VM state preparation is unavailable, expired, or already consumed"
         }
     }
 }
@@ -85,21 +92,36 @@ public struct CapsuleVmLifecycle: Equatable, Sendable {
 
 public struct CapsuleVmStartDescriptor: Sendable {
     public let trustedImage: TrustedGuestImageDescriptor
-    public let stateDirectoryURL: URL
+    public let statePreparationID: String
     public let cpuCount: Int
     public let memorySize: UInt64
 
     public init(
         trustedImage: TrustedGuestImageDescriptor,
-        stateDirectoryURL: URL,
+        statePreparationID: String,
         cpuCount: Int,
         memorySize: UInt64
     ) {
         self.trustedImage = trustedImage
-        self.stateDirectoryURL = stateDirectoryURL
+        self.statePreparationID = statePreparationID
         self.cpuCount = cpuCount
         self.memorySize = memorySize
     }
+}
+
+public struct CapsuleVmStatePreparationDescriptor: Sendable {
+    public let stateDirectoryURL: URL
+    public let stateDiskBytes: UInt64
+
+    public init(stateDirectoryURL: URL, stateDiskBytes: UInt64) {
+        self.stateDirectoryURL = stateDirectoryURL
+        self.stateDiskBytes = stateDiskBytes
+    }
+}
+
+public struct CapsuleVmPreparedState: Equatable, Sendable {
+    public let preparationID: String
+    public let requirements: CapsuleVmStateDiskPreparationRequirements
 }
 
 public struct CapsuleVmStartedGuest: Equatable, Sendable {
@@ -109,14 +131,31 @@ public struct CapsuleVmStartedGuest: Equatable, Sendable {
 
 public typealias CapsuleVmStartCompletion = @Sendable (Result<CapsuleVmStartedGuest, Error>) -> Void
 public typealias CapsuleVmStopCompletion = @Sendable (Result<Void, Error>) -> Void
+public typealias CapsuleVmPrepareStateCompletion = @Sendable (
+    Result<CapsuleVmPreparedState, Error>
+) -> Void
+public typealias CapsuleVmCancelStateCompletion = @Sendable (Result<Void, Error>) -> Void
 
 private struct CapsuleVmPreparedStart: @unchecked Sendable {
     let image: VerifiedGuestImage
     let stateDiskLease: CapsuleVmStateDiskLease
 }
 
+private struct CapsuleVmPendingStatePreparation: @unchecked Sendable {
+    let id: String
+    let preparation: CapsuleVmStateDiskPreparation
+}
+
 public protocol CapsuleVmSessionControlling: AnyObject, Sendable {
     func currentState() -> CapsuleVmLifecycleState
+    func prepareState(
+        descriptor: CapsuleVmStatePreparationDescriptor,
+        completion: @escaping CapsuleVmPrepareStateCompletion
+    )
+    func cancelStatePreparation(
+        id: String,
+        completion: @escaping CapsuleVmCancelStateCompletion
+    )
     func start(
         descriptor: CapsuleVmStartDescriptor,
         completion: @escaping CapsuleVmStartCompletion
@@ -133,6 +172,7 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
     private let emitter: CapsuleVmFrameEmitter
     private let consoleOutput: FileHandle
     private let onFatalError: @Sendable (Error) -> Void
+    private let statePreparationTTL: TimeInterval
 
     private var lifecycle = CapsuleVmLifecycle()
     private var bootGeneration: UInt64 = 0
@@ -141,8 +181,12 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
     private var consoleRelay: CapsuleVmConsoleRelay?
     private var activeImage: VerifiedGuestImage?
     private let stateDiskLeaseHolder = CapsuleVmStateDiskLeaseHolder()
+    private var pendingStatePreparation: CapsuleVmPendingStatePreparation?
+    private var statePreparationInFlight = false
+    private var statePreparationGeneration: UInt64 = 0
     private var pendingStart: CapsuleVmStartCompletion?
     private var pendingStops: [CapsuleVmStopCompletion] = []
+    private var confirmedStopStreamDrainInFlight = false
 
     public init(
         emitter: CapsuleVmFrameEmitter,
@@ -152,12 +196,15 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
             label: "app.lamarck.capsule-vm.image-verification",
             qos: .userInitiated
         ),
+        statePreparationTTL: TimeInterval = 120,
         onFatalError: @escaping @Sendable (Error) -> Void = { _ in }
     ) {
+        precondition(statePreparationTTL.isFinite && statePreparationTTL > 0)
         self.emitter = emitter
         self.consoleOutput = consoleOutput
         self.vmQueue = vmQueue
         self.verificationQueue = verificationQueue
+        self.statePreparationTTL = statePreparationTTL
         self.onFatalError = onFatalError
         super.init()
     }
@@ -166,12 +213,90 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
         vmQueue.sync { lifecycle.state }
     }
 
+    public func prepareState(
+        descriptor: CapsuleVmStatePreparationDescriptor,
+        completion: @escaping CapsuleVmPrepareStateCompletion
+    ) {
+        vmQueue.async { [self] in
+            guard !statePreparationInFlight,
+                  pendingStatePreparation == nil,
+                  !stateDiskLeaseHolder.hasLease,
+                  virtualMachine == nil,
+                  (lifecycle.state == .idle
+                    || lifecycle.state == .stopped
+                    || lifecycle.state == .failed) else {
+                completion(.failure(CapsuleVmLifecycleError.invalidTransition(
+                    from: lifecycle.state,
+                    operation: "prepare state disk"
+                )))
+                return
+            }
+
+            statePreparationGeneration &+= 1
+            let generation = statePreparationGeneration
+            statePreparationInFlight = true
+            verificationQueue.async { [weak self] in
+                guard let self else { return }
+                let result: Result<CapsuleVmStateDiskPreparation, Error>
+                do {
+                    result = .success(try CapsuleVmStateDiskManager.prepare(
+                        in: descriptor.stateDirectoryURL,
+                        size: descriptor.stateDiskBytes
+                    ))
+                } catch {
+                    result = .failure(error)
+                }
+                self.vmQueue.async { [weak self] in
+                    self?.finishStatePreparation(
+                        result,
+                        generation: generation,
+                        completion: completion
+                    )
+                }
+            }
+        }
+    }
+
+    public func cancelStatePreparation(
+        id: String,
+        completion: @escaping CapsuleVmCancelStateCompletion
+    ) {
+        vmQueue.async { [self] in
+            guard let pendingStatePreparation,
+                  pendingStatePreparation.id == id else {
+                completion(.failure(CapsuleVmLifecycleError.statePreparationUnavailable))
+                return
+            }
+            self.pendingStatePreparation = nil
+            statePreparationGeneration &+= 1
+            do {
+                try pendingStatePreparation.preparation.cancel()
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+                onFatalError(error)
+            }
+        }
+    }
+
     public func start(
         descriptor: CapsuleVmStartDescriptor,
         completion: @escaping CapsuleVmStartCompletion
     ) {
         vmQueue.async { [self] in
+            guard let pendingStatePreparation,
+                  pendingStatePreparation.id == descriptor.statePreparationID else {
+                completion(.failure(CapsuleVmLifecycleError.statePreparationUnavailable))
+                return
+            }
+            self.pendingStatePreparation = nil
+            statePreparationGeneration &+= 1
             guard !stateDiskLeaseHolder.hasLease, virtualMachine == nil else {
+                do {
+                    try pendingStatePreparation.preparation.cancel()
+                } catch {
+                    onFatalError(error)
+                }
                 completion(.failure(CapsuleVmLifecycleError.invalidTransition(
                     from: lifecycle.state,
                     operation: "start while a prior VM state lease is retained"
@@ -181,10 +306,20 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
             do {
                 try lifecycle.beginStart()
             } catch {
+                do {
+                    try pendingStatePreparation.preparation.cancel()
+                } catch let releaseError {
+                    onFatalError(releaseError)
+                }
                 completion(.failure(error))
                 return
             }
             guard VZVirtualMachine.isSupported else {
+                do {
+                    try pendingStatePreparation.preparation.cancel()
+                } catch {
+                    onFatalError(error)
+                }
                 lifecycle.didFail()
                 emitState(.failed)
                 completion(.failure(CapsuleVmLifecycleError.virtualizationUnavailable))
@@ -200,9 +335,7 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
                 guard let self else { return }
                 let result: Result<CapsuleVmPreparedStart, Error>
                 do {
-                    let lease = try CapsuleVmStateDiskManager.acquire(
-                        in: descriptor.stateDirectoryURL
-                    )
+                    let lease = try pendingStatePreparation.preparation.consume()
                     do {
                         let image = try GuestImageVerifier.verify(descriptor.trustedImage)
                         result = .success(CapsuleVmPreparedStart(
@@ -234,6 +367,7 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
 
     public func stop(completion: @escaping CapsuleVmStopCompletion) {
         vmQueue.async { [self] in
+            cancelPendingStatePreparation()
             switch lifecycle.state {
             case .idle, .stopped:
                 try? lifecycle.beginStop()
@@ -271,18 +405,12 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
                 if virtualMachine == nil {
                     bootGeneration &+= 1
                     finishStopped()
-                } else {
-                    multiplexer?.closeAll(
-                        code: "vm_stopping",
-                        message: "Capsule VM start was cancelled"
-                    )
                 }
 
             case .running:
                 pendingStops.append(completion)
                 try? lifecycle.beginStop()
                 emitState(.stopping)
-                multiplexer?.closeAll(code: "vm_stopping", message: "Capsule VM is stopping")
                 guard let virtualMachine else {
                     finishStopped()
                     return
@@ -310,7 +438,14 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
             state = lifecycle.state
             mux = multiplexer
         }
-        guard state == .running, let mux else {
+        // The listener belongs to the current verified VZ device and is
+        // installed before `machine.start`. A fast Guest may therefore open
+        // CONTROL and begin its authenticated handshake before VZ schedules the
+        // start completion which advances this reducer to `.running`. The same
+        // current mux remains authoritative while `.stopping` drains frames
+        // already ordered around the asynchronous stop request; finishStopped
+        // removes it before the lifecycle becomes inactive.
+        guard state.acceptsHostStreamFrames, let mux else {
             throw CapsuleVmLifecycleError.sessionUnavailable
         }
         try mux.acceptHostFrame(frame)
@@ -335,7 +470,89 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
     ) {
         guard self.virtualMachine === virtualMachine,
               !stateDiskLeaseHolder.mustRetainUntilProcessExit else { return }
-        finishFailed(error, leaseOutcome: .confirmedStopped)
+        // This delegate callback confirms that VZ no longer owns the VM even
+        // when it reports a stop diagnostic. During an explicit stop that is
+        // sufficient to release the disk lease and complete teardown; treating
+        // it as an unconfirmed stop would unnecessarily quarantine the Host.
+        if lifecycle.state == .stopping {
+            finishStopped()
+        } else {
+            finishFailed(error, leaseOutcome: .confirmedStopped)
+        }
+    }
+
+    private func finishStatePreparation(
+        _ result: Result<CapsuleVmStateDiskPreparation, Error>,
+        generation: UInt64,
+        completion: @escaping CapsuleVmPrepareStateCompletion
+    ) {
+        guard statePreparationInFlight else {
+            if case .success(let preparation) = result {
+                do {
+                    try preparation.cancel()
+                } catch {
+                    onFatalError(error)
+                }
+            }
+            completion(.failure(CapsuleVmLifecycleError.startCancelled))
+            return
+        }
+        statePreparationInFlight = false
+        guard generation == statePreparationGeneration else {
+            if case .success(let preparation) = result {
+                do {
+                    try preparation.cancel()
+                } catch {
+                    onFatalError(error)
+                }
+            }
+            completion(.failure(CapsuleVmLifecycleError.startCancelled))
+            return
+        }
+
+        switch result {
+        case .failure(let error):
+            completion(.failure(error))
+
+        case .success(let preparation):
+            let id = UUID().uuidString.lowercased()
+            pendingStatePreparation = CapsuleVmPendingStatePreparation(
+                id: id,
+                preparation: preparation
+            )
+            completion(.success(CapsuleVmPreparedState(
+                preparationID: id,
+                requirements: preparation.requirements
+            )))
+            vmQueue.asyncAfter(deadline: .now() + statePreparationTTL) { [weak self] in
+                guard let self,
+                      self.statePreparationGeneration == generation,
+                      let pending = self.pendingStatePreparation,
+                      pending.id == id else { return }
+                self.pendingStatePreparation = nil
+                self.statePreparationGeneration &+= 1
+                do {
+                    try pending.preparation.cancel()
+                } catch {
+                    self.onFatalError(error)
+                }
+            }
+        }
+    }
+
+    private func cancelPendingStatePreparation() {
+        statePreparationGeneration &+= 1
+        // A preparation already executing on verificationQueue still owns its
+        // in-flight slot until its completion releases any acquired lease.
+        // Reject a replacement preparation during that interval instead of
+        // racing it against the old worker on state.raw.lock.
+        guard let pendingStatePreparation else { return }
+        self.pendingStatePreparation = nil
+        do {
+            try pendingStatePreparation.preparation.cancel()
+        } catch {
+            onFatalError(error)
+        }
     }
 
     private func finishPreparation(
@@ -401,7 +618,11 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
                 return
             }
 
-            let mux = CapsuleVmVsockMultiplexer(vmQueue: vmQueue, emitter: emitter)
+            let mux = CapsuleVmVsockMultiplexer(
+                vmQueue: vmQueue,
+                emitter: emitter,
+                onFatalError: onFatalError
+            )
             mux.install(on: socketDevice)
             virtualMachine = machine
             multiplexer = mux
@@ -453,6 +674,7 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
     }
 
     private func finishStopped() {
+        if confirmedStopStreamDrainInFlight { return }
         if lifecycle.state == .stopped,
            virtualMachine == nil,
            multiplexer == nil,
@@ -466,13 +688,28 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
             finishFailed(error, leaseOutcome: .stopFailed)
             return
         }
-        multiplexer?.closeAll(code: "vm_stopped", message: "Capsule VM stopped")
-        multiplexer = nil
         virtualMachine?.delegate = nil
         virtualMachine = nil
         consoleRelay?.close()
         consoleRelay = nil
         activeImage = nil
+
+        if let multiplexer {
+            confirmedStopStreamDrainInFlight = true
+            multiplexer.drainForConfirmedStop(
+                code: "vm_stopped",
+                message: "Capsule VM stopped"
+            ) { [weak self] in
+                self?.finishStoppedAfterStreamDrain()
+            }
+            return
+        }
+        finishStoppedAfterStreamDrain()
+    }
+
+    private func finishStoppedAfterStreamDrain() {
+        confirmedStopStreamDrainInFlight = false
+        multiplexer = nil
         try? lifecycle.didStop()
         emitState(.stopped)
         let completions = pendingStops
@@ -494,6 +731,7 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
             }
         }
         let retainResources = stateDiskLeaseHolder.mustRetainUntilProcessExit
+        confirmedStopStreamDrainInFlight = false
         lifecycle.didFail()
         multiplexer?.closeAll(code: "vm_failed", message: String(describing: reportedError))
         multiplexer = nil

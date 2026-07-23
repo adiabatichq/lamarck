@@ -49,6 +49,20 @@ export interface HostArtifactActivation {
   readonly dependencyDigest?: `sha256:${string}`;
 }
 
+interface HostArtifactWriterDependencies {
+  removeTemporary(path: string): Promise<void>;
+  syncDirectory(path: string): Promise<void>;
+  afterPublication(published: boolean): Promise<void>;
+}
+
+const DEFAULT_ARTIFACT_WRITER_DEPENDENCIES: HostArtifactWriterDependencies = {
+  async removeTemporary(path) {
+    await rm(path, { force: true });
+  },
+  syncDirectory,
+  async afterPublication() {},
+};
+
 /**
  * Host-private artifact CAS plus atomic per-App activation pointers.
  *
@@ -59,6 +73,8 @@ export class HostArtifactStore {
   readonly #requestedRoot: string;
   readonly #storageBudget: CapsuleStorageBudgetLike | undefined;
   readonly #afterActivationPointerRename: (() => Promise<void>) | undefined;
+  readonly #writer: HostArtifactWriterDependencies;
+  readonly #publicationTails = new Map<string, Promise<void>>();
   #root: string | undefined;
   #quarantined: Error | undefined;
 
@@ -66,10 +82,16 @@ export class HostArtifactStore {
     storageBudget?: CapsuleStorageBudgetLike;
     /** Test seam for a failure after the activation pointer becomes visible. */
     afterActivationPointerRename?: () => Promise<void>;
+    /** Deterministic managed-writer seams; production uses unlink(2) and directory fsync. */
+    artifactWriter?: Partial<HostArtifactWriterDependencies>;
   } = {}) {
     this.#requestedRoot = resolve(root);
     this.#storageBudget = options.storageBudget;
     this.#afterActivationPointerRename = options.afterActivationPointerRename;
+    this.#writer = {
+      ...DEFAULT_ARTIFACT_WRITER_DEPENDENCIES,
+      ...options.artifactWriter,
+    };
   }
 
   async receive(
@@ -83,10 +105,6 @@ export class HostArtifactStore {
     validateArtifactBytes(expectedBytes);
     const root = await this.#prepare();
     const destination = this.#casPath(root, digest);
-    const existing = await this.#readVerified(destination, digest, expectedBytes);
-    if (existing) {
-      throw new Error("Host artifact CAS already contains this export; no stream was expected");
-    }
     let reservation: CapsuleStorageReservation | undefined;
     if (this.#storageBudget) {
       reservation = await this.#storageBudget.reserve({
@@ -135,67 +153,145 @@ export class HostArtifactStore {
       await output.sync();
       await output.chmod(0o400);
     } catch (error) {
-      await output.close().catch(() => {});
-      await rm(temporary, { force: true }).catch(() => {});
+      const failures: unknown[] = [error];
+      try {
+        await output.close();
+      } catch (closeError) {
+        failures.push(closeError);
+      }
+      try {
+        await this.#removeTemporaryDurably(temporary, directory);
+      } catch (cleanupError) {
+        failures.push(cleanupError);
+        const failure = combinedError("Host artifact temporary cleanup failed", failures);
+        this.#quarantined = failure;
+        throw normalizeCapsuleStorageError(failure, "Host artifact storage cleanup failed");
+      }
       await reservation?.release();
-      throw normalizeCapsuleStorageError(error, "Host artifact storage is full");
+      throw normalizeCapsuleStorageError(
+        combinedError("Host artifact write failed", failures),
+        "Host artifact storage is full",
+      );
     }
     try {
       await output.close();
     } catch (error) {
-      await rm(temporary, { force: true }).catch(() => {});
+      try {
+        await this.#removeTemporaryDurably(temporary, directory);
+      } catch (cleanupError) {
+        const failure = combinedError(
+          "Host artifact temporary cleanup failed",
+          [error, cleanupError],
+        );
+        this.#quarantined = failure;
+        throw normalizeCapsuleStorageError(failure, "Host artifact storage cleanup failed");
+      }
       await reservation?.release();
       throw normalizeCapsuleStorageError(error, "Host artifact storage is full");
     }
 
     let published = false;
-    let publicationError: unknown;
+    let cleanupAttempted = false;
+    let cleanupConfirmed = false;
     try {
-      try {
-        await link(temporary, destination);
-        published = true;
-      } catch (error) {
-        if (!isNodeError(error, "EEXIST")) throw error;
-        const winner = await this.#readVerified(destination, digest, expectedBytes);
-        if (!winner) throw new Error("Host artifact CAS collision is invalid");
-      }
-    } catch (error) {
-      publicationError = error;
-    } finally {
-      await rm(temporary, { force: true }).catch(() => {});
-    }
-    if (publicationError !== undefined) {
-      await reservation?.release();
-      throw normalizeCapsuleStorageError(publicationError, "Host artifact publication failed");
-    }
-    try {
-      await syncDirectory(directory);
-      await reservation?.commit(
-        published ? expectedBytes : 0,
-        published ? destination : undefined,
-      );
-      await this.#storageBudget?.claim({
-        owner,
-        scope: "artifact-cas",
-        path: destination,
-        bytes: expectedBytes,
+      return await this.#withPublicationLock(digest, async () => {
+        this.#assertWriterAvailable();
+        let publicationError: unknown;
+        try {
+          await link(temporary, destination);
+          published = true;
+        } catch (error) {
+          if (!isNodeError(error, "EEXIST")) {
+            publicationError = error;
+          } else {
+            try {
+              const winner = await this.#readVerified(destination, digest, expectedBytes);
+              if (!winner) throw new Error("Host artifact CAS collision is invalid");
+            } catch (winnerError) {
+              publicationError = winnerError;
+            }
+          }
+        }
+        if (publicationError === undefined) {
+          try {
+            await this.#writer.afterPublication(published);
+          } catch (error) {
+            publicationError = error;
+          }
+        }
+
+        cleanupAttempted = true;
+        try {
+          // The hard-link winner must remove its temporary name and make that
+          // unlink durable before any same-digest publisher can accept it.
+          await this.#removeTemporaryDurably(temporary, directory);
+          cleanupConfirmed = true;
+        } catch (cleanupError) {
+          const failure = combinedError(
+            "Host artifact temporary cleanup failed",
+            publicationError === undefined
+              ? [cleanupError]
+              : [publicationError, cleanupError],
+          );
+          this.#quarantined = failure;
+          throw failure;
+        }
+        if (publicationError !== undefined) {
+          if (published) this.#quarantined = asError(publicationError);
+          throw publicationError;
+        }
+
+        try {
+          await reservation?.commit(
+            published ? expectedBytes : 0,
+            published ? destination : undefined,
+          );
+          await this.#storageBudget?.claim({
+            owner,
+            scope: "artifact-cas",
+            path: destination,
+            bytes: expectedBytes,
+          });
+          const artifact = await this.#readVerified(destination, digest, expectedBytes);
+          if (!artifact) {
+            throw new Error("Host artifact disappeared after publication accounting");
+          }
+          return artifact;
+        } catch (error) {
+          if (published) this.#quarantined = asError(error);
+          throw error;
+        }
       });
     } catch (error) {
-      if (published) {
-        if (this.#storageBudget) await this.#storageBudget.remove(destination).catch(() => {});
-        else await rm(destination, { force: true }).catch(() => {});
+      if (!cleanupAttempted) {
+        try {
+          cleanupAttempted = true;
+          await this.#removeTemporaryDurably(temporary, directory);
+          cleanupConfirmed = true;
+        } catch (cleanupError) {
+          const failure = combinedError(
+            "Host artifact temporary cleanup failed",
+            [error, cleanupError],
+          );
+          this.#quarantined = failure;
+          throw normalizeCapsuleStorageError(failure, "Host artifact publication failed");
+        }
       }
-      await reservation?.release().catch(() => {});
-      throw normalizeCapsuleStorageError(error, "Host artifact accounting failed");
+      if (!published && cleanupConfirmed) {
+        await reservation?.release();
+      }
+      throw normalizeCapsuleStorageError(error, "Host artifact publication failed");
     }
-    return await this.require(digest, expectedBytes);
   }
 
   async find(digestValue: string, expectedBytes?: number): Promise<HostArtifact | undefined> {
     const digest = validateDigest(digestValue);
     if (expectedBytes !== undefined) validateArtifactBytes(expectedBytes);
     const root = await this.#prepare();
-    return await this.#readVerified(this.#casPath(root, digest), digest, expectedBytes);
+    return await this.#withPublicationLock(digest, async () => {
+      this.#assertWriterAvailable();
+      return await this.#readVerified(this.#casPath(root, digest), digest, expectedBytes);
+    });
   }
 
   async require(digestValue: string, expectedBytes?: number): Promise<HostArtifact> {
@@ -466,7 +562,7 @@ export class HostArtifactStore {
 
   async #prepare(): Promise<string> {
     if (this.#quarantined) {
-      throw new Error("Host artifact store is quarantined after an ambiguous activation failure", {
+      throw new Error("Host artifact store is quarantined after an ambiguous managed write", {
         cause: this.#quarantined,
       });
     }
@@ -481,6 +577,40 @@ export class HostArtifactStore {
     await assertPrivateDirectory(join(root, "active"));
     this.#root = root;
     return root;
+  }
+
+  #assertWriterAvailable(): void {
+    if (this.#quarantined) {
+      throw new Error("Host artifact store is quarantined after an ambiguous managed write", {
+        cause: this.#quarantined,
+      });
+    }
+  }
+
+  async #removeTemporaryDurably(path: string, directory: string): Promise<void> {
+    await this.#writer.removeTemporary(path);
+    await this.#writer.syncDirectory(directory);
+  }
+
+  async #withPublicationLock<T>(
+    digest: `sha256:${string}`,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const prior = this.#publicationTails.get(digest) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#publicationTails.set(digest, current);
+    await prior;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.#publicationTails.get(digest) === current) {
+        this.#publicationTails.delete(digest);
+      }
+    }
   }
 
   async #restoreActivationPointer(
@@ -677,4 +807,14 @@ function hasExactKeys(value: Record<string, unknown>, expected: readonly string[
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
   return error instanceof Error && (error as NodeJS.ErrnoException).code === code;
+}
+
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+function combinedError(message: string, errors: readonly unknown[]): Error {
+  return errors.length === 1
+    ? asError(errors[0])
+    : new AggregateError(errors, message);
 }
