@@ -99,7 +99,7 @@ interface PendingUiOperation {
   readonly runtimeSenderId: string;
   readonly previousViewer?: StoredViewer;
   readonly cleanupTasks: Promise<void>[];
-  readonly cleanupFailures: unknown[];
+  readonly cleanupFailures: PendingCleanupFailure[];
   readonly queuedRevocations: Set<string>;
   browserIssued?: IssuedCapability;
   viewerId: string;
@@ -116,6 +116,20 @@ interface PendingUiOperation {
   readonly abortController: AbortController;
   runtimeUnbound: boolean;
   previousDetached: boolean;
+}
+
+interface PendingCleanupFailure {
+  readonly error: unknown;
+  readonly controlPlane: boolean;
+}
+
+export interface StopAllOptions {
+  /**
+   * Core authority is already gone or is being terminated. Local bindings and
+   * the backend still fail closed, but remote channel deletion is no longer a
+   * meaningful confirmation because those channels live only in the old Core.
+   */
+  readonly controlPlaneLost?: boolean;
 }
 
 export interface CapsuleManagerOptions {
@@ -153,10 +167,13 @@ export class CapsuleManager {
   readonly #pendingUiOperations = new Map<string, PendingUiOperation>();
   readonly #stopOperations = new Map<string, Promise<void>>();
   readonly #retireOperations = new Map<string, Promise<void>>();
+  readonly #unexpectedUiLossOperations = new Set<Promise<void>>();
   readonly #stoppingApps = new Set<string>();
   #stoppingAll = false;
   #stopAllOperation: Promise<void> | null = null;
   #terminalFailure: CapsuleRestartRequiredError | null = null;
+  #controlPlaneRequests = new AbortController();
+  #controlPlaneLost = false;
   #generation = 0;
 
   constructor(options: CapsuleManagerOptions) {
@@ -663,7 +680,11 @@ export class CapsuleManager {
     }
   }
 
-  stopAll(): Promise<void> {
+  stopAll(options: StopAllOptions = {}): Promise<void> {
+    if (options.controlPlaneLost && !this.#controlPlaneLost) {
+      this.#controlPlaneLost = true;
+      this.#controlPlaneRequests.abort(new ControlPlaneLostError());
+    }
     if (this.#stopAllOperation) return this.#stopAllOperation;
     let resolveStop!: () => void;
     let rejectStop!: (error: unknown) => void;
@@ -683,6 +704,7 @@ export class CapsuleManager {
         ...this.#rebuildOperations.values(),
         ...this.#stopOperations.values(),
         ...this.#retireOperations.values(),
+        ...this.#unexpectedUiLossOperations,
       ];
       const pendingUi = [...this.#pendingUiOperations.values()];
       const viewers = [...this.#viewers.values()];
@@ -718,9 +740,9 @@ export class CapsuleManager {
       } catch (error) {
         backendStop = Promise.reject(error);
       }
-      const revocations = [...affectedApps].map((appId) => (
-        this.#revokeAppCapabilities(appId)
-      ));
+      const revocations = this.#controlPlaneLost
+        ? []
+        : [...affectedApps].map((appId) => this.#revokeAppCapabilities(appId));
 
       const teardown = (async () => {
         const [backendResult] = await Promise.allSettled([backendStop, ...revocations]);
@@ -730,10 +752,15 @@ export class CapsuleManager {
         // Capability issuance already in flight at the first revoke can commit
         // afterward. Revoke each affected App again only after issuance and
         // launch cleanup have quiesced.
-        const finalRevocations = await Promise.allSettled(
-          [...affectedApps].map((appId) => this.#revokeAppCapabilities(appId)),
-        );
-        const failures = [backendResult, ...finalRevocations]
+        const finalRevocations = this.#controlPlaneLost
+          ? []
+          : await Promise.allSettled(
+            [...affectedApps].map((appId) => this.#revokeAppCapabilities(appId)),
+          );
+        const failures = [
+          backendResult,
+          ...(this.#controlPlaneLost ? [] : finalRevocations),
+        ]
           .filter((result): result is PromiseRejectedResult => result.status === "rejected")
           .map((result) => result.reason);
         if (failures.length > 0) {
@@ -748,6 +775,8 @@ export class CapsuleManager {
         () => {
           if (this.#stopAllOperation === shared) this.#stopAllOperation = null;
           this.#stoppingAll = false;
+          this.#controlPlaneRequests = new AbortController();
+          this.#controlPlaneLost = false;
           resolveStop();
         },
         (error) => {
@@ -840,7 +869,13 @@ export class CapsuleManager {
     } catch (error) {
       hostCleanup = Promise.reject(error);
     }
-    void this.#settleUnexpectedUiLoss(viewer, event.error, hostCleanup).catch(() => {});
+    let settlement: Promise<void>;
+    settlement = this.#settleUnexpectedUiLoss(viewer, event.error, hostCleanup)
+      .finally(() => {
+        this.#unexpectedUiLossOperations.delete(settlement);
+      });
+    this.#unexpectedUiLossOperations.add(settlement);
+    void settlement.catch(() => {});
   }
 
   #beginPendingUiOperation(
@@ -914,13 +949,18 @@ export class CapsuleManager {
   #queuePendingRevocation(pending: PendingUiOperation, channelId: string): void {
     if (pending.queuedRevocations.has(channelId)) return;
     pending.queuedRevocations.add(channelId);
-    this.#trackPendingCleanup(pending, this.#revokeCapability(channelId));
+    if (this.#controlPlaneLost) return;
+    this.#trackPendingCleanup(pending, this.#revokeCapability(channelId), true);
   }
 
-  #trackPendingCleanup(pending: PendingUiOperation, operation: Promise<unknown>): void {
+  #trackPendingCleanup(
+    pending: PendingUiOperation,
+    operation: Promise<unknown>,
+    controlPlane = false,
+  ): void {
     const tracked = operation.then(
       () => {},
-      (error) => { pending.cleanupFailures.push(error); },
+      (error) => { pending.cleanupFailures.push({ error, controlPlane }); },
     );
     pending.cleanupTasks.push(tracked);
   }
@@ -1118,16 +1158,23 @@ export class CapsuleManager {
     }
     this.#finishPendingUiOperation(pending);
 
-    if (pending.cleanupFailures.length > 0 || pending.commitContractViolated) {
-      const appWide = await Promise.allSettled([
-        this.#revokeAppCapabilities(pending.appId),
-      ]);
-      pending.cleanupFailures.push(...appWide
-        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-        .map((result) => result.reason));
+    const cleanupFailures = pending.cleanupFailures
+      .filter((failure) => !failure.controlPlane || !this.#controlPlaneLost)
+      .map((failure) => failure.error);
+    if (cleanupFailures.length > 0 || pending.commitContractViolated) {
+      if (!this.#controlPlaneLost) {
+        const appWide = await Promise.allSettled([
+          this.#revokeAppCapabilities(pending.appId),
+        ]);
+        if (!this.#controlPlaneLost) {
+          cleanupFailures.push(...appWide
+            .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+            .map((result) => result.reason));
+        }
+      }
       return await this.#collapseBackendBoundary([
         pending.candidateLost?.error ?? pending.previousLost?.error ?? failure,
-        ...pending.cleanupFailures,
+        ...cleanupFailures,
       ]);
     }
     throw failure;
@@ -1143,17 +1190,27 @@ export class CapsuleManager {
       this.#revokeCapability(viewer.channelId),
       this.#revokeCapability(viewer.runtimeChannelId),
     ]);
-    const failures = results
+    const hostFailures = results.slice(0, 1)
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => result.reason);
+    const controlPlaneFailures = this.#controlPlaneLost
+      ? []
+      : results.slice(1)
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => result.reason);
+    const failures = [...hostFailures, ...controlPlaneFailures];
     if (failures.length === 0) return;
 
-    const appWideRevoke = await Promise.allSettled([
-      this.#revokeAppCapabilities(viewer.appId),
-    ]);
-    failures.push(...appWideRevoke
-      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-      .map((result) => result.reason));
+    if (!this.#controlPlaneLost) {
+      const appWideRevoke = await Promise.allSettled([
+        this.#revokeAppCapabilities(viewer.appId),
+      ]);
+      if (!this.#controlPlaneLost) {
+        failures.push(...appWideRevoke
+          .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+          .map((result) => result.reason));
+      }
+    }
     await this.#collapseBackendBoundary([cause, ...failures]);
   }
 
@@ -1225,18 +1282,48 @@ export class CapsuleManager {
   }
 
   async #hostRequest(path: string, init: RequestInit = {}): Promise<Response> {
+    const controlPlane = this.#controlPlaneRequests.signal;
+    if (controlPlane.aborted) throw controlPlane.reason;
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${this.#coreToken}`);
     if (init.body !== undefined) headers.set("Content-Type", "application/json");
-    const response = await this.#fetch(`${this.#coreBaseUrl()}${path}`, { ...init, headers });
+    const response = await withAbortSignal(
+      this.#fetch(`${this.#coreBaseUrl()}${path}`, {
+        ...init,
+        headers,
+        signal: controlPlane,
+      }),
+      controlPlane,
+    );
     if (response.ok) return response;
     const body = await response.json().catch(() => ({})) as { error?: string };
     throw new Error(body.error ?? `Core returned HTTP ${response.status}`);
   }
 }
 
+class ControlPlaneLostError extends Error {
+  constructor() {
+    super("Core control plane is unavailable");
+    this.name = "ControlPlaneLostError";
+  }
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : error === undefined ? "" : String(error);
+}
+
+async function withAbortSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason;
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([operation, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function withDeadline<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {

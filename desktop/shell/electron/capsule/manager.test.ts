@@ -1027,6 +1027,146 @@ describe("CapsuleManager", () => {
     await firstStop;
   });
 
+  test("stops locally after control-plane loss without calling the dead Core", async () => {
+    const backend = new FakeBackend();
+    const { fetch, calls } = createFetch();
+    const bindings = systemBindings();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...bindings,
+    });
+    await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const callCountBeforeStop = calls.length;
+
+    await manager.stopAll({ controlPlaneLost: true });
+
+    expect(backend.stopAllCalls).toBe(1);
+    expect(bindings.unbindSystemSender).toHaveBeenCalled();
+    expect(calls.slice(callCountBeforeStop).some((call) => (
+      call.init?.method === "DELETE"
+    ))).toBe(false);
+    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer))
+      .resolves.toMatchObject({ appId: "app-a" });
+  });
+
+  test("upgrades an in-flight global stop when the control plane is lost", async () => {
+    const backend = new FakeBackend();
+    const base = createFetch();
+    let reportDeleteStarted!: () => void;
+    const deleteStarted = new Promise<void>((resolve) => {
+      reportDeleteStarted = resolve;
+    });
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "DELETE") {
+        reportDeleteStarted();
+        return await new Promise<Response>(() => {});
+      }
+      return await base.fetch(input, init);
+    }) as typeof globalThis.fetch;
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+    await manager.openViewer("app-a", 7, verifyPreparedViewer);
+
+    const stopping = manager.stopAll();
+    await deleteStarted;
+    const upgraded = manager.stopAll({ controlPlaneLost: true });
+
+    expect(upgraded).toBe(stopping);
+    await stopping;
+    expect(backend.stopAllCalls).toBe(1);
+    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer))
+      .resolves.toMatchObject({ appId: "app-a" });
+  });
+
+  test("waits for an old UI-loss settlement before reusing the control plane", async () => {
+    const backend = new FakeBackend();
+    const base = createFetch();
+    let deleteCalls = 0;
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "DELETE") {
+        deleteCalls += 1;
+        return await new Promise<Response>(() => {});
+      }
+      return await base.fetch(input, init);
+    }) as typeof globalThis.fetch;
+    let reportHostCleanupStarted!: () => void;
+    const hostCleanupStarted = new Promise<void>((resolve) => {
+      reportHostCleanupStarted = resolve;
+    });
+    let releaseHostCleanup!: () => void;
+    const hostCleanup = new Promise<void>((resolve) => {
+      releaseHostCleanup = resolve;
+    });
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+      onUiLost() {
+        reportHostCleanupStarted();
+        return hostCleanup;
+      },
+    });
+    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    backend.uiLostHandler?.({
+      instanceId: opened.instanceId,
+      appId: opened.appId,
+      error: new Error("old UI exited"),
+    });
+    await hostCleanupStarted;
+
+    let stopSettled = false;
+    const stopping = manager.stopAll({ controlPlaneLost: true });
+    void stopping.then(() => { stopSettled = true; });
+    await Promise.resolve();
+    expect(stopSettled).toBe(false);
+
+    releaseHostCleanup();
+    await stopping;
+    expect(deleteCalls).toBe(2);
+    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer))
+      .resolves.toMatchObject({ appId: "app-a" });
+    expect(deleteCalls).toBe(2);
+  });
+
+  test("still quarantines a failed backend after control-plane loss", async () => {
+    const backend = new FakeBackend();
+    backend.stopAll = async () => {
+      backend.stopAllCalls += 1;
+      throw new Error("backend stop failed");
+    };
+    const { fetch } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+
+    await expect(manager.stopAll({ controlPlaneLost: true })).rejects.toMatchObject({
+      name: "CapsuleRestartRequiredError",
+      restartRequired: true,
+    });
+    await expect(manager.status()).resolves.toMatchObject({
+      available: false,
+      restartRequired: true,
+    });
+  });
+
   test("never binds a capability issued after the global stop fence", async () => {
     const backend = new FakeBackend();
     const base = createFetch();

@@ -3,8 +3,8 @@
 // multipart upload so a transient failure retries one part instead of the
 // complete desktop or Guest payload.
 //
-// Credentials come from the environment (see oss/RELEASE-CREDENTIALS.md in
-// the private repository for custody):
+// Credentials are supplied through the environment. See RELEASING.md for
+// release-infrastructure setup and the required variables:
 //   R2_ACCOUNT_ID, R2_RELEASES_ACCESS_KEY_ID, R2_RELEASES_SECRET_ACCESS_KEY
 
 import { createHash, createHmac } from "node:crypto";

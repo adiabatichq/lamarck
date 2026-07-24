@@ -122,6 +122,115 @@ describe("Shell Host configuration", () => {
     expect(mainSource).toContain("return coreRuntime.snapshot()");
   });
 
+  test("collapses App authority synchronously when either control-plane process is lost", () => {
+    const collapse = mainSource.match(
+      /function beginUnexpectedControlPlaneTeardown\([\s\S]*?\n\}\n\nfunction beginUnexpectedGuardTeardown/,
+    )?.[0];
+    if (!collapse) throw new Error("unexpected control-plane teardown is missing");
+
+    const unbind = collapse.indexOf("systemBroker.unbindAll()");
+    const detach = collapse.indexOf("detachAllAppWebContents()");
+    const capsuleStop = collapse.indexOf(
+      "capsuleManager.stopAll({ controlPlaneLost: true })",
+    );
+    const coreStop = collapse.indexOf(
+      "stopControlPlaneProcesses(coreChild, guardChild)",
+    );
+    const queue = collapse.indexOf("enqueueRuntime(async () =>");
+    expect(unbind).toBeGreaterThan(-1);
+    expect(detach).toBeGreaterThan(unbind);
+    expect(capsuleStop).toBeGreaterThan(detach);
+    expect(coreStop).toBeGreaterThan(capsuleStop);
+    expect(queue).toBeGreaterThan(coreStop);
+    expect(collapse).toContain("expectedGuardStops.add(guardChild)");
+    expect(collapse).toContain("extendControlPlaneTeardownBarrier(teardown)");
+
+    const barrier = mainSource.match(
+      /function extendControlPlaneTeardownBarrier\([\s\S]*?\n\}\n\nfunction latchControlPlaneRestartRequired/,
+    )?.[0];
+    if (!barrier) throw new Error("control-plane teardown barrier is missing");
+    expect(barrier).toContain("controlPlaneTeardownBarrier");
+    expect(barrier).toContain("void barrier.catch(() => {})");
+
+    const guardLoss = mainSource.match(
+      /function beginUnexpectedGuardTeardown\([\s\S]*?\n\}\n\nfunction beginUnexpectedCoreTeardown/,
+    )?.[0];
+    if (!guardLoss) throw new Error("unexpected Guard teardown is missing");
+    expect(guardLoss).toContain("handledGuardLosses.has(child)");
+    expect(guardLoss).toContain("expectedGuardStops.has(child)");
+    expect(guardLoss).toContain("guard !== child");
+
+    const coreLoss = mainSource.match(
+      /function beginUnexpectedCoreTeardown\([\s\S]*?\n\}\n\nfunction isGuardReadyMessage/,
+    )?.[0];
+    if (!coreLoss) throw new Error("unexpected Core teardown is missing");
+    expect(coreLoss).toContain("handledCoreLosses.has(child)");
+    expect(coreLoss).toContain("expectedCoreStops.has(child)");
+    expect(coreLoss).toContain("core !== child");
+
+    const heartbeat = mainSource.match(
+      /function startGuardHeartbeat\([\s\S]*?\n\}\n\nasync function startGuard/,
+    )?.[0];
+    if (!heartbeat) throw new Error("Guard heartbeat lifecycle is missing");
+    expect(heartbeat).toMatch(
+      /beginUnexpectedGuardTeardown\([\s\S]*?Guard utility became unresponsive/,
+    );
+    expect(heartbeat).toMatch(
+      /catch \(error\) \{[\s\S]*?beginUnexpectedGuardTeardown/,
+    );
+
+    const guardStartup = mainSource.match(
+      /async function startGuard\([\s\S]*?\n\}\n\nfunction startCore/,
+    )?.[0];
+    if (!guardStartup) throw new Error("Guard process lifecycle is missing");
+    expect(guardStartup).toMatch(
+      /child\.on\("error", \(type, location, report\)[\s\S]*?beginUnexpectedGuardTeardown/,
+    );
+    expect(guardStartup).toMatch(
+      /child\.on\("exit", \(code\)[\s\S]*?beginUnexpectedGuardTeardown/,
+    );
+
+    const coreStartup = mainSource.match(
+      /function startCore\([\s\S]*?\n\}\n\nasync function stopCore/,
+    )?.[0];
+    if (!coreStartup) throw new Error("Core process lifecycle is missing");
+    expect(coreStartup).toMatch(
+      /child\.on\("error", \(error\)[\s\S]*?beginUnexpectedCoreTeardown/,
+    );
+    expect(coreStartup).toMatch(
+      /child\.on\("exit", \(code, signal\)[\s\S]*?beginUnexpectedCoreTeardown/,
+    );
+
+    const runtimeStartup = mainSource.match(
+      /async function startRuntime\([\s\S]*?\n\}\n\nasync function stopRuntime/,
+    )?.[0];
+    if (!runtimeStartup) throw new Error("runtime startup lifecycle is missing");
+    expect(runtimeStartup.indexOf("await controlPlaneTeardownBarrier")).toBeLessThan(
+      runtimeStartup.indexOf("markCoreStarting()"),
+    );
+
+    const processStops = mainSource.match(
+      /async function stopCore\([\s\S]*?\n\}\n\nasync function stopGuard\([\s\S]*?\n\}\n\nasync function startRuntime/,
+    )?.[0];
+    if (!processStops) throw new Error("control-plane process stop lifecycle is missing");
+    expect(processStops).toContain('child.kill("SIGKILL")');
+    expect(processStops).toContain("await waitForCoreExit(child, 500)");
+    expect(processStops).toContain("Node Core termination was not confirmed");
+    expect(processStops).toContain("latchControlPlaneRestartRequired(failure)");
+    expect(processStops).toContain("await waitForGuardExit(child, 500)");
+    expect(processStops).toContain("Guard utility termination was not confirmed");
+    expect(processStops).toContain("async function stopControlPlaneProcesses");
+    expect(processStops).toMatch(
+      /child\.postMessage\(\{ type: "shutdown" \}\);\s*\} catch \{\s*try \{\s*child\.kill\(\);\s*\} catch \{\}/,
+    );
+    expect(processStops.indexOf("await stopCore(coreChild)")).toBeLessThan(
+      processStops.indexOf("await stopGuard(guardChild)"),
+    );
+    expect(processStops).toMatch(
+      /if \(failures\.length === 0\) return;[\s\S]*?latchControlPlaneRestartRequired/,
+    );
+  });
+
   test("reserves initial startup in the runtime queue before renderer IPC can race it", () => {
     const ready = mainSource.match(
       /app\.whenReady\(\)\.then\(async \(\) => \{[\s\S]*?\n\}\);/,
@@ -433,6 +542,8 @@ describe("Shell Host configuration", () => {
 
     const shutdown = match[0];
     expect(shutdown).toContain("capsuleFailure = error");
-    expect(shutdown).toContain("if (capsuleFailure !== undefined) throw capsuleFailure");
+    expect(shutdown).toContain("await stopControlPlaneProcesses()");
+    expect(shutdown).toContain("processFailure = error");
+    expect(shutdown).toContain('new AggregateError(failures, "Runtime shutdown was incomplete")');
   });
 });
