@@ -122,7 +122,7 @@ const release = {
   supervisorVersion: "0.1.0",
   features: EXPECTED_FEATURES,
   runtimeAbi: "capsule-node-v1",
-  nodeVersion: "24.10.0",
+  nodeVersion: "24.18.0",
   nodeModulesAbi: "137",
   libc: "glibc-2.43",
   cpuCount: 4,

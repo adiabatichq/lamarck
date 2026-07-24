@@ -45,7 +45,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 test "$(id -u)" -eq 0
-test "$(node --version)" = v24.10.0
+test "$(node --version)" = v24.18.0
 test -x /usr/sbin/runc
 test -f /sys/fs/cgroup/cgroup.controllers
 

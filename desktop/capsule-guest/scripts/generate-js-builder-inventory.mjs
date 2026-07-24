@@ -71,8 +71,8 @@ const inventory = {
   })),
 };
 if (
-  inventory.runtime.nodeVersion !== "v24.10.0"
-  || inventory.runtime.npmVersion !== "11.6.1"
+  inventory.runtime.nodeVersion !== "v24.18.0"
+  || inventory.runtime.npmVersion !== "11.16.0"
   || inventory.tools.esbuildVersion !== "0.25.12"
   || inventory.tools.typescriptVersion !== "5.9.3"
 ) throw new Error("JavaScript builder toolchain does not match the pinned release identity");

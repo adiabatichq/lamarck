@@ -188,7 +188,7 @@ try {
     "Guest build snapshot still includes App System SDK source",
   );
   assert(
-    JSON.stringify(await verifyGuestNodeClosure(repo, { runtimeVersion: "24.10.0" }))
+    JSON.stringify(await verifyGuestNodeClosure(repo, { runtimeVersion: "24.18.0" }))
       === JSON.stringify(["desktop/capsule", "desktop/capsule-guest"]),
     "current Guest workspace closure is not exact",
   );
@@ -197,7 +197,7 @@ try {
   assert(
     JSON.stringify(await verifyGuestNodeClosure(
       nodeClosureFixture,
-      { runtimeVersion: "24.10.0" },
+      { runtimeVersion: "24.18.0" },
     )) === JSON.stringify(["desktop/capsule", "desktop/capsule-guest"]),
     "valid Guest Node closure fixture was rejected",
   );
@@ -206,7 +206,7 @@ try {
   capsuleManifest.engines.node = ">=24.12.0";
   await writeFile(capsuleManifestPath, `${JSON.stringify(capsuleManifest)}\n`);
   await expectReject(
-    verifyGuestNodeClosure(nodeClosureFixture, { runtimeVersion: "24.10.0" }),
+    verifyGuestNodeClosure(nodeClosureFixture, { runtimeVersion: "24.18.0" }),
     /does not accept pinned Node/,
   );
   capsuleManifest.engines.node = ">=24.10.0";
@@ -215,7 +215,7 @@ try {
   const coreManifest = JSON.parse(await readFile(coreManifestPath, "utf8"));
   coreManifest.engines.node = ">=99.0.0";
   await writeFile(coreManifestPath, `${JSON.stringify(coreManifest)}\n`);
-  await verifyGuestNodeClosure(nodeClosureFixture, { runtimeVersion: "24.10.0" });
+  await verifyGuestNodeClosure(nodeClosureFixture, { runtimeVersion: "24.18.0" });
   const postBuild = await readFile(join(
     repo,
     "desktop/capsule-guest/buildroot/board/lamarck/arm64/post-build.sh",
@@ -270,10 +270,10 @@ try {
     "Buildroot must fail rather than warn when any custom download lacks a hash",
   );
   const pinnedLinuxHash =
-    "sha256  b726a4d15cf9ae06219b56d87820776e34d89fbc137e55fb54a9b9c3015b8f1e  linux-6.18.7.tar.xz";
+    "sha256  a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0  linux-6.18.39.tar.xz";
   const expectedHashFiles = new Map([
     [
-      "desktop/capsule-guest/buildroot/patches/linux/6.18.7/linux.hash",
+      "desktop/capsule-guest/buildroot/patches/linux/6.18.39/linux.hash",
       [
         pinnedLinuxHash,
         "sha256  fb5a425bd3b3cd6071a3a9aff9909a859e7c1158d54d32e07658398cd67eb6a0  COPYING",
@@ -282,7 +282,7 @@ try {
       ],
     ],
     [
-      "desktop/capsule-guest/buildroot/patches/linux-headers/6.18.7/linux-headers.hash",
+      "desktop/capsule-guest/buildroot/patches/linux-headers/6.18.39/linux-headers.hash",
       [
         pinnedLinuxHash,
         "sha256  fb5a425bd3b3cd6071a3a9aff9909a859e7c1158d54d32e07658398cd67eb6a0  COPYING",
@@ -293,8 +293,8 @@ try {
     [
       "desktop/capsule-guest/buildroot/package/node24-bin/node24-bin.hash",
       [
-        "sha256  07f0558316ebb8977dd6fb29b4de8d369a639d3d8cef544293852a6f5eea6af8  node-v24.10.0-linux-arm64.tar.xz",
-        "sha256  537308465103a306d0e3eecf42632b4ff1b48aaaec044e9fc10a78c81fd00b34  LICENSE",
+        "sha256  58c9520501f6ae2b52d5b210444e24b9d0c029a58c5011b797bc1fe7105886f6  node-v24.18.0-linux-arm64.tar.xz",
+        "sha256  148eacf7863ef4329224a29398623077200a27194aa075569faf4a0a85566ca5  LICENSE",
       ],
     ],
   ]);
@@ -640,9 +640,9 @@ async function createJavaScriptBuilderFixture(work, snapshotRoot, manifestDigest
     sourceSnapshotManifestDigest: manifestDigest,
     packageLockSha256: digest(await readFile(join(snapshotRoot, "package-lock.json"))),
     runtime: {
-      nodeVersion: "v24.10.0",
+      nodeVersion: "v24.18.0",
       nodeExecutableSha256: placeholder,
-      npmVersion: "11.6.1",
+      npmVersion: "11.16.0",
       npmCliSha256: placeholder,
     },
     tools: {
@@ -666,18 +666,18 @@ async function createJavaScriptBuilderFixture(work, snapshotRoot, manifestDigest
 }
 
 async function createLegalFixture(root, { nestedSources = true } = {}) {
-  await mkdir(join(root, "licenses", "linux-6.18.7"), { recursive: true });
-  await mkdir(join(root, "licenses", "node24-bin-24.10.0"), { recursive: true });
+  await mkdir(join(root, "licenses", "linux-6.18.39"), { recursive: true });
+  await mkdir(join(root, "licenses", "node24-bin-24.18.0"), { recursive: true });
   await mkdir(join(root, "licenses", "busybox-1.38.0"), { recursive: true });
   await mkdir(join(root, "licenses", "versioned-release_1__candidate"), { recursive: true });
   await mkdir(join(root, "sources"), { recursive: true });
-  await writeFile(join(root, "licenses", "linux-6.18.7", "COPYING"), "GPL-2.0-only\n");
-  await writeFile(join(root, "licenses", "node24-bin-24.10.0", "LICENSE"), "MIT\n");
+  await writeFile(join(root, "licenses", "linux-6.18.39", "COPYING"), "GPL-2.0-only\n");
+  await writeFile(join(root, "licenses", "node24-bin-24.18.0", "LICENSE"), "MIT\n");
   await writeFile(join(root, "licenses", "busybox-1.38.0", "LICENSE"), "GPL-2.0-only\n");
   await writeFile(join(root, "licenses", "versioned-release_1__candidate", "LICENSE"), "MIT\n");
   const sourceFixtures = [
-    ["linux-6.18.7", "linux-6.18.7.tar.xz", "linux source\n"],
-    ["node24-bin-24.10.0", "node-v24.10.0-linux-arm64.tar.xz", "node source\n"],
+    ["linux-6.18.39", "linux-6.18.39.tar.xz", "linux source\n"],
+    ["node24-bin-24.18.0", "node-v24.18.0-linux-arm64.tar.xz", "node source\n"],
     ["busybox-1.38.0", "busybox-1.38.0.tar.bz2", "busybox source\n"],
     ["versioned-release_1__candidate", "versioned.tar.xz", "versioned source\n"],
   ];
@@ -691,8 +691,8 @@ async function createLegalFixture(root, { nestedSources = true } = {}) {
   await writeFile(join(root, "manifest.csv"), [
     '"PACKAGE","VERSION","LICENSE","LICENSE FILES","SOURCE ARCHIVE","SOURCE SITE","DEPENDENCIES WITH LICENSES"',
     '"busybox","1.38.0","GPL-2.0-only","LICENSE","busybox-1.38.0.tar.bz2","https://busybox.net",""',
-    '"linux","6.18.7","GPL-2.0-only","COPYING","linux-6.18.7.tar.xz","https://kernel.org",""',
-    '"node24-bin","24.10.0","MIT","LICENSE","node-v24.10.0-linux-arm64.tar.xz","https://nodejs.org",""',
+    '"linux","6.18.39","GPL-2.0-only","COPYING","linux-6.18.39.tar.xz","https://kernel.org",""',
+    '"node24-bin","24.18.0","MIT","LICENSE","node-v24.18.0-linux-arm64.tar.xz","https://nodejs.org",""',
     '"versioned","release/1: candidate","MIT","LICENSE","versioned.tar.xz","https://example.invalid",""',
     "",
   ].join("\n"));

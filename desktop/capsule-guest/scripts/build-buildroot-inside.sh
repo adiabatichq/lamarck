@@ -112,7 +112,7 @@ test -s "$work/output/images/Image"
 test -s "$work/output/images/rootfs.ext4"
 test -s "$work/output/legal-info/manifest.csv"
 test -s "$work/output/legal-info/legal-info.sha256"
-kernel_config="$work/output/build/linux-6.18.7/.config"
+kernel_config="$work/output/build/linux-6.18.39/.config"
 test -s "$kernel_config"
 # runc implements cgroup-v2 device rules with a cgroup BPF program.  Missing
 # any of these turns the apparent deny-all device policy into a launch failure

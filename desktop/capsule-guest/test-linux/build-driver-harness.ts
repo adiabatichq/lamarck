@@ -57,7 +57,7 @@ const runner = new LinuxBuildCapsuleRunner({
 const workspace = `${plan.buildRoot}/workspace`;
 const cgroupPath = `${CGROUP_MOUNT}/${plan.config.linux.cgroupsPath}`;
 
-assert.equal(process.version, "v24.10.0", "Build integration gate must use the Guest Node version");
+assert.equal(process.version, "v24.18.0", "Build integration gate must use the Guest Node version");
 assertProductionPlan(plan);
 
 await runOfflineBuild("initial");

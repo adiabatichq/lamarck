@@ -31,8 +31,8 @@ export async function validateJavaScriptBuilderOutput(prebuiltValue, snapshotVal
     "typescriptVersion", "typescriptPackageSha256", "typescriptCliSha256",
   ]);
   if (
-    runtime.nodeVersion !== "v24.10.0"
-    || runtime.npmVersion !== "11.6.1"
+    runtime.nodeVersion !== "v24.18.0"
+    || runtime.npmVersion !== "11.16.0"
     || tools.esbuildVersion !== "0.25.12"
     || tools.typescriptVersion !== "5.9.3"
   ) throw new Error("JavaScript builder inventory has an unexpected pinned tool version");

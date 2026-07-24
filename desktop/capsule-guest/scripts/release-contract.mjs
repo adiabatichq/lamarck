@@ -271,7 +271,7 @@ function exactReleaseDescriptor(value) {
   }
   if (
     object.runtimeAbi !== "capsule-node-v1"
-    || object.nodeVersion !== "24.10.0"
+    || object.nodeVersion !== "24.18.0"
     || object.nodeModulesAbi !== "137"
     || object.libc !== "glibc-2.43"
     || object.cpuCount !== 4

@@ -1,6 +1,6 @@
 FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
 
-# Keep the signed-Guest Node 24.10 runtime at /usr/local. The second pinned
+# Keep the signed-Guest Node 24.18 runtime at /usr/local. The second pinned
 # runtime models Electron's Host-side Node for Core/Guard in this all-in-one
 # Linux gate; it is never mounted into the runc workload or Guest rootfs.
 RUN printf '%s\n' \
@@ -13,10 +13,10 @@ RUN printf '%s\n' \
       busybox-static ca-certificates curl e2fsprogs erofs-utils iproute2 \
       musl-tools runc util-linux xz-utils \
     && curl --fail --location --proto '=https' --tlsv1.2 \
-      https://nodejs.org/dist/v24.10.0/node-v24.10.0-linux-arm64.tar.xz \
+      https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-arm64.tar.xz \
       -o /tmp/node.tar.xz \
     && printf '%s  %s\n' \
-      07f0558316ebb8977dd6fb29b4de8d369a639d3d8cef544293852a6f5eea6af8 \
+      58c9520501f6ae2b52d5b210444e24b9d0c029a58c5011b797bc1fe7105886f6 \
       /tmp/node.tar.xz | sha256sum --check --strict \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
     && rm -f /tmp/node.tar.xz \
@@ -57,7 +57,7 @@ RUN chmod 0755 \
       /usr/local/libexec/capsule-runtime-probe \
       /usr/local/libexec/lamarck-build-policy-probe \
       /usr/local/libexec/lamarck-offline-npm.mjs \
-    && test "$(node --version)" = v24.10.0
+    && test "$(node --version)" = v24.18.0
 RUN test "$(/opt/lamarck/host-node/bin/node --version)" = v24.18.0
 
 ENTRYPOINT ["/usr/local/bin/lamarck-linux-integration"]

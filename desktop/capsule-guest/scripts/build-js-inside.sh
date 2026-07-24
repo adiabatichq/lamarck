@@ -6,8 +6,8 @@ snapshot="${LAMARCK_BUILD_SNAPSHOT:-/snapshot}"
 export_root="${LAMARCK_JS_BUILD_EXPORT:-/prebuilt}"
 work=/work/js-build
 
-test "$(node --version)" = v24.10.0
-test "$(npm --version)" = 11.6.1
+test "$(node --version)" = v24.18.0
+test "$(npm --version)" = 11.16.0
 node "$snapshot/desktop/capsule-guest/scripts/prepare-build-snapshot.mjs" verify "$snapshot"
 [ -d "$export_root" ] || { echo "JavaScript build export is unavailable" >&2; exit 73; }
 [ -z "$(find "$export_root" -mindepth 1 -maxdepth 1 -print -quit)" ] || {

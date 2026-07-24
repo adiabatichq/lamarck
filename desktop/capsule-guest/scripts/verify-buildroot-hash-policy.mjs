@@ -14,9 +14,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
-const LINUX_VERSION = "6.18.7";
+const LINUX_VERSION = "6.18.39";
 const LINUX_ARCHIVE = `linux-${LINUX_VERSION}.tar.xz`;
-const LINUX_SHA256 = "b726a4d15cf9ae06219b56d87820776e34d89fbc137e55fb54a9b9c3015b8f1e";
+const LINUX_SHA256 = "a7a7e3d2ae9d95e74197223a8d4eb5f6be7aac21b6e6de27e9685d001c1f8cb0";
 const LINUX_HASH_LINES = [
   `sha256  ${LINUX_SHA256}  ${LINUX_ARCHIVE}`,
   "sha256  fb5a425bd3b3cd6071a3a9aff9909a859e7c1158d54d32e07658398cd67eb6a0  COPYING",
@@ -24,8 +24,8 @@ const LINUX_HASH_LINES = [
   "sha256  8e378ab93586eb55135d3bc119cce787f7324f48394777d00c34fa3d0be3303f  LICENSES/exceptions/Linux-syscall-note",
 ];
 const NODE_HASH_LINES = [
-  "sha256  07f0558316ebb8977dd6fb29b4de8d369a639d3d8cef544293852a6f5eea6af8  node-v24.10.0-linux-arm64.tar.xz",
-  "sha256  537308465103a306d0e3eecf42632b4ff1b48aaaec044e9fc10a78c81fd00b34  LICENSE",
+  "sha256  58c9520501f6ae2b52d5b210444e24b9d0c029a58c5011b797bc1fe7105886f6  node-v24.18.0-linux-arm64.tar.xz",
+  "sha256  148eacf7863ef4329224a29398623077200a27194aa075569faf4a0a85566ca5  LICENSE",
 ];
 
 const [sourceValue, outputValue, externalValue, extra] = process.argv.slice(2);

@@ -2039,7 +2039,7 @@ class FakeSession extends EventEmitter {
       runtimeAbi: "capsule-node-v1" as const,
       architecture: "arm64" as const,
       libc: "musl",
-      nodeVersion: "24.10.0",
+      nodeVersion: "24.18.0",
       nodeModulesAbi: "137",
       sourceDigest: this.currentPackageDigest,
       installDigest: this.currentInstallDigest,
@@ -2261,7 +2261,7 @@ function guestRelease(): LoadedCapsuleGuestRelease {
     runtime: {
       runtimeAbi: "capsule-node-v1",
       architecture: "arm64",
-      nodeVersion: "24.10.0",
+      nodeVersion: "24.18.0",
       nodeModulesAbi: "137",
       libc: "musl",
     },

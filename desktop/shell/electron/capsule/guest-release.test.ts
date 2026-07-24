@@ -53,7 +53,7 @@ describe("Capsule Guest release descriptor", () => {
     expect(loaded.runtime).toEqual({
       runtimeAbi: "capsule-node-v1",
       architecture: "arm64",
-      nodeVersion: "24.10.0",
+      nodeVersion: "24.18.0",
       nodeModulesAbi: "137",
       libc: "glibc-2.43",
     });
@@ -82,7 +82,7 @@ describe("Capsule Guest release descriptor", () => {
         value.features = (value.features as string[]).filter((item) => item !== "vsock-record-v2");
       }],
       ["runtime ABI", (value) => { value.runtimeAbi = "node-any"; }],
-      ["Node version", (value) => { value.nodeVersion = "v24.10.0"; }],
+      ["Node version", (value) => { value.nodeVersion = "v24.18.0"; }],
       ["memory alignment", (value) => { value.memorySizeBytes = 4 * 1024 * 1024 * 1024 + 1; }],
       ["unsafe bundle path", (value) => { value.bundleRelativePath = "../guest"; }],
       ["backslash bundle path", (value) => { value.bundleRelativePath = "images\\guest"; }],
@@ -226,7 +226,7 @@ function validDescriptor(): CapsuleGuestReleaseDescriptor {
       "warm-rebuild-v1",
     ],
     runtimeAbi: "capsule-node-v1",
-    nodeVersion: "24.10.0",
+    nodeVersion: "24.18.0",
     nodeModulesAbi: "137",
     libc: "glibc-2.43",
     cpuCount: 4,

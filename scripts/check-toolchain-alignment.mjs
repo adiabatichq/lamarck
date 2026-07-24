@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 const PINNED_NODE = "24.18.0";
 const PINNED_NPM = "11.16.0";
 const HOST_ENGINES_FLOOR = ">=24.12.0";
-const GUEST_NODE = "24.10.0";
+const GUEST_NODE = "24.18.0";
 const GUEST_ENGINES_FLOOR = ">=24.10.0";
 const GUEST_RUNTIME_WORKSPACES = new Set([
   "desktop/capsule",

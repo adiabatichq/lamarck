@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-NODE24_BIN_VERSION = 24.10.0
+NODE24_BIN_VERSION = 24.18.0
 NODE24_BIN_SOURCE = node-v$(NODE24_BIN_VERSION)-linux-arm64.tar.xz
 NODE24_BIN_SITE = https://nodejs.org/dist/v$(NODE24_BIN_VERSION)
 NODE24_BIN_LICENSE = MIT

@@ -53,7 +53,7 @@ const driver = new LinuxRuncDriver({
   diagnosticLogDirectory: "/run/lamarck/runc-driver-logs",
 });
 
-assert.equal(process.version, "v24.10.0", "integration gate must use the Guest Node version");
+assert.equal(process.version, "v24.18.0", "integration gate must use the Guest Node version");
 assert.equal(driver.available, true, "production LinuxRuncDriver must find real runc");
 const hostNodeProbe = spawnSync(HOST_NODE, [
   "-e",

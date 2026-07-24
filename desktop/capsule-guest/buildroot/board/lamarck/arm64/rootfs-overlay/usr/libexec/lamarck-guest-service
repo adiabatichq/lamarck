@@ -66,7 +66,7 @@ case " $(cat /proc/cmdline) " in
 		printf 'state-ok\n' > /var/lib/lamarck/.boot-smoke
 		test "$(cat /var/lib/lamarck/.boot-smoke)" = state-ok
 		rm -f /var/lib/lamarck/.boot-smoke
-		test "$(/usr/local/bin/node --version)" = v24.10.0
+		test "$(/usr/local/bin/node --version)" = v24.18.0
 		/usr/local/bin/node -e '
 			const glibc = process.report.getReport().header.glibcVersionRuntime;
 			if (process.arch !== "arm64" || process.versions.modules !== "137" || glibc !== "2.43") {

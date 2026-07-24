@@ -66,7 +66,7 @@ export function formatReleaseRuncSmokeError(error: unknown): string {
   return format(error, 0);
 }
 
-const EXPECTED_NODE_VERSION = "v24.10.0";
+const EXPECTED_NODE_VERSION = "v24.18.0";
 const EXPECTED_NODE_MODULES_ABI = "137";
 const EXPECTED_GLIBC_VERSION = "2.43";
 const SMOKE_ROOT = "/run/lamarck/release-runc-smoke";

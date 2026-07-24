@@ -15,16 +15,16 @@ RUN printf '%s\n' \
 
 # The privileged Guest supervisor is compiled in this builder, never by an
 # ambient Host node_modules tree. Node's official arm64 archive is pinned by
-# full SHA-256 and includes the pinned npm 11.6.1 CLI.
-RUN wget -O /tmp/node-v24.10.0-linux-arm64.tar.xz \
-      https://nodejs.org/dist/v24.10.0/node-v24.10.0-linux-arm64.tar.xz \
+# full SHA-256 and includes the pinned npm 11.16.0 CLI.
+RUN wget -O /tmp/node-v24.18.0-linux-arm64.tar.xz \
+      https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-arm64.tar.xz \
     && printf '%s  %s\n' \
-      '07f0558316ebb8977dd6fb29b4de8d369a639d3d8cef544293852a6f5eea6af8' \
-      '/tmp/node-v24.10.0-linux-arm64.tar.xz' | sha256sum -c - \
+      '58c9520501f6ae2b52d5b210444e24b9d0c029a58c5011b797bc1fe7105886f6' \
+      '/tmp/node-v24.18.0-linux-arm64.tar.xz' | sha256sum -c - \
     && tar -C /usr/local --strip-components=1 \
-      -xf /tmp/node-v24.10.0-linux-arm64.tar.xz \
-    && rm -f /tmp/node-v24.10.0-linux-arm64.tar.xz \
-    && test "$(node --version)" = v24.10.0 \
-    && test "$(npm --version)" = 11.6.1
+      -xf /tmp/node-v24.18.0-linux-arm64.tar.xz \
+    && rm -f /tmp/node-v24.18.0-linux-arm64.tar.xz \
+    && test "$(node --version)" = v24.18.0 \
+    && test "$(npm --version)" = 11.16.0
 
 WORKDIR /work

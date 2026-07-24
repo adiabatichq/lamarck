@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const GUEST_NODE_VERSION = "24.10.0";
+export const GUEST_NODE_VERSION = "24.18.0";
 export const GUEST_NODE_ENGINE = ">=24.10.0";
 const GUEST_WORKSPACE = "desktop/capsule-guest";
 
