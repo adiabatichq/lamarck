@@ -230,7 +230,7 @@ test("entitlement verification rejects missing, extra, and non-boolean grants", 
   }, ["com.apple.security.cs.allow-jit"]), /not true/);
 });
 
-test("the real dry-run entrypoint rejects missing credentials before filesystem work", () => {
+test("the real dry-run entrypoint fails closed before filesystem work", () => {
   const env = { ...process.env };
   delete env.LAMARCK_CODESIGN_IDENTITY;
   delete env.LAMARCK_NOTARY_PROFILE;
@@ -239,7 +239,10 @@ test("the real dry-run entrypoint rejects missing credentials before filesystem 
     "--dry-run",
   ], { cwd: root, env, encoding: "utf8" });
   assert.notEqual(result.status, 0);
-  assert.match(`${result.stdout}\n${result.stderr}`, /LAMARCK_CODESIGN_IDENTITY is required/);
+  const expectedError = process.platform === "darwin"
+    ? /LAMARCK_CODESIGN_IDENTITY is required/
+    : /production macOS release packaging requires macOS/;
+  assert.match(`${result.stdout}\n${result.stderr}`, expectedError);
 });
 
 test("a valid macOS dry-run is pure and does not require release input paths", {
