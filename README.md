@@ -8,13 +8,13 @@
 <h1 align="center">Lamarck</h1>
 
 <p align="center">
-  An open-source, local-first personal operating system that keeps an owned
-  history of your life and work—so apps, automations, and AI can start with
-  context instead of starting from zero.
+  An open-source, local-first environment for personal software that evolves
+  with you—so apps, automations, and AI can be created, replaced, and improved
+  around one system you own.
 </p>
 
 <p align="center">
-  <strong>Not memory for an agent. Memory for the person.</strong>
+  <strong>A personal system that evolves with you.</strong>
 </p>
 
 <p align="center">
