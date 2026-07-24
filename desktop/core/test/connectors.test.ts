@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import { gunzipSync, gzipSync } from "node:zlib";
@@ -2883,6 +2883,7 @@ auth:
     let syncState: unknown;
     const events: any[] = [];
     const blobWrites: any[] = [];
+    const warnings = new Map<string, any>();
     const context = {
       guard: {
         async writeTextBlob(input: any) {
@@ -2914,11 +2915,247 @@ auth:
           syncState = next;
         },
       },
+      warnings: {
+        async set(warning: any) {
+          warnings.set(warning.key, warning);
+        },
+        async clear(key: string) {
+          warnings.delete(key);
+        },
+      },
       config,
       signal: new AbortController().signal,
     };
-    return { context, events, blobWrites, getState: () => syncState };
+    return { context, events, blobWrites, getState: () => syncState, getWarnings: () => warnings };
   }
+
+  test("code-agent-transcripts collapses Windows home paths without matching sibling names", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { collapseHome } = await import(agentUrl) as {
+      collapseHome(value: string, homeValue: string): string;
+    };
+    const windowsHome = String.raw`C:\Users\Alice`;
+
+    expect(collapseHome(
+      String.raw`C:\Users\Alice\.codex\sessions\rollout.jsonl`,
+      windowsHome,
+    )).toBe("~/.codex/sessions/rollout.jsonl");
+    expect(collapseHome(
+      "c:/users/alice/.claude/projects/session.jsonl",
+      windowsHome,
+    )).toBe("~/.claude/projects/session.jsonl");
+    expect(collapseHome(
+      String.raw`C:\Users\Alice-Other\.codex\sessions\rollout.jsonl`,
+      windowsHome,
+    )).toBe(String.raw`C:\Users\Alice-Other\.codex\sessions\rollout.jsonl`);
+  });
+
+  test("code-agent-transcripts surfaces permission errors during transcript discovery", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const claudeRoot = join(workspace, "claude-permission-denied");
+    mkdirSync(claudeRoot, { recursive: true });
+    const run = makeCodeAgentContext({
+      "include-codex": false,
+      "include-claude": true,
+      "claude-root": claudeRoot,
+      "lookback-days": 30,
+    });
+    const permissionError = new Error("permission denied");
+    (permissionError as any).code = "EACCES";
+
+    await expect(syncOnce(run.context, {
+      now: Date.UTC(2026, 6, 1, 3),
+      async readdirImpl() {
+        throw permissionError;
+      },
+    })).rejects.toMatchObject({ code: "EACCES" });
+
+    expect(run.events).toEqual([]);
+  });
+
+  test("code-agent-transcripts discovers resumed Codex rollouts for 90 days while backfilling 30", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-discovery-horizon");
+    const now = Date.UTC(2026, 6, 1, 3);
+
+    function writeRollout(
+      day: [string, string, string],
+      sessionId: string,
+      turnId: string,
+      message: string,
+      modifiedAt: Date,
+    ) {
+      const dayDir = join(codexRoot, ...day);
+      mkdirSync(dayDir, { recursive: true });
+      const path = join(dayDir, `${sessionId}.jsonl`);
+      writeFileSync(
+        path,
+        [
+          { timestamp: modifiedAt.toISOString(), type: "session_meta", payload: { id: sessionId } },
+          { timestamp: modifiedAt.toISOString(), type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+          {
+            timestamp: modifiedAt.toISOString(),
+            type: "event_msg",
+            payload: { type: "task_complete", turn_id: turnId, last_agent_message: message },
+          },
+        ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+      );
+      utimesSync(path, modifiedAt, modifiedAt);
+    }
+
+    writeRollout(
+      ["2026", "04", "15"],
+      "within-discovery-session",
+      "within-discovery-turn",
+      "Resumed inside discovery horizon.",
+      new Date("2026-06-30T12:00:00.000Z"),
+    );
+    writeRollout(
+      ["2026", "05", "01"],
+      "outside-backfill-session",
+      "outside-backfill-turn",
+      "Old modification inside discovery horizon.",
+      new Date("2026-05-01T12:00:00.000Z"),
+    );
+    writeRollout(
+      ["2026", "03", "15"],
+      "outside-discovery-session",
+      "outside-discovery-turn",
+      "Resumed outside discovery horizon.",
+      new Date("2026-06-30T12:00:00.000Z"),
+    );
+
+    const defaultRun = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    await syncOnce(defaultRun.context, { now });
+
+    expect(defaultRun.events.map((event) => event.payload.content?.text)).toEqual([
+      "Resumed inside discovery horizon.",
+    ]);
+
+    const expandedRun = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 120,
+    });
+    await syncOnce(expandedRun.context, { now });
+
+    expect(new Set(expandedRun.events.map((event) => event.payload.content?.text))).toEqual(new Set([
+      "Resumed inside discovery horizon.",
+      "Old modification inside discovery horizon.",
+      "Resumed outside discovery horizon.",
+    ]));
+  });
+
+  test("code-agent-transcripts applies lookback days to events inside a resumed transcript", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-event-lookback");
+    const dayDir = join(codexRoot, "2026", "04", "15");
+    const transcriptPath = join(dayDir, "resumed.jsonl");
+    mkdirSync(dayDir, { recursive: true });
+    writeFileSync(
+      transcriptPath,
+      [
+        { timestamp: "2026-05-01T00:00:00.000Z", type: "session_meta", payload: { id: "event-lookback-session" } },
+        { timestamp: "2026-05-01T00:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "old-turn" } },
+        {
+          timestamp: "2026-05-01T00:00:02.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", client_id: "old-human", message: "Old human." },
+        },
+        {
+          timestamp: "2026-05-01T00:00:03.000Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: "old-turn", last_agent_message: "Old agent." },
+        },
+        { timestamp: "2026-05-31T00:00:00.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "cross-turn" } },
+        {
+          timestamp: "2026-05-31T00:00:01.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", client_id: "cross-human", message: "Cross-boundary human." },
+        },
+        {
+          timestamp: "2026-06-02T00:00:00.000Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: "cross-turn", last_agent_message: "Cross-boundary agent." },
+        },
+        { timestamp: "2026-06-30T00:00:00.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "new-turn" } },
+        {
+          timestamp: "2026-06-30T00:00:01.000Z",
+          type: "event_msg",
+          payload: { type: "user_message", client_id: "new-human", message: "New human." },
+        },
+        {
+          timestamp: "2026-06-30T00:00:02.000Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: "new-turn", last_agent_message: "New agent." },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    const recentMtime = new Date("2026-06-30T12:00:00.000Z");
+    utimesSync(transcriptPath, recentMtime, recentMtime);
+    const now = Date.UTC(2026, 6, 1, 3);
+
+    const defaultRun = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    await syncOnce(defaultRun.context, { now });
+
+    expect(defaultRun.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+      "code_agent.agent_turn",
+    ]);
+    expect(defaultRun.events.map((event) => event.payload.content?.text)).toEqual([
+      "New human.",
+      "Cross-boundary agent.",
+      "New agent.",
+    ]);
+    expect(defaultRun.blobWrites).toHaveLength(2);
+    expect(JSON.stringify({
+      events: defaultRun.events,
+      blobs: defaultRun.blobWrites.map((write) => write.text),
+    })).not.toContain("Old human.");
+    expect(JSON.stringify({
+      events: defaultRun.events,
+      blobs: defaultRun.blobWrites.map((write) => write.text),
+    })).not.toContain("Old agent.");
+
+    const expandedRun = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 120,
+    });
+    await syncOnce(expandedRun.context, { now });
+
+    expect(expandedRun.events).toHaveLength(6);
+    expect(new Set(expandedRun.events.map((event) => event.payload.content?.text))).toEqual(new Set([
+      "Old human.",
+      "Cross-boundary human.",
+      "New human.",
+      "Old agent.",
+      "Cross-boundary agent.",
+      "New agent.",
+    ]));
+  });
 
   test("code-agent-transcripts packs one Codex interaction into human and agent events", async () => {
     const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
@@ -3027,7 +3264,8 @@ auth:
       "lookback-days": 30,
       "max-inline-bytes": 8192,
     });
-    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    const observedAt = Date.UTC(2026, 6, 1, 3);
+    await syncOnce(run.context, { now: observedAt });
 
     expect(run.events.map((event) => event.type)).toEqual([
       "code_agent.human_message",
@@ -3057,23 +3295,993 @@ auth:
         status: "completed",
         content: { text: "Focused tests passed.", truncated: false },
         raw: {
-          format: "codex-jsonl",
+          format: "codex-turn-bundle-v1",
           recordCount: 6,
-          firstSourceLineIndex: 2,
-          lastSourceLineIndex: 10,
+          rootFirstSourceLineIndex: 2,
+          rootLastSourceLineIndex: 10,
           ids: { sessionId: "codex-session-1", turnId },
           contentRef: { kind: "content-blob", encoding: "gzip" },
         },
       },
     });
     expect(run.blobWrites).toHaveLength(1);
+    expect(run.blobWrites[0].mediaType).toBe("application/json");
+    expect(run.events[1].payload.raw.contentRef.mediaType).toBe("application/json");
+    const bundle = JSON.parse(run.blobWrites[0].text);
+    expect(bundle).toMatchObject({
+      version: 1,
+      root: {
+        role: "main",
+        sessionId: "codex-session-1",
+        turnId,
+        recordCount: 6,
+      },
+      childTrajectories: [],
+    });
     expect(run.blobWrites[0].text).toContain('"type":"function_call_output"');
     expect(run.blobWrites[0].text).toContain('"phase":"final_answer"');
     expect(run.blobWrites[0].text).not.toContain("Private reasoning.");
     expect(run.blobWrites[0].text).not.toContain('"type":"user_message"');
   });
 
-  test("code-agent-transcripts keeps only bounded anchors while a Codex turn is open", async () => {
+  test("code-agent-transcripts preserves current Codex tool calls and outputs in selected raw", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-current-tool-items");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const turnId = "current-tool-items-turn";
+    const toolTypes = [
+      "tool_search_call",
+      "tool_search_output",
+      "local_shell_call",
+      "local_shell_call_output",
+      "image_generation_call",
+    ];
+    const records = [
+      { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "current-tool-items-session" } },
+      { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+      ...toolTypes.map((type, index) => ({
+        timestamp: `2026-07-01T02:00:0${index + 2}.000Z`,
+        type: "response_item",
+        payload: {
+          type,
+          call_id: `current-tool-call-${index}`,
+          output: `current-tool-output-${index}`,
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        },
+      })),
+      {
+        timestamp: "2026-07-01T02:00:08.000Z",
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: turnId, last_agent_message: "Current tools captured." },
+      },
+    ];
+    writeFileSync(
+      join(dayDir, "rollout.jsonl"),
+      records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+
+    expect(run.events).toHaveLength(1);
+    expect(run.events[0].payload.content.text).toBe("Current tools captured.");
+    const bundle = JSON.parse(run.blobWrites[0].text);
+    const selectedTypes = bundle.root.records
+      .map((wrapper: any) => wrapper.record.payload?.type)
+      .filter((type: unknown) => toolTypes.includes(String(type)));
+    expect(selectedTypes).toEqual(toolTypes);
+  });
+
+  test("code-agent-transcripts preserves Codex inter-agent communication in root raw", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-inter-agent-communication");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const turnId = "inter-agent-turn";
+    writeFileSync(
+      join(dayDir, "rollout.jsonl"),
+      [
+        { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "inter-agent-session" } },
+        { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "inter_agent_communication",
+          payload: {
+            author: "/root/worker",
+            recipient: "/root",
+            other_recipients: [],
+            content: "Worker result for this turn.",
+            trigger_turn: false,
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:02.500Z",
+          type: "inter_agent_communication",
+          payload: {
+            author: "/root/other",
+            recipient: "/root",
+            other_recipients: [],
+            content: "Message from a different turn.",
+            trigger_turn: false,
+            internal_chat_message_metadata_passthrough: { turn_id: "different-turn" },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:03.000Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: turnId, last_agent_message: "Root turn complete." },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+
+    expect(run.events).toHaveLength(1);
+    expect(run.events[0].payload.content.text).toBe("Root turn complete.");
+    const bundle = JSON.parse(run.blobWrites[0].text);
+    const communications = bundle.root.records
+      .map((wrapper: any) => wrapper.record)
+      .filter((record: any) => record.type === "inter_agent_communication");
+    expect(communications).toHaveLength(1);
+    expect(communications[0].payload.content).toBe("Worker result for this turn.");
+    expect(run.blobWrites[0].text).not.toContain("Message from a different turn.");
+  });
+
+  test("code-agent-transcripts redacts structured secrets inside JSON-encoded tool payloads", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-json-tool-secrets");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const turnId = "json-secret-turn";
+    const password = "short-secret-value";
+    const apiKey = "another-short-secret";
+    const argumentsJson = `{ "username": "alice", "exactInteger": 9007199254740993, "negativeZero": -0, "password": "${password}" }`;
+    const losslessJson = '{ "exactInteger": 9007199254740993, "negativeZero": -0 }';
+    writeFileSync(
+      join(dayDir, "rollout.jsonl"),
+      [
+        { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "json-secret-session" } },
+        { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            call_id: "json-secret-call",
+            name: "authenticate",
+            arguments: argumentsJson,
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:02.500Z",
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            call_id: "json-lossless-call",
+            name: "inspect",
+            arguments: losslessJson,
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:03.000Z",
+          type: "response_item",
+          payload: {
+            type: "function_call_output",
+            call_id: "json-secret-call",
+            output: JSON.stringify({ ok: true, nested: { apiKey } }),
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:04.000Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: turnId, last_agent_message: "Authenticated." },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+
+    const bundle = JSON.parse(run.blobWrites[0].text);
+    const payloads = bundle.root.records.map((wrapper: any) => wrapper.record.payload);
+    const call = payloads.find((payload: any) => payload.call_id === "json-secret-call");
+    const losslessCall = payloads.find((payload: any) => payload.call_id === "json-lossless-call");
+    const output = payloads.find((payload: any) => payload.type === "function_call_output");
+    expect(call.arguments).toBe("[REDACTED_STRUCTURED_VALUE]");
+    expect(losslessCall.arguments).toBe(losslessJson);
+    expect(output.output).toBe("[REDACTED_STRUCTURED_VALUE]");
+    expect(run.blobWrites[0].text).not.toContain(password);
+    expect(run.blobWrites[0].text).not.toContain(apiKey);
+  });
+
+  test("code-agent-transcripts redacts a structured field that exceeds its inspection depth", async () => {
+    const redactionUrl = new URL(
+      "../../template/connectors/code-agent-transcripts/redaction.mjs",
+      import.meta.url,
+    ).href;
+    const { redactValue } = await import(redactionUrl) as {
+      redactValue(value: unknown, fieldName?: string, depth?: number): any;
+    };
+    const secret = "tiny-secret";
+    const nestedJson = "[".repeat(50_000)
+      + `{"password":"${secret}"}`
+      + "]".repeat(50_000);
+
+    expect(() => JSON.parse(nestedJson)).not.toThrow();
+    const redacted = redactValue({ arguments: nestedJson }).arguments;
+    expect(redacted).toBe("[REDACTED_STRUCTURED_VALUE]");
+    expect(redacted).not.toContain(secret);
+  });
+
+  test("code-agent-transcripts elides only explicit provider-native base64 payloads", async () => {
+    const redactionUrl = new URL(
+      "../../template/connectors/code-agent-transcripts/redaction.mjs",
+      import.meta.url,
+    ).href;
+    const { redactValue } = await import(redactionUrl) as {
+      redactValue(value: unknown, fieldName?: string, depth?: number): any;
+    };
+    const codexImage = "A".repeat(5_000);
+    const claudeImage = "B".repeat(5_000);
+    const unrelatedEncodedValue = "C".repeat(5_000);
+
+    expect(redactValue({
+      codex: { type: "image_generation_call", result: codexImage },
+      claude: { source: { type: "base64", data: claudeImage } },
+      checksum: unrelatedEncodedValue,
+    })).toEqual({
+      codex: { type: "image_generation_call", result: "[REDACTED_PAYLOAD]" },
+      claude: { source: { type: "base64", data: "[REDACTED_PAYLOAD]" } },
+      checksum: unrelatedEncodedValue,
+    });
+  });
+
+  test("code-agent-transcripts keeps replayed parent turns and native fork turns on their own sessions", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-forked-session-identity");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const parentSessionId = "019ef405-c421-7cc0-9eae-94a7049df323";
+    const parentTurnId = "019efbb0-834d-7150-91ba-7e14b20724f4";
+    const forkSessionId = "019efe12-e569-7440-892a-6f4dd49937bd";
+    const forkTurnId = "019efe12-f09c-7fe1-ad1f-d0a2848b4453";
+    const transcriptPath = join(dayDir, "rollout.jsonl");
+    const records = [
+      {
+        timestamp: "2026-06-25T09:18:31.923Z",
+        type: "session_meta",
+        payload: {
+          id: forkSessionId,
+          session_id: forkSessionId,
+          timestamp: "2026-06-25T09:18:31.814Z",
+          forked_from_id: parentSessionId,
+          thread_source: "cli",
+        },
+      },
+      {
+        timestamp: "2026-06-25T09:18:31.923Z",
+        type: "session_meta",
+        payload: {
+          id: parentSessionId,
+          session_id: parentSessionId,
+          timestamp: "2026-06-23T10:27:59.179Z",
+          thread_source: "cli",
+        },
+      },
+      { timestamp: "2026-06-25T09:18:31.924Z", type: "event_msg", payload: { type: "task_started", turn_id: parentTurnId } },
+      { timestamp: "2026-06-25T09:18:31.924Z", type: "event_msg", payload: { type: "user_message", client_id: "parent-client", message: "Parent prompt." } },
+      {
+        timestamp: "2026-06-25T09:18:31.924Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          phase: "final_answer",
+          content: [{ type: "output_text", text: "Parent answer." }],
+          internal_chat_message_metadata_passthrough: { turn_id: parentTurnId },
+        },
+      },
+      { timestamp: "2026-06-25T09:18:31.924Z", type: "event_msg", payload: { type: "task_complete", turn_id: parentTurnId, last_agent_message: "Parent answer." } },
+      { timestamp: "2026-06-25T09:18:34.658Z", type: "event_msg", payload: { type: "task_started", turn_id: forkTurnId } },
+      { timestamp: "2026-06-25T09:18:34.688Z", type: "event_msg", payload: { type: "user_message", client_id: "fork-client", message: "Fork prompt." } },
+      {
+        timestamp: "2026-06-25T09:18:35.000Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          phase: "final_answer",
+          content: [{ type: "output_text", text: "Fork answer." }],
+          internal_chat_message_metadata_passthrough: { turn_id: forkTurnId },
+        },
+      },
+      { timestamp: "2026-06-25T09:19:22.444Z", type: "event_msg", payload: { type: "task_complete", turn_id: forkTurnId, last_agent_message: "Fork answer." } },
+    ];
+    writeFileSync(
+      transcriptPath,
+      records.slice(0, 4).map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    const observedAt = Date.UTC(2026, 6, 1, 3);
+    await syncOnce(run.context, { now: observedAt });
+    const firstCursor = Object.values((run.getState() as any).files)[0] as any;
+    expect(firstCursor.openInteractions[parentTurnId].sessionId).toBe(parentSessionId);
+    expect(firstCursor.session).toMatchObject({
+      id: parentSessionId,
+      canonicalSessionId: forkSessionId,
+      canonicalMetadataSeen: true,
+    });
+
+    appendFileSync(
+      transcriptPath,
+      records.slice(4).map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    await syncOnce(run.context, { now: observedAt + 1_000 });
+
+    const parentEvents = run.events.filter((event) => event.payload.raw.ids.turnId === parentTurnId);
+    const forkEvents = run.events.filter((event) => event.payload.raw.ids.turnId === forkTurnId);
+    expect(parentEvents).toHaveLength(2);
+    expect(parentEvents[0].payload.interactionId).toBe(parentEvents[1].payload.interactionId);
+    expect(parentEvents.map((event) => event.payload.raw.ids.sessionId)).toEqual([
+      parentSessionId,
+      parentSessionId,
+    ]);
+    expect(forkEvents).toHaveLength(2);
+    expect(forkEvents[0].payload.interactionId).toBe(forkEvents[1].payload.interactionId);
+    expect(forkEvents.map((event) => event.payload.raw.ids.sessionId)).toEqual([
+      forkSessionId,
+      forkSessionId,
+    ]);
+    expect(run.blobWrites.map((write) => JSON.parse(write.text).root.sessionId)).toEqual([
+      parentSessionId,
+      forkSessionId,
+    ]);
+  });
+
+  test("code-agent-transcripts preserves the model for each Codex turn closed in one scan", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-turn-models");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const records: any[] = [
+      {
+        timestamp: "2026-07-01T02:00:00.000Z",
+        type: "session_meta",
+        payload: { id: "model-session", model: "session-default", thread_source: "cli" },
+      },
+    ];
+    for (const [index, turn] of [
+      { id: "model-turn-one", model: "model-one", prompt: "First model?", answer: "First model." },
+      { id: "model-turn-two", model: "model-two", prompt: "Second model?", answer: "Second model." },
+    ].entries()) {
+      const second = index + 1;
+      records.push(
+        {
+          timestamp: `2026-07-01T02:00:0${second}.000Z`,
+          type: "event_msg",
+          payload: { type: "task_started", turn_id: turn.id },
+        },
+        {
+          timestamp: `2026-07-01T02:00:0${second}.010Z`,
+          type: "turn_context",
+          payload: { model: turn.model },
+        },
+        {
+          timestamp: `2026-07-01T02:00:0${second}.020Z`,
+          type: "event_msg",
+          payload: { type: "user_message", client_id: `${turn.id}-client`, message: turn.prompt },
+        },
+        {
+          timestamp: `2026-07-01T02:00:0${second}.030Z`,
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: turn.answer }],
+            internal_chat_message_metadata_passthrough: { turn_id: turn.id },
+          },
+        },
+        {
+          timestamp: `2026-07-01T02:00:0${second}.040Z`,
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: turn.id, last_agent_message: turn.answer },
+        },
+      );
+    }
+    writeFileSync(
+      join(dayDir, "rollout.jsonl"),
+      records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+
+    expect(run.events.filter((event) => event.type === "code_agent.agent_turn")
+      .map((event) => event.payload.content.text)).toEqual([
+      "First model.",
+      "Second model.",
+    ]);
+    expect(run.blobWrites.map((write) => JSON.parse(write.text).root.model)).toEqual([
+      "model-one",
+      "model-two",
+    ]);
+  });
+
+  test("code-agent-transcripts excludes internal Codex sessions from D0", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-internal-sessions");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const turnId = "memory-turn";
+    writeFileSync(
+      join(dayDir, "memory-rollout.jsonl"),
+      [
+        {
+          timestamp: "2026-07-01T02:00:00.000Z",
+          type: "session_meta",
+          payload: {
+            id: "memory-session",
+            source: { internal: "memory_consolidation" },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.000Z",
+          type: "event_msg",
+          payload: { type: "task_started", turn_id: turnId },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.100Z",
+          type: "event_msg",
+          payload: { type: "user_message", client_id: "memory-client", message: "Consolidate memory." },
+        },
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: "Memory consolidated." }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:02.100Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: turnId, last_agent_message: "Memory consolidated." },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+
+    expect(run.events).toEqual([]);
+    expect(run.blobWrites).toEqual([]);
+  });
+
+  test("code-agent-transcripts marks a Codex task_complete terminal error as failed", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-failed-turn");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const turnId = "failed-turn";
+    const terminalError = {
+      message: "stream disconnected before completion",
+      codex_error_info: "other",
+    };
+    writeFileSync(
+      join(dayDir, "rollout.jsonl"),
+      [
+        {
+          timestamp: "2026-07-01T02:00:00.000Z",
+          type: "session_meta",
+          payload: { id: "failed-session", thread_source: "user" },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.000Z",
+          type: "event_msg",
+          payload: { type: "task_started", turn_id: turnId },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.100Z",
+          type: "event_msg",
+          payload: { type: "user_message", client_id: "failed-client", message: "Finish the task." },
+        },
+        {
+          timestamp: "2026-07-01T02:00:02.100Z",
+          type: "event_msg",
+          payload: {
+            type: "task_complete",
+            turn_id: turnId,
+            last_agent_message: null,
+            error: terminalError,
+          },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    expect(run.events[1].startedAt).toBe(Date.parse("2026-07-01T02:00:01.000Z"));
+    expect(run.events[1].endedAt).toBe(Date.parse("2026-07-01T02:00:02.100Z"));
+    expect(run.events[1].payload.status).toBe("failed");
+    expect(run.events[1].payload.content).toBeUndefined();
+    expect(run.blobWrites).toHaveLength(1);
+    const bundle = JSON.parse(run.blobWrites[0].text);
+    expect(bundle.root.status).toBe("failed");
+    expect(bundle.root.records.at(-1).record.payload.error).toEqual(terminalError);
+  });
+
+  test("code-agent-transcripts ignores Codex subagents and emits the root without waiting", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-subagent-sessions");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const rootPath = join(dayDir, "root-rollout.jsonl");
+    const childPath = join(dayDir, "guardian-rollout.jsonl");
+    const rootSessionId = "root-session";
+    const rootTurnId = "root-turn";
+    const childSessionId = "guardian-session";
+    const childTurnId = "guardian-turn";
+
+    writeFileSync(
+      rootPath,
+      [
+        {
+          timestamp: "2026-07-01T02:00:00.000Z",
+          type: "session_meta",
+          payload: { id: rootSessionId, thread_source: "cli", cwd: "/Users/alice/project" },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.000Z",
+          type: "event_msg",
+          payload: { type: "task_started", turn_id: rootTurnId },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.100Z",
+          type: "event_msg",
+          payload: { type: "user_message", client_id: "root-client", message: "Inspect the build." },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    writeFileSync(
+      childPath,
+      [
+        {
+          timestamp: "2026-07-01T02:00:01.200Z",
+          type: "session_meta",
+          payload: {
+            id: childSessionId,
+            parent_thread_id: rootSessionId,
+            thread_source: "subagent",
+            source: { subagent: { other: "guardian" } },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.300Z",
+          type: "event_msg",
+          payload: { type: "task_started", turn_id: childTurnId },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.400Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Assess this approval request." }],
+            internal_chat_message_metadata_passthrough: { turn_id: childTurnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:01.400Z",
+          type: "event_msg",
+          payload: { type: "user_message", message: "Assess this approval request." },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+      "max-inline-bytes": 8192,
+    });
+    const observedAt = Date.UTC(2026, 6, 1, 3);
+    await syncOnce(run.context, { now: observedAt });
+
+    expect(run.events.map((event) => event.type)).toEqual(["code_agent.human_message"]);
+    expect(JSON.stringify(run.events)).not.toContain('{\\"outcome\\":\\"allow\\"}');
+
+    appendFileSync(
+      rootPath,
+      [
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: "The build is safe." }],
+            internal_chat_message_metadata_passthrough: { turn_id: rootTurnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:02.100Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: rootTurnId, last_agent_message: "The build is safe." },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    await syncOnce(run.context, { now: observedAt });
+
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    expect(run.events[1]).toMatchObject({
+      payload: {
+        conversationKey: expect.stringContaining("root-rollout.jsonl"),
+        content: { text: "The build is safe.", truncated: false },
+        raw: {
+          format: "codex-turn-bundle-v1",
+          recordCount: 3,
+          ids: { sessionId: rootSessionId, turnId: rootTurnId },
+          contentRef: { kind: "content-blob", encoding: "gzip" },
+        },
+      },
+    });
+    expect(run.blobWrites).toHaveLength(1);
+    const bundle = JSON.parse(run.blobWrites[0].text);
+    expect(bundle.root).toMatchObject({ role: "main", sessionId: rootSessionId, turnId: rootTurnId, recordCount: 3 });
+    expect(bundle.childTrajectories).toEqual([]);
+
+    appendFileSync(
+      childPath,
+      [
+        {
+          timestamp: "2026-07-01T02:00:02.200Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: '{"outcome":"allow"}' }],
+            internal_chat_message_metadata_passthrough: { turn_id: childTurnId },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:02.300Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: childTurnId, last_agent_message: '{"outcome":"allow"}' },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    await syncOnce(run.context, { now: observedAt + 1_000 });
+
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    const d0AgentTurn = JSON.stringify(run.events[1]);
+    expect(d0AgentTurn).not.toContain("allow");
+    expect(d0AgentTurn).not.toContain(childSessionId);
+    expect(d0AgentTurn).not.toContain("Assess this approval request.");
+    expect(run.blobWrites).toHaveLength(1);
+    expect(run.blobWrites[0].text).not.toContain("allow");
+  });
+
+  test("code-agent-transcripts fast-forwards a non-root Codex transcript after canonical metadata", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncTranscriptFile } = await import(agentUrl) as {
+      syncTranscriptFile(options: unknown): Promise<any>;
+    };
+    const codexRoot = join(workspace, "codex-fast-forward-child");
+    const childPath = join(codexRoot, "2026", "07", "01", "guardian.jsonl");
+    mkdirSync(dirname(childPath), { recursive: true });
+    const metadataLine = JSON.stringify({
+      timestamp: "2026-07-01T02:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: "child-session",
+        thread_source: "subagent",
+        source: { subagent: { other: "guardian" } },
+      },
+    });
+    writeFileSync(
+      childPath,
+      `${metadataLine}\n${Array.from({ length: 100 }, (_, index) => JSON.stringify({
+        type: "response_item",
+        payload: { type: "message", index },
+      })).join("\n")}\n`,
+    );
+    const fileInfo = statSync(childPath);
+    let recordsRead = 0;
+
+    const result = await syncTranscriptFile({
+      provider: "codex",
+      root: codexRoot,
+      file: {
+        path: childPath,
+        size: fileInfo.size,
+        mtimeMs: fileInfo.mtimeMs,
+      },
+      cursor: {
+        lineCount: 0,
+        byteOffset: 0,
+        size: 0,
+        mtimeMs: 0,
+        session: {},
+        openInteractions: {},
+      },
+      config: {
+        "include-reasoning": false,
+        "max-inline-bytes": 8192,
+      },
+      signal: new AbortController().signal,
+      async *readLinesImpl() {
+        recordsRead += 1;
+        yield metadataLine;
+        recordsRead += 1;
+        throw new Error("non-root transcript tail was read");
+      },
+    });
+
+    expect(recordsRead).toBe(1);
+    expect(result.events).toEqual([]);
+    expect(result.cursor).toMatchObject({
+      byteOffset: fileInfo.size,
+      session: {
+        canonicalSessionId: "child-session",
+        canonicalMetadataSeen: true,
+        isSubagent: true,
+      },
+      openInteractions: {},
+    });
+  });
+
+  test("code-agent-transcripts keeps a persistent unreadable child isolated from root capture", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { runWatch } = await import(agentUrl) as {
+      runWatch(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-unreadable-child");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const childPath = join(dayDir, "00-guardian.jsonl");
+    const rootPath = join(dayDir, "99-root.jsonl");
+    writeFileSync(childPath, JSON.stringify({ type: "session_meta", payload: { id: "child-session", thread_source: "subagent" } }) + "\n");
+    writeFileSync(
+      rootPath,
+      [
+        { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "root-session", thread_source: "cli" } },
+        { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "root-turn" } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "root-client", message: "Capture the root." } },
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: "Root captured." }],
+            internal_chat_message_metadata_passthrough: { turn_id: "root-turn" },
+          },
+        },
+        { timestamp: "2026-07-01T02:00:02.100Z", type: "event_msg", payload: { type: "task_complete", turn_id: "root-turn", last_agent_message: "Root captured." } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    const controller = new AbortController();
+    (run.context as any).signal = controller.signal;
+    let childReadAttempts = 0;
+    async function* readLinesImpl(path: string, startOffset: number) {
+      if (path === childPath) {
+        childReadAttempts += 1;
+        const error = new Error("child disappeared");
+        (error as any).code = "ENOENT";
+        throw error;
+      }
+      const text = readFileSync(path).subarray(startOffset).toString("utf8");
+      for (const line of text.split("\n")) {
+        if (line) yield line;
+      }
+    }
+
+    let waits = 0;
+    await runWatch(run.context, {
+      syncOnceDeps: {
+        now: Date.UTC(2026, 6, 1, 3),
+        readLinesImpl,
+      },
+      async waitImpl() {
+        waits += 1;
+        if (waits === 4) controller.abort();
+      },
+    });
+
+    expect(childReadAttempts).toBe(4);
+    expect(waits).toBe(4);
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    expect(run.events[1].payload.content.text).toBe("Root captured.");
+    expect(run.getWarnings().get("code-agent-transcripts-files")).toMatchObject({
+      details: {
+        failures: [{ provider: "codex", sourceFile: childPath, error: "child disappeared" }],
+      },
+    });
+  });
+
+  test("code-agent-transcripts suppresses Claude subagent transcript files and inline sidechain records", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const claudeRoot = join(workspace, "claude-subagent-suppression");
+    const projectDir = join(claudeRoot, "Users-alice-project");
+    const subagentsDir = join(projectDir, "session-root", "subagents");
+    mkdirSync(subagentsDir, { recursive: true });
+    writeFileSync(
+      join(projectDir, "session.jsonl"),
+      [
+        {
+          type: "user",
+          uuid: "human-root",
+          promptId: "prompt-root",
+          userType: "external",
+          sessionId: "claude-session-root",
+          timestamp: "2026-07-01T01:00:01.000Z",
+          message: { role: "user", content: "Start the root." },
+        },
+        {
+          type: "assistant",
+          uuid: "sidechain-final",
+          isSidechain: true,
+          agentId: "agent-abc",
+          sessionId: "claude-session-root",
+          timestamp: "2026-07-01T01:00:02.000Z",
+          message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "Sidechain aside." }] },
+        },
+        {
+          type: "assistant",
+          uuid: "assistant-root",
+          sessionId: "claude-session-root",
+          timestamp: "2026-07-01T01:00:03.000Z",
+          message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "Root done." }] },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    writeFileSync(
+      join(subagentsDir, "agent-abc.jsonl"),
+      [
+        {
+          type: "user",
+          uuid: "child-prompt",
+          isSidechain: true,
+          agentId: "agent-abc",
+          sessionId: "claude-session-root",
+          timestamp: "2026-07-01T01:00:01.500Z",
+          message: { role: "user", content: "Child prompt." },
+        },
+        {
+          type: "assistant",
+          uuid: "child-final",
+          isSidechain: true,
+          agentId: "agent-abc",
+          sessionId: "claude-session-root",
+          timestamp: "2026-07-01T01:00:01.900Z",
+          message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "Child done." }] },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": false,
+      "include-claude": true,
+      "claude-root": claudeRoot,
+      "lookback-days": 30,
+    });
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 2) });
+
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    expect(run.events[1].payload.content.text).toBe("Root done.");
+    expect(run.events[1].endedAt).toBe(Date.parse("2026-07-01T01:00:03.000Z"));
+    const serializedEvents = JSON.stringify(run.events);
+    expect(serializedEvents).not.toContain("Sidechain aside.");
+    expect(serializedEvents).not.toContain("Child done.");
+    expect(run.blobWrites).toHaveLength(1);
+    expect(run.blobWrites[0].text).not.toContain("Sidechain aside.");
+    const stateFiles = Object.keys((run.getState() as any).files);
+    expect(stateFiles).toHaveLength(1);
+    expect(stateFiles[0]).not.toContain("subagents");
+  });
+
+  test("code-agent-transcripts keeps bounded cursor state while a Codex turn is open", async () => {
     const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
@@ -3098,7 +4306,8 @@ auth:
       "lookback-days": 30,
     });
 
-    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    const observedAt = Date.UTC(2026, 6, 1, 3);
+    await syncOnce(run.context, { now: observedAt });
     expect(run.events.map((event) => event.type)).toEqual(["code_agent.human_message"]);
     expect(run.blobWrites).toHaveLength(0);
     const firstState = run.getState() as any;
@@ -3136,7 +4345,7 @@ auth:
       ].map((record) => JSON.stringify(record)).join("\n") + "\n",
     );
 
-    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    await syncOnce(run.context, { now: observedAt });
     expect(run.events.map((event) => event.type)).toEqual([
       "code_agent.human_message",
       "code_agent.agent_turn",
@@ -3184,14 +4393,15 @@ auth:
       "lookback-days": 30,
     });
 
-    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    const observedAt = Date.UTC(2026, 6, 1, 3);
+    await syncOnce(run.context, { now: observedAt });
     expect(run.events.map((event) => event.type)).toEqual(["code_agent.human_message"]);
     const firstCursor = Object.values((run.getState() as any).files)[0] as any;
     expect(firstCursor.lineCount).toBe(3);
     expect(firstCursor.byteOffset).toBe(Buffer.byteLength(completePrefix));
 
     appendFileSync(transcriptPath, "\n");
-    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    await syncOnce(run.context, { now: observedAt });
     expect(run.events.map((event) => event.type)).toEqual([
       "code_agent.human_message",
       "code_agent.agent_turn",
@@ -3199,7 +4409,7 @@ auth:
     expect(run.events[1].payload.content.text).toBe("Closed.");
   });
 
-  test("code-agent-transcripts does not commit a closed turn cursor when raw materialization is aborted", async () => {
+  test("code-agent-transcripts isolates an unsignaled AbortError during root materialization", async () => {
     const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
@@ -3224,8 +4434,8 @@ auth:
       "lookback-days": 30,
     });
 
-    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
-    const stateBeforeClosure = JSON.parse(JSON.stringify(run.getState()));
+    const observedAt = Date.UTC(2026, 6, 1, 3);
+    await syncOnce(run.context, { now: observedAt });
     appendFileSync(
       transcriptPath,
       [
@@ -3244,33 +4454,280 @@ auth:
       ].map((record) => JSON.stringify(record)).join("\n") + "\n",
     );
 
-    const controller = new AbortController();
-    (run.context as any).signal = controller.signal;
-    let readPass = 0;
-    async function* abortDuringRawRead(path: string, startOffset: number) {
-      const pass = ++readPass;
-      const text = readFileSync(path).subarray(startOffset).toString("utf8");
-      for (const line of text.split("\n")) {
-        if (!line) continue;
-        yield line;
-        if (pass === 2) controller.abort();
-      }
-    }
+    const stateBeforeMaterialization = JSON.parse(JSON.stringify(run.getState()));
+    const originalWriteTextBlob = (run.context as any).guard.writeTextBlob;
+    (run.context as any).guard.writeTextBlob = async () => {
+      const error = new Error("materialization aborted");
+      error.name = "AbortError";
+      throw error;
+    };
 
-    await expect(syncOnce(run.context, {
-      now: Date.UTC(2026, 6, 1, 3),
-      readLinesImpl: abortDuringRawRead,
-    })).rejects.toMatchObject({ name: "AbortError" });
-    expect(run.getState()).toEqual(stateBeforeClosure);
+    await syncOnce(run.context, { now: observedAt });
+    expect((run.context as any).signal.aborted).toBe(false);
+    expect(run.getState()).toEqual(stateBeforeMaterialization);
     expect(run.events.map((event) => event.type)).toEqual(["code_agent.human_message"]);
+    expect(run.blobWrites).toEqual([]);
+    expect(run.getWarnings().get("code-agent-transcripts-files")).toMatchObject({
+      details: {
+        failures: [{ provider: "codex", error: "materialization aborted" }],
+      },
+    });
 
-    (run.context as any).signal = new AbortController().signal;
-    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    (run.context as any).guard.writeTextBlob = originalWriteTextBlob;
+    await syncOnce(run.context, { now: observedAt + 30_000 });
     expect(run.events.map((event) => event.type)).toEqual([
       "code_agent.human_message",
       "code_agent.agent_turn",
     ]);
     expect(run.events[1].payload.content.text).toBe("Safely finished.");
+    expect(run.getWarnings().size).toBe(0);
+  });
+
+  test("code-agent-transcripts exhausts retries for a root identified during initial materialization", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { runWatch } = await import(agentUrl) as {
+      runWatch(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-initial-materialization-failure");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const transcriptPath = join(dayDir, "rollout.jsonl");
+    const turnId = "initial-materialization-turn";
+    writeFileSync(
+      transcriptPath,
+      [
+        { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "initial-materialization-session", thread_source: "cli" } },
+        { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "initial-materialization-client", message: "Capture this root." } },
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: "Root captured." }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId },
+          },
+        },
+        { timestamp: "2026-07-01T02:00:02.100Z", type: "event_msg", payload: { type: "task_complete", turn_id: turnId, last_agent_message: "Root captured." } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    let materializationAttempts = 0;
+    async function* readLinesImpl(path: string, startOffset: number) {
+      if (startOffset > 0) {
+        materializationAttempts += 1;
+        throw new Error("permanent initial root materialization failure");
+      }
+      const text = readFileSync(path).subarray(startOffset).toString("utf8");
+      for (const line of text.split("\n")) {
+        if (line) yield line;
+      }
+    }
+    const warningScopes: string[] = [];
+    let waits = 0;
+
+    await expect(runWatch(run.context, {
+      syncOnceDeps: {
+        now: Date.UTC(2026, 6, 1, 3),
+        readLinesImpl,
+      },
+      async waitImpl() {
+        waits += 1;
+        const failure = run.getWarnings()
+          .get("code-agent-transcripts-files")
+          ?.details?.failures?.[0];
+        if (failure?.scope) warningScopes.push(failure.scope);
+      },
+    })).rejects.toThrow(
+      "failed after 3 retries: permanent initial root materialization failure",
+    );
+
+    expect(materializationAttempts).toBe(4);
+    expect(waits).toBe(3);
+    expect(warningScopes).toEqual(["root", "root", "root"]);
+    expect(run.events).toEqual([]);
+    expect(run.getWarnings().size).toBe(0);
+  });
+
+  test("code-agent-transcripts watch retries transient failures, exits on cancellation, and enforces its retry budget", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { runWatch } = await import(agentUrl) as {
+      runWatch(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-watch-retry");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    writeFileSync(
+      join(dayDir, "rollout.jsonl"),
+      [
+        { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "watch-session" } },
+        { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "watch-turn" } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "watch-client", message: "Retry this root." } },
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: "Retry succeeded." }],
+            internal_chat_message_metadata_passthrough: { turn_id: "watch-turn" },
+          },
+        },
+        { timestamp: "2026-07-01T02:00:02.100Z", type: "event_msg", payload: { type: "task_complete", turn_id: "watch-turn", last_agent_message: "Retry succeeded." } },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    const controller = new AbortController();
+    (run.context as any).signal = controller.signal;
+
+    const originalStateGet = (run.context as any).state.get;
+    let stateGetAttempts = 0;
+    (run.context as any).state.get = async () => {
+      stateGetAttempts += 1;
+      if (stateGetAttempts === 1) throw new Error("temporary state read failure");
+      return originalStateGet();
+    };
+
+    const originalWriteTextBlob = (run.context as any).guard.writeTextBlob;
+    let blobAttempts = 0;
+    (run.context as any).guard.writeTextBlob = async (input: any) => {
+      blobAttempts += 1;
+      if (blobAttempts === 1) {
+        const error = new Error("temporary blob write abort");
+        error.name = "AbortError";
+        throw error;
+      }
+      return originalWriteTextBlob(input);
+    };
+
+    const originalWriteEvents = (run.context as any).guard.writeEvents;
+    (run.context as any).guard.writeEvents = async (events: any[]) => {
+      const result = await originalWriteEvents(events);
+      controller.abort();
+      return result;
+    };
+
+    let waits = 0;
+    await runWatch(run.context, {
+      syncOnceDeps: { now: Date.UTC(2026, 6, 1, 3) },
+      async waitImpl() {
+        waits += 1;
+        if (waits > 3) throw new Error("watch did not recover");
+      },
+    });
+
+    expect(stateGetAttempts).toBe(3);
+    expect(blobAttempts).toBe(2);
+    expect(waits).toBe(2);
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    expect(run.events[1].payload.content.text).toBe("Retry succeeded.");
+    expect(run.getWarnings().size).toBe(0);
+
+    const canceledRun = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    const canceledController = new AbortController();
+    (canceledRun.context as any).signal = canceledController.signal;
+    let canceledBlobAttempts = 0;
+    (canceledRun.context as any).guard.writeTextBlob = async () => {
+      canceledBlobAttempts += 1;
+      canceledController.abort();
+      const error = new Error("connector canceled");
+      error.name = "AbortError";
+      throw error;
+    };
+    let canceledWaits = 0;
+
+    await runWatch(canceledRun.context, {
+      syncOnceDeps: { now: Date.UTC(2026, 6, 1, 3) },
+      async waitImpl() {
+        canceledWaits += 1;
+      },
+    });
+
+    expect(canceledController.signal.aborted).toBe(true);
+    expect(canceledBlobAttempts).toBe(1);
+    expect(canceledWaits).toBe(0);
+    expect(canceledRun.events).toEqual([]);
+    expect(canceledRun.getWarnings().size).toBe(0);
+
+    const exhaustedRootRun = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    let exhaustedRootAttempts = 0;
+    (exhaustedRootRun.context as any).guard.writeTextBlob = async () => {
+      exhaustedRootAttempts += 1;
+      throw new Error("permanent root blob failure");
+    };
+    let exhaustedRootWaits = 0;
+    let rootWarningSeenDuringRetries = false;
+
+    await expect(runWatch(exhaustedRootRun.context, {
+      syncOnceDeps: { now: Date.UTC(2026, 6, 1, 3) },
+      async waitImpl() {
+        exhaustedRootWaits += 1;
+        rootWarningSeenDuringRetries ||= exhaustedRootRun.getWarnings().has("code-agent-transcripts-files");
+      },
+    })).rejects.toThrow("failed after 3 retries: permanent root blob failure");
+
+    expect(exhaustedRootAttempts).toBe(4);
+    expect(exhaustedRootWaits).toBe(3);
+    expect(exhaustedRootRun.events).toEqual([]);
+    expect(rootWarningSeenDuringRetries).toBe(true);
+    expect(exhaustedRootRun.getWarnings().size).toBe(0);
+
+    const exhaustedSyncRun = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+    });
+    let exhaustedSyncAttempts = 0;
+    (exhaustedSyncRun.context as any).state.get = async () => {
+      exhaustedSyncAttempts += 1;
+      throw new Error("permanent state failure");
+    };
+    let exhaustedSyncWaits = 0;
+    const syncWarningSnapshots: unknown[] = [];
+
+    await expect(runWatch(exhaustedSyncRun.context, {
+      syncOnceDeps: { now: Date.UTC(2026, 6, 1, 3) },
+      async waitImpl() {
+        exhaustedSyncWaits += 1;
+        syncWarningSnapshots.push(exhaustedSyncRun.getWarnings().get("code-agent-transcripts-watch"));
+      },
+    })).rejects.toThrow("sync failed after 3 retries: permanent state failure");
+
+    expect(exhaustedSyncAttempts).toBe(4);
+    expect(exhaustedSyncWaits).toBe(3);
+    expect(syncWarningSnapshots.at(-1)).toMatchObject({
+      details: { failureCount: 3, retriesRemaining: 1 },
+    });
+    expect(exhaustedSyncRun.getWarnings().size).toBe(0);
   });
 
   test("code-agent-transcripts applies the 8192-byte content and human raw limits", async () => {
@@ -3317,6 +4774,100 @@ auth:
     expect(run.blobWrites.map((write) => write.text)).toContain(longMessage);
   });
 
+  test("code-agent-transcripts elides multi-megabyte data URLs without overflowing", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const codexRoot = join(workspace, "codex-large-data-url");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const transcriptPath = join(dayDir, "rollout.jsonl");
+    const dataUrl = `data:image/png;base64,${"A".repeat(5_800_000)}=`;
+    const githubToken = `ghp_${"x".repeat(30)}`;
+    const commitSha = "a".repeat(40);
+    const encodedChecksum = `${"B".repeat(46)}==`;
+    const jwt = `${"h".repeat(24)}.${"p".repeat(24)}.${"s".repeat(24)}`;
+    const structuredSecret = "Ab9+/".repeat(8);
+    writeFileSync(
+      transcriptPath,
+      [
+        { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "large-data-session" } },
+        { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "large-data-turn" } },
+        {
+          timestamp: "2026-07-01T02:00:02.000Z",
+          type: "response_item",
+          payload: {
+            type: "custom_tool_call_output",
+            call_id: "image-output",
+            output: [
+              { type: "text", text: `token=${githubToken}` },
+              { type: "image", image_url: dataUrl },
+              {
+                type: "metadata",
+                commitSha,
+                encodedChecksum,
+                jwt,
+                secretAccessKey: structuredSecret,
+                tokenCount: 42,
+              },
+            ],
+            internal_chat_message_metadata_passthrough: { turn_id: "large-data-turn" },
+          },
+        },
+        {
+          timestamp: "2026-07-01T02:00:03.000Z",
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: "large-data-turn", last_agent_message: "Image inspected." },
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+
+    const run = makeCodeAgentContext({
+      "include-codex": true,
+      "include-claude": false,
+      "codex-root": codexRoot,
+      "lookback-days": 30,
+      "max-inline-bytes": 8192,
+    });
+    const originalBufferConcat = Buffer.concat;
+    let concatenatedBytes = 0;
+    (Buffer as any).concat = (buffers: Uint8Array[], totalLength?: number) => {
+      const byteLength = totalLength
+        ?? buffers.reduce((sum, buffer) => sum + buffer.byteLength, 0);
+      concatenatedBytes += byteLength;
+      return originalBufferConcat(buffers, totalLength);
+    };
+    try {
+      await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    } finally {
+      (Buffer as any).concat = originalBufferConcat;
+    }
+
+    expect(run.events).toHaveLength(1);
+    expect(run.events[0]).toMatchObject({
+      type: "code_agent.agent_turn",
+      payload: {
+        content: { text: "Image inspected." },
+        raw: { recordCount: 3, contentRef: { kind: "content-blob" } },
+      },
+    });
+    expect(run.getWarnings().size).toBe(0);
+    expect(run.blobWrites).toHaveLength(1);
+    expect(run.blobWrites[0].text).toContain("data:image/png;base64,[REDACTED_PAYLOAD]");
+    expect(run.blobWrites[0].text).not.toContain(githubToken);
+    expect(run.blobWrites[0].text).toContain(commitSha);
+    expect(run.blobWrites[0].text).toContain(encodedChecksum);
+    expect(run.blobWrites[0].text).not.toContain(jwt);
+    expect(run.blobWrites[0].text).not.toContain(structuredSecret);
+    expect(run.blobWrites[0].text).toContain('"secretAccessKey":"[REDACTED_SECRET]"');
+    expect(run.blobWrites[0].text).toContain('"tokenCount":42');
+    expect(run.blobWrites[0].text.length).toBeLessThan(10_000);
+    expect(concatenatedBytes).toBeLessThan(dataUrl.length * 5);
+    const cursor = Object.values((run.getState() as any).files)[0] as any;
+    expect(cursor.byteOffset).toBe(statSync(transcriptPath).size);
+  });
+
   test("code-agent-transcripts packs Claude Code tool activity and strips reasoning by default", async () => {
     const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
@@ -3326,6 +4877,7 @@ auth:
     const projectDir = join(claudeRoot, "Users-alice-project");
     mkdirSync(projectDir, { recursive: true });
     const promptId = "prompt-1";
+    const toolResultSecret = "claude-short-secret";
     writeFileSync(
       join(projectDir, "session.jsonl"),
       [
@@ -3358,7 +4910,14 @@ auth:
           promptId,
           sessionId: "claude-session-1",
           timestamp: "2026-07-01T01:00:02.000Z",
-          message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tool-1", content: "file contents" }] },
+          message: {
+            role: "user",
+            content: [{
+              type: "tool_result",
+              tool_use_id: "tool-1",
+              content: JSON.stringify({ file: "contents", password: toolResultSecret }),
+            }],
+          },
         },
         {
           type: "assistant",
@@ -3418,6 +4977,14 @@ auth:
     expect(run.blobWrites[0].text).toContain('"type":"tool_result"');
     expect(run.blobWrites[0].text).not.toContain("Reasoning notes.");
     expect(run.blobWrites[0].text).not.toContain("Final private reasoning.");
+    expect(run.blobWrites[0].text).not.toContain(toolResultSecret);
+    const rawRecords = run.blobWrites[0].text
+      .trim()
+      .split("\n")
+      .map((line: string) => JSON.parse(line).record);
+    const toolResultRecord = rawRecords.find((record: any) => record.uuid === "tool-result-1");
+    const toolResult = toolResultRecord.message.content.find((part: any) => part.type === "tool_result");
+    expect(toolResult.content).toBe("[REDACTED_STRUCTURED_VALUE]");
   });
 
   test("code-agent-transcripts accepts Claude prompts without origin and keeps steering in one agent turn", async () => {
@@ -3524,6 +5091,68 @@ auth:
     expect(run.blobWrites[0].text).toContain("Audit and catalog checked.");
     expect(run.blobWrites[0].text).not.toContain("Also check the catalog.");
     expect(run.blobWrites[0].text).not.toContain("Synthetic task notification.");
+  });
+
+  test("code-agent-transcripts keeps a Claude interaction on its opening session", async () => {
+    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const claudeRoot = join(workspace, "claude-session-identity");
+    const projectDir = join(claudeRoot, "Users-alice-project");
+    mkdirSync(projectDir, { recursive: true });
+    const promptId = "prompt-session-bound";
+    writeFileSync(
+      join(projectDir, "session.jsonl"),
+      [
+        {
+          type: "user",
+          uuid: "human-session-a",
+          promptId,
+          origin: { kind: "human" },
+          sessionId: "claude-session-a",
+          timestamp: "2026-07-01T01:00:00.000Z",
+          message: { role: "user", content: "Keep this interaction joined." },
+        },
+        {
+          type: "assistant",
+          uuid: "assistant-session-a",
+          sessionId: "claude-session-a",
+          timestamp: "2026-07-01T01:00:01.000Z",
+          message: {
+            role: "assistant",
+            stop_reason: "end_turn",
+            content: [{ type: "text", text: "Interaction joined." }],
+          },
+        },
+        {
+          type: "ai-title",
+          sessionId: "claude-session-b",
+          timestamp: "2026-07-01T01:00:02.000Z",
+          aiTitle: "Later session metadata",
+        },
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    const run = makeCodeAgentContext({
+      "include-codex": false,
+      "include-claude": true,
+      "claude-root": claudeRoot,
+      "lookback-days": 30,
+    });
+
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 2) });
+
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message",
+      "code_agent.agent_turn",
+    ]);
+    const [human, agent] = run.events;
+    expect(human.payload.interactionId).toBe(`claude-code:claude-session-a:${promptId}`);
+    expect(agent.payload.interactionId).toBe(human.payload.interactionId);
+    expect(agent.payload.raw.ids).toMatchObject({
+      sessionId: "claude-session-a",
+      promptId,
+    });
   });
 
   test("code-agent-transcripts includes redacted Claude reasoning only when enabled", async () => {
