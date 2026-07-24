@@ -57,6 +57,11 @@ try {
   const netSource = await readFile(join(guest, "native", "net-helper.c"), "utf8");
   assert(netSource.includes("key[0] == 'a' || key[0] == 'b'"), "net helper does not admit only App/Build namespace prefixes");
   assert(netSource.includes("request.ifr_flags |= IFF_UP"), "net helper does not bring loopback up");
+  assert(netSource.includes("GET / HTTP/1.1"), "net helper readiness does not probe the viewer protocol");
+  assert(netSource.includes("response[index - 3] == '\\r'"), "net helper readiness does not require complete HTTP headers");
+  assert(netSource.includes("signal(SIGPIPE, SIG_IGN)"), "net helper readiness can terminate on a transient peer reset");
+  assert(netSource.includes("SOCK_NONBLOCK"), "net helper readiness connect can exceed its absolute deadline");
+  assert(netSource.includes("bounded_deadline"), "net helper readiness attempts are not bounded by the global deadline");
   if (process.platform === "linux") {
     const netCompile = spawnSync(compiler, [
       "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
@@ -64,6 +69,22 @@ try {
     ], { encoding: "utf8" });
     if (netCompile.error) throw netCompile.error;
     if (netCompile.status !== 0) throw new Error(`net helper compile failed:\n${netCompile.stderr}`);
+
+    const netStatusExecutable = join(root, "net-status-test");
+    const netStatusCompile = spawnSync(compiler, [
+      "-std=c11", "-Wall", "-Wextra", "-Werror",
+      "-o", netStatusExecutable,
+      join(guest, "native", "net-helper-status-test.c"),
+    ], { encoding: "utf8" });
+    if (netStatusCompile.error) throw netStatusCompile.error;
+    if (netStatusCompile.status !== 0) {
+      throw new Error(`net helper status test compile failed:\n${netStatusCompile.stderr}`);
+    }
+    const netStatus = spawnSync(netStatusExecutable, [], { encoding: "utf8" });
+    if (netStatus.error) throw netStatus.error;
+    if (netStatus.status !== 0) {
+      throw new Error(`net helper status test failed with status ${netStatus.status}`);
+    }
   }
   process.stdout.write("native helper tests passed\n");
 } finally {

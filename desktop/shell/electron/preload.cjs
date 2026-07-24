@@ -6,6 +6,12 @@ contextBridge.exposeInMainWorld("lamarckHost", {
   importRecoveryCode: (recoveryCode) => ipcRenderer.invoke("auth:importRecoveryCode", recoveryCode),
   getCoreBaseUrl: () => ipcRenderer.invoke("core:getBaseUrl"),
   getCoreStartError: () => ipcRenderer.invoke("core:getStartError"),
+  getCoreRuntimeState: () => ipcRenderer.invoke("core:getRuntimeState"),
+  onCoreRuntimeState: (callback) => {
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on("core:runtimeState", listener);
+    return () => ipcRenderer.removeListener("core:runtimeState", listener);
+  },
   retryCore: () => ipcRenderer.invoke("core:retry"),
   rotateCorePort: () => ipcRenderer.invoke("core:rotatePort"),
   openExternal: (url) => ipcRenderer.invoke("shell:openExternal", url),

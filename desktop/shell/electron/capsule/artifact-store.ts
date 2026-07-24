@@ -49,6 +49,11 @@ export interface HostArtifactActivation {
   readonly dependencyDigest?: `sha256:${string}`;
 }
 
+export interface HostArtifactRetention {
+  /** Idempotently releases this process-local prepared-artifact pin. */
+  release(): void;
+}
+
 interface HostArtifactWriterDependencies {
   removeTemporary(path: string): Promise<void>;
   syncDirectory(path: string): Promise<void>;
@@ -75,6 +80,8 @@ export class HostArtifactStore {
   readonly #afterActivationPointerRename: (() => Promise<void>) | undefined;
   readonly #writer: HostArtifactWriterDependencies;
   readonly #publicationTails = new Map<string, Promise<void>>();
+  readonly #retainedDigests = new Map<`sha256:${string}`, number>();
+  readonly #pruningDigests = new Set<`sha256:${string}`>();
   #root: string | undefined;
   #quarantined: Error | undefined;
 
@@ -92,6 +99,33 @@ export class HostArtifactStore {
       ...DEFAULT_ARTIFACT_WRITER_DEPENDENCIES,
       ...options.artifactWriter,
     };
+  }
+
+  /**
+   * Keeps an unactivated candidate artifact across reconstructable-data GC.
+   * The retention is process-local: after a Host crash no candidate runtime
+   * survives, so startup may safely prune the resulting unreferenced CAS file.
+   */
+  retain(artifact: HostArtifactIdentity): HostArtifactRetention {
+    const digest = validateDigest(artifact.digest);
+    validateArtifactBytes(artifact.bytes);
+    if (this.#pruningDigests.has(digest)) {
+      throw new Error("Host artifact is currently being pruned; retry candidate preparation");
+    }
+    const root = this.#root;
+    if (!root) throw new Error("Host artifact store is not prepared");
+    assertRetainableArtifact(this.#casPath(root, digest), artifact.bytes);
+    this.#retainedDigests.set(digest, (this.#retainedDigests.get(digest) ?? 0) + 1);
+    let released = false;
+    return Object.freeze({
+      release: () => {
+        if (released) return;
+        released = true;
+        const remaining = (this.#retainedDigests.get(digest) ?? 0) - 1;
+        if (remaining > 0) this.#retainedDigests.set(digest, remaining);
+        else this.#retainedDigests.delete(digest);
+      },
+    });
   }
 
   async receive(
@@ -517,6 +551,9 @@ export class HostArtifactStore {
   async pruneUnreferenced(): Promise<number> {
     const root = await this.#prepare();
     const pinned = new Set<string>();
+    for (const digest of this.#retainedDigests.keys()) {
+      pinned.add(this.#casPath(root, digest));
+    }
     const activeDirectory = join(root, "active");
     for (const entry of await readdir(activeDirectory, { withFileTypes: true })) {
       const match = /^([a-f0-9]{64})\.json$/.exec(entry.name);
@@ -540,20 +577,39 @@ export class HostArtifactStore {
       const directory = join(casRoot, prefix.name);
       for (const entry of await readdir(directory, { withFileTypes: true })) {
         const path = join(directory, entry.name);
-        if (!entry.isFile() || (
-          !/^[a-f0-9]{64}$/.test(entry.name)
-          && !entry.name.startsWith(".artifact-")
-        )) {
+        const digestMatch = /^([a-f0-9]{64})$/.exec(entry.name);
+        if (!entry.isFile() || (!digestMatch && !entry.name.startsWith(".artifact-"))) {
           throw new Error("Host artifact CAS contains an invalid entry");
         }
         if (pinned.has(path)) continue;
-        if (this.#storageBudget) {
-          removedBytes += await this.#storageBudget.remove(path);
-        } else {
-          const details = await lstat(path);
-          await rm(path);
-          removedBytes += details.size;
+        if (!digestMatch) {
+          if (this.#storageBudget) {
+            removedBytes += await this.#storageBudget.remove(path);
+          } else {
+            const details = await lstat(path);
+            await rm(path);
+            removedBytes += details.size;
+          }
+          continue;
         }
+        const digest = `sha256:${digestMatch[1]}` as const;
+        removedBytes += await this.#withPublicationLock(digest, async () => {
+          // A retention may have been acquired after the initial snapshot.
+          // From this synchronous recheck through the pruning marker there is
+          // no await, so either the pin or deletion owns this digest.
+          if (this.#retainedDigests.has(digest)) return 0;
+          this.#pruningDigests.add(digest);
+          try {
+            if (this.#storageBudget) {
+              return await this.#storageBudget.remove(path);
+            }
+            const details = await lstat(path);
+            await rm(path);
+            return details.size;
+          } finally {
+            this.#pruningDigests.delete(digest);
+          }
+        });
       }
       await syncDirectory(directory);
     }
@@ -774,6 +830,34 @@ function assertSameFile(before: BigIntStats, after: BigIntStats, message: string
     || after.ctimeNs !== before.ctimeNs
   ) {
     throw new Error(message);
+  }
+}
+
+function assertRetainableArtifact(path: string, expectedBytes: number): void {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const details = fstatSync(descriptor, { bigint: true });
+    if (
+      !details.isFile()
+      || details.nlink !== 1n
+      || details.size !== BigInt(expectedBytes)
+      || (Number(details.mode) & 0o777) !== 0o400
+    ) {
+      throw new Error("Host artifact cannot be retained because its CAS entry is invalid");
+    }
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) {
+      throw new Error("Host artifact cannot be retained because its CAS entry is missing", {
+        cause: error,
+      });
+    }
+    throw error;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 

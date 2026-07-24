@@ -21,12 +21,22 @@ import {
 } from "electron";
 import { spawn, type ChildProcess } from "child_process";
 import { randomBytes } from "crypto";
-import { existsSync, cpSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import {
+  existsSync,
+  cpSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "fs";
 import { createServer } from "net";
 import { join, relative, sep } from "path";
+import { performance } from "perf_hooks";
 import { pathToFileURL } from "url";
 import {
   CapsuleManager,
+  type PreparedViewerBinding,
   type ReloadedBrowserBinding,
 } from "./capsule/manager";
 import { MacOsCapsuleBackend } from "./capsule/macos-backend";
@@ -34,6 +44,7 @@ import { isCapsuleRestartRequiredError } from "./capsule/backend";
 import { SystemBroker } from "./capsule/system-broker";
 import { SystemStreamServer } from "./capsule/system-stream";
 import { createViewerGateway, type ViewerGatewayBinding } from "./capsule/viewer-gateway";
+import { waitForViewerHttpReady } from "./capsule/viewer-readiness";
 import { clearDisposableAppViewerStorage } from "./capsule/viewer-storage";
 import {
   ViewerLifecycleCoordinator,
@@ -48,6 +59,15 @@ import {
   parseAllowedExternalUrl,
   type AppViewerOriginBinding,
 } from "./capsule/web-policy";
+import {
+  CoreRuntimeStateController,
+  type CoreRuntimeState,
+} from "./core-runtime-state";
+import {
+  isWorkspaceVaultId,
+  WorkspaceVaultStateController,
+  withEncryptedVaultRecord,
+} from "./workspace-vault-state";
 
 app.setName("Lamarck");
 
@@ -65,6 +85,9 @@ const GUARD_START_TIMEOUT_MS = 10_000;
 const GUARD_HEARTBEAT_INTERVAL_MS = 5_000;
 const GUARD_HEARTBEAT_TIMEOUT_MS = 30_000;
 const PROCESS_STOP_TIMEOUT_MS = 1_500;
+const CORE_READY_TIMEOUT_MS = 10_000;
+const CORE_READY_REQUEST_TIMEOUT_MS = 750;
+const CORE_READY_RETRY_DELAY_MS = 200;
 const PRIVATE_RUNTIME_ENV = [
   "LAMARCK_GUARD_ORIGIN",
   "LAMARCK_GUARD_TOKEN",
@@ -77,8 +100,8 @@ let guardOrigin = "";
 let workspace = "";
 let corePort = 0;
 let coreStartError: string | null = null;
-let vaultId = "";
-let vaultKey = "";
+const coreRuntime = new CoreRuntimeStateController(notifyCoreRuntimeState);
+const workspaceVault = new WorkspaceVaultStateController();
 let nextTerminalId = 1;
 let isQuitting = false;
 let shutdownComplete = false;
@@ -111,6 +134,7 @@ interface AppViewerReplacement {
   gateway: ViewerGatewayBinding;
   viewerSession: Session;
   protocolPartition: string;
+  stopHealthMonitoring?(): void;
 }
 
 interface AppViewerProtocolBinding extends AppViewerOriginBinding {
@@ -122,6 +146,9 @@ interface AppViewerSessionState {
 }
 
 const appViewers = new Map<string, AppViewerRecord>();
+// Includes hidden first-launch renderers during the narrow interval after
+// their browser authority is bound but before they can enter appViewers.
+const preparedAppViewerSenderIds = new Set<number>();
 const appArchiveOperations = new Map<string, Promise<{ ok: true; id: string }>>();
 const appViewerSessions = new Map<string, AppViewerSessionState>();
 const appViewerLifecycle = new ViewerLifecycleCoordinator();
@@ -244,7 +271,10 @@ function loadWorkspaceSettings(targetWorkspace = workspace): WorkspaceSettings {
 function saveWorkspaceSettings(settings: WorkspaceSettings, targetWorkspace = workspace): void {
   const lamarckDir = join(targetWorkspace, ".lamarck");
   mkdirSync(lamarckDir, { recursive: true });
-  writeFileSync(workspaceSettingsPath(targetWorkspace), JSON.stringify(settings, null, 2) + "\n", "utf8");
+  atomicWriteText(
+    workspaceSettingsPath(targetWorkspace),
+    JSON.stringify(settings, null, 2) + "\n",
+  );
 }
 
 function vaultRecordsPath(): string {
@@ -261,39 +291,72 @@ function loadVaultRecords(): Record<string, string> {
 
 function saveVaultRecords(records: Record<string, string>): void {
   mkdirSync(app.getPath("userData"), { recursive: true });
-  writeFileSync(vaultRecordsPath(), JSON.stringify(records, null, 2) + "\n", "utf8");
+  atomicWriteText(vaultRecordsPath(), JSON.stringify(records, null, 2) + "\n");
 }
 
-function loadOrCreateVaultKey(nextVaultId: string, opts: { allowCreate: boolean }): string {
-  if (!safeStorage.isEncryptionAvailable()) {
+function atomicWriteText(path: string, contents: string): void {
+  const temporary = `${path}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  try {
+    writeFileSync(temporary, contents, { encoding: "utf8", flag: "wx" });
+    renameSync(temporary, path);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+async function loadOrCreateVaultKey(
+  nextVaultId: string,
+  opts: { allowCreate: boolean },
+): Promise<string> {
+  if (!(await safeStorage.isAsyncEncryptionAvailable())) {
     throw new Error("Electron safeStorage is unavailable; cannot unlock the workspace vault key");
   }
   const records = loadVaultRecords();
-  const encrypted = records[nextVaultId];
+  const encrypted = Object.hasOwn(records, nextVaultId)
+    ? records[nextVaultId]
+    : undefined;
+  if (encrypted !== undefined && typeof encrypted !== "string") {
+    throw new Error("Workspace vault key record is invalid");
+  }
   if (encrypted) {
-    return safeStorage.decryptString(Buffer.from(encrypted, "base64"));
+    const decrypted = await safeStorage.decryptStringAsync(Buffer.from(encrypted, "base64"));
+    if (decrypted.shouldReEncrypt) {
+      saveVaultRecords(withEncryptedVaultRecord(
+        records,
+        nextVaultId,
+        (await safeStorage.encryptStringAsync(decrypted.result)).toString("base64"),
+      ));
+    }
+    return decrypted.result;
   }
   if (!opts.allowCreate) {
     throw new Error("Workspace vault is locked on this device. Import the recovery code to unlock it.");
   }
   const recoveryCode = randomBytes(32).toString("base64url");
-  records[nextVaultId] = safeStorage.encryptString(recoveryCode).toString("base64");
-  saveVaultRecords(records);
+  saveVaultRecords(withEncryptedVaultRecord(
+    records,
+    nextVaultId,
+    (await safeStorage.encryptStringAsync(recoveryCode)).toString("base64"),
+  ));
   return recoveryCode;
 }
 
-function importVaultKey(nextVaultId: string, recoveryCode: string): void {
-  const decoded = Buffer.from(recoveryCode.trim(), "base64url");
+async function importVaultKey(nextVaultId: string, recoveryCode: string): Promise<string> {
+  const normalized = recoveryCode.trim();
+  const decoded = Buffer.from(normalized, "base64url");
   if (decoded.length !== 32) {
     throw new Error("Recovery code must decode to a 32-byte vault key");
   }
-  if (!safeStorage.isEncryptionAvailable()) {
+  if (!(await safeStorage.isAsyncEncryptionAvailable())) {
     throw new Error("Electron safeStorage is unavailable; cannot store the workspace vault key");
   }
   const records = loadVaultRecords();
-  records[nextVaultId] = safeStorage.encryptString(recoveryCode.trim()).toString("base64");
-  saveVaultRecords(records);
-  vaultKey = recoveryCode.trim();
+  saveVaultRecords(withEncryptedVaultRecord(
+    records,
+    nextVaultId,
+    (await safeStorage.encryptStringAsync(normalized)).toString("base64"),
+  ));
+  return normalized;
 }
 
 function saveWorkspacePath(nextWorkspace: string): void {
@@ -322,11 +385,25 @@ function ensureWorkspace(targetWorkspace = workspace): void {
 }
 
 async function ensureWorkspaceRuntimeSettings(opts?: { rotatePort?: boolean }): Promise<void> {
-  const settings = loadWorkspaceSettings();
+  const targetWorkspace = workspace;
+  const settings = loadWorkspaceSettings(targetWorkspace);
+  if (settings.vaultId !== undefined && !isWorkspaceVaultId(settings.vaultId)) {
+    workspaceVault.begin(targetWorkspace);
+    throw new Error("Workspace vault ID is invalid");
+  }
   const createdVaultId = !settings.vaultId;
   if (!settings.vaultId) {
     settings.vaultId = randomBytes(16).toString("base64url");
   }
+  const nextVaultId = settings.vaultId;
+  // Existing vault identity is selected before any fallible port or Keychain
+  // work. A workspace transition can therefore never expose the previous
+  // Workspace's plaintext recovery key. A first-run ID remains private until
+  // both its encrypted record and Workspace settings have been persisted.
+  let vaultSelection = workspaceVault.begin(
+    targetWorkspace,
+    createdVaultId ? "" : nextVaultId,
+  );
 
   if (opts?.rotatePort || !settings.corePort || !isSupportedCorePort(settings.corePort)) {
     settings.corePort = await chooseAvailableCorePort(settings.corePort);
@@ -336,11 +413,31 @@ async function ensureWorkspaceRuntimeSettings(opts?: { rotatePort?: boolean }): 
       `Core port ${settings.corePort} is already in use. Close the other app or explicitly rotate the workspace core port.`,
     );
   }
+  if (!settings.vaultId || !settings.corePort) {
+    throw new Error("Workspace runtime settings could not be initialized");
+  }
 
-  saveWorkspaceSettings(settings);
-  corePort = settings.corePort;
-  vaultId = settings.vaultId;
-  vaultKey = loadOrCreateVaultKey(vaultId, { allowCreate: createdVaultId });
+  const nextCorePort = settings.corePort;
+  const nextVaultKey = await loadOrCreateVaultKey(nextVaultId, {
+    allowCreate: createdVaultId,
+  });
+  if (isQuitting) {
+    throw new Error("Runtime startup was cancelled because Lamarck is quitting");
+  }
+  // On first run the recoverable Keychain record must exist before the
+  // Workspace begins referring to its vaultId. A crash can leave an unused
+  // encrypted record, but never a Workspace that points at a missing key.
+  saveWorkspaceSettings(settings, targetWorkspace);
+  if (workspace !== targetWorkspace) {
+    throw new Error("Workspace changed while its vault was being unlocked");
+  }
+  if (createdVaultId) {
+    vaultSelection = workspaceVault.begin(targetWorkspace, nextVaultId);
+  }
+  if (!workspaceVault.unlock(vaultSelection, nextVaultKey)) {
+    throw new Error("Workspace vault unlock belonged to a stale selection");
+  }
+  corePort = nextCorePort;
 }
 
 async function chooseAvailableCorePort(exclude?: number): Promise<number> {
@@ -368,6 +465,40 @@ function isPortAvailable(port: number): Promise<boolean> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function notifyCoreRuntimeState(state: CoreRuntimeState): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    const contents = window.webContents;
+    if (
+      shellWebContents.has(contents.id)
+      && !contents.isDestroyed()
+    ) contents.send("core:runtimeState", state);
+  }
+}
+
+function markCoreStarting(): number {
+  coreStartError = null;
+  return coreRuntime.begin();
+}
+
+function markCoreReady(generation: number): boolean {
+  const published = coreRuntime.ready(generation);
+  if (published) coreStartError = null;
+  return published;
+}
+
+function markCoreFailed(
+  error: unknown,
+  generation = coreRuntime.snapshot().generation,
+): string {
+  const message = errorMessage(error);
+  if (coreRuntime.fail(generation, message)) coreStartError = message;
+  return message;
+}
+
+function coreRuntimeState(): CoreRuntimeState {
+  return coreRuntime.snapshot();
 }
 
 function unprivilegedEnvironment(
@@ -457,7 +588,7 @@ function stopGuardHeartbeat(child?: UtilityProcess): void {
   guardPongListener = null;
 }
 
-function startGuardHeartbeat(child: UtilityProcess): void {
+function startGuardHeartbeat(child: UtilityProcess, generation: number): void {
   stopGuardHeartbeat();
   guardHeartbeatChild = child;
   guardLastPongAt = Date.now();
@@ -475,8 +606,11 @@ function startGuardHeartbeat(child: UtilityProcess): void {
       return;
     }
     if (Date.now() - guardLastPongAt > GUARD_HEARTBEAT_TIMEOUT_MS) {
-      coreStartError = "Guard utility became unresponsive and was terminated";
-      console.error(`[electron] ${coreStartError}`);
+      const failure = markCoreFailed(
+        "Guard utility became unresponsive and was terminated",
+        generation,
+      );
+      console.error(`[electron] ${failure}`);
       stopGuardHeartbeat(child);
       child.kill();
       return;
@@ -491,7 +625,7 @@ function startGuardHeartbeat(child: UtilityProcess): void {
   guardHeartbeatTimer = setInterval(ping, GUARD_HEARTBEAT_INTERVAL_MS);
 }
 
-async function startGuard(): Promise<void> {
+async function startGuard(generation: number): Promise<void> {
   if (guard) throw new Error("Guard utility is already running");
 
   console.log("[electron] Starting Node Guard utility...");
@@ -508,6 +642,9 @@ async function startGuard(): Promise<void> {
 
   child.on("error", (type, location, report) => {
     console.error(`[electron] Guard utility ${type} at ${location}\n${report}`);
+    if (!expectedGuardStops.has(child) && !isQuitting) {
+      markCoreFailed(`Guard utility ${type} at ${location}`, generation);
+    }
   });
   child.on("exit", (code) => {
     stopGuardHeartbeat(child);
@@ -519,7 +656,7 @@ async function startGuard(): Promise<void> {
     }
     console.log(`[electron] Guard utility exited with code ${code}`);
     if (!expected && !isQuitting) {
-      coreStartError = `Guard utility exited unexpectedly (code ${code})`;
+      markCoreFailed(`Guard utility exited unexpectedly (code ${code})`, generation);
       // The core must never continue without the process that exclusively owns
       // data.db. Fail closed; the existing Retry action restarts both processes.
       void stopCore();
@@ -530,7 +667,7 @@ async function startGuard(): Promise<void> {
     const port = await waitForGuardReady(child);
     if (guard !== child) throw new Error("Guard utility stopped during startup");
     guardOrigin = `http://127.0.0.1:${port}`;
-    startGuardHeartbeat(child);
+    startGuardHeartbeat(child, generation);
     console.log(`[electron] Guard utility ready on ${guardOrigin}`);
   } catch (error) {
     if (guard === child) await stopGuard();
@@ -538,7 +675,7 @@ async function startGuard(): Promise<void> {
   }
 }
 
-function startCore(): void {
+function startCore(generation: number): void {
   if (!guard || !guardOrigin) {
     throw new Error("Cannot start core before the Guard utility is ready");
   }
@@ -551,18 +688,20 @@ function startCore(): void {
       ELECTRON_RUN_AS_NODE: "1",
       PORT: String(corePort),
       LAMARCK_CORE_TOKEN: CORE_TOKEN,
-      LAMARCK_VAULT_KEY: vaultKey,
+      LAMARCK_VAULT_KEY: workspaceVault.requireKey(workspace),
       LAMARCK_GUARD_ORIGIN: guardOrigin,
       LAMARCK_GUARD_TOKEN: GUARD_TOKEN,
     },
   });
   core = child;
-  coreStartError = null;
   child.on("error", (error) => {
     if (expectedCoreStops.has(child) || isQuitting) return;
     if (core === child) core = null;
-    coreStartError = `Node Core failed to start: ${error.message}`;
-    console.error(`[electron] ${coreStartError}`);
+    const failure = markCoreFailed(
+      `Node Core failed to start: ${error.message}`,
+      generation,
+    );
+    console.error(`[electron] ${failure}`);
     systemBroker.unbindAll();
     detachAllAppWebContents();
     void capsuleManager.stopAll().catch((teardownError) => {
@@ -577,7 +716,10 @@ function startCore(): void {
     console.log(`[electron] Node Core exited with code ${code}${signal ? ` (${signal})` : ""}`);
     if (core === child) core = null;
     if (!expected && !isQuitting) {
-      coreStartError = `Node Core exited unexpectedly${code === null ? "" : ` (code ${code})`}`;
+      markCoreFailed(
+        `Node Core exited unexpectedly${code === null ? "" : ` (code ${code})`}`,
+        generation,
+      );
       // The authenticated loopback listener no longer exists. Remove every
       // local App authority before another process can reuse the port and
       // receive capabilities or the Host bearer from stale requests.
@@ -632,13 +774,17 @@ async function stopGuard(): Promise<void> {
   await waitForGuardExit(child, 500);
 }
 
-async function startRuntime(opts?: { rotatePort?: boolean }): Promise<void> {
+async function startRuntime(opts?: { rotatePort?: boolean }): Promise<number> {
+  const generation = markCoreStarting();
   try {
     await ensureWorkspaceRuntimeSettings(opts);
-    await startGuard();
-    startCore();
+    if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
+    await startGuard(generation);
+    if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
+    startCore(generation);
+    return generation;
   } catch (error) {
-    coreStartError = errorMessage(error);
+    markCoreFailed(error, generation);
     await stopCore();
     await stopGuard();
     throw error;
@@ -648,15 +794,21 @@ async function startRuntime(opts?: { rotatePort?: boolean }): Promise<void> {
 async function stopRuntime(): Promise<void> {
   // Revoke every App launch channel while Core is still alive, then tear down
   // the VM/backend before releasing Core and Guard authority.
+  let capsuleFailure: unknown;
   try {
     await stopAllAppViewers();
   } catch (error) {
+    capsuleFailure = error;
     console.error(`[electron] App Capsule shutdown failed: ${errorMessage(error)}`);
   }
   // Core can still issue Guard requests, so always stop it before releasing
   // data.db ownership from the Guard utility.
   await stopCore();
   await stopGuard();
+  // A workspace switch or runtime retry must not start another authority
+  // generation after Capsule teardown became ambiguous. Process exit may
+  // continue, but in-process reuse is fail-closed.
+  if (capsuleFailure !== undefined) throw capsuleFailure;
 }
 
 async function switchWorkspace(nextWorkspace: string): Promise<string> {
@@ -665,14 +817,21 @@ async function switchWorkspace(nextWorkspace: string): Promise<string> {
     throw new Error("Workspace path is required");
   }
   if (normalized === workspace) return workspace;
-  disposeAllTerminals();
-  await stopRuntime();
-  workspace = normalized;
-  saveWorkspacePath(workspace);
-  ensureWorkspace(workspace);
-  await startRuntime();
-  await waitForCore();
-  return workspace;
+  markCoreStarting();
+  try {
+    disposeAllTerminals();
+    await stopRuntime();
+    workspace = normalized;
+    workspaceVault.begin(workspace);
+    saveWorkspacePath(workspace);
+    ensureWorkspace(workspace);
+    const generation = await startRuntime();
+    await waitForCore(generation);
+    return workspace;
+  } catch (error) {
+    markCoreFailed(error);
+    throw error;
+  }
 }
 
 function createTerminal(sender: WebContents): Promise<{ id: string }> {
@@ -879,33 +1038,230 @@ function bindAppViewerCleanup(
   contents.once("destroyed", cleanup);
 }
 
-async function openAppViewer(sender: WebContents, appId: string): Promise<{ viewerId: string }> {
-  const owner = requireShellWindow(sender);
-  const opened = await capsuleManager.openViewer(appId, sender.id);
-  let gateway: ViewerGatewayBinding | null = null;
-  let viewerUrl: URL;
+async function loadAppViewerDocument(
+  view: WebContentsView,
+  viewerUrl: string,
+  authoritySignal?: AbortSignal,
+  onUnexpectedMainResponse?: (response: {
+    statusCode: number;
+    statusLine: string;
+  }) => void,
+): Promise<() => void> {
+  const contents = view.webContents;
+  const viewerSession = contents.session;
+  const expectedOrigin = new URL(viewerUrl).origin;
+  let resolveMainResponse!: (
+    value: { statusCode: number; statusLine: string },
+  ) => void;
+  const mainResponse = new Promise<{ statusCode: number; statusLine: string }>((resolve) => {
+    resolveMainResponse = resolve;
+  });
+  let capturedInitialResponse = false;
+  const responseListener = (details: Electron.OnCompletedListenerDetails) => {
+    if (details.webContentsId !== contents.id || details.resourceType !== "mainFrame") return;
+    try {
+      if (new URL(details.url).origin !== expectedOrigin) return;
+    } catch {
+      return;
+    }
+    const response = {
+      statusCode: details.statusCode,
+      statusLine: details.statusLine,
+    };
+    if (!capturedInitialResponse) {
+      capturedInitialResponse = true;
+      resolveMainResponse(response);
+      return;
+    }
+    if (response.statusCode < 200 || response.statusCode > 299) {
+      onUnexpectedMainResponse?.(response);
+    }
+  };
+  viewerSession.webRequest.onCompleted(responseListener);
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    deadlineTimer = setTimeout(() => {
+      if (!contents.isDestroyed()) contents.stop();
+      reject(new Error("App viewer document did not finish within 8000ms"));
+    }, 8_000);
+  });
+  let abortListener: (() => void) | undefined;
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    if (!authoritySignal) return;
+    abortListener = () => {
+      if (!contents.isDestroyed()) contents.stop();
+      reject(
+        authoritySignal.reason instanceof Error
+          ? authoritySignal.reason
+          : new Error("App viewer document load was cancelled"),
+      );
+    };
+    if (authoritySignal.aborted) abortListener();
+    else authoritySignal.addEventListener("abort", abortListener, { once: true });
+  });
+  let finalMainResponse: { statusCode: number; statusLine: string } | null = null;
+  let keepResponseMonitor = false;
   try {
+    await Promise.race([
+      Promise.all([
+        contents.loadURL(viewerUrl),
+        mainResponse,
+      ]).then(([, response]) => {
+        finalMainResponse = response;
+      }),
+      deadline,
+      cancelled,
+    ]);
+    if (!finalMainResponse) {
+      throw new Error("App viewer document completed without an HTTP response");
+    }
+    const { statusCode, statusLine } = finalMainResponse;
+    if (statusCode < 200 || statusCode > 299) {
+      throw new Error(
+        `App viewer document failed before publication: ${statusLine || `HTTP ${statusCode}`}`,
+      );
+    }
+    keepResponseMonitor = true;
+    return () => viewerSession.webRequest.onCompleted(null);
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    if (authoritySignal && abortListener) {
+      authoritySignal.removeEventListener("abort", abortListener);
+    }
+    if (!keepResponseMonitor) viewerSession.webRequest.onCompleted(null);
+  }
+}
+
+interface PreparedAppViewerSurface extends AppViewerReplacement {
+  viewerId: string;
+  assertHealthy(): void;
+  stopHealthMonitoring(): void;
+}
+
+interface PrepareAppViewerSurfaceOptions {
+  appId: string;
+  binding: PreparedViewerBinding;
+  shellContents: WebContents;
+  assertHostCurrent(): void;
+  onCreated?(surface: PreparedAppViewerSurface): void;
+}
+
+async function prepareAppViewerSurface(
+  options: PrepareAppViewerSurfaceOptions,
+): Promise<PreparedAppViewerSurface> {
+  const { appId, binding, shellContents } = options;
+  const protocolPartition = appPartition(appId, binding.channelId);
+  let gateway: ViewerGatewayBinding | null = null;
+  let view: WebContentsView | null = null;
+  let viewerSession: Session | null = null;
+  let rendererFailure: Error | null = null;
+  let healthMonitoring = false;
+  let authorityAbortMonitoring = false;
+  let preparedAuthoritySenderId: number | null = null;
+  let mainFrameNavigationStarted = false;
+  let stopResponseMonitor: (() => void) | null = null;
+  const onAuthorityAborted = () => {
+    if (!view) return;
+    // A prepared first-launch renderer is not registered in appViewers yet.
+    // Revoke its browser authority in the same abort call stack as Manager
+    // stopAll/boundary loss instead of waiting for async verification cleanup.
+    systemBroker.unbindSender(view.webContents.id);
+  };
+  const stopAuthorityAbortMonitoring = () => {
+    if (authorityAbortMonitoring) {
+      authorityAbortMonitoring = false;
+      binding.signal.removeEventListener("abort", onAuthorityAborted);
+    }
+    if (preparedAuthoritySenderId !== null) {
+      preparedAppViewerSenderIds.delete(preparedAuthoritySenderId);
+      preparedAuthoritySenderId = null;
+    }
+  };
+  const markUnhealthy = (error: Error) => {
+    if (!healthMonitoring || rendererFailure) return;
+    rendererFailure = error;
+    binding.invalidate(error);
+  };
+  const onRenderProcessGone = (
+    _event: Electron.Event,
+    details: Electron.RenderProcessGoneDetails,
+  ) => {
+    markUnhealthy(
+      new Error(`Prepared App viewer renderer exited before publication: ${details.reason}`),
+    );
+  };
+  const onDestroyed = () => {
+    markUnhealthy(new Error("Prepared App viewer renderer was destroyed before publication"));
+  };
+  const onDidFailLoad = (
+    _event: Electron.Event,
+    errorCode: number,
+    errorDescription: string,
+    _validatedURL: string,
+    isMainFrame: boolean,
+  ) => {
+    if (!isMainFrame) return;
+    markUnhealthy(
+      new Error(
+        `Prepared App viewer navigation failed before publication `
+        + `(${errorCode}): ${errorDescription}`,
+      ),
+    );
+  };
+  const onDidStartNavigation = (
+    details: Electron.Event<Electron.WebContentsDidStartNavigationEventParams>,
+  ) => {
+    if (!details.isMainFrame || details.isSameDocument) return;
+    if (!mainFrameNavigationStarted) {
+      mainFrameNavigationStarted = true;
+      return;
+    }
+    markUnhealthy(
+      new Error(
+        `Prepared App viewer started another navigation before publication: ${details.url}`,
+      ),
+    );
+  };
+  const assertHealthy = () => {
+    if (rendererFailure) throw rendererFailure;
+    if (!view || view.webContents.isDestroyed()) {
+      throw new Error("Prepared App viewer renderer is no longer available");
+    }
+  };
+  const stopHealthMonitoring = () => {
+    stopAuthorityAbortMonitoring();
+    if (!healthMonitoring) return;
+    healthMonitoring = false;
+    stopResponseMonitor?.();
+    stopResponseMonitor = null;
+    if (!view) return;
+    view.webContents.removeListener("render-process-gone", onRenderProcessGone);
+    view.webContents.removeListener("destroyed", onDestroyed);
+    view.webContents.removeListener("did-fail-load", onDidFailLoad);
+    view.webContents.removeListener("did-start-navigation", onDidStartNavigation);
+  };
+  try {
+    binding.assertCurrent();
+    options.assertHostCurrent();
     gateway = await createViewerGateway({
-      instanceId: opened.instanceId,
-      originHost: appOriginHost(appId, opened.channelId),
+      instanceId: binding.instanceId,
+      originHost: appOriginHost(appId, binding.channelId),
       transport: {
-        openUiStream: () => capsuleManager.openViewerStream(opened.viewerId),
+        openUiStream: (instanceId) => {
+          if (instanceId !== binding.instanceId) {
+            throw new Error("App viewer gateway candidate identity changed");
+          }
+          return binding.openUiStream();
+        },
       },
     });
-    viewerUrl = new URL(gateway.viewerUrl);
+    const viewerUrl = new URL(gateway.viewerUrl);
     if (viewerUrl.protocol !== "http:" || !viewerUrl.hostname.endsWith(".localhost")) {
-      throw new Error("invalid viewer origin");
+      throw new Error("Capsule viewer gateway did not establish a bound origin");
     }
-  } catch {
-    await gateway?.close().catch(() => {});
-    await capsuleManager.closeViewer(opened.viewerId, sender.id);
-    throw new Error("Capsule viewer gateway could not establish a bound origin");
-  }
+    binding.assertCurrent();
+    options.assertHostCurrent();
 
-  let view: WebContentsView | null = null;
-  let cleanupSession: Session | null = null;
-  const protocolPartition = appPartition(appId, opened.channelId);
-  try {
     view = new WebContentsView({
       webPreferences: {
         preload: APP_PRELOAD,
@@ -918,181 +1274,306 @@ async function openAppViewer(sender: WebContents, appId: string): Promise<{ view
         disableBlinkFeatures: "WebRTC",
       },
     });
+    healthMonitoring = true;
+    view.webContents.on("render-process-gone", onRenderProcessGone);
+    view.webContents.on("destroyed", onDestroyed);
+    view.webContents.on("did-fail-load", onDidFailLoad);
+    view.webContents.on("did-start-navigation", onDidStartNavigation);
     view.webContents.on("before-input-event", (event, input) => {
       if (!isOpenLauncherShortcut(input)) return;
       event.preventDefault();
-      if (sender.isDestroyed()) return;
-      // The viewer holds webContents focus; move it to the Shell first so the
-      // launcher search field actually receives the keystrokes that follow.
-      sender.focus();
-      sender.send("shell:open-launcher");
+      if (shellContents.isDestroyed()) return;
+      shellContents.focus();
+      shellContents.send("shell:open-launcher");
     });
-    const viewerSession = view.webContents.session;
-    cleanupSession = viewerSession;
-    // This is an in-memory, generation-specific partition, but clear before
-    // binding as a fail-closed guard against accidental Electron session reuse.
+    viewerSession = view.webContents.session;
+    const surface: PreparedAppViewerSurface = {
+      view,
+      gateway,
+      viewerSession,
+      protocolPartition,
+      viewerId: binding.viewerId,
+      assertHealthy,
+      stopHealthMonitoring,
+    };
+    options.onCreated?.(surface);
+    view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    view.setVisible(false);
+
     await clearDisposableAppViewerStorage(viewerSession);
+    binding.assertCurrent();
+    options.assertHostCurrent();
     await configureAppWebContents(
       view,
       viewerUrl,
       gateway.proxyUrl,
       protocolPartition,
-      opened.viewerId,
+      binding.viewerId,
     );
-    assertViewerAuthorityCurrent(
-      opened,
-      capsuleManager.getViewer(opened.viewerId, sender.id),
-    );
-    systemBroker.bindSender(view.webContents.id, {
-      channelId: opened.channelId,
-      capability: opened.capability,
+    binding.assertCurrent();
+    options.assertHostCurrent();
+    await waitForViewerHttpReady({
+      request: (signal) => viewerSession!.fetch(gateway!.viewerUrl, {
+        cache: "no-store",
+        redirect: "manual",
+        signal: AbortSignal.any([signal, binding.signal]),
+        headers: { accept: "text/html,application/xhtml+xml" },
+      }),
+      assertCurrent: () => {
+        binding.assertCurrent();
+        options.assertHostCurrent();
+      },
     });
-    owner.contentView.addChildView(view);
-    const record: AppViewerRecord = {
-      appId,
-      ownerWebContentsId: sender.id,
-      owner,
+    binding.assertCurrent();
+    options.assertHostCurrent();
+    binding.signal.addEventListener("abort", onAuthorityAborted, { once: true });
+    authorityAbortMonitoring = true;
+    preparedAuthoritySenderId = view.webContents.id;
+    preparedAppViewerSenderIds.add(preparedAuthoritySenderId);
+    systemBroker.bindSender(view.webContents.id, binding);
+    binding.assertCurrent();
+    options.assertHostCurrent();
+    stopResponseMonitor = await loadAppViewerDocument(
       view,
-      appWebContentsId: view.webContents.id,
-      viewerSession,
-      protocolPartition,
-      gateway,
-      pendingReplacement: null,
-    };
-    appViewers.set(opened.viewerId, record);
-    bindAppViewerCleanup(view, opened.viewerId, sender.id);
-    await view.webContents.loadURL(gateway.viewerUrl);
-    assertViewerAuthorityCurrent(
-      opened,
-      capsuleManager.getViewer(opened.viewerId, sender.id),
+      gateway.viewerUrl,
+      binding.signal,
+      ({ statusCode, statusLine }) => {
+        markUnhealthy(
+          new Error(
+            `Prepared App viewer navigation became unhealthy before publication: `
+            + `${statusLine || `HTTP ${statusCode}`}`,
+          ),
+        );
+      },
     );
-    if (appViewers.get(opened.viewerId) !== record) {
-      throw new Error("App viewer was detached while its renderer was loading");
-    }
-    return { viewerId: opened.viewerId };
+    assertHealthy();
+    binding.assertCurrent();
+    options.assertHostCurrent();
+    return surface;
   } catch (error) {
-    if (view) systemBroker.unbindSender(view.webContents.id);
-    clearAppViewerBinding(protocolPartition, opened.viewerId);
-    appViewers.delete(opened.viewerId);
+    stopHealthMonitoring();
     if (view) {
-      try { owner.contentView.removeChildView(view); } catch {}
-      if (!view.webContents.isDestroyed()) view.webContents.close({ waitForBeforeUnload: false });
+      systemBroker.unbindSender(view.webContents.id);
+      expectedAppViewerCloses.add(view.webContents);
+      if (!view.webContents.isDestroyed()) {
+        view.webContents.close({ waitForBeforeUnload: false });
+      }
     }
-    await Promise.allSettled([
-      gateway.close(),
-      capsuleManager.closeViewer(opened.viewerId, sender.id),
-      cleanupSession
-        ? clearDisposableAppViewerStorage(cleanupSession)
+    clearAppViewerBinding(protocolPartition, binding.viewerId);
+    const cleanup = await Promise.allSettled([
+      gateway?.close() ?? Promise.resolve(),
+      viewerSession
+        ? clearDisposableAppViewerStorage(viewerSession)
         : Promise.resolve(),
     ]);
+    const cleanupFailures = cleanup
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupFailures],
+        "Prepared App viewer and its Host resources both failed",
+      );
+    }
     throw error;
   }
 }
 
-async function reloadAppViewer(
+async function disposePreparedAppViewerSurface(
+  surface: PreparedAppViewerSurface,
+  owner?: BrowserWindow,
+): Promise<void> {
+  surface.stopHealthMonitoring();
+  systemBroker.unbindSender(surface.view.webContents.id);
+  clearAppViewerBinding(surface.protocolPartition, surface.viewerId);
+  expectedAppViewerCloses.add(surface.view.webContents);
+  if (owner) {
+    try { owner.contentView.removeChildView(surface.view); } catch {}
+  }
+  if (!surface.view.webContents.isDestroyed()) {
+    surface.view.webContents.close({ waitForBeforeUnload: false });
+  }
+  const results = await Promise.allSettled([
+    surface.gateway.close(),
+    clearDisposableAppViewerStorage(surface.viewerSession),
+  ]);
+  const failures = results
+    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+    .map((result) => result.reason);
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "App viewer surface cleanup failed");
+  }
+}
+
+async function openAppViewer(sender: WebContents, appId: string): Promise<{ viewerId: string }> {
+  const owner = requireShellWindow(sender);
+  let opened: Awaited<ReturnType<CapsuleManager["openViewer"]>> | null = null;
+  let preparedSurface: PreparedAppViewerSurface | null = null;
+  try {
+    opened = await capsuleManager.openViewer(appId, sender.id, async (binding) => {
+      preparedSurface = await prepareAppViewerSurface({
+        appId,
+        binding,
+        shellContents: sender,
+        assertHostCurrent: () => {
+          if (owner.isDestroyed() || sender.isDestroyed()) {
+            throw new Error("App viewer owner was destroyed during launch");
+          }
+        },
+      });
+    });
+    const surface = preparedSurface as PreparedAppViewerSurface | null;
+    if (!surface) throw new Error("App viewer committed without a prepared renderer");
+    assertViewerAuthorityCurrent(
+      opened,
+      capsuleManager.getViewer(opened.viewerId, sender.id),
+    );
+    surface.assertHealthy();
+    const record: AppViewerRecord = {
+      appId,
+      ownerWebContentsId: sender.id,
+      owner,
+      view: surface.view,
+      appWebContentsId: surface.view.webContents.id,
+      viewerSession: surface.viewerSession,
+      protocolPartition: surface.protocolPartition,
+      gateway: surface.gateway,
+      pendingReplacement: null,
+    };
+    appViewers.set(opened.viewerId, record);
+    bindAppViewerCleanup(surface.view, opened.viewerId, sender.id);
+    if (appViewers.get(opened.viewerId) !== record) {
+      throw new Error("App viewer was detached while its renderer was loading");
+    }
+    surface.assertHealthy();
+    surface.stopHealthMonitoring();
+    surface.assertHealthy();
+    owner.contentView.addChildView(surface.view);
+    return { viewerId: opened.viewerId };
+  } catch (error) {
+    const cleanupFailures: unknown[] = [];
+    const surface = preparedSurface as PreparedAppViewerSurface | null;
+    if (surface) {
+      try {
+        await disposePreparedAppViewerSurface(surface, owner);
+      } catch (cleanupError) {
+        cleanupFailures.push(cleanupError);
+      }
+      preparedSurface = null;
+    }
+    if (opened) {
+      appViewers.delete(opened.viewerId);
+      try {
+        await capsuleManager.closeViewer(opened.viewerId, sender.id);
+      } catch (cleanupError) {
+        cleanupFailures.push(cleanupError);
+      }
+    }
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupFailures],
+        `${errorMessage(error)}; App viewer launch cleanup also failed`,
+      );
+    }
+    throw error;
+  }
+}
+
+async function prepareReloadedAppViewer(
+  record: AppViewerRecord,
+  binding: PreparedViewerBinding,
+  lifecycleGeneration: number,
+): Promise<PreparedAppViewerSurface> {
+  let created: PreparedAppViewerSurface | null = null;
+  try {
+    const surface = await prepareAppViewerSurface({
+      appId: record.appId,
+      binding,
+      shellContents: record.owner.webContents,
+      onCreated: (replacement) => {
+        created = replacement;
+        record.pendingReplacement = replacement;
+      },
+      assertHostCurrent: () => {
+        appViewerLifecycle.assertCurrent(record.appId, lifecycleGeneration);
+        if (appViewers.get(binding.viewerId) !== record) {
+          throw new Error("App viewer was detached during reload");
+        }
+        if (created && record.pendingReplacement !== created) {
+          throw new Error("App viewer replacement was superseded");
+        }
+        if (record.owner.isDestroyed()) {
+          throw new Error("App viewer owner was destroyed during reload");
+        }
+      },
+    });
+    return surface;
+  } catch (error) {
+    if (created && record.pendingReplacement === created) {
+      record.pendingReplacement = null;
+    }
+    throw error;
+  }
+}
+
+function commitReloadedAppViewer(
   record: AppViewerRecord,
   binding: ReloadedBrowserBinding,
   lifecycleGeneration: number,
-): Promise<void> {
-  assertCurrentAppViewer(record, binding.viewerId, lifecycleGeneration, undefined, binding);
+  replacement: PreparedAppViewerSurface,
+): { cleanup: Promise<void> } {
+  if (record.pendingReplacement !== replacement) {
+    throw new Error("App viewer replacement was superseded before commit");
+  }
+  assertCurrentAppViewer(record, binding.viewerId, lifecycleGeneration, replacement, binding);
   const previousGateway = record.gateway;
   const previousView = record.view;
   const previousSession = record.viewerSession;
   const previousProtocolPartition = record.protocolPartition;
   const previousBounds = previousView.getBounds();
-  const nextProtocolPartition = appPartition(record.appId, binding.channelId);
-  let committedGeneration: number | undefined;
-  const nextGateway = await createViewerGateway({
-    instanceId: binding.viewerId,
-    originHost: appOriginHost(record.appId, binding.channelId),
-    transport: {
-      openUiStream: () => capsuleManager.openViewerStream(binding.viewerId),
-    },
-  });
-  let nextView: WebContentsView | null = null;
-  let nextSession: Session | null = null;
-  try {
-    assertCurrentAppViewer(record, binding.viewerId, lifecycleGeneration, undefined, binding);
-    const nextUrl = new URL(nextGateway.viewerUrl);
-    nextView = new WebContentsView({
-      webPreferences: {
-        preload: APP_PRELOAD,
-        partition: nextProtocolPartition,
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true,
-        webSecurity: true,
-        allowRunningInsecureContent: false,
-        disableBlinkFeatures: "WebRTC",
-      },
-    });
-    nextSession = nextView.webContents.session;
-    const replacement: AppViewerReplacement = {
-      view: nextView,
-      gateway: nextGateway,
-      viewerSession: nextSession,
-      protocolPartition: nextProtocolPartition,
-    };
-    record.pendingReplacement = replacement;
-    await clearDisposableAppViewerStorage(nextSession);
-    await configureAppWebContents(
-      nextView,
-      nextUrl,
-      nextGateway.proxyUrl,
-      nextProtocolPartition,
-      binding.viewerId,
-    );
-    assertCurrentAppViewer(record, binding.viewerId, lifecycleGeneration, replacement, binding);
-    // Cut over browser authority by WebContents, not by rebinding the old
-    // renderer. Old App code is destroyed before the replacement capability
-    // exists in a renderer, and its disposable browser state is removed before
-    // the new generation loads.
-    systemBroker.unbindSender(previousView.webContents.id);
-    expectedAppViewerCloses.add(previousView.webContents);
-    try { record.owner.contentView.removeChildView(previousView); } catch {}
-    if (!previousView.webContents.isDestroyed()) {
-      previousView.webContents.close({ waitForBeforeUnload: false });
-    }
-    clearAppViewerBinding(previousProtocolPartition, binding.viewerId);
-    await clearDisposableAppViewerStorage(previousSession);
-    assertCurrentAppViewer(record, binding.viewerId, lifecycleGeneration, replacement, binding);
-    systemBroker.bindSender(nextView.webContents.id, binding);
-    await nextView.webContents.loadURL(nextGateway.viewerUrl);
-    assertCurrentAppViewer(record, binding.viewerId, lifecycleGeneration, replacement, binding);
-    nextView.setBounds(previousBounds);
-    record.owner.contentView.addChildView(nextView);
-    bindAppViewerCleanup(nextView, binding.viewerId, record.ownerWebContentsId);
+  const previousVisible = previousView.getVisible();
+  replacement.assertHealthy();
+  replacement.view.setBounds(previousBounds);
+  bindAppViewerCleanup(replacement.view, binding.viewerId, record.ownerWebContentsId);
+  replacement.assertHealthy();
+  replacement.stopHealthMonitoring();
+  replacement.assertHealthy();
+  record.owner.contentView.addChildView(replacement.view);
+  replacement.view.setVisible(previousVisible);
 
-    record.view = nextView;
-    record.appWebContentsId = nextView.webContents.id;
-    record.viewerSession = nextSession;
-    record.protocolPartition = nextProtocolPartition;
-    record.gateway = nextGateway;
-    record.pendingReplacement = null;
-    // A committed renderer receives a fresh lifecycle generation. Any stale
-    // async continuation from the previous generation must now fail CAS.
-    committedGeneration = appViewerLifecycle.invalidate(record.appId);
-  } catch (error) {
-    if (nextView) {
-      if (record.pendingReplacement?.view === nextView) record.pendingReplacement = null;
-      systemBroker.unbindSender(nextView.webContents.id);
-      clearAppViewerBinding(nextProtocolPartition, binding.viewerId);
-      expectedAppViewerCloses.add(nextView.webContents);
-      try { record.owner.contentView.removeChildView(nextView); } catch {}
-      if (!nextView.webContents.isDestroyed()) {
-        nextView.webContents.close({ waitForBeforeUnload: false });
-      }
-    }
-    await Promise.allSettled([
-      nextGateway.close(),
-      nextSession
-        ? clearDisposableAppViewerStorage(nextSession)
-        : Promise.resolve(),
-    ]);
-    throw error;
+  record.view = replacement.view;
+  record.appWebContentsId = replacement.view.webContents.id;
+  record.viewerSession = replacement.viewerSession;
+  record.protocolPartition = replacement.protocolPartition;
+  record.gateway = replacement.gateway;
+  record.pendingReplacement = null;
+  // A committed renderer receives a fresh lifecycle generation. Any stale
+  // async continuation from the previous generation must now fail CAS.
+  const committedGeneration = appViewerLifecycle.invalidate(record.appId);
+
+  // The candidate document is already fully loaded. Retire the old renderer
+  // only after the new one is attached, so transient startup responses and
+  // failed candidate loads never blank the last-known-good UI.
+  systemBroker.unbindSender(previousView.webContents.id);
+  expectedAppViewerCloses.add(previousView.webContents);
+  try { record.owner.contentView.removeChildView(previousView); } catch {}
+  if (!previousView.webContents.isDestroyed()) {
+    previousView.webContents.close({ waitForBeforeUnload: false });
   }
-  await previousGateway.close();
-  assertCurrentAppViewer(record, binding.viewerId, committedGeneration!, undefined, binding);
+  clearAppViewerBinding(previousProtocolPartition, binding.viewerId);
+  assertCurrentAppViewer(record, binding.viewerId, committedGeneration, undefined, binding);
+  const cleanup = Promise.allSettled([
+    Promise.resolve().then(() => previousGateway.close()),
+    Promise.resolve().then(() => clearDisposableAppViewerStorage(previousSession)),
+  ]).then((results) => {
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (failures.length > 0) {
+      console.error("[electron] Previous App viewer cleanup failed", ...failures);
+    }
+  });
+  return { cleanup };
 }
 
 function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
@@ -1101,22 +1582,70 @@ function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
     const initialViewerId = initialEntry?.[0];
     const initialRecord = initialEntry?.[1];
     const lifecycleGeneration = appViewerLifecycle.generation(appId);
-    const result = await capsuleManager.reloadApp(appId);
-    if (result.browserBindings.length === 0) return { active: result.active };
-
+    let preparedSurface: PreparedAppViewerSurface | null = null;
+    let backendCommitted = false;
     try {
-      for (const binding of result.browserBindings) {
-        const record = appViewers.get(binding.viewerId);
-        if (!record || record !== initialRecord) {
-          throw new Error("Reloaded App viewer is no longer attached");
-        }
-        await reloadAppViewer(record, binding, lifecycleGeneration);
-      }
+      const result = await capsuleManager.reloadApp(
+        appId,
+        async (binding) => {
+          const record = appViewers.get(binding.viewerId);
+          if (!record || record !== initialRecord) {
+            throw new Error("Reloaded App viewer is no longer attached");
+          }
+          preparedSurface = await prepareReloadedAppViewer(
+            record,
+            binding,
+            lifecycleGeneration,
+          );
+        },
+        (binding) => {
+          backendCommitted = true;
+          const record = appViewers.get(binding.viewerId);
+          const surface = preparedSurface as PreparedAppViewerSurface | null;
+          if (!record || record !== initialRecord || !surface) {
+            throw new Error("Reloaded App viewer was not prepared for renderer commit");
+          }
+          const publication = commitReloadedAppViewer(
+            record,
+            binding,
+            lifecycleGeneration,
+            surface,
+          );
+          preparedSurface = null;
+          return publication;
+        },
+      );
+      if (!backendCommitted) return { active: result.active };
       return { active: result.active };
     } catch (error) {
-      // The backend has already committed the replacement generation. A Host
-      // cutover failure cannot roll back to the retired workload, so remove all
-      // provisional/current renderer authority and close the manager viewer.
+      const cleanupFailures: unknown[] = [];
+      const surface = preparedSurface as PreparedAppViewerSurface | null;
+      if (surface && initialRecord) {
+        if (initialRecord.pendingReplacement === surface) {
+          initialRecord.pendingReplacement = null;
+        }
+        try {
+          await disposePreparedAppViewerSurface(surface, initialRecord.owner);
+        } catch (cleanupError) {
+          cleanupFailures.push(cleanupError);
+        }
+        preparedSurface = null;
+      }
+      // Before Manager commit, verifier or Candidate failure leaves the
+      // previous Runtime, authority, activation, and renderer untouched.
+      if (!backendCommitted) {
+        if (cleanupFailures.length > 0) {
+          throw new AggregateError(
+            [error, ...cleanupFailures],
+            `${errorMessage(error)}; prepared renderer cleanup also failed`,
+          );
+        }
+        throw error;
+      }
+
+      // A failure in the final no-I/O Electron attachment happens after the
+      // backend commit. Remove all authority rather than expose mismatched
+      // Runtime and renderer generations.
       const cleanup = initialRecord && initialViewerId
         ? detachAppViewerRecord(initialViewerId, initialRecord)
         : [];
@@ -1131,7 +1660,16 @@ function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
         // the entire App identity rather than leave a manager-only generation.
         cleanup.push(capsuleManager.stopApp(appId));
       }
-      await Promise.allSettled(cleanup);
+      const cleanupResults = await Promise.allSettled(cleanup);
+      cleanupFailures.push(...cleanupResults
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => result.reason));
+      if (cleanupFailures.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupFailures],
+          `${errorMessage(error)}; committed renderer cleanup also failed`,
+        );
+      }
       throw error;
     }
   });
@@ -1157,6 +1695,7 @@ function assertCurrentAppViewer(
       !current
       || current.appId !== record.appId
       || current.viewerId !== binding.viewerId
+      || current.instanceId !== binding.instanceId
       || current.channelId !== binding.channelId
       || current.capability !== binding.capability
     ) {
@@ -1220,6 +1759,7 @@ function detachAppViewerRecord(
   const pending = record.pendingReplacement;
   record.pendingReplacement = null;
   if (pending) {
+    pending.stopHealthMonitoring?.();
     detachView(pending.view, pending.viewerSession, pending.protocolPartition);
     captureCleanup(() => pending.gateway.close());
   }
@@ -1306,6 +1846,14 @@ function archiveAppFromHost(appId: string): Promise<{ ok: true; id: string }> {
 }
 
 function detachAllAppWebContents(): void {
+  // A Manager operation can commit immediately before its Promise continuation
+  // publishes the first renderer into appViewers. Revoke that hidden browser
+  // authority synchronously too; the continuation will observe the missing
+  // Manager generation and finish the remaining surface cleanup.
+  for (const senderId of preparedAppViewerSenderIds) {
+    preparedAppViewerSenderIds.delete(senderId);
+    systemBroker.unbindSender(senderId);
+  }
   const entries = [...appViewers.entries()];
   for (const [viewerId, record] of entries) {
     for (const cleanup of detachAppViewerRecord(viewerId, record)) {
@@ -1321,22 +1869,67 @@ async function stopAllAppViewers(): Promise<void> {
   await capsuleManager.stopAll();
 }
 
-async function waitForCore(retries = 20, delay = 500): Promise<void> {
-  for (let i = 0; i < retries; i++) {
-    if (!core || !guard) {
-      throw new Error(coreStartError ?? "Core runtime stopped during startup");
+async function waitForCore(
+  generation: number,
+): Promise<void> {
+  const deadline = performance.now() + CORE_READY_TIMEOUT_MS;
+  while (performance.now() < deadline) {
+    const expectedCore = core;
+    const expectedGuard = guard;
+    if (!expectedCore || !expectedGuard) {
+      const failure = new Error(
+        coreRuntime.snapshot().error
+        ?? coreStartError
+        ?? "Core runtime stopped during startup",
+      );
+      markCoreFailed(failure, generation);
+      throw failure;
     }
+    const request = new AbortController();
+    const remaining = Math.max(1, deadline - performance.now());
+    const requestTimeout = setTimeout(
+      () => request.abort(),
+      Math.min(CORE_READY_REQUEST_TIMEOUT_MS, remaining),
+    );
     try {
       const res = await fetch(`${coreBaseUrl()}/api/apps`, {
         headers: { Authorization: `Bearer ${CORE_TOKEN}` },
+        signal: request.signal,
       });
       if (!res.ok) throw new Error(`Core returned ${res.status}`);
+      const state = coreRuntime.snapshot();
+      if (
+        state.generation !== generation
+        || state.phase !== "starting"
+        || core !== expectedCore
+        || guard !== expectedGuard
+      ) {
+        throw new Error("Core readiness belonged to a stale runtime generation");
+      }
+      if (!markCoreReady(generation)) {
+        throw new Error("Core readiness could not publish its runtime generation");
+      }
       return;
-    } catch {
-      await new Promise((r) => setTimeout(r, delay));
+    } catch (error) {
+      const state = coreRuntime.snapshot();
+      if (state.generation !== generation) throw error;
+      if (state.phase === "failed") {
+        throw new Error(state.error ?? "Core runtime failed during startup");
+      }
+    } finally {
+      clearTimeout(requestTimeout);
+    }
+    const retryDelay = Math.min(
+      CORE_READY_RETRY_DELAY_MS,
+      Math.max(0, deadline - performance.now()),
+    );
+    if (retryDelay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelay));
     }
   }
-  throw new Error("Core server did not start in time");
+  const failure = new Error("Core server did not start in time");
+  markCoreFailed(failure, generation);
+  throw failure;
 }
 
 function coreBaseUrl(): string {
@@ -1345,17 +1938,29 @@ function coreBaseUrl(): string {
 }
 
 async function retryCore(): Promise<{ coreBaseUrl: string }> {
-  await stopRuntime();
-  await startRuntime();
-  await waitForCore();
-  return { coreBaseUrl: coreBaseUrl() };
+  markCoreStarting();
+  try {
+    await stopRuntime();
+    const generation = await startRuntime();
+    await waitForCore(generation);
+    return { coreBaseUrl: coreBaseUrl() };
+  } catch (error) {
+    markCoreFailed(error);
+    throw error;
+  }
 }
 
 async function rotateCorePort(): Promise<{ coreBaseUrl: string }> {
-  await stopRuntime();
-  await startRuntime({ rotatePort: true });
-  await waitForCore();
-  return { coreBaseUrl: coreBaseUrl() };
+  markCoreStarting();
+  try {
+    await stopRuntime();
+    const generation = await startRuntime({ rotatePort: true });
+    await waitForCore(generation);
+    return { coreBaseUrl: coreBaseUrl() };
+  } catch (error) {
+    markCoreFailed(error);
+    throw error;
+  }
 }
 
 async function createWindow(): Promise<void> {
@@ -1420,23 +2025,35 @@ async function createWindow(): Promise<void> {
 
 app.whenReady().then(async () => {
   workspace = loadWorkspacePath();
+  workspaceVault.begin(workspace);
   ipcMain.handle("auth:getCoreToken", (event) => {
     requireShellIpc(event);
     return CORE_TOKEN;
   });
   ipcMain.handle("auth:getRecoveryCode", (event) => {
     requireShellIpc(event);
-    return vaultKey;
+    return workspaceVault.recoveryCode(workspace);
   });
   ipcMain.handle("auth:importRecoveryCode", async (event, recoveryCode: string) => {
     requireShellIpc(event);
     return enqueueRuntime(async () => {
-      if (!vaultId) throw new Error("Workspace vault is not initialized");
-      importVaultKey(vaultId, recoveryCode);
-      await stopRuntime();
-      await startRuntime();
-      await waitForCore();
-      return { coreBaseUrl: coreBaseUrl() };
+      const targetWorkspace = workspace;
+      const selection = workspaceVault.current(targetWorkspace);
+      if (!selection?.vaultId) throw new Error("Workspace vault is not initialized");
+      const importedKey = await importVaultKey(selection.vaultId, recoveryCode);
+      if (!workspaceVault.unlock(selection, importedKey)) {
+        throw new Error("Workspace changed while its recovery code was being imported");
+      }
+      markCoreStarting();
+      try {
+        await stopRuntime();
+        const generation = await startRuntime();
+        await waitForCore(generation);
+        return { coreBaseUrl: coreBaseUrl() };
+      } catch (error) {
+        markCoreFailed(error);
+        throw error;
+      }
     });
   });
   ipcMain.handle("core:getBaseUrl", (event) => {
@@ -1446,6 +2063,10 @@ app.whenReady().then(async () => {
   ipcMain.handle("core:getStartError", (event) => {
     requireShellIpc(event);
     return coreStartError;
+  });
+  ipcMain.handle("core:getRuntimeState", (event) => {
+    requireShellIpc(event);
+    return coreRuntimeState();
   });
   ipcMain.handle("core:retry", (event) => {
     requireShellIpc(event);
@@ -1551,15 +2172,32 @@ app.whenReady().then(async () => {
     return { ok: true };
   });
   ensureWorkspace();
+  let releaseInitialStartup!: () => void;
+  const shellReady = new Promise<void>((resolve) => {
+    releaseInitialStartup = resolve;
+  });
+  // Reserve the first runtime-queue position before renderer IPC becomes
+  // usable, but do not touch Keychain until the Shell window is present.
+  const initialStartup = enqueueRuntime(async () => {
+    await shellReady;
+    if (isQuitting) {
+      throw new Error("Runtime startup was cancelled because Lamarck is quitting");
+    }
+    const generation = await startRuntime();
+    await waitForCore(generation);
+  });
   // The shell is useful even while Core is starting or unavailable. Create the
   // window first so Keychain prompts and recovery failures never block the UI.
-  if (!isQuitting) await createWindow();
   try {
-    await startRuntime();
-    await waitForCore();
+    if (!isQuitting) await createWindow();
+  } finally {
+    releaseInitialStartup();
+  }
+  try {
+    await initialStartup;
   } catch (err) {
-    coreStartError = errorMessage(err);
-    console.error(`[electron] Core failed to start: ${coreStartError}`);
+    const failure = markCoreFailed(err);
+    console.error(`[electron] Core failed to start: ${failure}`);
   }
 });
 
@@ -1573,8 +2211,14 @@ app.on("before-quit", (event) => {
   if (isQuitting) return;
   isQuitting = true;
   disposeAllTerminals();
-  void stopRuntime().finally(() => {
-    shutdownComplete = true;
-    app.quit();
-  });
+  void stopRuntime()
+    .catch((error) => {
+      console.error(`[electron] Runtime shutdown required process exit: ${errorMessage(error)}`);
+    })
+    .finally(() => {
+      shutdownComplete = true;
+      // Runtime authority is fully torn down above. Use Electron's immediate
+      // exit path without re-entering before-quit.
+      app.exit(0);
+    });
 });

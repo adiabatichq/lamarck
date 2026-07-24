@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppLauncher } from "./components/AppLauncher";
 import { SchemaApprovalModal } from "./components/SchemaApprovalModal";
 import { WorkingTreeConflictModal } from "./components/WorkingTreeConflictModal";
@@ -17,10 +17,14 @@ import {
   type SchemaRequest,
 } from "./lib/api";
 import { isUiApp } from "./lib/app-visual";
+import {
+  coreResponseDisposition,
+  resolveCoreRequestFailure,
+  type CoreStatus,
+} from "./lib/core-availability";
 import { SystemRoom } from "./system/SystemRoom";
 import "./styles/global.css";
 
-type CoreStatus = "checking" | "connected" | "offline";
 type ShellMode = "use" | "system";
 
 interface StoredUseState {
@@ -48,6 +52,7 @@ export function App() {
   const [identityBusy, setIdentityBusy] = useState(false);
   const [storageKey, setStorageKey] = useState<string | null>(null);
   const [workspaceState, setWorkspaceState] = useState<StoredUseState>(EMPTY_USE_STATE);
+  const appRefreshSequence = useRef(0);
 
   const uiApps = useMemo(() => apps.filter(isUiApp), [apps]);
   const activeApp = useMemo(
@@ -74,23 +79,83 @@ export function App() {
   }, [storageKey, workspaceState]);
 
   const refreshApps = useCallback(async () => {
+    const request = ++appRefreshSequence.current;
+    const host = window.lamarckHost;
+    const isCurrent = () => request === appRefreshSequence.current;
+    const publishFailure = (failure: {
+      status: "checking" | "offline";
+      error: string | null;
+    }) => {
+      if (!isCurrent()) return;
+      // Inventory from a prior runtime generation cannot keep a native App
+      // surface mounted while Host authority is restarting or unavailable.
+      setApps([]);
+      setCoreStatus(failure.status);
+      setCoreError(failure.error);
+      setAppsLoading(failure.status === "checking");
+    };
+
     try {
+      const before = host ? await host.getCoreRuntimeState() : null;
+      if (!isCurrent()) return;
+      if (before && before.phase !== "ready") {
+        publishFailure(await resolveCoreRequestFailure(
+          new Error(before.error ?? "Core runtime is starting"),
+          async () => before,
+        ));
+        return;
+      }
+
       const result = await listApps();
+      const after = host ? await host.getCoreRuntimeState() : null;
+      if (!isCurrent()) return;
+      if (before && after) {
+        const disposition = coreResponseDisposition(before, after);
+        if (disposition === "retry") {
+          // The old response is discarded. Read the new generation now even
+          // if its ready notification raced this request.
+          void refreshApps();
+          return;
+        }
+        if (disposition === "unavailable") {
+          publishFailure(await resolveCoreRequestFailure(
+            new Error(after.error ?? "Core runtime generation changed"),
+            async () => after,
+          ));
+          return;
+        }
+      }
       setApps(result.apps);
       setCoreStatus("connected");
       setCoreError(null);
-    } catch (error) {
-      setCoreStatus("offline");
-      setCoreError(error instanceof Error ? error.message : String(error));
-    } finally {
       setAppsLoading(false);
+    } catch (error) {
+      const runtime = host
+        ? await host.getCoreRuntimeState().catch(() => null)
+        : null;
+      if (!isCurrent()) return;
+      const failure = await resolveCoreRequestFailure(
+        error,
+        runtime ? async () => runtime : undefined,
+      );
+      publishFailure(failure);
     }
   }, []);
 
   useEffect(() => {
+    let disposed = false;
+    const refresh = () => {
+      if (!disposed) void refreshApps();
+    };
+    const unsubscribe = window.lamarckHost?.onCoreRuntimeState(refresh);
     void refreshApps();
     const timer = window.setInterval(() => void refreshApps(), 5_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      disposed = true;
+      appRefreshSequence.current += 1;
+      unsubscribe?.();
+      window.clearInterval(timer);
+    };
   }, [refreshApps]);
 
   useEffect(() => {

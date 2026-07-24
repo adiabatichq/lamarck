@@ -1,6 +1,10 @@
 import type { ReactNode } from "react";
 import type { AppInfo } from "../lib/api";
 import { AppMark } from "../components/AppMark";
+import {
+  emptyWorkspaceCopy,
+  type CoreStatus,
+} from "../lib/core-availability";
 import styles from "./UseWorkspace.module.css";
 
 interface UseWorkspaceProps {
@@ -10,7 +14,7 @@ interface UseWorkspaceProps {
   launcherOpen: boolean;
   launcher: ReactNode;
   appSurface: ReactNode;
-  coreStatus: "checking" | "connected" | "offline";
+  coreStatus: CoreStatus;
   systemNeedsAttention: boolean;
   onToggleLauncher: () => void;
   onOpenApp: (appId: string) => void;
@@ -138,11 +142,13 @@ function EmptyUseWorkspace({
   onOpenSystem,
 }: {
   hasApps: boolean;
-  coreStatus: "checking" | "connected" | "offline";
+  coreStatus: CoreStatus;
   onOpen: () => void;
   onOpenSystem: () => void;
 }) {
   const offline = coreStatus === "offline";
+  const checking = coreStatus === "checking";
+  const copy = emptyWorkspaceCopy(coreStatus, hasApps);
   return (
     <section className={styles.empty}>
       <div className={styles.emptyOrbit} aria-hidden="true">
@@ -150,17 +156,11 @@ function EmptyUseWorkspace({
         <i />
       </div>
       <div className={styles.emptyCopy}>
-        <span className={styles.emptyEyebrow}>{offline ? "System unavailable" : "Quiet canvas"}</span>
-        <h1>{offline ? "The workspace is offline." : hasApps ? "Open an app." : "Nothing needs to be here."}</h1>
-        <p>
-          {offline
-            ? "Use System to inspect the workspace and retry its runtime."
-            : hasApps
-              ? "Choose an interface when you need it. The workspace stays out of the way otherwise."
-              : "Apps with a UI will appear here when you build or install them."}
-        </p>
+        <span className={styles.emptyEyebrow}>{copy.eyebrow}</span>
+        <h1>{copy.title}</h1>
+        <p>{copy.detail}</p>
         <div className={styles.emptyActions}>
-          {!offline && (
+          {!offline && !checking && (
             <button type="button" className={styles.primaryAction} onClick={onOpen}>
               <OpenIcon />
               Open an app

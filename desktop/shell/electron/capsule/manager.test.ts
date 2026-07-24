@@ -1,12 +1,13 @@
 import { describe, expect, test, vi } from "vitest";
-import type { Duplex } from "node:stream";
+import { PassThrough, type Duplex } from "node:stream";
 import type {
   CapsuleBackend,
   CapsuleUiInstance,
+  CapsuleUiPreparation,
   CapsuleUiSpec,
 } from "./backend";
 import { CapsuleRestartRequiredError } from "./backend";
-import { CapsuleManager } from "./manager";
+import { CapsuleManager, type PreparedViewerBinding } from "./manager";
 
 const MANIFEST_GENERATION = 7;
 const MANIFEST_DIGEST = `sha256:${"a".repeat(64)}`;
@@ -18,11 +19,21 @@ class FakeBackend implements CapsuleBackend {
   appStops: string[] = [];
   appRetires: string[] = [];
   replacements: Array<{ instanceId: string; spec: CapsuleUiSpec }> = [];
+  preparations: Array<{
+    preparationId: string;
+    instanceId: string;
+    previousInstanceId?: string;
+    spec: CapsuleUiSpec;
+  }> = [];
+  committedPreparations: string[] = [];
+  abortedPreparations: string[] = [];
+  openedStreams: string[] = [];
   stopAllCalls = 0;
   failStopUi = false;
   rebuildGate: Promise<void> | undefined;
   retireGate: Promise<void> | undefined;
   loseReplacementBeforeReturn = false;
+  loseCommittedReplacementBeforeReturn = false;
   boundaryLostHandler: ((error: unknown) => void) | undefined;
   uiLostHandler: ((event: { instanceId: string; appId: string; error: Error }) => void) | undefined;
   setBoundaryLostHandler(handler: (error: unknown) => void) {
@@ -32,6 +43,51 @@ class FakeBackend implements CapsuleBackend {
     this.uiLostHandler = handler;
   }
   async status() { return { available: true, backend: "fake" }; }
+  async prepareUi(
+    spec: CapsuleUiSpec,
+    previousInstanceId?: string,
+  ): Promise<CapsuleUiPreparation> {
+    if (previousInstanceId) {
+      this.replacements.push({ instanceId: previousInstanceId, spec });
+      await this.rebuildGate;
+    } else {
+      this.starts.push(spec);
+    }
+    const suffix = previousInstanceId ? `${previousInstanceId}-replacement` : `instance-${spec.appId}`;
+    const prepared = {
+      preparationId: `preparation-${this.preparations.length + 1}`,
+      instanceId: suffix,
+      previousInstanceId,
+      spec,
+    };
+    this.preparations.push(prepared);
+    if (this.loseReplacementBeforeReturn && previousInstanceId) {
+      this.uiLostHandler?.({
+        instanceId: prepared.instanceId,
+        appId: spec.appId,
+        error: new Error("replacement exited before publication"),
+      });
+    }
+    return prepared;
+  }
+  async commitPreparedUi(preparationId: string): Promise<CapsuleUiInstance> {
+    this.committedPreparations.push(preparationId);
+    const prepared = this.preparations.find((candidate) => (
+      candidate.preparationId === preparationId
+    ));
+    if (!prepared) throw new Error("unknown preparation");
+    if (this.loseCommittedReplacementBeforeReturn && prepared.previousInstanceId) {
+      this.uiLostHandler?.({
+        instanceId: prepared.instanceId,
+        appId: prepared.spec.appId,
+        error: new Error("committed replacement exited before Host publication"),
+      });
+    }
+    return { instanceId: prepared.instanceId };
+  }
+  async abortPreparedUi(preparationId: string): Promise<void> {
+    this.abortedPreparations.push(preparationId);
+  }
   async startUi(spec: CapsuleUiSpec): Promise<CapsuleUiInstance> {
     this.starts.push(spec);
     return { instanceId: `instance-${spec.appId}` };
@@ -49,7 +105,10 @@ class FakeBackend implements CapsuleBackend {
     }
     return replacement;
   }
-  async openUiStream(): Promise<Duplex> { throw new Error("stream fixture not connected"); }
+  async openUiStream(instanceId: string): Promise<Duplex> {
+    this.openedStreams.push(instanceId);
+    return new PassThrough();
+  }
   async stopUi(id: string) {
     this.stops.push(id);
     if (this.failStopUi) throw new Error("stop failed");
@@ -124,6 +183,13 @@ async function rejectionOf(operation: Promise<unknown>): Promise<Error> {
   throw new Error("Expected operation to reject");
 }
 
+const verifyPreparedViewer = async (binding: {
+  assertCurrent(): void;
+}): Promise<void> => {
+  binding.assertCurrent();
+};
+const publishReloadedViewer = (): void => {};
+
 describe("CapsuleManager", () => {
   test("derives the UI launch from Core and keeps the capability Host-side", async () => {
     const backend = new FakeBackend();
@@ -137,7 +203,7 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    const viewer = await manager.openViewer("app-a", 7);
+    const viewer = await manager.openViewer("app-a", 7, verifyPreparedViewer);
     expect(viewer).toMatchObject({
       appId: "app-a",
       channelId: "channel-app-a-2",
@@ -158,6 +224,144 @@ describe("CapsuleManager", () => {
     }
   });
 
+  test("keeps a prepared launch unpublished until its hidden viewer verifies", async () => {
+    const backend = new FakeBackend();
+    const { fetch } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+    let preparedBinding!: PreparedViewerBinding;
+    let releaseVerification!: () => void;
+    const verificationGate = new Promise<void>((resolve) => {
+      releaseVerification = resolve;
+    });
+    let reportVerificationStarted!: () => void;
+    const verificationStarted = new Promise<void>((resolve) => {
+      reportVerificationStarted = resolve;
+    });
+
+    const opening = manager.openViewer("app-a", 7, async (binding) => {
+      preparedBinding = binding;
+      reportVerificationStarted();
+      await verificationGate;
+      binding.assertCurrent();
+    });
+    await verificationStarted;
+
+    expect(manager.getViewer(preparedBinding.viewerId, 7)).toBeNull();
+    expect(backend.committedPreparations).toEqual([]);
+    expect(preparedBinding).toMatchObject({
+      appId: "app-a",
+      instanceId: "instance-app-a",
+      channelId: "channel-app-a-2",
+      capability: "secret-capability-app-a-2",
+    });
+    const stream = await preparedBinding.openUiStream();
+    stream.destroy();
+    expect(backend.openedStreams).toEqual(["instance-app-a"]);
+
+    releaseVerification();
+    const opened = await opening;
+    expect(opened.viewerId).toBe(preparedBinding.viewerId);
+    expect(backend.committedPreparations).toEqual(["preparation-1"]);
+    expect(manager.getViewer(opened.viewerId, 7)).toBe(opened);
+    const committedStream = await preparedBinding.openUiStream();
+    committedStream.destroy();
+    expect(backend.openedStreams).toEqual([
+      "instance-app-a",
+      "instance-app-a",
+    ]);
+  });
+
+  test("aborts a failed prepared launch without publishing its viewer", async () => {
+    const backend = new FakeBackend();
+    const { fetch, calls } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+    let candidateViewerId = "";
+
+    await expect(manager.openViewer("app-a", 7, async (binding) => {
+      candidateViewerId = binding.viewerId;
+      throw new Error("hidden document returned 503");
+    })).rejects.toThrow("hidden document returned 503");
+
+    expect(manager.getViewer(candidateViewerId, 7)).toBeNull();
+    expect(backend.committedPreparations).toEqual([]);
+    expect(backend.abortedPreparations).toEqual(["preparation-1"]);
+    for (const channel of [1, 2]) {
+      expect(calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
+        .toBe(true);
+    }
+  });
+
+  test("aborts a prepared launch when the hidden renderer invalidates it", async () => {
+    const backend = new FakeBackend();
+    const { fetch, calls } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+    let candidateViewerId = "";
+
+    await expect(manager.openViewer("app-a", 7, async (binding) => {
+      candidateViewerId = binding.viewerId;
+      binding.invalidate(new Error("hidden renderer exited"));
+    })).rejects.toThrow("launch was cancelled");
+
+    expect(manager.getViewer(candidateViewerId, 7)).toBeNull();
+    expect(backend.committedPreparations).toEqual([]);
+    expect(backend.abortedPreparations).toEqual(["preparation-1"]);
+    for (const channel of [1, 2]) {
+      expect(calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
+        .toBe(true);
+    }
+  });
+
+  test("preserves the prior viewer and capabilities when replacement verification fails", async () => {
+    const backend = new FakeBackend();
+    const { fetch, calls } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+
+    await expect(manager.reloadApp("app-a", async () => {
+      throw new Error("replacement document was incomplete");
+    }, publishReloadedViewer)).rejects.toThrow("replacement document was incomplete");
+
+    expect(manager.getViewer(opened.viewerId, 7)).toBe(opened);
+    expect(backend.committedPreparations).toEqual(["preparation-1"]);
+    expect(backend.abortedPreparations).toEqual(["preparation-2"]);
+    for (const channel of [1, 2]) {
+      expect(calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
+        .toBe(false);
+    }
+    for (const channel of [3, 4]) {
+      expect(calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
+        .toBe(true);
+    }
+  });
+
   test("does not launch when Core cannot issue the exact manifest authority", async () => {
     const backend = new FakeBackend();
     const { fetch, calls } = createFetch({}, {
@@ -172,7 +376,7 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    await expect(manager.openViewer("app-a", 7))
+    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer))
       .rejects.toThrow("different App manifest authority");
     expect(backend.starts).toEqual([]);
     const issuance = calls.find((call) => (
@@ -198,7 +402,7 @@ describe("CapsuleManager", () => {
       fetch,
       ...systemBindings(),
     });
-    const viewer = await manager.openViewer("app-a", 7);
+    const viewer = await manager.openViewer("app-a", 7, verifyPreparedViewer);
 
     expect(await manager.closeViewer(viewer.viewerId, 8)).toBe(false);
     expect(backend.stops).toEqual([]);
@@ -213,6 +417,9 @@ describe("CapsuleManager", () => {
     const manager = new CapsuleManager({
       backend: {
         async status() { return { available: false, backend: "test", reason: "no verified image" }; },
+        async prepareUi() { throw new Error("must not prepare"); },
+        async commitPreparedUi() { throw new Error("must not commit"); },
+        async abortPreparedUi() {},
         async startUi() { throw new Error("must not run"); },
         async replaceUi() { throw new Error("must not replace"); },
         async openUiStream() { throw new Error("must not stream"); },
@@ -228,7 +435,7 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    await expect(manager.openViewer("app-a", 7)).rejects.toThrow("no verified image");
+    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).rejects.toThrow("no verified image");
     expect(calls).toEqual([]);
   });
 
@@ -250,7 +457,7 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    await expect(manager.openViewer("app-a", 7))
+    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer))
       .rejects.toBeInstanceOf(CapsuleRestartRequiredError);
     expect(calls).toEqual([]);
   });
@@ -286,8 +493,8 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
       onBackendBoundaryLost,
     });
-    const viewerA = await manager.openViewer("app-a", 7);
-    const viewerB = await manager.openViewer("app-b", 8);
+    const viewerA = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const viewerB = await manager.openViewer("app-b", 8, verifyPreparedViewer);
     backend.failStopUi = true;
 
     const failure = await rejectionOf(manager.closeViewer(viewerA.viewerId, 7));
@@ -315,7 +522,7 @@ describe("CapsuleManager", () => {
       ...bindings,
       onBackendBoundaryLost,
     });
-    const viewer = await manager.openViewer("app-a", 7);
+    const viewer = await manager.openViewer("app-a", 7, verifyPreparedViewer);
 
     backend.boundaryLostHandler?.(new Error("Guest control channel lost"));
     await vi.waitFor(() => expect(backend.stopAllCalls).toBe(1));
@@ -345,7 +552,7 @@ describe("CapsuleManager", () => {
       ...bindings,
       onUiLost,
     });
-    const viewer = await manager.openViewer("app-a", 7);
+    const viewer = await manager.openViewer("app-a", 7, verifyPreparedViewer);
 
     backend.uiLostHandler?.({
       instanceId: viewer.instanceId,
@@ -399,7 +606,7 @@ describe("CapsuleManager", () => {
       ...bindings,
     });
 
-    const opening = manager.openViewer("app-a", 7);
+    const opening = manager.openViewer("app-a", 7, verifyPreparedViewer);
     await browserCapabilityStarted;
     backend.uiLostHandler?.({
       instanceId: "instance-app-a",
@@ -412,8 +619,12 @@ describe("CapsuleManager", () => {
     releaseBrowserCapability();
 
     await expect(opening).rejects.toThrow("workload exited during publication");
-    expect(await manager.reloadApp("app-a")).toEqual({ active: false, browserBindings: [] });
-    expect(backend.stops).toContain("instance-app-a");
+    expect(await manager.reloadApp(
+      "app-a",
+      verifyPreparedViewer,
+      publishReloadedViewer,
+    )).toEqual({ active: false, browserBindings: [] });
+    expect(backend.abortedPreparations).toContain("preparation-1");
     expect(base.calls.some((call) => call.url.endsWith("/channels/channel-app-a-1"))).toBe(true);
     expect(base.calls.some((call) => call.url.endsWith("/channels/channel-app-a-2"))).toBe(true);
   });
@@ -432,23 +643,115 @@ describe("CapsuleManager", () => {
       ...bindings,
       onUiLost,
     });
-    const opened = await manager.openViewer("app-a", 7);
+    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
     backend.loseReplacementBeforeReturn = true;
 
-    await expect(manager.reloadApp("app-a")).rejects.toThrow(
+    await expect(manager.reloadApp(
+      "app-a",
+      verifyPreparedViewer,
+      publishReloadedViewer,
+    )).rejects.toThrow(
       "replacement exited before publication",
     );
 
-    expect(manager.getViewer(opened.viewerId, 7)).toBeNull();
-    expect(onUiLost).toHaveBeenCalledWith(expect.objectContaining({
-      viewerId: opened.viewerId,
-      instanceId: "instance-app-a-replacement",
-    }));
-    expect(backend.stops).toContain("instance-app-a-replacement");
-    for (const channel of [1, 2, 3, 4]) {
+    expect(manager.getViewer(opened.viewerId, 7)).toBe(opened);
+    expect(onUiLost).not.toHaveBeenCalled();
+    expect(backend.abortedPreparations).toContain("preparation-2");
+    for (const channel of [3, 4]) {
       expect(base.calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
         .toBe(true);
     }
+    for (const channel of [1, 2]) {
+      expect(base.calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
+        .toBe(false);
+    }
+  });
+
+  test("never leaves the retired prior viewer mapped after post-commit candidate loss", async () => {
+    const backend = new FakeBackend();
+    const { fetch, calls } = createFetch();
+    const bindings = systemBindings();
+    const onUiLost = vi.fn();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...bindings,
+      onUiLost,
+    });
+    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    backend.loseCommittedReplacementBeforeReturn = true;
+
+    await expect(manager.reloadApp(
+      "app-a",
+      verifyPreparedViewer,
+      publishReloadedViewer,
+    )).rejects.toThrow(
+      "committed replacement exited before Host publication",
+    );
+
+    expect(manager.getViewer(opened.viewerId, 7)).toBeNull();
+    expect(bindings.unbindSystemSender).toHaveBeenCalledWith(
+      backend.starts[0]!.sdkSenderId,
+    );
+    expect(onUiLost).toHaveBeenCalledWith(expect.objectContaining({
+      viewerId: opened.viewerId,
+      instanceId: opened.instanceId,
+    }));
+    expect(backend.stops).toContain("instance-app-a-replacement");
+    for (const channel of [1, 2, 3, 4]) {
+      expect(calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
+        .toBe(true);
+    }
+  });
+
+  test("detaches a prior viewer lost during candidate verification", async () => {
+    const backend = new FakeBackend();
+    const { fetch } = createFetch();
+    const bindings = systemBindings();
+    const onUiLost = vi.fn();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...bindings,
+      onUiLost,
+    });
+    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    let prepared!: PreparedViewerBinding;
+    let reportVerifierStarted!: () => void;
+    const verifierStarted = new Promise<void>((resolve) => {
+      reportVerifierStarted = resolve;
+    });
+    const reload = manager.reloadApp("app-a", async (binding) => {
+      prepared = binding;
+      reportVerifierStarted();
+      await new Promise<void>((_resolve, reject) => {
+        binding.signal.addEventListener("abort", () => reject(binding.signal.reason), {
+          once: true,
+        });
+      });
+    }, publishReloadedViewer);
+    await verifierStarted;
+
+    backend.uiLostHandler?.({
+      instanceId: opened.instanceId,
+      appId: "app-a",
+      error: new Error("prior workload exited during verification"),
+    });
+
+    expect(prepared.signal.aborted).toBe(true);
+    expect(manager.getViewer(opened.viewerId, 7)).toBeNull();
+    expect(onUiLost).toHaveBeenCalledWith(expect.objectContaining({
+      viewerId: opened.viewerId,
+      instanceId: opened.instanceId,
+    }));
+    await expect(reload).rejects.toThrow("prior workload exited during verification");
+    expect(backend.abortedPreparations).toContain("preparation-2");
   });
 
   test("does not report a replacement active if it exits while old channels are retiring", async () => {
@@ -460,11 +763,13 @@ describe("CapsuleManager", () => {
       reportOldChannelRetirement = resolve;
     });
     const oldChannelGate = new Promise<void>((resolve) => { releaseOldChannel = resolve; });
+    const cutoverOrder: string[] = [];
     let held = false;
     const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (!held && init?.method === "DELETE" && url.endsWith("/channels/channel-app-a-1")) {
         held = true;
+        cutoverOrder.push("old-channel-revocation");
         reportOldChannelRetirement();
         await oldChannelGate;
       }
@@ -479,10 +784,24 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
       onUiLost: vi.fn(),
     });
-    const opened = await manager.openViewer("app-a", 7);
+    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
 
-    const reload = manager.reloadApp("app-a");
+    const reload = manager.reloadApp(
+      "app-a",
+      verifyPreparedViewer,
+      (binding) => {
+        cutoverOrder.push("renderer-publication");
+        expect(manager.getViewer(binding.viewerId, 7)).toMatchObject({
+          instanceId: binding.instanceId,
+          channelId: binding.channelId,
+        });
+      },
+    );
     await oldChannelRetirementStarted;
+    expect(cutoverOrder).toEqual([
+      "renderer-publication",
+      "old-channel-revocation",
+    ]);
     backend.uiLostHandler?.({
       instanceId: "instance-app-a-replacement",
       appId: "app-a",
@@ -495,6 +814,67 @@ describe("CapsuleManager", () => {
     await vi.waitFor(() => {
       expect(base.calls.some((call) => call.url.endsWith("/channels/channel-app-a-3"))).toBe(true);
       expect(base.calls.some((call) => call.url.endsWith("/channels/channel-app-a-4"))).toBe(true);
+    });
+  });
+
+  test("removes the committed generation when synchronous renderer publication fails", async () => {
+    const backend = new FakeBackend();
+    const { fetch, calls } = createFetch();
+    const bindings = systemBindings();
+    const onUiLost = vi.fn();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...bindings,
+      onUiLost,
+    });
+    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+
+    await expect(manager.reloadApp(
+      "app-a",
+      verifyPreparedViewer,
+      () => {
+        throw new Error("renderer cutover failed");
+      },
+    )).rejects.toThrow("renderer cutover failed");
+
+    expect(manager.getViewer(opened.viewerId, 7)).toBeNull();
+    expect(backend.stops).toContain("instance-app-a-replacement");
+    expect(onUiLost).toHaveBeenCalledWith(expect.objectContaining({
+      viewerId: opened.viewerId,
+      instanceId: "instance-app-a-replacement",
+    }));
+    for (const channel of [1, 2, 3, 4]) {
+      expect(calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
+        .toBe(true);
+    }
+  });
+
+  test("does not let best-effort renderer retirement hold the reload fence", async () => {
+    const backend = new FakeBackend();
+    const { fetch } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+    await manager.openViewer("app-a", 7, verifyPreparedViewer);
+
+    await expect(manager.reloadApp(
+      "app-a",
+      verifyPreparedViewer,
+      () => ({ cleanup: new Promise<void>(() => {}) }),
+    )).resolves.toMatchObject({
+      active: true,
+      browserBindings: [{
+        instanceId: "instance-app-a-replacement",
+      }],
     });
   });
 
@@ -518,14 +898,14 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    await expect(manager.openViewer("app-a", 7)).rejects.toThrow("declares services");
-    await expect(manager.openViewer("app-b", 7)).rejects.toThrow("declares jobs");
+    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).rejects.toThrow("declares services");
+    await expect(manager.openViewer("app-b", 7, verifyPreparedViewer)).rejects.toThrow("declares jobs");
     expect(backend.starts).toEqual([]);
     expect(calls.filter((call) => call.url.endsWith("/api/app-runtime/channels")))
       .toEqual([]);
   });
 
-  test("serializes stop behind an in-flight rebuild", async () => {
+  test("cancels an in-flight rebuild before waiting for it to settle", async () => {
     const backend = new FakeBackend();
     let releaseRebuild!: () => void;
     backend.rebuildGate = new Promise<void>((resolve) => { releaseRebuild = resolve; });
@@ -538,18 +918,224 @@ describe("CapsuleManager", () => {
       fetch,
       ...systemBindings(),
     });
-    await manager.openViewer("app-a", 7);
+    await manager.openViewer("app-a", 7, verifyPreparedViewer);
 
-    const rebuild = manager.reloadApp("app-a");
+    const rebuild = manager.reloadApp(
+      "app-a",
+      verifyPreparedViewer,
+      publishReloadedViewer,
+    );
     await Promise.resolve();
     const stop = manager.stopApp("app-a");
     await Promise.resolve();
-    expect(backend.appStops).toEqual([]);
+    expect(backend.appStops).toEqual(["app-a"]);
 
     releaseRebuild();
     await expect(rebuild).rejects.toThrow("reload was cancelled");
     await stop;
     expect(backend.appStops).toEqual(["app-a"]);
+  });
+
+  test("aborts the verifier and preparation before App stop waits for reload", async () => {
+    const backend = new FakeBackend();
+    const { fetch } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+    await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    let reportVerificationStarted!: () => void;
+    const verificationStarted = new Promise<void>((resolve) => {
+      reportVerificationStarted = resolve;
+    });
+    let verifierSignal!: AbortSignal;
+    const reload = manager.reloadApp("app-a", async (binding) => {
+      verifierSignal = binding.signal;
+      reportVerificationStarted();
+      await new Promise<void>((_resolve, reject) => {
+        binding.signal.addEventListener("abort", () => {
+          reject(binding.signal.reason);
+        }, { once: true });
+      });
+    }, publishReloadedViewer);
+    await verificationStarted;
+
+    const stopping = manager.stopApp("app-a");
+    expect(verifierSignal.aborted).toBe(true);
+    expect(backend.abortedPreparations).toContain("preparation-2");
+    await expect(reload).rejects.toThrow("stopping");
+    await stopping;
+    expect(backend.appStops).toEqual(["app-a"]);
+  });
+
+  test("issues global backend cancellation before waiting for in-flight launches", async () => {
+    const backend = new FakeBackend();
+    let reportLaunchStarted!: () => void;
+    let rejectLaunch!: (error: Error) => void;
+    const launchStarted = new Promise<void>((resolve) => { reportLaunchStarted = resolve; });
+    backend.prepareUi = async (spec) => {
+      backend.starts.push(spec);
+      reportLaunchStarted();
+      return await new Promise<{
+        preparationId: string;
+        instanceId: string;
+      }>((_resolve, reject) => {
+        rejectLaunch = reject;
+      });
+    };
+    let releaseBackendStop!: () => void;
+    const backendStop = new Promise<void>((resolve) => { releaseBackendStop = resolve; });
+    backend.stopAll = () => {
+      backend.stopAllCalls += 1;
+      rejectLaunch(new Error("launch cancelled by stopAll"));
+      return backendStop;
+    };
+    const { fetch } = createFetch();
+    const bindings = systemBindings();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...bindings,
+    });
+
+    const opening = manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const openingFailure = expect(opening).rejects.toThrow("launch cancelled by stopAll");
+    await launchStarted;
+
+    const firstStop = manager.stopAll();
+    const duplicateStop = manager.stopAll();
+    expect(duplicateStop).toBe(firstStop);
+    expect(backend.stopAllCalls).toBe(1);
+    expect(bindings.unbindSystemSender).toHaveBeenCalledWith(
+      backend.starts[0]!.sdkSenderId,
+    );
+
+    let stopSettled = false;
+    void firstStop.finally(() => { stopSettled = true; });
+    await openingFailure;
+    await Promise.resolve();
+    expect(stopSettled).toBe(false);
+
+    releaseBackendStop();
+    await firstStop;
+  });
+
+  test("never binds a capability issued after the global stop fence", async () => {
+    const backend = new FakeBackend();
+    const base = createFetch();
+    let reportIssuanceStarted!: () => void;
+    let releaseIssuance!: () => void;
+    const issuanceStarted = new Promise<void>((resolve) => { reportIssuanceStarted = resolve; });
+    const issuanceGate = new Promise<void>((resolve) => { releaseIssuance = resolve; });
+    let held = false;
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (!held && url.endsWith("/api/app-runtime/channels") && init?.method === "POST") {
+        held = true;
+        reportIssuanceStarted();
+        await issuanceGate;
+      }
+      return await base.fetch(input, init);
+    }) as typeof globalThis.fetch;
+    const bindings = systemBindings();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...bindings,
+    });
+
+    const opening = manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const openingFailure = expect(opening).rejects.toThrow("launch was cancelled");
+    await issuanceStarted;
+    const stopping = manager.stopAll();
+    expect(backend.stopAllCalls).toBe(1);
+
+    releaseIssuance();
+    await openingFailure;
+    await stopping;
+
+    expect(bindings.bindSystemSender).not.toHaveBeenCalled();
+    expect(backend.starts).toEqual([]);
+    expect(base.calls.some((call) => (
+      call.url.endsWith("/api/app-runtime/apps/app-a/channels")
+      && call.init?.method === "DELETE"
+    ))).toBe(true);
+    expect(base.calls.some((call) => (
+      call.url.endsWith("/api/app-runtime/channels/channel-app-a-1")
+      && call.init?.method === "DELETE"
+    ))).toBe(true);
+  });
+
+  test("does not admit App-scoped teardown after the global fence", async () => {
+    const backend = new FakeBackend();
+    let releaseBackendStop!: () => void;
+    backend.stopAll = () => {
+      backend.stopAllCalls += 1;
+      return new Promise<void>((resolve) => { releaseBackendStop = resolve; });
+    };
+    const { fetch } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+    manager.beginAppRetirement("app-a");
+
+    const globalStop = manager.stopAll();
+    expect(manager.stopApp("app-b")).toBe(globalStop);
+    await expect(manager.retireApp("app-a")).rejects.toThrow("App Capsule is stopping");
+    expect(backend.appStops).toEqual([]);
+    expect(backend.appRetires).toEqual([]);
+
+    releaseBackendStop();
+    await globalStop;
+  });
+
+  test("quarantines the Manager when global shutdown does not quiesce", async () => {
+    vi.useFakeTimers();
+    try {
+      const backend = new FakeBackend();
+      backend.stopAll = () => new Promise<void>(() => {});
+      const { fetch } = createFetch();
+      const manager = new CapsuleManager({
+        backend,
+        workspacePath: () => "/workspace",
+        coreBaseUrl: () => "http://127.0.0.1:32100",
+        coreToken: "host-token",
+        fetch,
+        ...systemBindings(),
+      });
+
+      const stopping = manager.stopAll();
+      const rejected = expect(stopping).rejects.toMatchObject({
+        name: "CapsuleRestartRequiredError",
+        restartRequired: true,
+      });
+      await vi.advanceTimersByTimeAsync(20_000);
+      await rejected;
+      await expect(manager.status()).resolves.toMatchObject({
+        available: false,
+        restartRequired: true,
+      });
+      await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).rejects.toMatchObject({
+        restartRequired: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("holds one retirement fence across teardown and blocks new App generations", async () => {
@@ -567,8 +1153,12 @@ describe("CapsuleManager", () => {
     });
 
     manager.beginAppRetirement("app-a");
-    await expect(manager.openViewer("app-a", 7)).rejects.toThrow("active viewer");
-    await expect(manager.reloadApp("app-a")).rejects.toThrow("stopping");
+    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).rejects.toThrow("active viewer");
+    await expect(manager.reloadApp(
+      "app-a",
+      verifyPreparedViewer,
+      publishReloadedViewer,
+    )).rejects.toThrow("stopping");
 
     const first = manager.retireApp("app-a");
     const duplicate = manager.retireApp("app-a");
@@ -581,9 +1171,9 @@ describe("CapsuleManager", () => {
 
     releaseRetirement();
     await first;
-    await expect(manager.openViewer("app-a", 7)).rejects.toThrow("active viewer");
+    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).rejects.toThrow("active viewer");
     manager.finishAppRetirement("app-a");
-    await expect(manager.openViewer("app-a", 7)).resolves.toMatchObject({ appId: "app-a" });
+    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).resolves.toMatchObject({ appId: "app-a" });
   });
 
   test("rotates runtime and browser channels before replacing a live UI", async () => {
@@ -598,14 +1188,19 @@ describe("CapsuleManager", () => {
       fetch,
       ...bindings,
     });
-    const opened = await manager.openViewer("app-a", 7);
+    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
 
-    const reloaded = await manager.reloadApp("app-a");
+    const reloaded = await manager.reloadApp(
+      "app-a",
+      verifyPreparedViewer,
+      publishReloadedViewer,
+    );
 
     expect(reloaded).toMatchObject({
       active: true,
       browserBindings: [{
         viewerId: opened.viewerId,
+        instanceId: "instance-app-a-replacement",
         channelId: "channel-app-a-4",
         capability: "secret-capability-app-a-4",
       }],

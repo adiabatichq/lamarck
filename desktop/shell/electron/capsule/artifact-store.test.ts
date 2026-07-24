@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { HostArtifactStore } from "./artifact-store";
 import { CapsuleStorageBudget } from "./storage-budget";
 
@@ -63,6 +63,119 @@ describe("HostArtifactStore", () => {
     await store.deactivate("a".repeat(64));
     expect(await store.active("a".repeat(64))).toBeUndefined();
     await expect(store.deactivate("a".repeat(64))).resolves.toBeUndefined();
+  });
+
+  test("pins an unactivated prepared artifact until its retention is released", async () => {
+    const { store } = fixture();
+    const bytes = Buffer.from("prepared but not activated");
+    const expected = identity(bytes);
+    const artifact = await store.receive(
+      OWNER,
+      expected.digest,
+      expected.bytes,
+      Readable.from([bytes]),
+    );
+    const retention = store.retain(artifact);
+    const secondRetention = store.retain(artifact);
+
+    await expect(store.pruneUnreferenced()).resolves.toBe(0);
+    await expect(readFile(artifact.path)).resolves.toEqual(bytes);
+
+    retention.release();
+    retention.release();
+    await expect(store.pruneUnreferenced()).resolves.toBe(0);
+    await expect(readFile(artifact.path)).resolves.toEqual(bytes);
+
+    secondRetention.release();
+    await expect(store.pruneUnreferenced()).resolves.toBe(bytes.byteLength);
+    await expect(readFile(artifact.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("honors a retention acquired after pruning took its initial pin snapshot", async () => {
+    const { store } = fixture();
+    const activeBytes = Buffer.from("active artifact");
+    const activeIdentity = identity(activeBytes);
+    const activeArtifact = await store.receive(
+      OWNER,
+      activeIdentity.digest,
+      activeIdentity.bytes,
+      Readable.from([activeBytes]),
+    );
+    await store.activate(OWNER, activeArtifact, {
+      packageDigest: `sha256:${"1".repeat(64)}`,
+      imageDigest: `sha256:${"2".repeat(64)}`,
+    });
+    const candidateBytes = Buffer.from("late retained candidate");
+    const candidateIdentity = identity(candidateBytes);
+    const candidate = await store.receive(
+      OWNER,
+      candidateIdentity.digest,
+      candidateIdentity.bytes,
+      Readable.from([candidateBytes]),
+    );
+    let releaseActiveScan!: () => void;
+    const activeScanGate = new Promise<void>((resolve) => {
+      releaseActiveScan = resolve;
+    });
+    let activeScanStarted!: () => void;
+    const activeScan = new Promise<void>((resolve) => {
+      activeScanStarted = resolve;
+    });
+    const readActive = store.active.bind(store);
+    vi.spyOn(store, "active").mockImplementation(async (appKey) => {
+      activeScanStarted();
+      await activeScanGate;
+      return await readActive(appKey);
+    });
+
+    const pruning = store.pruneUnreferenced();
+    await activeScan;
+    const retention = store.retain(candidate);
+    releaseActiveScan();
+
+    await expect(pruning).resolves.toBe(0);
+    await expect(readFile(candidate.path)).resolves.toEqual(candidateBytes);
+    retention.release();
+  });
+
+  test("never reports a pin after pruning has admitted deletion", async () => {
+    const root = join(
+      tmpdir(),
+      `lamarck-artifact-${process.pid}-${Math.random().toString(16).slice(2)}`,
+    );
+    roots.push(root);
+    const budget = storageBudget(root);
+    const store = new HostArtifactStore(root, { storageBudget: budget });
+    const bytes = Buffer.from("candidate racing deletion");
+    const expected = identity(bytes);
+    const artifact = await store.receive(
+      OWNER,
+      expected.digest,
+      expected.bytes,
+      Readable.from([bytes]),
+    );
+    let releaseRemoval!: () => void;
+    const removalGate = new Promise<void>((resolve) => {
+      releaseRemoval = resolve;
+    });
+    let removalStarted!: () => void;
+    const removing = new Promise<void>((resolve) => {
+      removalStarted = resolve;
+    });
+    const remove = budget.remove.bind(budget);
+    vi.spyOn(budget, "remove").mockImplementation(async (path, options) => {
+      removalStarted();
+      await removalGate;
+      return await remove(path, options);
+    });
+
+    const pruning = store.pruneUnreferenced();
+    await removing;
+    expect(() => store.retain(artifact)).toThrow("currently being pruned");
+    releaseRemoval();
+
+    await expect(pruning).resolves.toBe(bytes.byteLength);
+    expect(() => store.retain(artifact)).toThrow("CAS entry is missing");
   });
 
   test("rejects truncated and digest-mismatched Guest exports without publishing", async () => {

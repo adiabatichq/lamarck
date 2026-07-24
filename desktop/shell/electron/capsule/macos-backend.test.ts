@@ -23,7 +23,11 @@ import type { CapsuleTreeSnapshot } from "./package-snapshot";
 import type { NpmDependencyBundle } from "./dependency-broker";
 import type { SystemStreamServer } from "./system-stream";
 import { CapsuleGuestRequestError } from "./guest-session";
-import { CapsuleRestartRequiredError, isCapsuleRestartRequiredError } from "./backend";
+import {
+  CapsuleRestartRequiredError,
+  isCapsuleRestartRequiredError,
+  type CapsuleUiPreparation,
+} from "./backend";
 import { MacOsCapsuleBackend, type MacOsCapsuleBackendOptions } from "./macos-backend";
 import { CapsuleStorageBudget, type CapsuleStorageBudgetLike } from "./storage-budget";
 
@@ -161,6 +165,207 @@ describe("MacOsCapsuleBackend orchestration", () => {
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
     await harness.backend.stopAll();
     expect(harness.vm.stopCalls).toBeGreaterThan(0);
+  });
+
+  test("keeps a first-launch candidate unactivated and streamable until explicit commit", async () => {
+    const harness = createHarness();
+    const prepared = await harness.backend.prepareUi(spec("sender-a"));
+
+    expect(harness.store.activation).toBeUndefined();
+    expect(harness.store.activationWrites).toBe(0);
+    expect(harness.store.retained.get(ARTIFACT_A)).toBe(1);
+    const viewer = await harness.backend.openUiStream(prepared.instanceId);
+
+    await expect(harness.backend.commitPreparedUi(prepared.preparationId))
+      .resolves.toEqual({ instanceId: prepared.instanceId });
+    await expect(harness.backend.commitPreparedUi(prepared.preparationId))
+      .resolves.toEqual({ instanceId: prepared.instanceId });
+    await expect(harness.backend.abortPreparedUi(prepared.preparationId))
+      .rejects.toThrow("already committed");
+    expect(harness.store.activationWrites).toBe(1);
+    expect(harness.store.activation?.artifact.digest).toBe(ARTIFACT_A);
+    expect(harness.store.retained.has(ARTIFACT_A)).toBe(false);
+    expect(viewer.destroyed).toBe(false);
+
+    viewer.destroy();
+    await harness.backend.stopAll();
+  });
+
+  test("authoritatively cleans a launched candidate when prepared-artifact retention fails", async () => {
+    const harness = createHarness();
+    harness.store.failNextRetain = true;
+
+    await expect(harness.backend.prepareUi(spec("sender-a")))
+      .rejects.toThrow("injected prepared artifact retention failure");
+    expect(harness.session.stoppedApps).toHaveLength(1);
+    expect(harness.system.detached).toBeGreaterThan(0);
+    expect(harness.store.activation).toBeUndefined();
+
+    await expect(harness.backend.startUi(spec("sender-b")))
+      .resolves.toEqual(expect.objectContaining({ instanceId: expect.any(String) }));
+    await harness.backend.stopAll();
+  });
+
+  test("aborts a prepared replacement without changing or stopping its last-known-good UI", async () => {
+    const harness = createHarness();
+    const active = await harness.backend.startUi(spec("sender-a"));
+    const activationWrites = harness.store.activationWrites;
+    harness.packageDigest = PACKAGE_B;
+    const prepared = await harness.backend.prepareUi(spec("sender-b"), active.instanceId);
+    const oldViewer = await harness.backend.openUiStream(active.instanceId);
+    const candidateViewer = await harness.backend.openUiStream(prepared.instanceId);
+
+    expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
+    expect(harness.store.activationWrites).toBe(activationWrites);
+    expect(harness.session.stoppedApps).toHaveLength(0);
+
+    await harness.backend.abortPreparedUi(prepared.preparationId);
+    await expect(harness.backend.abortPreparedUi(prepared.preparationId)).resolves.toBeUndefined();
+    await expect(harness.backend.commitPreparedUi(prepared.preparationId))
+      .rejects.toThrow("already aborted");
+    expect(candidateViewer.destroyed).toBe(true);
+    expect(oldViewer.destroyed).toBe(false);
+    expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
+    await expect(harness.backend.openUiStream(prepared.instanceId))
+      .rejects.toThrow("no longer active or prepared");
+    const stillActive = await harness.backend.openUiStream(active.instanceId);
+
+    oldViewer.destroy();
+    stillActive.destroy();
+    await harness.backend.stopAll();
+  });
+
+  test("replacement commit alone rotates activation, retires the old UI, and publishes the candidate", async () => {
+    const harness = createHarness();
+    const active = await harness.backend.startUi(spec("sender-a"));
+    harness.packageDigest = PACKAGE_B;
+    const prepared = await harness.backend.prepareUi(spec("sender-b"), active.instanceId);
+    const oldViewer = await harness.backend.openUiStream(active.instanceId);
+    const candidateViewer = await harness.backend.openUiStream(prepared.instanceId);
+    const writesBeforeCommit = harness.store.activationWrites;
+
+    const committed = await harness.backend.commitPreparedUi(prepared.preparationId);
+
+    expect(committed).toEqual({ instanceId: prepared.instanceId });
+    expect(harness.store.activationWrites).toBe(writesBeforeCommit + 1);
+    expect(harness.store.activation?.packageDigest).toBe(PACKAGE_B);
+    expect(oldViewer.destroyed).toBe(true);
+    expect(candidateViewer.destroyed).toBe(false);
+    await expect(harness.backend.openUiStream(active.instanceId))
+      .rejects.toThrow("no longer active or prepared");
+    const currentViewer = await harness.backend.openUiStream(prepared.instanceId);
+
+    candidateViewer.destroy();
+    currentViewer.destroy();
+    await harness.backend.stopAll();
+  });
+
+  test("rolls activation back instead of publishing when the previous UI exits during commit", async () => {
+    const harness = createHarness();
+    const active = await harness.backend.startUi(spec("sender-a"));
+    harness.packageDigest = PACKAGE_B;
+    const prepared = await harness.backend.prepareUi(spec("sender-b"), active.instanceId);
+    harness.store.afterNextActivation = () => harness.session.emitOldestWorkloadExit();
+
+    await expect(harness.backend.commitPreparedUi(prepared.preparationId))
+      .rejects.toThrow("exited");
+
+    expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
+    expect(harness.store.retained.size).toBe(0);
+    await expect(harness.backend.openUiStream(prepared.instanceId))
+      .rejects.toThrow("no longer active or prepared");
+    await expect(harness.backend.openUiStream(active.instanceId))
+      .rejects.toThrow("no longer active or prepared");
+    await harness.backend.stopAll();
+  });
+
+  test("rejects a prepared candidate exit at commit while preserving the prior UI", async () => {
+    const harness = createHarness();
+    const uiLost = vi.fn();
+    harness.backend.setUiLostHandler(uiLost);
+    const active = await harness.backend.startUi(spec("sender-a"));
+    harness.packageDigest = PACKAGE_B;
+    const prepared = await harness.backend.prepareUi(spec("sender-b"), active.instanceId);
+
+    harness.session.emitLatestWorkloadExit();
+
+    expect(uiLost).toHaveBeenCalledWith(expect.objectContaining({
+      instanceId: prepared.instanceId,
+      appId: "weather",
+    }));
+    await expect(harness.backend.commitPreparedUi(prepared.preparationId))
+      .rejects.toThrow("exited");
+    expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
+    const oldViewer = await harness.backend.openUiStream(active.instanceId);
+    await expect(harness.backend.openUiStream(prepared.instanceId))
+      .rejects.toThrow("no longer active or prepared");
+    await vi.waitFor(() => {
+      expect(harness.session.stoppedApps).toHaveLength(1);
+      expect(harness.store.retained.size).toBe(0);
+    });
+
+    oldViewer.destroy();
+    await harness.backend.stopAll();
+  });
+
+  test("admits prepared abort after ordinary viewer work saturates the queue", async () => {
+    const harness = createHarness();
+    const prepared = await harness.backend.prepareUi(spec("sender-a"));
+    harness.session.blockViewerAttach();
+    const attachments = Array.from(
+      { length: 32 },
+      () => harness.backend.openUiStream(prepared.instanceId),
+    );
+    const attachmentResults = Promise.allSettled(attachments);
+    const aborting = harness.backend.abortPreparedUi(prepared.preparationId);
+
+    await vi.waitFor(() => {
+      expect(harness.session.operations.at(-1)).toBe("viewer.attach");
+    });
+    harness.session.releaseViewerAttach();
+
+    await expect(aborting).resolves.toBeUndefined();
+    for (const result of await attachmentResults) {
+      if (result.status === "fulfilled") result.value.destroy();
+    }
+    expect(harness.store.retained.size).toBe(0);
+    await expect(harness.backend.commitPreparedUi(prepared.preparationId))
+      .rejects.toThrow("already aborted");
+    await harness.backend.stopAll();
+  });
+
+  test("global stop discards prepared UIs and invalidates their transaction handles", async () => {
+    const harness = createHarness();
+    const prepared = await harness.backend.prepareUi(spec("sender-a"));
+    const viewer = await harness.backend.openUiStream(prepared.instanceId);
+
+    await harness.backend.stopAll();
+
+    expect(viewer.destroyed).toBe(true);
+    expect(harness.store.activation).toBeUndefined();
+    expect(harness.store.retained.size).toBe(0);
+    await expect(harness.backend.commitPreparedUi(prepared.preparationId))
+      .rejects.toThrow("already aborted");
+  });
+
+  test("retirement stops active and prepared generations before removing activation", async () => {
+    const harness = createHarness();
+    const active = await harness.backend.startUi(spec("sender-a"));
+    harness.packageDigest = PACKAGE_B;
+    const prepared = await harness.backend.prepareUi(spec("sender-b"), active.instanceId);
+    const oldViewer = await harness.backend.openUiStream(active.instanceId);
+    const candidateViewer = await harness.backend.openUiStream(prepared.instanceId);
+
+    await harness.backend.retireApp("weather");
+
+    expect(oldViewer.destroyed).toBe(true);
+    expect(candidateViewer.destroyed).toBe(true);
+    expect(harness.session.stoppedApps).toHaveLength(2);
+    expect(harness.store.activation).toBeUndefined();
+    expect(harness.store.retained.size).toBe(0);
+    await expect(harness.backend.commitPreparedUi(prepared.preparationId))
+      .rejects.toThrow("already aborted");
+    await harness.backend.stopAll();
   });
 
   test("rebuilds source-only changes from the same-App sealed base without invoking the dependency broker", async () => {
@@ -541,7 +746,8 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.session.emit("fatal", new Error("CONTROL was lost"));
     await vi.waitFor(() => expect(boundaryLost).toHaveBeenCalledOnce());
     expect(boundaryLost).toHaveBeenCalledWith(expect.objectContaining({ message: "CONTROL was lost" }));
-    await expect(harness.backend.openUiStream(instance.instanceId)).rejects.toThrow("no longer active");
+    await expect(harness.backend.openUiStream(instance.instanceId))
+      .rejects.toThrow("Capsule boundary recovery is still in progress");
     expect(harness.system.detached).toBeGreaterThan(0);
     expect(harness.vm.stopCalls).toBeGreaterThan(0);
   });
@@ -564,7 +770,8 @@ describe("MacOsCapsuleBackend orchestration", () => {
     expect(harness.vm.stopCalls).toBe(1);
     expect(harness.lifecycleEvents).toContain("helper.stop.begin");
     expect(harness.lifecycleEvents).not.toContain("session.close");
-    await expect(harness.backend.openUiStream(instance.instanceId)).rejects.toThrow("no longer active");
+    await expect(harness.backend.openUiStream(instance.instanceId))
+      .rejects.toThrow("Capsule backend is stopping");
 
     harness.vm.releaseStop();
     await stopFromBoundary;
@@ -574,6 +781,99 @@ describe("MacOsCapsuleBackend orchestration", () => {
       "session.close",
       "helper.close",
     ]);
+  });
+
+  test("publishes one stopping fence while joining an in-progress fatal cleanup", async () => {
+    const harness = createHarness();
+    await harness.backend.startUi(spec("sender-a"));
+    harness.vm.blockStop();
+    let firstStop: Promise<void> | undefined;
+    let duplicateStop: Promise<void> | undefined;
+    let lateLaunch: Promise<CapsuleUiPreparation> | undefined;
+    harness.backend.setBoundaryLostHandler(() => {
+      firstStop = harness.backend.stopAll();
+      duplicateStop = harness.backend.stopAll();
+      lateLaunch = harness.backend.prepareUi(spec("sender-b"));
+    });
+
+    harness.session.emit("fatal", new Error("CONTROL was lost"));
+    await vi.waitFor(() => expect(firstStop).toBeDefined());
+
+    expect(duplicateStop).toBe(firstStop);
+    await expect(lateLaunch).rejects.toThrow("Capsule backend is stopping");
+    expect(harness.vm.stopCalls).toBe(1);
+
+    harness.vm.releaseStop();
+    await firstStop;
+  });
+
+  test("bounds stopAll while joining fatal cleanup and quarantines its stopping helper", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createHarness();
+      await harness.backend.startUi(spec("sender-a"));
+      harness.lifecycleEvents.length = 0;
+      harness.vm.blockStop();
+      let stopFromBoundary: Promise<void> | undefined;
+      harness.backend.setBoundaryLostHandler(() => {
+        stopFromBoundary = harness.backend.stopAll();
+      });
+
+      harness.session.emit("fatal", new Error("CONTROL was lost"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stopFromBoundary).toBeDefined();
+      expect(harness.lifecycleEvents).toContain("helper.stop.begin");
+      const rejected = expect(stopFromBoundary).rejects.toMatchObject({
+        name: "CapsuleRestartRequiredError",
+        restartRequired: true,
+      });
+
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      await rejected;
+      expect(harness.lifecycleEvents).toContain("helper.close");
+      await expect(harness.backend.status()).resolves.toMatchObject({
+        available: false,
+        restartRequired: true,
+      });
+      expect(harness.backend.stopAll()).toBe(stopFromBoundary);
+
+      harness.vm.releaseStop();
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("quarantines and detaches a global stop that exceeds its deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createHarness();
+      await harness.backend.startUi(spec("sender-a"));
+      harness.vm.blockStop();
+
+      const stopping = harness.backend.stopAll();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.lifecycleEvents).toContain("helper.stop.begin");
+      const rejected = expect(stopping).rejects.toMatchObject({
+        name: "CapsuleRestartRequiredError",
+        restartRequired: true,
+      });
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      await rejected;
+      expect(harness.system.detached).toBeGreaterThan(0);
+      expect(harness.lifecycleEvents).toContain("helper.close");
+      await expect(harness.backend.status()).resolves.toMatchObject({
+        available: false,
+        restartRequired: true,
+      });
+
+      harness.vm.releaseStop();
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("loses the whole VM boundary when App teardown is not confirmed", async () => {
@@ -622,7 +922,8 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await harness.backend.startUi(spec("sender-a"));
     harness.vm.failStop = true;
 
-    await expect(harness.backend.stopAll()).rejects.toThrow("shutdown was incomplete");
+    await expect(harness.backend.stopAll())
+      .rejects.toThrow("quarantined until Host restart");
     expect(harness.vm.stopCalls).toBeGreaterThan(0);
     await expect(harness.backend.status()).resolves.toMatchObject({
       available: false,
@@ -786,6 +1087,25 @@ describe("MacOsCapsuleBackend orchestration", () => {
     expect(harness.storageRemovals).toEqual([]);
     expect(harness.store.pruneCalls).toBe(0);
     expect(harness.store.activation).toBeDefined();
+  });
+
+  test("keeps global shutdown failed after boundary cleanup cannot confirm VZ stop", async () => {
+    const harness = createHarness();
+    await harness.backend.startUi(spec("sender-a"));
+    harness.vm.failStop = true;
+
+    harness.session.emit("fatal", new Error("injected Guest boundary loss"));
+    await vi.waitFor(async () => {
+      expect(await harness.backend.status()).toMatchObject({
+        available: false,
+        restartRequired: true,
+      });
+    });
+
+    const failure = await rejectionOf(harness.backend.stopAll());
+    expect(failure).toBeInstanceOf(CapsuleRestartRequiredError);
+    await expect(harness.backend.stopAll()).rejects.toBe(failure);
+    expect(harness.vm.stopCalls).toBe(1);
   });
 
   test("reconstructs fresh-process activation ownership and evicts stale residue before new admission", async () => {
@@ -1384,6 +1704,8 @@ class FakeSession extends EventEmitter {
   private currentDependencyDigest = DEPENDENCY;
   private currentInstallDigest = INSTALL;
   private currentWarmBuild = false;
+  private viewerAttachGate: Promise<void> | undefined;
+  private releaseBlockedViewerAttach: (() => void) | undefined;
 
   constructor(
     private readonly system: FakeSystemStreamServer,
@@ -1421,6 +1743,30 @@ class FakeSession extends EventEmitter {
       exitCode: 0,
       signal: null,
     });
+  }
+
+  emitOldestWorkloadExit() {
+    const [workloadHandle, appHandle] = [...this.workloadApps.entries()][0]!;
+    this.guestEvent("workload.exited", {
+      appHandle,
+      workloadHandle,
+      exitCode: 0,
+      signal: null,
+    });
+  }
+
+  blockViewerAttach() {
+    if (this.viewerAttachGate) throw new Error("viewer attach is already blocked");
+    this.viewerAttachGate = new Promise<void>((resolve) => {
+      this.releaseBlockedViewerAttach = resolve;
+    });
+  }
+
+  releaseViewerAttach() {
+    const release = this.releaseBlockedViewerAttach;
+    this.viewerAttachGate = undefined;
+    this.releaseBlockedViewerAttach = undefined;
+    release?.();
   }
 
   emitLatestWorkloadFault(message: string) {
@@ -1551,7 +1897,9 @@ class FakeSession extends EventEmitter {
         this.stoppedApps.push(body.appHandle);
         if (this.trackRetirementLifecycle) this.lifecycleEvents.push("guest.app.stopped");
         return { stopped: true };
-      case "viewer.attach": return { ready: true };
+      case "viewer.attach":
+        if (this.viewerAttachGate) await this.viewerAttachGate;
+        return { ready: true };
       case "vm.drain": return { drained: true };
       default: throw new Error(`unexpected operation ${operation}`);
     }
@@ -1724,10 +2072,13 @@ class FakeSession extends EventEmitter {
 
 class FakeArtifactStore {
   readonly cas = new Map<string, HostArtifact>();
+  readonly retained = new Map<string, number>();
   activation: (HostArtifactActivation & { packageDigest: `sha256:${string}` }) | undefined;
+  activationWrites = 0;
   afterNextActivation: (() => void) | undefined;
   failNextFind = false;
   failNextReceiveAfterDrain = false;
+  failNextRetain = false;
   readonly deactivatedKeys: string[] = [];
   pruneCalls = 0;
   trackRetirementLifecycle = false;
@@ -1773,6 +2124,7 @@ class FakeArtifactStore {
       dependencyDigest?: string;
     },
   ) {
+    this.activationWrites += 1;
     const stored = this.cas.get(artifact.digest)!;
     this.activation = {
       artifact: stored,
@@ -1795,8 +2147,29 @@ class FakeArtifactStore {
     this.activation = undefined;
     if (this.trackRetirementLifecycle) this.lifecycleEvents.push("artifact.deactivated");
   }
+  retain(artifact: HostArtifact) {
+    if (this.failNextRetain) {
+      this.failNextRetain = false;
+      throw new Error("injected prepared artifact retention failure");
+    }
+    this.retained.set(artifact.digest, (this.retained.get(artifact.digest) ?? 0) + 1);
+    let released = false;
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        const remaining = (this.retained.get(artifact.digest) ?? 0) - 1;
+        if (remaining > 0) this.retained.set(artifact.digest, remaining);
+        else this.retained.delete(artifact.digest);
+      },
+    };
+  }
   async pruneUnreferenced() {
     this.pruneCalls += 1;
+    for (const digest of [...this.cas.keys()]) {
+      if (this.activation?.artifact.digest === digest || this.retained.has(digest)) continue;
+      this.cas.delete(digest);
+    }
     if (this.trackRetirementLifecycle) this.lifecycleEvents.push("artifact.pruned");
     return 0;
   }

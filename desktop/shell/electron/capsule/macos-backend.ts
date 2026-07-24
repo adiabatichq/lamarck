@@ -50,6 +50,7 @@ import type {
   CapsuleBackendStatus,
   CapsuleUiInstance,
   CapsuleUiLostEvent,
+  CapsuleUiPreparation,
   CapsuleUiSpec,
 } from "./backend";
 import {
@@ -88,6 +89,7 @@ import {
   HostArtifactStore,
   type HostArtifact,
   type HostArtifactActivation,
+  type HostArtifactRetention,
 } from "./artifact-store";
 import type { SystemStreamServer } from "./system-stream";
 import { CapsuleStorageBudget, type CapsuleStorageBudgetLike } from "./storage-budget";
@@ -131,10 +133,12 @@ const WORKLOAD_STREAM_ATTACH_TIMEOUT_MS = 10_000;
 const BLOB_EVENT_CONFIRM_TIMEOUT_MS = 10_000;
 const BUILD_TIMEOUT_MS = 120_000;
 const BUILD_REQUEST_TIMEOUT_MS = 10 * 60_000;
+const STOP_ALL_DEADLINE_MS = 15_000;
 const MAX_SERIAL_OPERATIONS = 32;
 const MAX_EARLY_DATA_STREAMS = 64;
 const MAX_LIVE_UI_INSTANCES = 16;
 const MAX_VIEWER_STREAMS_GLOBAL = 32;
+const MAX_RETAINED_PREPARATION_OUTCOMES = 64;
 
 export interface MacOsCapsuleBackendOptions {
   /** Absolute path to the signed Swift Virtualization.framework helper. */
@@ -226,6 +230,7 @@ interface ArtifactStoreLike {
     },
   ): Promise<void>;
   deactivate(appKey: string): Promise<void>;
+  retain(artifact: HostArtifact): HostArtifactRetention;
   pruneUnreferenced(): Promise<number>;
 }
 
@@ -278,7 +283,7 @@ interface UiRecord {
   readonly bootGeneration: number;
   readonly detachSystemStream: () => void;
   readonly viewerStreams: Set<Duplex>;
-  lifecycle: "launching" | "replacement" | "active" | "stopping" | "lost";
+  lifecycle: "launching" | "prepared" | "replacement" | "active" | "stopping" | "lost";
   terminalError?: Error;
 }
 
@@ -300,6 +305,19 @@ interface ActivationCheckpoint {
   readonly appKey: string;
   readonly previous: HostArtifactActivation | undefined;
 }
+
+interface PreparedUiRecord {
+  readonly preparationId: string;
+  readonly candidate: Candidate;
+  readonly packageDigest: `sha256:${string}`;
+  readonly previousInstanceId?: string;
+  readonly retention: HostArtifactRetention;
+  state: "prepared" | "committing";
+}
+
+type PreparedUiOutcome =
+  | { readonly decision: "committed"; readonly instanceId: string }
+  | { readonly decision: "aborted"; readonly error?: Error };
 
 interface EventWaiter<T> {
   readonly promise: Promise<T>;
@@ -346,9 +364,13 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   readonly #storageBudget: CapsuleStorageBudgetLike;
   readonly #serial = new BoundedSerialQueue(MAX_SERIAL_OPERATIONS);
   readonly #instances = new Map<string, UiRecord>();
+  readonly #preparedUi = new Map<string, PreparedUiRecord>();
+  readonly #preparedInstances = new Map<string, PreparedUiRecord>();
+  readonly #preparedOutcomes = new Map<string, PreparedUiOutcome>();
   readonly #workloads = new Map<string, UiRecord>();
   readonly #namespaceBases = new Set<number>();
   readonly #launchControllers = new Map<string, Set<AbortController>>();
+  readonly #shuttingDownBoots = new Map<BootBoundary, number>();
 
   #boundaryLostHandler: ((error: unknown) => void) | undefined;
   #uiLostHandler: ((event: CapsuleUiLostEvent) => void) | undefined;
@@ -432,169 +454,176 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     }
   }
 
-  startUi(spec: CapsuleUiSpec): Promise<CapsuleUiInstance> {
+  prepareUi(
+    spec: CapsuleUiSpec,
+    previousInstanceId?: string,
+  ): Promise<CapsuleUiPreparation> {
+    try {
+      this.#assertAcceptingWork();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return this.#withLaunch(spec.appId, (signal) => this.#serial.run(async () => {
       this.#assertAcceptingWork();
       const ownerKey = hashAppId(spec.appId);
-      return await this.#withTransientStorage(ownerKey, async () => {
-      if (this.#instances.size >= MAX_LIVE_UI_INSTANCES) {
-        throw new Error("Capsule backend reached its live UI isolation limit");
-      }
-      const release = await this.#loadRelease();
-      const snapshot = await this.#dependencies.snapshot({
-        packageDir: spec.packageDir,
-        cacheDir: join(this.#options.cacheDirectory, "packages", ownerKey),
-        ownerKey,
-        storageBudget: this.#storageBudget,
-      });
-      await this.#assertSnapshotManifestAuthority(snapshot, spec);
-      throwIfAborted(signal);
-      const resolved = await this.#resolveArtifact(release, spec, snapshot, signal);
-      const runtimeCapacity = createCapsuleRuntimeStateCapacityPlan({
-        artifact: retainedArtifact(resolved.artifact),
-        liveRuntimeLeases: this.#liveRuntimeStorageLeases(),
-      });
-      const boot = await this.#ensureBoot(runtimeCapacity.stateDiskBytes, release);
-      const candidate = await this.#launchCandidate(
-        boot,
-        spec,
-        resolved,
-        runtimeCapacity.runtimePlan,
-        signal,
-      );
-      let activation: ActivationCheckpoint | undefined;
+      let prepared: PreparedUiRecord | undefined;
+      let launchedCandidate: Candidate | undefined;
+      let candidateRetention: HostArtifactRetention | undefined;
       try {
-        activation = await this.#activateCandidate(candidate, snapshot, boot);
-        this.#publishCandidate(candidate);
-        return { instanceId: candidate.instanceId };
-      } catch (error) {
-        const failures: unknown[] = [error];
-        if (activation) {
-          try {
-            await this.#rollbackCandidateActivation(candidate, activation);
-          } catch (rollbackError) {
-            failures.push(rollbackError);
+        return await this.#withTransientStorage(ownerKey, async () => {
+          let previous: UiRecord | undefined;
+          if (previousInstanceId !== undefined) {
+            previous = this.#instances.get(previousInstanceId);
+            if (!previous) throw new Error("App Capsule UI instance is no longer active");
+            if (previous.appId !== spec.appId) {
+              throw new Error("Replacement App identity mismatch");
+            }
+            if (previous.bootGeneration !== this.#boot?.generation) {
+              throw new Error("Previous UI belongs to a lost Guest boundary");
+            }
           }
-        }
+          if (this.#workloads.size >= MAX_LIVE_UI_INSTANCES) {
+            throw new Error("Capsule backend reached its live UI isolation limit");
+          }
+
+          const release = await this.#loadRelease();
+          const snapshot = await this.#dependencies.snapshot({
+            packageDir: spec.packageDir,
+            cacheDir: join(this.#options.cacheDirectory, "packages", ownerKey),
+            ownerKey,
+            storageBudget: this.#storageBudget,
+          });
+          await this.#assertSnapshotManifestAuthority(snapshot, spec);
+          throwIfAborted(signal);
+          const resolved = await this.#resolveArtifact(release, spec, snapshot, signal);
+          const runtimeCapacity = createCapsuleRuntimeStateCapacityPlan({
+            artifact: retainedArtifact(resolved.artifact),
+            liveRuntimeLeases: this.#liveRuntimeStorageLeases(),
+          });
+          const boot = await this.#ensureBoot(runtimeCapacity.stateDiskBytes, release);
+          if (previous && previous.bootGeneration !== boot.generation) {
+            throw new Error("Previous UI belongs to a lost Guest boundary");
+          }
+          const candidate = await this.#launchCandidate(
+            boot,
+            spec,
+            resolved,
+            runtimeCapacity.runtimePlan,
+            signal,
+          );
+          launchedCandidate = candidate;
+          candidate.lifecycle = "prepared";
+          const preparationId = this.#allocatePreparationId();
+          candidateRetention = this.#artifacts.retain(candidate.artifact);
+          prepared = {
+            preparationId,
+            candidate,
+            packageDigest: snapshot.digest,
+            ...(previousInstanceId === undefined ? {} : { previousInstanceId }),
+            retention: candidateRetention,
+            state: "prepared",
+          };
+          this.#preparedUi.set(preparationId, prepared);
+          this.#preparedInstances.set(candidate.instanceId, prepared);
+          return Object.freeze({
+            preparationId,
+            instanceId: candidate.instanceId,
+          });
+        });
+      } catch (error) {
+        const candidate = prepared?.candidate ?? launchedCandidate;
+        if (!candidate) throw error;
+        const failures: unknown[] = [error];
         try {
+          const boot = await this.#requireCurrentBoot(candidate.bootGeneration);
           await this.#discardCandidate(candidate, boot);
         } catch (cleanupError) {
           failures.push(cleanupError);
-          await this.#loseBoundary(cleanupError, boot);
+          await this.#loseBoundary(cleanupError);
+        } finally {
+          if (prepared) {
+            this.#completePreparation(prepared, { decision: "aborted" });
+          } else {
+            candidateRetention?.release();
+          }
         }
         if (failures.length > 1) {
-          throw new AggregateError(failures, "Candidate activation rollback or cleanup failed");
+          throw new AggregateError(
+            failures,
+            "Prepared UI cleanup after storage GC failure failed",
+          );
         }
-        throw failures[0];
+        throw error;
       }
-      });
     }));
   }
 
-  replaceUi(instanceId: string, spec: CapsuleUiSpec): Promise<CapsuleUiInstance> {
-    return this.#withLaunch(spec.appId, (signal) => this.#serial.run(async () => {
+  commitPreparedUi(preparationId: string): Promise<CapsuleUiInstance> {
+    try {
       this.#assertAcceptingWork();
-      const ownerKey = hashAppId(spec.appId);
-      return await this.#withTransientStorage(ownerKey, async () => {
-      const previous = this.#instances.get(instanceId);
-      if (!previous) throw new Error("App Capsule UI instance is no longer active");
-      if (previous.appId !== spec.appId) throw new Error("Replacement App identity mismatch");
-      if (previous.bootGeneration !== this.#boot?.generation) {
-        throw new Error("Previous UI belongs to a lost Guest boundary");
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.#serial.runCritical(async () => {
+      this.#assertAcceptingWork();
+      const outcome = this.#preparedOutcomes.get(preparationId);
+      if (outcome?.decision === "committed") return { instanceId: outcome.instanceId };
+      if (outcome?.decision === "aborted") {
+        if (outcome.error) throw outcome.error;
+        throw new Error("App Capsule UI preparation was already aborted");
       }
-      const release = await this.#loadRelease();
-      const snapshot = await this.#dependencies.snapshot({
-        packageDir: spec.packageDir,
-        cacheDir: join(this.#options.cacheDirectory, "packages", ownerKey),
-        ownerKey,
-        storageBudget: this.#storageBudget,
-      });
-      await this.#assertSnapshotManifestAuthority(snapshot, spec);
-      throwIfAborted(signal);
-      const resolved = await this.#resolveArtifact(release, spec, snapshot, signal);
-      const runtimeCapacity = createCapsuleRuntimeStateCapacityPlan({
-        artifact: retainedArtifact(resolved.artifact),
-        liveRuntimeLeases: this.#liveRuntimeStorageLeases(),
-      });
-      const boot = await this.#ensureBoot(runtimeCapacity.stateDiskBytes, release);
-      if (previous.bootGeneration !== boot.generation) {
-        throw new Error("Previous UI belongs to a lost Guest boundary");
+      const prepared = this.#preparedUi.get(preparationId);
+      if (!prepared) throw new Error("App Capsule UI preparation is no longer pending");
+      if (prepared.state !== "prepared") {
+        throw new Error("App Capsule UI preparation is already committing");
       }
-      const candidate = await this.#launchCandidate(
-        boot,
-        spec,
-        resolved,
-        runtimeCapacity.runtimePlan,
-        signal,
-      );
-      let activation: ActivationCheckpoint;
-      try {
-        // Last-known-good: no mutation of the live instance happens until the
-        // replacement has passed Guest-side TCP readiness.
-        activation = await this.#activateCandidate(candidate, snapshot, boot);
-        candidate.lifecycle = "replacement";
-      } catch (error) {
-        try {
-          await this.#discardCandidate(candidate, boot);
-        } catch (cleanupError) {
-          await this.#loseBoundary(cleanupError, boot);
-          throw new AggregateError(
-            [error, cleanupError],
-            "Replacement cleanup lost Guest containment",
-          );
-        }
-        throw error;
-      }
+      prepared.state = "committing";
+      return await this.#commitPreparation(prepared);
+    });
+  }
 
-      try {
-        await this.#stopRecord(previous, boot);
-      } catch (error) {
-        // A failed retirement loses containment certainty. The manager must
-        // revoke both generations rather than exposing two App identities.
-        let rollbackError: unknown;
-        try {
-          await this.#rollbackCandidateActivation(candidate, activation);
-        } catch (failure) {
-          rollbackError = failure;
-        }
-        await this.#loseBoundary(error, boot);
-        if (rollbackError !== undefined) {
-          throw new AggregateError(
-            [error, rollbackError],
-            "Previous UI retirement and activation rollback both failed",
-          );
-        }
-        throw error;
+  abortPreparedUi(preparationId: string): Promise<void> {
+    return this.#serial.runCritical(async () => {
+      const outcome = this.#preparedOutcomes.get(preparationId);
+      if (outcome?.decision === "aborted") {
+        await this.#artifacts.pruneUnreferenced();
+        return;
       }
-      try {
-        if (candidate.terminalError) throw candidate.terminalError;
-        this.#instances.delete(previous.instanceId);
-        this.#publishCandidate(candidate);
-      } catch (error) {
-        let rollbackError: unknown;
-        try {
-          await this.#rollbackCandidateActivation(candidate, activation);
-        } catch (failure) {
-          rollbackError = failure;
-        }
-        await this.#loseBoundary(error, boot);
-        if (rollbackError !== undefined) {
-          throw new AggregateError(
-            [error, rollbackError],
-            "Replacement publication and activation rollback both failed",
-          );
-        }
-        throw error;
+      if (outcome?.decision === "committed") {
+        throw new Error("App Capsule UI preparation was already committed");
       }
-      return { instanceId: candidate.instanceId };
-      });
-    }));
+      const prepared = this.#preparedUi.get(preparationId);
+      if (!prepared) throw new Error("App Capsule UI preparation is no longer pending");
+      if (prepared.state !== "prepared") {
+        throw new Error("App Capsule UI preparation is already committing");
+      }
+      await this.#abortPreparation(prepared);
+      await this.#artifacts.pruneUnreferenced();
+    });
+  }
+
+  async startUi(spec: CapsuleUiSpec): Promise<CapsuleUiInstance> {
+    const prepared = await this.prepareUi(spec);
+    return await this.#commitCompatibilityPreparation(prepared);
+  }
+
+  async replaceUi(instanceId: string, spec: CapsuleUiSpec): Promise<CapsuleUiInstance> {
+    const prepared = await this.prepareUi(spec, instanceId);
+    return await this.#commitCompatibilityPreparation(prepared);
   }
 
   openUiStream(instanceId: string): Promise<Duplex> {
+    try {
+      this.#assertAcceptingWork();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return this.#serial.run(async () => {
-      const instance = this.#instances.get(instanceId);
-      if (!instance) throw new Error("App Capsule UI instance is no longer active");
+      this.#assertAcceptingWork();
+      const instance = this.#instances.get(instanceId)
+        ?? this.#preparedInstances.get(instanceId)?.candidate;
+      if (!instance) throw new Error("App Capsule UI instance is no longer active or prepared");
+      if (instance.terminalError) throw instance.terminalError;
       if (instance.viewerStreams.size >= CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE) {
         throw new Error("App viewer connection limit reached");
       }
@@ -624,9 +653,16 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   stopUi(instanceId: string): Promise<void> {
-    const known = this.#instances.get(instanceId);
+    const known = this.#instances.get(instanceId)
+      ?? this.#preparedInstances.get(instanceId)?.candidate;
     if (known) this.#abortLaunches(known.appId, "UI stop requested");
-    return this.#serial.run(async () => {
+    return this.#serial.runCritical(async () => {
+      const prepared = this.#preparedInstances.get(instanceId);
+      if (prepared) {
+        await this.#abortPreparation(prepared);
+        await this.#artifacts.pruneUnreferenced();
+        return;
+      }
       const instance = this.#instances.get(instanceId);
       if (!instance) return;
       const boot = await this.#requireCurrentBoot(instance.bootGeneration);
@@ -642,25 +678,30 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   stopApp(appId: string): Promise<void> {
     this.#abortLaunches(appId, "App stop requested");
-    return this.#serial.run(async () => {
+    return this.#serial.runCritical(async () => {
+      const preparations = [...this.#preparedUi.values()]
+        .filter((prepared) => prepared.candidate.appId === appId);
+      for (const prepared of preparations) await this.#abortPreparation(prepared);
       const records = [...this.#instances.values()].filter((record) => record.appId === appId);
-      if (records.length === 0) return;
-      const boot = await this.#requireCurrentBoot(records[0]!.bootGeneration);
-      for (const record of records) {
-        try {
-          await this.#stopRecord(record, boot);
-          this.#instances.delete(record.instanceId);
-        } catch (error) {
-          await this.#loseBoundary(error, boot);
-          throw error;
+      if (records.length > 0) {
+        const boot = await this.#requireCurrentBoot(records[0]!.bootGeneration);
+        for (const record of records) {
+          try {
+            await this.#stopRecord(record, boot);
+            this.#instances.delete(record.instanceId);
+          } catch (error) {
+            await this.#loseBoundary(error, boot);
+            throw error;
+          }
         }
       }
+      if (preparations.length > 0) await this.#artifacts.pruneUnreferenced();
     });
   }
 
   retireApp(appId: string): Promise<void> {
     this.#abortLaunches(appId, "App retirement requested");
-    return this.#serial.run(async () => {
+    return this.#serial.runCritical(async () => {
       // A boundary-loss path clears the in-memory instance registry before it
       // knows whether VZ actually stopped. Wait for an in-progress cleanup,
       // then refuse Host cache retirement if that stop remained ambiguous.
@@ -669,6 +710,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       if (this.#fatalCleanup) await this.#fatalCleanup;
       if (this.#terminalFailure) throw this.#terminalFailure;
 
+      const preparations = [...this.#preparedUi.values()]
+        .filter((prepared) => prepared.candidate.appId === appId);
+      for (const prepared of preparations) await this.#abortPreparation(prepared);
       const records = [...this.#instances.values()].filter((record) => record.appId === appId);
       if (records.length > 0) {
         const boot = await this.#requireCurrentBoot(records[0]!.bootGeneration);
@@ -704,13 +748,35 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   stopAll(): Promise<void> {
     if (this.#stopAllPromise) return this.#stopAllPromise;
-    if (this.#fatalCleanup) return this.#fatalCleanup;
+    if (this.#terminalFailure) return Promise.reject(this.#terminalFailure);
+    let resolveStop!: () => void;
+    let rejectStop!: (error: unknown) => void;
+    const shared = new Promise<void>((resolve, reject) => {
+      resolveStop = resolve;
+      rejectStop = reject;
+    });
+    // Publish before aborting launches: cancellation callbacks can reenter
+    // shutdown and must join the same physical teardown.
+    this.#stopAllPromise = shared;
     this.#stoppingAll = true;
     this.#abortAllLaunches("Capsule backend is stopping");
-    const operation = this.#serial.run(async () => {
+    let operation: Promise<void>;
+    try {
+      operation = this.#serial.runCritical(async () => {
+        if (this.#fatalCleanup) await this.#fatalCleanup;
+        if (this.#terminalFailure) throw this.#terminalFailure;
         const boot = this.#boot;
         if (boot) {
           const failures: unknown[] = [];
+          for (const prepared of [...this.#preparedUi.values()]) {
+            try {
+              await this.#discardCandidate(prepared.candidate, boot);
+            } catch (error) {
+              failures.push(error);
+            } finally {
+              this.#completePreparation(prepared, { decision: "aborted" });
+            }
+          }
           for (const record of [...this.#instances.values()]) {
             try {
               await this.#stopRecord(record, boot);
@@ -719,6 +785,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
             }
           }
           this.#instances.clear();
+          this.#preparedUi.clear();
+          this.#preparedInstances.clear();
           this.#workloads.clear();
           try {
             const result = await boot.session.request("vm.drain", {});
@@ -739,15 +807,74 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           if (pending) await this.#shutdownBoot(pending);
         }
         this.#instances.clear();
+        this.#abandonAllPreparations();
         this.#workloads.clear();
       });
-    let tracked!: Promise<void>;
-    tracked = operation.finally(() => {
-      this.#stoppingAll = false;
-      if (this.#stopAllPromise === tracked) this.#stopAllPromise = undefined;
-    });
-    this.#stopAllPromise = tracked;
-    return tracked;
+    } catch (error) {
+      operation = Promise.reject(error);
+    }
+
+    let settled = false;
+    const deadline = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const terminal = new CapsuleRestartRequiredError(
+        "Capsule shutdown exceeded its deadline; runtime is quarantined until Host restart",
+      );
+      this.#quarantineAfterStopFailure(terminal);
+      rejectStop(this.#terminalFailure);
+    }, STOP_ALL_DEADLINE_MS);
+
+    void operation.then(
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        this.#stoppingAll = false;
+        if (this.#stopAllPromise === shared) this.#stopAllPromise = undefined;
+        resolveStop();
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        const terminal = error instanceof CapsuleRestartRequiredError
+          ? error
+          : new CapsuleRestartRequiredError(
+            `Capsule shutdown was not confirmed: ${asError(error).message}; runtime is quarantined until Host restart`,
+            { cause: error },
+          );
+        this.#quarantineAfterStopFailure(terminal);
+        // Retain the shared rejected promise and the admission fence. The
+        // serial operation may have failed before reaching VM teardown.
+        rejectStop(this.#terminalFailure);
+      },
+    );
+    return shared;
+  }
+
+  #quarantineAfterStopFailure(terminal: CapsuleRestartRequiredError): void {
+    this.#terminalFailure ??= terminal;
+    const boots = new Set([
+      ...(this.#boot ? [this.#boot] : []),
+      ...this.#shuttingDownBoots.keys(),
+    ]);
+    for (const boot of boots) {
+      boot.intentional = true;
+      if (this.#boot === boot) this.#boot = undefined;
+      boot.session.close();
+      boot.helper.close();
+    }
+    const records = new Set([...this.#instances.values(), ...this.#workloads.values()]);
+    for (const record of records) {
+      record.lifecycle = "lost";
+      record.detachSystemStream();
+      for (const stream of record.viewerStreams) stream.destroy();
+      record.viewerStreams.clear();
+    }
+    this.#instances.clear();
+    this.#abandonAllPreparations();
+    this.#workloads.clear();
   }
 
   async #loadRelease(): Promise<LoadedCapsuleGuestRelease> {
@@ -798,7 +925,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         boot.intentional
         || boot.generation !== this.#bootGeneration
         || this.#fatalCleanup
+        || this.#stoppingAll
+        || this.#terminalFailure
       ) {
+        await this.#shutdownBoot(boot);
         throw new Error("Capsule Guest boundary failed during authenticated boot");
       }
       this.#boot = boot;
@@ -1738,9 +1868,245 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     }
   }
 
+  async #commitPreparation(prepared: PreparedUiRecord): Promise<CapsuleUiInstance> {
+    const candidate = prepared.candidate;
+    let boot: BootBoundary;
+    try {
+      boot = await this.#requireCurrentBoot(candidate.bootGeneration);
+    } catch (error) {
+      this.#completePreparation(prepared, { decision: "aborted" });
+      throw error;
+    }
+    if (candidate.terminalError) {
+      const error = candidate.terminalError;
+      await this.#abortPreparation(prepared, error);
+      throw error;
+    }
+
+    const previous = prepared.previousInstanceId === undefined
+      ? undefined
+      : this.#instances.get(prepared.previousInstanceId);
+    if (prepared.previousInstanceId !== undefined && !previous) {
+      await this.#abortPreparation(prepared);
+      throw new Error("Prepared replacement no longer owns its previous UI generation");
+    }
+    if (previous && (
+      previous.appId !== candidate.appId
+      || previous.bootGeneration !== candidate.bootGeneration
+    )) {
+      await this.#abortPreparation(prepared);
+      throw new Error("Prepared replacement previous UI authority changed");
+    }
+
+    let activation: ActivationCheckpoint | undefined;
+    try {
+      activation = await this.#activateCandidate(candidate, prepared.packageDigest, boot);
+    } catch (error) {
+      return await this.#failPreparedCommit(prepared, boot, error);
+    }
+
+    if (!previous) {
+      try {
+        this.#publishCandidate(candidate);
+        this.#completePreparation(prepared, {
+          decision: "committed",
+          instanceId: candidate.instanceId,
+        });
+        return { instanceId: candidate.instanceId };
+      } catch (error) {
+        return await this.#failPreparedCommit(prepared, boot, error, activation);
+      }
+    }
+
+    if (
+      this.#instances.get(previous.instanceId) !== previous
+      || previous.lifecycle !== "active"
+      || previous.terminalError
+    ) {
+      return await this.#failPreparedCommit(
+        prepared,
+        boot,
+        previous.terminalError
+          ?? new Error("Prepared replacement lost its previous UI generation during commit"),
+        activation,
+      );
+    }
+
+    candidate.lifecycle = "replacement";
+    try {
+      await this.#stopRecord(previous, boot);
+    } catch (error) {
+      let rollbackError: unknown;
+      try {
+        await this.#rollbackCandidateActivation(candidate, activation);
+      } catch (failure) {
+        rollbackError = failure;
+      }
+      try {
+        await this.#loseBoundary(error, boot);
+      } finally {
+        this.#completePreparation(prepared, { decision: "aborted" });
+      }
+      if (rollbackError !== undefined) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "Previous UI retirement and activation rollback both failed",
+        );
+      }
+      throw error;
+    }
+
+    try {
+      if (candidate.terminalError) throw candidate.terminalError;
+      this.#instances.delete(previous.instanceId);
+      this.#publishCandidate(candidate);
+      this.#completePreparation(prepared, {
+        decision: "committed",
+        instanceId: candidate.instanceId,
+      });
+      return { instanceId: candidate.instanceId };
+    } catch (error) {
+      let rollbackError: unknown;
+      try {
+        await this.#rollbackCandidateActivation(candidate, activation);
+      } catch (failure) {
+        rollbackError = failure;
+      }
+      try {
+        await this.#loseBoundary(error, boot);
+      } finally {
+        this.#completePreparation(prepared, { decision: "aborted" });
+      }
+      if (rollbackError !== undefined) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "Replacement publication and activation rollback both failed",
+        );
+      }
+      throw error;
+    }
+  }
+
+  async #commitCompatibilityPreparation(
+    prepared: CapsuleUiPreparation,
+  ): Promise<CapsuleUiInstance> {
+    try {
+      return await this.commitPreparedUi(prepared.preparationId);
+    } catch (error) {
+      try {
+        await this.abortPreparedUi(prepared.preparationId);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "App Capsule UI commit and candidate cleanup both failed",
+        );
+      }
+      throw error;
+    }
+  }
+
+  async #failPreparedCommit(
+    prepared: PreparedUiRecord,
+    boot: BootBoundary,
+    cause: unknown,
+    activation?: ActivationCheckpoint,
+  ): Promise<never> {
+    const failures: unknown[] = [cause];
+    if (activation) {
+      try {
+        await this.#rollbackCandidateActivation(prepared.candidate, activation);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    try {
+      await this.#discardCandidate(prepared.candidate, boot);
+    } catch (error) {
+      failures.push(error);
+      try {
+        await this.#loseBoundary(error, boot);
+      } catch (boundaryError) {
+        if (boundaryError !== error) failures.push(boundaryError);
+      }
+    } finally {
+      this.#completePreparation(prepared, { decision: "aborted" });
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "Candidate activation rollback or cleanup failed");
+    }
+    throw cause;
+  }
+
+  async #abortPreparation(prepared: PreparedUiRecord, outcomeError?: Error): Promise<void> {
+    let boot: BootBoundary;
+    try {
+      boot = await this.#requireCurrentBoot(prepared.candidate.bootGeneration);
+    } catch (error) {
+      this.#completePreparation(prepared, {
+        decision: "aborted",
+        ...(outcomeError === undefined ? {} : { error: outcomeError }),
+      });
+      throw error;
+    }
+    try {
+      await this.#discardCandidate(prepared.candidate, boot);
+    } catch (error) {
+      try {
+        await this.#loseBoundary(error, boot);
+      } finally {
+        this.#completePreparation(prepared, {
+          decision: "aborted",
+          ...(outcomeError === undefined ? {} : { error: outcomeError }),
+        });
+      }
+      throw error;
+    }
+    this.#completePreparation(prepared, {
+      decision: "aborted",
+      ...(outcomeError === undefined ? {} : { error: outcomeError }),
+    });
+  }
+
+  #completePreparation(prepared: PreparedUiRecord, outcome: PreparedUiOutcome): void {
+    if (this.#preparedUi.get(prepared.preparationId) === prepared) {
+      this.#preparedUi.delete(prepared.preparationId);
+    }
+    if (this.#preparedInstances.get(prepared.candidate.instanceId) === prepared) {
+      this.#preparedInstances.delete(prepared.candidate.instanceId);
+    }
+    prepared.retention.release();
+    this.#rememberPreparationOutcome(prepared.preparationId, outcome);
+  }
+
+  #abandonAllPreparations(): void {
+    for (const prepared of [...this.#preparedUi.values()]) {
+      this.#completePreparation(prepared, { decision: "aborted" });
+    }
+    this.#preparedUi.clear();
+    this.#preparedInstances.clear();
+  }
+
+  #rememberPreparationOutcome(preparationId: string, outcome: PreparedUiOutcome): void {
+    this.#preparedOutcomes.delete(preparationId);
+    this.#preparedOutcomes.set(preparationId, outcome);
+    while (this.#preparedOutcomes.size > MAX_RETAINED_PREPARATION_OUTCOMES) {
+      const oldest = this.#preparedOutcomes.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#preparedOutcomes.delete(oldest);
+    }
+  }
+
+  #allocatePreparationId(): string {
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      const id = `prepare_${randomBytes(24).toString("base64url")}`;
+      if (!this.#preparedUi.has(id) && !this.#preparedOutcomes.has(id)) return id;
+    }
+    throw new Error("Could not allocate an App Capsule UI preparation");
+  }
+
   async #activateCandidate(
     candidate: Candidate,
-    snapshot: CapsuleTreeSnapshot,
+    packageDigest: `sha256:${string}`,
     boot: BootBoundary,
   ): Promise<ActivationCheckpoint> {
     if (candidate.terminalError) throw candidate.terminalError;
@@ -1751,7 +2117,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     };
     try {
       await this.#artifacts.activate(checkpoint.appKey, candidate.artifact, {
-        packageDigest: snapshot.digest,
+        packageDigest,
         imageDigest: boot.release.handshake.expectedImageDigest,
         ...(candidate.installDigest === undefined
           ? {}
@@ -1818,6 +2184,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   async #discardCandidate(candidate: Candidate, boot: BootBoundary): Promise<void> {
     candidate.lifecycle = "stopping";
+    for (const stream of candidate.viewerStreams) stream.destroy();
+    candidate.viewerStreams.clear();
     candidate.detachSystemStream();
     const result = await boot.session.request("app.stop", { appHandle: candidate.appHandle });
     this.#parseGuestResult(boot, parseAppStopResult, result);
@@ -1899,6 +2267,39 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     if (record.lifecycle === "stopping" || record.lifecycle === "lost") return;
     record.terminalError = terminalError;
     if (record.lifecycle === "launching") return;
+    if (record.lifecycle === "prepared") {
+      const prepared = this.#preparedInstances.get(record.instanceId);
+      record.lifecycle = "lost";
+      let notificationError: unknown;
+      try {
+        this.#uiLostHandler?.({
+          instanceId: record.instanceId,
+          appId: record.appId,
+          error: terminalError,
+        });
+      } catch (error) {
+        notificationError = error;
+      }
+      for (const stream of record.viewerStreams) stream.destroy();
+      record.viewerStreams.clear();
+      if (notificationError !== undefined) {
+        this.#loseBoundaryInBackground(notificationError, boot);
+        return;
+      }
+      if (!prepared || prepared.candidate !== record) {
+        this.#loseBoundaryInBackground(
+          new Error("Prepared UI terminal event had no matching transaction"),
+          boot,
+        );
+        return;
+      }
+      void this.#serial.runCritical(async () => {
+        if (this.#preparedUi.get(prepared.preparationId) !== prepared) return;
+        await this.#abortPreparation(prepared, terminalError);
+        await this.#artifacts.pruneUnreferenced();
+      }).catch((error) => this.#loseBoundaryInBackground(error, boot));
+      return;
+    }
     if (record.lifecycle === "replacement") {
       this.#loseBoundaryInBackground(terminalError, boot);
       return;
@@ -1926,7 +2327,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       this.#loseBoundaryInBackground(notificationError, boot);
       return;
     }
-    void this.#serial.run(async () => {
+    void this.#serial.runCritical(async () => {
       try {
         const result = await boot.session.request("app.stop", { appHandle: record.appHandle });
         this.#parseGuestResult(boot, parseAppStopResult, result);
@@ -2172,6 +2573,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   async #shutdownBoot(boot: BootBoundary): Promise<void> {
+    this.#shuttingDownBoots.set(
+      boot,
+      (this.#shuttingDownBoots.get(boot) ?? 0) + 1,
+    );
     boot.intentional = true;
     if (this.#boot === boot) this.#boot = undefined;
     try {
@@ -2195,6 +2600,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       // CapsuleVmHostClient.close synchronously kills the helper transport;
       // stopGuest failure is still surfaced to the caller above.
       boot.helper.close();
+      const shutdowns = (this.#shuttingDownBoots.get(boot) ?? 1) - 1;
+      if (shutdowns === 0) this.#shuttingDownBoots.delete(boot);
+      else this.#shuttingDownBoots.set(boot, shutdowns);
     }
   }
 
@@ -2217,12 +2625,13 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     this.#abortAllLaunches(failure.message);
     const boot = expected ?? this.#boot;
     if (boot) boot.intentional = true;
-    for (const instance of this.#instances.values()) {
+    for (const instance of new Set([...this.#instances.values(), ...this.#workloads.values()])) {
       instance.detachSystemStream();
       for (const stream of instance.viewerStreams) stream.destroy();
       instance.viewerStreams.clear();
     }
     this.#instances.clear();
+    this.#abandonAllPreparations();
     this.#workloads.clear();
 
     // Publish the in-progress cleanup promise before notifying the manager, so
@@ -2282,7 +2691,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   #activeViewerStreamCount(): number {
     let streams = 0;
-    for (const instance of this.#instances.values()) streams += instance.viewerStreams.size;
+    for (const instance of new Set(this.#workloads.values())) {
+      streams += instance.viewerStreams.size;
+    }
     return streams;
   }
 
@@ -2396,6 +2807,19 @@ class BoundedSerialQueue {
     if (this.#pending >= this.limit) {
       return Promise.reject(new Error("Capsule backend operation queue is full"));
     }
+    return this.#enqueue(operation);
+  }
+
+  /**
+   * Teardown and transaction decisions must remain admissible even when
+   * ordinary work has filled the queue; otherwise a live Guest workload can
+   * outlive the Host handle which was supposed to retire it.
+   */
+  runCritical<T>(operation: () => Promise<T>): Promise<T> {
+    return this.#enqueue(operation);
+  }
+
+  #enqueue<T>(operation: () => Promise<T>): Promise<T> {
     this.#pending += 1;
     const start = this.#tail;
     let release!: () => void;

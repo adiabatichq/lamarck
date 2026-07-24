@@ -25,14 +25,19 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
   const refresh = useCallback(async () => {
     setError(null);
     setMessage(null);
-    const [host, baseUrl, startError] = await Promise.all([
+    const [host, baseUrl, startError, runtime] = await Promise.all([
       window.lamarckHost?.getWorkspacePath().catch(() => "") ?? Promise.resolve(""),
       window.lamarckHost?.getCoreBaseUrl().catch(() => "") ?? Promise.resolve(""),
       window.lamarckHost?.getCoreStartError().catch(() => null) ?? Promise.resolve(null),
+      window.lamarckHost?.getCoreRuntimeState().catch(() => null) ?? Promise.resolve(null),
     ]);
     setHostPath(host);
     setCoreBaseUrl(baseUrl);
     if (host) setWorkspacePath(host);
+    if (runtime?.phase === "starting") {
+      setCorePath("");
+      return;
+    }
     if (startError) {
       setError(startError);
       setCorePath("");
@@ -49,8 +54,8 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
   }, []);
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    void refresh();
+  }, [refresh, coreStatus]);
 
   const switchWorkspace = useCallback(
     async (nextPath: string) => {
@@ -198,10 +203,18 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
             </div>
           )}
           <div className={styles.buttonRow}>
-            <button className={styles.button} onClick={retryCore} disabled={!hasHost || busy}>
+            <button
+              className={styles.button}
+              onClick={retryCore}
+              disabled={!hasHost || busy || coreStatus === "checking"}
+            >
               Retry Core
             </button>
-            <button className={styles.button} onClick={rotateCorePort} disabled={!hasHost || busy}>
+            <button
+              className={styles.button}
+              onClick={rotateCorePort}
+              disabled={!hasHost || busy || coreStatus === "checking"}
+            >
               Rotate Port
             </button>
           </div>

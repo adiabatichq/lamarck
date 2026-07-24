@@ -12,6 +12,16 @@ interface Window {
     importRecoveryCode(recoveryCode: string): Promise<{ coreBaseUrl: string }>;
     getCoreBaseUrl(): Promise<string>;
     getCoreStartError(): Promise<string | null>;
+    getCoreRuntimeState(): Promise<{
+      generation: number;
+      phase: "starting" | "ready" | "failed";
+      error: string | null;
+    }>;
+    onCoreRuntimeState(callback: (state: {
+      generation: number;
+      phase: "starting" | "ready" | "failed";
+      error: string | null;
+    }) => void): () => void;
     retryCore(): Promise<{ coreBaseUrl: string }>;
     rotateCorePort(): Promise<{ coreBaseUrl: string }>;
     openExternal(url: string): Promise<void>;

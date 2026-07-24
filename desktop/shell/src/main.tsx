@@ -15,6 +15,8 @@ if (import.meta.env.DEV && !window.lamarckHost) {
     importRecoveryCode: async () => ({ coreBaseUrl: base }),
     getCoreBaseUrl: async () => base,
     getCoreStartError: async () => null,
+    getCoreRuntimeState: async () => ({ generation: 0, phase: "ready", error: null }),
+    onCoreRuntimeState: () => () => {},
     retryCore: async () => ({ coreBaseUrl: base }),
     rotateCorePort: async () => ({ coreBaseUrl: base }),
     openExternal: async (url: string) => {

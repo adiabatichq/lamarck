@@ -19,6 +19,14 @@ export interface CapsuleUiInstance {
   instanceId: string;
 }
 
+/**
+ * Host-private handle for a running candidate which has not changed the
+ * last-known-good activation or retired a prior UI generation.
+ */
+export interface CapsuleUiPreparation extends CapsuleUiInstance {
+  preparationId: string;
+}
+
 export interface CapsuleUiLostEvent {
   instanceId: string;
   appId: string;
@@ -76,13 +84,27 @@ export interface CapsuleBackend {
    * when the backend loses its VM/Guest containment boundary asynchronously.
    */
   setBoundaryLostHandler?(handler: (error: unknown) => void): void;
-  /** Reports an authenticated, unexpected terminal event for one live UI. */
+  /** Reports an authenticated, unexpected terminal event for one active or prepared UI. */
   setUiLostHandler?(handler: (event: CapsuleUiLostEvent) => void): void;
   status(): Promise<CapsuleBackendStatus>;
+  /**
+   * Builds and starts a streamable candidate without changing activation.
+   * When previousInstanceId is present, commit atomically replaces that exact
+   * active generation; abort leaves it untouched.
+   */
+  prepareUi(
+    spec: CapsuleUiSpec,
+    previousInstanceId?: string,
+  ): Promise<CapsuleUiPreparation>;
+  /** Commits exactly one prepared candidate. Commit and abort are mutually exclusive. */
+  commitPreparedUi(preparationId: string): Promise<CapsuleUiInstance>;
+  /** Discards exactly one prepared candidate without changing activation. */
+  abortPreparedUi(preparationId: string): Promise<void>;
+  /** Compatibility wrapper which prepares and immediately commits a new UI. */
   startUi(spec: CapsuleUiSpec): Promise<CapsuleUiInstance>;
-  /** Builds and starts a replacement before retiring the current UI. */
+  /** Compatibility wrapper which prepares and immediately commits a replacement. */
   replaceUi(instanceId: string, spec: CapsuleUiSpec): Promise<CapsuleUiInstance>;
-  /** Opens one instance-bound raw TCP stream to the declared Guest UI port. */
+  /** Opens one active or prepared instance-bound stream to the declared Guest UI port. */
   openUiStream(instanceId: string): Promise<Duplex>;
   stopUi(instanceId: string): Promise<void>;
   stopApp(appId: string): Promise<void>;
@@ -106,6 +128,19 @@ export class UnavailableCapsuleBackend implements CapsuleBackend {
   async status(): Promise<CapsuleBackendStatus> {
     return { available: false, backend: "unavailable", reason: this.reason };
   }
+
+  async prepareUi(
+    _spec: CapsuleUiSpec,
+    _previousInstanceId?: string,
+  ): Promise<CapsuleUiPreparation> {
+    throw new Error(`App Capsule unavailable: ${this.reason}`);
+  }
+
+  async commitPreparedUi(_preparationId: string): Promise<CapsuleUiInstance> {
+    throw new Error(`App Capsule unavailable: ${this.reason}`);
+  }
+
+  async abortPreparedUi(_preparationId: string): Promise<void> {}
 
   async startUi(_spec: CapsuleUiSpec): Promise<CapsuleUiInstance> {
     throw new Error(`App Capsule unavailable: ${this.reason}`);
