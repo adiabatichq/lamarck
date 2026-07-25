@@ -239,7 +239,9 @@ export function SystemRoom({
                 <button type="button" className={styles.surfaceBack} onClick={() => setShowConnectorCatalog(false)}>
                   <BackIcon /> Source console
                 </button>
-                <div className={styles.surfaceFill}><ConnectorCatalogView /></div>
+                <div className={styles.surfaceFill}>
+                  <ConnectorCatalogView onOpenConsole={() => setShowConnectorCatalog(false)} />
+                </div>
               </div>
             ) : (
               <ConnectorsView onOpenCatalog={() => setShowConnectorCatalog(true)} />

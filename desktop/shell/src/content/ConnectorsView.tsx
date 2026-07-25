@@ -24,7 +24,9 @@ import {
   startConnectorConfigPanel,
   startConnectorAuth,
   stopConnectorConfigPanelSession,
+  updateConnector,
   updateConnectorIntegration,
+  type AvailableConnectorView,
   type ConnectorIntegrationView,
   type InstalledConnectorView,
   type ConnectorRequirementView,
@@ -59,7 +61,7 @@ const PAUSE_PRESETS = [
 ] as const;
 
 export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }) {
-  const { sources, packages, loading, error, refresh } = useConnectors();
+  const { sources, packages, available, loading, error, refresh } = useConnectors();
   const [busy, setBusy] = useState<Record<string, string>>({});
   const [authPending, setAuthPending] = useState<Record<string, AuthPendingAttempt>>({});
   const [actionError, setActionError] = useState<string | null>(null);
@@ -186,6 +188,9 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
 
   const groups = useMemo(() => {
     const byConnector = new Map<string, ConnectorIntegrationView[]>();
+    const catalogByConnector = new Map(
+      available.map((entry) => [entry.connectorId, entry]),
+    );
     for (const c of sources) {
       const list = byConnector.get(c.connectorId) ?? [];
       list.push(c);
@@ -194,8 +199,9 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
     return packages.map((connector) => ({
       connector,
       integrations: byConnector.get(connector.connectorId) ?? [],
+      catalogEntry: catalogByConnector.get(connector.connectorId),
     }));
-  }, [sources, packages]);
+  }, [sources, packages, available]);
 
   const counts = useMemo(() => {
     const tally: Record<SourceLifecycle | "setup", number> = {
@@ -264,13 +270,14 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
               key={group.connector.connectorId}
               connector={group.connector}
               integrations={group.integrations}
-	              index={index}
-	              busy={busy}
-	              authPending={authPending}
-	              onAct={act}
-	              onOpenConfigPanel={openConfigPanel}
-	              onTrackAuthAttempt={trackAuthAttempt}
-	              onDismissAuthAttempt={dismissAuthAttempt}
+              catalogEntry={group.catalogEntry}
+              index={index}
+              busy={busy}
+              authPending={authPending}
+              onAct={act}
+              onOpenConfigPanel={openConfigPanel}
+              onTrackAuthAttempt={trackAuthAttempt}
+              onDismissAuthAttempt={dismissAuthAttempt}
             />
           ))
         )}
@@ -317,6 +324,7 @@ function TallyItem({
 interface ConnectorCardProps {
   connector: InstalledConnectorView;
   integrations: ConnectorIntegrationView[];
+  catalogEntry?: AvailableConnectorView;
   index: number;
   busy: Record<string, string>;
   authPending: Record<string, AuthPendingAttempt>;
@@ -329,6 +337,7 @@ interface ConnectorCardProps {
 function ConnectorCard({
   connector,
   integrations,
+  catalogEntry,
   index,
   busy,
   authPending,
@@ -338,6 +347,7 @@ function ConnectorCard({
   onDismissAuthAttempt,
 }: ConnectorCardProps) {
   const connectorId = connector.connectorId;
+  const updateAvailable = catalogEntry?.updateAvailable === true;
   const trust = trustView(connector);
   const trusted = trust === "official" || trust === "custom";
   const interactive = connector.supported && trust !== "broken";
@@ -352,20 +362,32 @@ function ConnectorCard({
         ? "broken"
         : "ready";
 
-  const [panel, setPanel] = useState<"approve" | "remove" | "add" | null>(null);
+  const [panel, setPanel] = useState<"approve" | "update" | "remove" | "add" | null>(null);
   const [addKeyInput, setAddKeyInput] = useState("");
+
+  useEffect(() => {
+    if (panel === "update" && !updateAvailable) {
+      setPanel(null);
+    }
+  }, [panel, updateAvailable]);
 
   return (
     <article
-      className={`${styles.card} ${styles[`card_${connectorCondition}`]}`}
+      className={`${styles.card} ${
+        updateAvailable && connectorCondition === "ready"
+          ? styles.card_update
+          : styles[`card_${connectorCondition}`]
+      }`}
       style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
     >
       <div className={styles.cardRail} />
       <div className={styles.cardBody}>
         <div className={styles.cardTop}>
-          <span className={`${styles.stateBadge} ${styles.tone_ready}`}>
+          <span className={`${styles.stateBadge} ${
+            updateAvailable ? styles.tone_setup : styles.tone_ready
+          }`}>
             <span className={styles.stateDot} />
-            INSTALLED
+            {updateAvailable ? "UPDATE AVAILABLE" : "INSTALLED"}
           </span>
           <h2 className={styles.cardName}>{connector.name}</h2>
           <span className={styles.cardMeta}>
@@ -378,6 +400,11 @@ function ConnectorCard({
             {trust === "broken" && <span className={styles.brokenSeal}>missing</span>}
           </span>
           <div className={styles.cardTopActions}>
+            {updateAvailable && panel !== "update" && (
+              <button className={styles.primaryBtn} onClick={() => setPanel("update")}>
+                Update connector…
+              </button>
+            )}
             {trust === "needs-approval" && panel !== "approve" && (
               <button className={styles.hazardBtn} onClick={() => setPanel("approve")}>
                 Review &amp; Approve
@@ -411,6 +438,48 @@ function ConnectorCard({
             )}
           </div>
         </div>
+
+        {panel === "update" && catalogEntry && (
+          <div className={styles.confirmPanel}>
+            <div className={styles.confirmText}>
+              Update <strong>{connector.name}</strong> from{" "}
+              <code>{shortHash(catalogEntry.installedHash ?? connector.packageHash)}</code>
+              {" → "}<code>{shortHash(catalogEntry.catalogHash)}</code>?
+              {integrations.length === 1 ? (
+                <>
+                  {" "}Its Source keeps its account, settings, schedule, pause policy, and sync
+                  progress.
+                </>
+              ) : integrations.length > 1 ? (
+                <>
+                  {" "}All {integrations.length} Sources keep their accounts, settings, schedules,
+                  pause policies, and sync progress.
+                </>
+              ) : (
+                <> The installed package will be replaced; no Sources are configured yet.</>
+              )}{" "}
+              Active runs stop during the package switch, and validation failure restores the
+              installed revision. A custom package may require approval again for its new hash.
+            </div>
+            <div className={styles.confirmActions}>
+              <button
+                className={styles.primaryBtn}
+                disabled={Boolean(busy[connectorId])}
+                onClick={() =>
+                  onAct(connectorId, "update", async () => {
+                    await updateConnector(connectorId);
+                    setPanel(null);
+                  })
+                }
+              >
+                {busy[connectorId] === "update" ? "updating…" : "Update connector"}
+              </button>
+              <button className={styles.ghostBtn} onClick={() => setPanel(null)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {panel === "approve" && (
           <div className={styles.confirmPanel}>
@@ -1159,6 +1228,11 @@ function clearAuthPendingAttempt(
   const next = { ...attempts };
   delete next[integrationId];
   return next;
+}
+
+function shortHash(hash: string | undefined): string {
+  if (!hash) return "unknown";
+  return hash.startsWith("sha256:") ? hash.slice(7, 19) : hash.slice(0, 12);
 }
 
 interface RequirementChipProps {
