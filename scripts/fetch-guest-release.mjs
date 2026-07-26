@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
-// Downloads the pinned Capsule Guest release from the public releases domain
+// Downloads the pinned Capsule Guest runtime from the public releases domain
 // into .lamarck/build/capsule-guest/release, verifying the pinned inventory,
-// every listed file, and the pinned manifest digest. Read-only against R2 —
-// no credentials involved.
+// every downloaded file, and the pinned manifest digest. The separately
+// downloadable source archive is fetched only with --include-source. Read-only
+// against R2 — no credentials involved.
 //
 //   node scripts/fetch-guest-release.mjs [--pin path] [--destination path]
+//     [--include-source]
 
 import { createHash } from "node:crypto";
 import { createWriteStream, existsSync } from "node:fs";
@@ -20,20 +22,29 @@ const pinPath = resolve(option("--pin") ?? join(root, "desktop", "capsule-guest"
 const destination = resolve(
   option("--destination") ?? join(root, ".lamarck", "build", "capsule-guest", "release"),
 );
+const includeSource = process.argv.includes("--include-source");
 
 const pin = JSON.parse(await readFile(pinPath, "utf8"));
 if (
-  pin.schemaVersion !== 1
+  ![1, 2].includes(pin.schemaVersion)
   || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(pin.imageVersion ?? "")
   || !/^sha256:[a-f0-9]{64}$/.test(pin.manifestDigest ?? "")
   || !/^sha256:[a-f0-9]{64}$/.test(pin.inventorySha256 ?? "")
   || !/^guest\/[a-z0-9/-]+\/[a-f0-9]{16}$/.test(pin.objectPrefix ?? "")
 ) throw new Error(`${pinPath} is not a valid guest pin`);
+const correspondingSource = pin.schemaVersion === 2
+  ? validateCorrespondingSource(pin.correspondingSource, pin, publicBase)
+  : undefined;
 
 if (existsSync(destination)) {
   try {
-    const existing = await validateGuestRelease(destination);
-    if (existing.descriptor.manifestDigest === pin.manifestDigest) {
+    const existing = await validateGuestRelease(destination, {
+      requireSourceArchive: includeSource,
+    });
+    if (
+      existing.descriptor.manifestDigest === pin.manifestDigest
+      && correspondingSourceMatches(existing.descriptor.correspondingSource, correspondingSource)
+    ) {
       console.log(`[guest] Pinned release already present at ${destination}`);
       process.exit(0);
     }
@@ -64,6 +75,7 @@ await mkdir(staging, { recursive: true });
 try {
   const paths = new Set();
   let aggregateBytes = 0;
+  let sourceInventoryEntry;
   for (const entry of files) {
     if (
       typeof entry.path !== "string"
@@ -77,6 +89,16 @@ try {
     paths.add(entry.path);
     aggregateBytes += entry.size;
     if (aggregateBytes > 16 * 1024 * 1024 * 1024) throw new Error("guest inventory is too large");
+    if (entry.path === correspondingSource?.file) {
+      if (
+        entry.size !== correspondingSource.bytes
+        || `sha256:${entry.sha256}` !== correspondingSource.sha256
+      ) {
+        throw new Error("guest source archive does not match the pinned metadata");
+      }
+      sourceInventoryEntry = entry;
+      if (!includeSource) continue;
+    }
     const target = join(staging, entry.path);
     await mkdir(dirname(target), { recursive: true });
     console.log(`[guest] GET ${entry.path} (${entry.size} bytes)`);
@@ -103,9 +125,17 @@ try {
       throw new Error(`guest file failed verification: ${entry.path}`);
     }
   }
-  const staged = await validateGuestRelease(staging);
+  if (correspondingSource && !sourceInventoryEntry) {
+    throw new Error("guest inventory omits the pinned source archive");
+  }
+  const staged = await validateGuestRelease(staging, {
+    requireSourceArchive: includeSource,
+  });
   if (staged.descriptor.manifestDigest !== pin.manifestDigest) {
     throw new Error("downloaded guest release does not match the pinned manifest digest");
+  }
+  if (!correspondingSourceMatches(staged.descriptor.correspondingSource, correspondingSource)) {
+    throw new Error("downloaded guest source offer does not match the repository pin");
   }
   await mkdir(dirname(destination), { recursive: true });
   await rename(staging, destination);
@@ -114,6 +144,39 @@ try {
   throw error;
 }
 console.log(`[guest] Pinned release ready at ${destination}`);
+
+function validateCorrespondingSource(value, pinValue, base) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${pinPath} has no valid corresponding-source metadata`);
+  }
+  const expectedUrl = `${base}/${pinValue.objectPrefix}/${value.file}`;
+  if (
+    value.imageVersion !== pinValue.imageVersion
+    || typeof value.file !== "string"
+    || !/^Lamarck-Capsule-Guest-[A-Za-z0-9._-]+-Open-Source\.tar\.gz$/.test(value.file)
+    || value.url !== expectedUrl
+    || !/^sha256:[a-f0-9]{64}$/.test(value.sha256 ?? "")
+    || !Number.isSafeInteger(value.bytes)
+    || value.bytes < 1
+    || value.bytes > 8 * 1024 * 1024 * 1024
+    || value.mediaType !== "application/gzip"
+    || value.format !== "tar+gzip"
+  ) throw new Error(`${pinPath} has invalid corresponding-source metadata`);
+  return value;
+}
+
+function correspondingSourceMatches(actual, expected) {
+  if (!actual || !expected) return actual === undefined && expected === undefined;
+  return [
+    "imageVersion",
+    "file",
+    "url",
+    "sha256",
+    "bytes",
+    "mediaType",
+    "format",
+  ].every((field) => actual[field] === expected[field]);
+}
 
 function option(name) {
   const index = process.argv.indexOf(name);

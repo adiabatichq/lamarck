@@ -136,4 +136,4 @@ node "$snapshot_guest/scripts/publish-guest-release.mjs" \
 	"$release_staging/release" \
 	"$release" \
 	"$build_staging/rename-excl"
-node "$snapshot_guest/scripts/verify-guest-release.mjs" "$release"
+node "$snapshot_guest/scripts/verify-guest-release.mjs" "$release" --require-source

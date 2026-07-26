@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { validateGuestRelease } from "../desktop/capsule-guest/scripts/release-contract.mjs";
 import { runPackagedNodePtySmoke } from "./macos-release-runtime.mjs";
 
 const ALPHA_BUNDLE_ID = "ai.lamarck.desktop.alpha";
@@ -71,6 +72,7 @@ const FIXED_ELECTRON_FILES = [
 
 await requireDirectory(distRoot, "renderer build output (npm run build)");
 await requireDirectory(nativeRoot, "capsule native staging (npm run capsule-guest:stage)");
+const guestRelease = await validateGuestRelease(join(nativeRoot, "capsule-guest"));
 await requireDirectory(templateRoot, "workspace template");
 await requireDirectory(electronSourceApp, "Electron.app (node node_modules/electron/install.js)");
 await requireFile(appIconSource, "Lamarck app icon");
@@ -177,6 +179,12 @@ try {
   await writeFile(join(outputRoot, `${archiveName}.sha256`), `${sha256}  ${archiveName}\n`, {
     encoding: "utf8",
   });
+  const openSource = guestRelease.descriptor.correspondingSource
+    ? {
+        purpose: "license-compliance",
+        ...guestRelease.descriptor.correspondingSource,
+      }
+    : undefined;
   await writeFile(join(outputRoot, `Lamarck-Alpha-${version}.release.json`), `${JSON.stringify({
     channel: "alpha",
     version,
@@ -185,6 +193,7 @@ try {
     bytes: size,
     pub_date: new Date().toISOString(),
     signing: "ad-hoc",
+    ...(openSource ? { openSource } : {}),
   }, null, 2)}\n`, { encoding: "utf8" });
 
   console.log(JSON.stringify({ archivePath, version, sha256, bytes: size }, null, 2));

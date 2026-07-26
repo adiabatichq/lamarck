@@ -95,10 +95,13 @@ npm run capsule-vm:build:macos
 npm start
 ```
 
-The Guest fetch verifies every downloaded artifact against the repository pin.
-The Capsule build produces an ad-hoc-signed local VM helper and stages the
-Guest into the Desktop resources. `npm start` then builds the canonical
-production Desktop output and launches it locally.
+The Guest fetch verifies every downloaded runtime artifact against the
+repository pin. The separately published corresponding-source archive is not
+needed to run Lamarck; compliance or rebuild work can fetch and verify it with
+`node scripts/fetch-guest-release.mjs --include-source`. The Capsule build
+produces an ad-hoc-signed local VM helper and stages only the Guest runtime into
+the Desktop resources. `npm start` then builds the canonical production Desktop
+output and launches it locally.
 
 On first launch, Lamarck asks you to either create a new Workspace or open an
 existing one. When creating a Workspace, the suggested location is:

@@ -405,7 +405,10 @@ try {
   assert(sbom.spdxVersion === "SPDX-2.3", "SPDX version was not generated");
   assert(sbom.packages.length === 4, "SPDX package inventory is incomplete");
   const offer = JSON.parse(await readFile(join(compliance, "corresponding-source-offer.json"), "utf8"));
-  assert(offer.fulfillment.kind === "bundled-corresponding-source", "source offer is not bundled");
+  assert(
+    offer.fulfillment.kind === "prepared-corresponding-source",
+    "source offer is not prepared for detached release packaging",
+  );
   const busyboxSource = offer.components.find((component) => component.name === "busybox")?.sourcePath;
   assert(
     busyboxSource === "corresponding-source/target-packages/busybox-1.38.0/busybox-1.38.0.tar.bz2",
@@ -470,7 +473,51 @@ try {
   await writeFile(key, privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
   const release = join(work, "release");
   runNode(join(scripts, "sign-guest-image.mjs"), [imageInput, compliance, release, key, "0.1.0"]);
-  runNode(join(scripts, "verify-guest-release.mjs"), [release]);
+  runNode(join(scripts, "verify-guest-release.mjs"), [release, "--require-source"]);
+
+  const releaseDescriptor = JSON.parse(
+    await readFile(join(release, "capsule-guest-release.json"), "utf8"),
+  );
+  assert(releaseDescriptor.schemaVersion === 2, "detached-source Guest descriptor was not emitted");
+  const sourceArchive = releaseDescriptor.correspondingSource;
+  assert(sourceArchive?.format === "tar+gzip", "source archive metadata is incomplete");
+  assert(
+    (await stat(join(release, sourceArchive.file))).size === sourceArchive.bytes,
+    "source archive size is not bound to the Guest descriptor",
+  );
+  const archiveListing = spawnSync("tar", [
+    "-tzf",
+    join(release, sourceArchive.file),
+  ], { encoding: "utf8" });
+  assert(
+    archiveListing.status === 0
+      && archiveListing.stdout.split("\n").some((path) =>
+        path.endsWith(
+          "corresponding-source/target-packages/busybox-1.38.0/busybox-1.38.0.tar.bz2",
+        )),
+    "detached archive does not contain the offered corresponding source",
+  );
+  const runtimeCompliance = await listFiles(
+    join(release, "capsule-guest-arm64", "compliance"),
+  );
+  assert(
+    !runtimeCompliance.some((path) => path.startsWith("corresponding-source/")),
+    "runtime Guest bundle still contains corresponding source",
+  );
+  const releasedOffer = JSON.parse(await readFile(
+    join(
+      release,
+      "capsule-guest-arm64",
+      "compliance",
+      "corresponding-source-offer.json",
+    ),
+    "utf8",
+  ));
+  assert(
+    releasedOffer.fulfillment.kind === "network-download"
+      && releasedOffer.fulfillment.archive.url === sourceArchive.url,
+    "signed source offer does not point to the detached immutable archive",
+  );
 
   const copiedRootfs = await stat(join(release, "capsule-guest-arm64", "rootfs.ext4"));
   assert(copiedRootfs.size === 64 * 1024 * 1024, "sparse rootfs logical size changed");
@@ -504,6 +551,21 @@ try {
   assert(staged === join(nativeRoot, "capsule-guest"), "release staged at an unexpected path");
   await stageCapsuleNative(root);
   runNode(join(scripts, "verify-guest-release.mjs"), [staged]);
+  assert(
+    !(await lstat(join(staged, sourceArchive.file)).catch(() => null)),
+    "Desktop native staging copied the developer-only source archive",
+  );
+  const stagedStrictVerification = spawnNode(
+    join(scripts, "verify-guest-release.mjs"),
+    [staged, "--require-source"],
+  );
+  assert(
+    stagedStrictVerification.status !== 0
+      && /archive is required but missing/.test(
+        stagedStrictVerification.stderr || stagedStrictVerification.stdout,
+      ),
+    "strict public-release verification accepted a runtime-only Guest projection",
+  );
 
   if (new Set(["darwin", "linux"]).has(process.platform)) {
     const publicationRoot = join(root, "publication");

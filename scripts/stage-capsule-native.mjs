@@ -5,6 +5,9 @@ import { lstat, mkdir, mkdtemp, open, rename, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  BUNDLE_NAME,
+  RELEASE_DESCRIPTOR_FILE,
+  copyAndHashSparse,
   copyTreeNoLinks,
   sha256File,
   validateGuestRelease,
@@ -52,7 +55,15 @@ export async function stageCapsuleNative(rootValue = defaultRoot, options = {}) 
   const stagingParent = await mkdtemp(join(nativeRoot, ".capsule-guest-stage-"));
   const stagingRelease = join(stagingParent, "release");
   try {
-    await copyTreeNoLinks(source, stagingRelease);
+    // Schema-v2 Guest releases keep corresponding source beside the runtime
+    // release. Stage only the descriptor and signed runtime bundle into the
+    // App; the descriptor's signed offer retains the immutable public URL.
+    await mkdir(stagingRelease, { mode: 0o700 });
+    await copyAndHashSparse(
+      join(source, RELEASE_DESCRIPTOR_FILE),
+      join(stagingRelease, RELEASE_DESCRIPTOR_FILE),
+    );
+    await copyTreeNoLinks(sourceRelease.bundle, join(stagingRelease, BUNDLE_NAME));
     await validateGuestRelease(stagingRelease);
     try {
       await rename(stagingRelease, destination);

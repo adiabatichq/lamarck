@@ -177,7 +177,8 @@ const notices = [
   "Lamarck Capsule Guest — Third-Party Notices",
   "",
   "This index is generated from Buildroot legal-info for target packages included in the Guest image.",
-  "The complete retained license texts are in licenses/. Corresponding source is in corresponding-source/.",
+  "The complete retained license texts are in licenses/.",
+  "Exact corresponding source is available as described in corresponding-source-offer.json.",
   "",
   ...packageRecords.flatMap((component) => [
     `${component.name} ${component.version}`,
@@ -199,10 +200,10 @@ const sourceOffer = {
     architecture: "arm64",
   },
   fulfillment: {
-    kind: "bundled-corresponding-source",
+    kind: "prepared-corresponding-source",
     root: "corresponding-source",
     statement:
-      "The exact source archives, applied Buildroot patches, Buildroot source, configuration, and Lamarck build sources for this release are bundled at the paths listed below.",
+      "The exact source archives, applied Buildroot patches, Buildroot source, configuration, and Lamarck build sources are prepared at the paths listed below. Release signing packages them as a separately downloadable archive.",
   },
   buildroot: {
     version: "2026.05",

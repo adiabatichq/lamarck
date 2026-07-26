@@ -57,6 +57,9 @@ if (
   || typeof release.pub_date !== "string"
   || !Number.isFinite(Date.parse(release.pub_date))
 ) throw new Error(`${releaseDocuments[0]} is not a valid alpha release document`);
+const openSource = release.openSource === undefined
+  ? undefined
+  : validatedOpenSource(release.openSource, publicBase);
 
 const archivePath = join(directory, release.file);
 const expectedSha256 = release.sha256.slice("sha256:".length);
@@ -108,6 +111,7 @@ const pointer = {
   sha256: release.sha256,
   bytes: release.bytes,
   pub_date: release.pub_date,
+  ...(openSource ? { openSource } : {}),
 };
 console.log(`[publish] PUT ${pointerKey}`);
 await store.putBuffer(pointerKey, Buffer.from(`${JSON.stringify(pointer, null, 2)}\n`, "utf8"), {
@@ -127,6 +131,44 @@ function validatedPublicBase(value) {
     || url.hash
   ) throw new Error("RELEASES_PUBLIC_BASE must be a public HTTPS origin or path");
   return url.toString().replace(/\/$/, "");
+}
+
+function validatedOpenSource(value, base) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("open-source release metadata must be an object");
+  }
+  const expectedUrlPrefix = `${base}/guest/macos/arm64/`;
+  if (
+    value.purpose !== "license-compliance"
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value.imageVersion ?? "")
+    || typeof value.file !== "string"
+    || !/^Lamarck-Capsule-Guest-[A-Za-z0-9._-]+-Open-Source\.tar\.gz$/.test(value.file)
+    || typeof value.url !== "string"
+    || !value.url.startsWith(expectedUrlPrefix)
+    || !new RegExp(`^[a-f0-9]{16}/${escapeRegExp(value.file)}$`).test(
+      value.url.slice(expectedUrlPrefix.length),
+    )
+    || !/^sha256:[a-f0-9]{64}$/.test(value.sha256 ?? "")
+    || !Number.isSafeInteger(value.bytes)
+    || value.bytes < 1
+    || value.bytes > 8 * 1024 * 1024 * 1024
+    || value.mediaType !== "application/gzip"
+    || value.format !== "tar+gzip"
+  ) throw new Error("open-source release metadata is invalid");
+  return {
+    purpose: "license-compliance",
+    imageVersion: value.imageVersion,
+    file: value.file,
+    url: value.url,
+    sha256: value.sha256,
+    bytes: value.bytes,
+    mediaType: "application/gzip",
+    format: "tar+gzip",
+  };
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 async function fetchWithRetry(url) {

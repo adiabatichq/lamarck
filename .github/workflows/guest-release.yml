@@ -73,6 +73,7 @@ jobs:
       - name: Build, sign, and boot-smoke Guest release
         env:
           LAMARCK_GUEST_IMAGE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASES_PUBLIC_BASE: ${{ vars.RELEASES_PUBLIC_BASE || 'https://releases.lamarck.ai' }}
           SOURCE_DATE_EPOCH: "0"
         run: npm run capsule-guest:image
 
@@ -93,7 +94,10 @@ jobs:
       - name: Verify release through the public domain
         env:
           RELEASES_PUBLIC_BASE: ${{ vars.RELEASES_PUBLIC_BASE || 'https://releases.lamarck.ai' }}
-        run: node scripts/fetch-guest-release.mjs --destination "${RUNNER_TEMP}/guest-public-verification"
+        run: >-
+          node scripts/fetch-guest-release.mjs
+          --destination "${RUNNER_TEMP}/guest-public-verification"
+          --include-source
 
       - name: Upload Guest pin proposal
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

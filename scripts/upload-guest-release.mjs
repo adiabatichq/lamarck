@@ -7,7 +7,8 @@
 //
 // Object layout (all writes this script performs):
 //   guest/macos/arm64/<manifest digest, first 16 hex>/<every file of the
-//     release tree: capsule-guest-release.json, capsule-guest-arm64/...>
+//     release tree: capsule-guest-release.json, capsule-guest-arm64/...,
+//     and the separately downloadable corresponding-source archive>
 //   guest/macos/arm64/<digest16>/files.json   <- upload inventory, written
 //                                                last; its presence marks the
 //                                                prefix complete
@@ -19,22 +20,27 @@
 
 import { readdir, writeFile } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
-import { validateGuestRelease } from "../desktop/capsule-guest/scripts/release-contract.mjs";
+import {
+  GUEST_RELEASE_PREFIX,
+  validateGuestRelease,
+} from "../desktop/capsule-guest/scripts/release-contract.mjs";
 import { r2StoreFromEnvironment } from "./r2-object-store.mjs";
 
-const GUEST_PREFIX = "guest/macos/arm64";
 const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const source = resolve(process.argv[2] ?? join(root, ".lamarck", "build", "capsule-guest", "release"));
 const bucket = process.env.R2_RELEASES_BUCKET ?? "lamarck-desktop-releases-prod";
 
-const { descriptor, manifest } = await validateGuestRelease(source);
+const { descriptor, manifest } = await validateGuestRelease(source, {
+  requireSourceArchive: true,
+});
 const digest = descriptor.manifestDigest;
 if (!/^sha256:[a-f0-9]{64}$/.test(digest)) {
   throw new Error("guest release descriptor has no valid manifest digest");
 }
-const objectPrefix = `${GUEST_PREFIX}/${digest.slice("sha256:".length, "sha256:".length + 16)}`;
+const objectPrefix =
+  `${GUEST_RELEASE_PREFIX}/${digest.slice("sha256:".length, "sha256:".length + 16)}`;
 
 const store = r2StoreFromEnvironment(bucket);
 const inventoryKey = `${objectPrefix}/files.json`;
@@ -48,7 +54,9 @@ const inventory = [];
 for (const relativePath of files) {
   const key = `${objectPrefix}/${relativePath}`;
   const uploaded = await store.putFileImmutable(key, join(source, relativePath), {
-    contentType: "application/octet-stream",
+    contentType: relativePath === descriptor.correspondingSource?.file
+      ? descriptor.correspondingSource.mediaType
+      : "application/octet-stream",
     cacheControl: IMMUTABLE_CACHE,
   });
   console.log(`[guest] ${uploaded.uploaded ? "PUT" : "KEEP"} ${key}`);
@@ -68,11 +76,14 @@ console.log(`[guest] ${inventoryResult.uploaded ? "PUT" : "KEEP"} ${inventoryKey
 
 const pinPath = join(root, "desktop", "capsule-guest", "release-pin.json");
 await writeFile(pinPath, `${JSON.stringify({
-  schemaVersion: 1,
+  schemaVersion: descriptor.schemaVersion,
   imageVersion: manifest.imageVersion,
   manifestDigest: digest,
   inventorySha256: `sha256:${inventoryResult.sha256}`,
   objectPrefix,
+  ...(descriptor.correspondingSource
+    ? { correspondingSource: descriptor.correspondingSource }
+    : {}),
 }, null, 2)}\n`, "utf8");
 console.log(`[guest] Wrote ${pinPath}; commit it so CI builds against this release`);
 

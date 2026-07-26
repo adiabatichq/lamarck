@@ -13,6 +13,7 @@ import { dirname, join, resolve, sep } from "node:path";
 export const RELEASE_DESCRIPTOR_FILE = "capsule-guest-release.json";
 export const ARCHITECTURE = "arm64";
 export const BUNDLE_NAME = `capsule-guest-${ARCHITECTURE}`;
+export const GUEST_RELEASE_PREFIX = "guest/macos/arm64";
 export const EXPECTED_FEATURES = Object.freeze([
   "artifact-adoption-receipt-v1",
   "artifact-erofs-v1",
@@ -29,15 +30,35 @@ const PUBLIC_KEY_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 128 * 1024 * 1024 * 1024;
 
-export async function validateGuestRelease(rootValue) {
+export async function validateGuestRelease(rootValue, options = {}) {
   const root = await requireDirectory(rootValue, "Guest release root");
-  const rootFiles = await listEntries(root);
-  if (JSON.stringify(rootFiles) !== JSON.stringify([BUNDLE_NAME, RELEASE_DESCRIPTOR_FILE].sort())) {
-    throw new Error("Guest release root contains unexpected entries");
-  }
   const descriptor = exactReleaseDescriptor(
     JSON.parse(await readSmallRegularFile(join(root, RELEASE_DESCRIPTOR_FILE), MAX_JSON_BYTES)),
   );
+  const expectedRootFiles = [BUNDLE_NAME, RELEASE_DESCRIPTOR_FILE];
+  const sourceArchive = descriptor.correspondingSource;
+  const sourceArchivePath = sourceArchive ? join(root, sourceArchive.file) : null;
+  const sourceArchiveDetails = sourceArchivePath
+    ? await lstatIfPresent(sourceArchivePath)
+    : undefined;
+  if (sourceArchiveDetails) {
+    if (
+      !sourceArchiveDetails.isFile()
+      || sourceArchiveDetails.isSymbolicLink()
+      || sourceArchiveDetails.size !== sourceArchive.bytes
+      || `sha256:${await sha256File(sourceArchivePath)}` !== sourceArchive.sha256
+    ) {
+      throw new Error("Guest corresponding-source archive does not match its signed metadata");
+    }
+    expectedRootFiles.push(sourceArchive.file);
+  } else if (sourceArchive && options.requireSourceArchive === true) {
+    throw new Error("Guest corresponding-source archive is required but missing");
+  }
+  const rootFiles = await listEntries(root);
+  expectedRootFiles.sort((left, right) => left.localeCompare(right, "en"));
+  if (JSON.stringify(rootFiles) !== JSON.stringify(expectedRootFiles)) {
+    throw new Error("Guest release root contains unexpected entries");
+  }
   const bundle = await requireDirectory(join(root, descriptor.bundleRelativePath), "Guest image bundle");
   const manifestBytes = await readSmallRegularBytes(join(bundle, "manifest.json"), MAX_JSON_BYTES);
   const manifestDigest = `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`;
@@ -103,8 +124,26 @@ export async function validateGuestRelease(rootValue) {
   if (![...compliancePaths].some((path) => path.startsWith("compliance/licenses/"))) {
     throw new Error("release contains no retained license texts");
   }
-  if (![...compliancePaths].some((path) => path.startsWith("compliance/corresponding-source/"))) {
-    throw new Error("release contains no corresponding source");
+  const bundledSourcePaths = [...compliancePaths]
+    .filter((path) => path.startsWith("compliance/corresponding-source/"));
+  if (descriptor.schemaVersion === 1 && bundledSourcePaths.length === 0) {
+    throw new Error("legacy release contains no bundled corresponding source");
+  }
+  if (descriptor.schemaVersion === 2 && bundledSourcePaths.length !== 0) {
+    throw new Error("detached-source release bundles corresponding source in the runtime");
+  }
+  if (descriptor.schemaVersion === 2) {
+    const offer = exactSourceOffer(JSON.parse(await readSmallRegularFile(
+      join(bundle, "compliance", "corresponding-source-offer.json"),
+      MAX_JSON_BYTES,
+    )));
+    if (
+      offer.subject.imageVersion !== manifest.imageVersion
+      || offer.subject.architecture !== descriptor.architecture
+      || !correspondingSourceMatches(offer.fulfillment.archive, sourceArchive)
+    ) {
+      throw new Error("corresponding-source offer does not match the Guest release");
+    }
   }
   const actualCompliance = (await listRegularFiles(join(bundle, "compliance")))
     .map((path) => `compliance/${path}`);
@@ -125,7 +164,14 @@ export async function validateGuestRelease(rootValue) {
   if (JSON.stringify(actualBundleFiles) !== JSON.stringify([...expectedBundleFiles].sort())) {
     throw new Error("Guest image bundle contains unsigned or unexpected files");
   }
-  return { root, bundle, descriptor, manifest, complianceManifest };
+  return {
+    root,
+    bundle,
+    descriptor,
+    manifest,
+    complianceManifest,
+    sourceArchivePath: sourceArchiveDetails ? sourceArchivePath : undefined,
+  };
 }
 
 export async function copyAndHashSparse(sourceValue, destinationValue) {
@@ -251,13 +297,23 @@ export function publicKeyFromRaw(raw) {
 }
 
 function exactReleaseDescriptor(value) {
-  const object = exactObject(value, "$", [
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("$ must be an object");
+  }
+  const schemaVersion = value.schemaVersion;
+  const fields = [
     "schemaVersion", "vmWireVersion", "guestProtocolVersion", "architecture",
     "bundleRelativePath", "manifestDigest", "pinnedEd25519PublicKey", "supervisorVersion",
     "features", "runtimeAbi", "nodeVersion", "nodeModulesAbi", "libc", "cpuCount",
     "memorySizeBytes", "stateFormatVersion",
-  ]);
-  if (object.schemaVersion !== 1 || object.vmWireVersion !== 2 || object.guestProtocolVersion !== 2) {
+  ];
+  if (schemaVersion === 2) fields.push("correspondingSource");
+  const object = exactObject(value, "$", fields);
+  if (
+    ![1, 2].includes(object.schemaVersion)
+    || object.vmWireVersion !== 2
+    || object.guestProtocolVersion !== 2
+  ) {
     throw new Error("unsupported Guest release descriptor version");
   }
   if (object.architecture !== ARCHITECTURE || object.bundleRelativePath !== BUNDLE_NAME) {
@@ -278,6 +334,80 @@ function exactReleaseDescriptor(value) {
     || object.memorySizeBytes !== 4 * 1024 * 1024 * 1024
     || object.stateFormatVersion !== 1
   ) throw new Error("Guest runtime descriptor does not match the pinned runtime");
+  if (object.schemaVersion === 2) {
+    object.correspondingSource = exactCorrespondingSource(
+      object.correspondingSource,
+      "$.correspondingSource",
+    );
+  }
+  return object;
+}
+
+function exactCorrespondingSource(value, label) {
+  const object = exactObject(value, label, [
+    "imageVersion", "file", "url", "sha256", "bytes", "mediaType", "format",
+  ]);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(object.imageVersion ?? "")) {
+    throw new Error(`${label}.imageVersion is invalid`);
+  }
+  if (
+    typeof object.file !== "string"
+    || !/^Lamarck-Capsule-Guest-[A-Za-z0-9._-]+-Open-Source\.tar\.gz$/.test(object.file)
+  ) {
+    throw new Error(`${label}.file is invalid`);
+  }
+  const url = validatedHttpsUrl(object.url, `${label}.url`);
+  if (!url.pathname.endsWith(`/${object.file}`)) {
+    throw new Error(`${label}.url does not name its source archive`);
+  }
+  digest(object.sha256, `${label}.sha256`);
+  if (!Number.isSafeInteger(object.bytes) || object.bytes < 1 || object.bytes > MAX_ARTIFACT_BYTES) {
+    throw new Error(`${label}.bytes is invalid`);
+  }
+  if (object.mediaType !== "application/gzip" || object.format !== "tar+gzip") {
+    throw new Error(`${label} archive format is invalid`);
+  }
+  return object;
+}
+
+function exactSourceOffer(value) {
+  const object = exactObject(value, "$", [
+    "schemaVersion", "subject", "fulfillment", "buildroot", "components", "files",
+  ]);
+  if (object.schemaVersion !== 2) throw new Error("unsupported corresponding-source offer version");
+  object.subject = exactObject(object.subject, "$.subject", ["name", "imageVersion", "architecture"]);
+  if (
+    object.subject.name !== "Lamarck Capsule Guest"
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(object.subject.imageVersion ?? "")
+    || object.subject.architecture !== ARCHITECTURE
+  ) {
+    throw new Error("corresponding-source offer subject is invalid");
+  }
+  object.fulfillment = exactObject(
+    object.fulfillment,
+    "$.fulfillment",
+    ["kind", "archive", "statement"],
+  );
+  if (
+    object.fulfillment.kind !== "network-download"
+    || typeof object.fulfillment.statement !== "string"
+    || object.fulfillment.statement.length < 20
+  ) {
+    throw new Error("corresponding-source fulfillment is invalid");
+  }
+  object.fulfillment.archive = exactCorrespondingSource(
+    object.fulfillment.archive,
+    "$.fulfillment.archive",
+  );
+  if (!object.buildroot || typeof object.buildroot !== "object" || Array.isArray(object.buildroot)) {
+    throw new Error("corresponding-source Buildroot metadata is invalid");
+  }
+  if (!Array.isArray(object.components) || object.components.length === 0) {
+    throw new Error("corresponding-source component inventory is empty");
+  }
+  if (!Array.isArray(object.files) || object.files.length === 0) {
+    throw new Error("corresponding-source file inventory is empty");
+  }
   return object;
 }
 
@@ -316,7 +446,9 @@ function exactImageManifest(value) {
 
 function exactComplianceManifest(value) {
   const object = exactObject(value, "$", ["schemaVersion", "subjectManifestDigest", "files"]);
-  if (object.schemaVersion !== 1) throw new Error("unsupported compliance manifest version");
+  if (![1, 2].includes(object.schemaVersion)) {
+    throw new Error("unsupported compliance manifest version");
+  }
   digest(object.subjectManifestDigest, "$.subjectManifestDigest");
   if (!Array.isArray(object.files) || object.files.length < 5 || object.files.length > 100_000) {
     throw new Error("compliance manifest file list is invalid");
@@ -373,6 +505,47 @@ async function requireDirectory(value, label) {
   const details = await lstat(path);
   if (!details.isDirectory() || details.isSymbolicLink()) throw new Error(`${label} is not a real directory`);
   return await realpath(path);
+}
+
+async function lstatIfPresent(path) {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function validatedHttpsUrl(value, label) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${label} is invalid`);
+  }
+  if (
+    url.protocol !== "https:"
+    || url.username
+    || url.password
+    || url.search
+    || url.hash
+  ) {
+    throw new Error(`${label} must be a public HTTPS URL`);
+  }
+  return url;
+}
+
+function correspondingSourceMatches(actual, expected) {
+  if (!actual || !expected) return false;
+  return [
+    "imageVersion",
+    "file",
+    "url",
+    "sha256",
+    "bytes",
+    "mediaType",
+    "format",
+  ].every((field) => actual[field] === expected[field]);
 }
 
 async function listEntries(root) {
