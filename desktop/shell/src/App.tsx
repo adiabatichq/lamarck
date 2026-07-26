@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppLauncher } from "./components/AppLauncher";
 import { SchemaApprovalModal } from "./components/SchemaApprovalModal";
+import { WorkspaceSetup } from "./components/WorkspaceSetup";
 import { WorkingTreeConflictModal } from "./components/WorkingTreeConflictModal";
 import { AppRuntimeView } from "./content/AppRuntimeView";
 import { UseWorkspace } from "./layout/UseWorkspace";
@@ -22,24 +23,84 @@ import {
   resolveCoreRequestFailure,
   type CoreStatus,
 } from "./lib/core-availability";
+import {
+  loadUseState,
+  type StoredUseState,
+  useWorkspaceStateKey,
+} from "./lib/use-workspace-state";
 import { SystemRoom } from "./system/SystemRoom";
 import "./styles/global.css";
 
 type ShellMode = "use" | "system";
 
-interface StoredUseState {
-  pinnedIds: string[];
-  recentIds: string[];
-  activeAppId: string | null;
+export function App() {
+  const [hostWorkspaceState, setHostWorkspaceState] = useState<HostWorkspaceState | null>(null);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const host = window.lamarckHost;
+    if (!host) {
+      setBootstrapError("The Lamarck Host is unavailable.");
+      return;
+    }
+    void host.getWorkspaceState()
+      .then((state) => {
+        if (!cancelled) setHostWorkspaceState(state);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setBootstrapError(error instanceof Error ? error.message : String(error));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (bootstrapError) {
+    return (
+      <main className="workspace-bootstrap-message">
+        <span>Lamarck</span>
+        <p>{bootstrapError}</p>
+        <button type="button" onClick={() => window.location.reload()}>Try again</button>
+      </main>
+    );
+  }
+
+  if (!hostWorkspaceState) {
+    return (
+      <main className="workspace-bootstrap-message" aria-live="polite">
+        <span>Lamarck</span>
+        <p>Preparing your Workspace…</p>
+      </main>
+    );
+  }
+
+  if (hostWorkspaceState.status === "setup") {
+    const setupState = hostWorkspaceState;
+    return (
+      <WorkspaceSetup
+        state={setupState}
+        onReady={(nextWorkspace) => {
+          setHostWorkspaceState({
+            status: "ready",
+            workspace: nextWorkspace,
+          });
+        }}
+      />
+    );
+  }
+
+  return (
+    <ActiveWorkspaceShell
+      key={hostWorkspaceState.workspace.vaultId}
+      workspace={hostWorkspaceState.workspace}
+    />
+  );
 }
 
-const EMPTY_USE_STATE: StoredUseState = {
-  pinnedIds: [],
-  recentIds: [],
-  activeAppId: null,
-};
-
-export function App() {
+function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescriptor }) {
   const [mode, setMode] = useState<ShellMode>("use");
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [apps, setApps] = useState<AppInfo[]>([]);
@@ -50,8 +111,11 @@ export function App() {
   const [workingTreeConflictOpen, setWorkingTreeConflictOpen] = useState(false);
   const [lamarckSession, setLamarckSession] = useState<LamarckSessionView>({ status: "signed_out" });
   const [identityBusy, setIdentityBusy] = useState(false);
-  const [storageKey, setStorageKey] = useState<string | null>(null);
-  const [workspaceState, setWorkspaceState] = useState<StoredUseState>(EMPTY_USE_STATE);
+  const storageKey = useWorkspaceStateKey(workspace.vaultId);
+  const [workspaceState, setWorkspaceState] = useState<StoredUseState>(() => loadUseState(
+    window.localStorage,
+    workspace.vaultId,
+  ));
   const appRefreshSequence = useRef(0);
 
   const uiApps = useMemo(() => apps.filter(isUiApp), [apps]);
@@ -61,21 +125,12 @@ export function App() {
   );
 
   useEffect(() => {
-    let cancelled = false;
-    void (window.lamarckHost?.getWorkspacePath() ?? Promise.resolve("browser"))
-      .catch(() => "browser")
-      .then((path) => {
-        if (cancelled) return;
-        const key = `lamarck.use-workspace.v1:${path || "browser"}`;
-        setStorageKey(key);
-        setWorkspaceState(readUseState(key));
-      });
-    return () => { cancelled = true; };
-  }, []);
-
-  useEffect(() => {
-    if (!storageKey) return;
-    window.localStorage.setItem(storageKey, JSON.stringify(workspaceState));
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(workspaceState));
+    } catch {
+      // UI state is a convenience cache; a full Storage area must not break
+      // the active Workspace.
+    }
   }, [storageKey, workspaceState]);
 
   const refreshApps = useCallback(async () => {
@@ -367,24 +422,6 @@ export function App() {
       />
     </>
   );
-}
-
-function readUseState(key: string): StoredUseState {
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(key) ?? "null") as Partial<StoredUseState> | null;
-    if (!parsed || typeof parsed !== "object") return EMPTY_USE_STATE;
-    return {
-      pinnedIds: stringArray(parsed.pinnedIds),
-      recentIds: stringArray(parsed.recentIds),
-      activeAppId: typeof parsed.activeAppId === "string" ? parsed.activeAppId : null,
-    };
-  } catch {
-    return EMPTY_USE_STATE;
-  }
-}
-
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 function arraysEqual(left: string[], right: string[]): boolean {

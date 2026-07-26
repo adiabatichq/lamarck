@@ -49,28 +49,36 @@ describe("Electron App/Shell web policy", () => {
   });
 
   test("rotates the viewer origin with every Host-issued browser generation", () => {
-    const first = appViewerOriginHost("/Users/person/Lamarck", "weather", "channel-one");
+    const vaultId = "AbCdEfGhIjKlMnOpQrStUv";
+    const otherVaultId = "ZyXwVuTsRqPoNmLkJiHgFe";
+    const first = appViewerOriginHost(vaultId, "weather", "channel-one");
     const replacement = appViewerOriginHost(
-      "/Users/person/Lamarck",
+      vaultId,
       "weather",
       "channel-two",
     );
+    const otherWorkspace = appViewerOriginHost(
+      otherVaultId,
+      "weather",
+      "channel-one",
+    );
     expect(first).toMatch(/^[a-f0-9]{32}\.localhost$/);
     expect(replacement).not.toBe(first);
+    expect(otherWorkspace).not.toBe(first);
     const firstPartition = appViewerPartition(
-      "/Users/person/Lamarck",
+      vaultId,
       "weather",
       "channel-one",
     );
     const replacementPartition = appViewerPartition(
-      "/Users/person/Lamarck",
+      vaultId,
       "weather",
       "channel-two",
     );
     expect(firstPartition).toMatch(/^lamarck-app-[a-f0-9]{32}$/);
     expect(firstPartition).not.toMatch(/^persist:/);
     expect(replacementPartition).not.toBe(firstPartition);
-    expect(() => appViewerOriginHost("/Users/person/Lamarck", "weather", ""))
+    expect(() => appViewerOriginHost(vaultId, "weather", ""))
       .toThrow("generation");
   });
 

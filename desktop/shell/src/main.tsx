@@ -22,9 +22,19 @@ if (import.meta.env.DEV && !window.lamarckHost) {
     openExternal: async (url: string) => {
       window.open(url, "_blank", "noopener");
     },
-    getWorkspacePath: async () => "",
+    getWorkspaceState: async () => ({
+      status: "ready" as const,
+      workspace: { path: "browser", vaultId: "browser" },
+    }),
     chooseWorkspacePath: async () => ({ path: null }),
-    setWorkspacePath: async (path: string) => ({ path }),
+    createWorkspace: async (path: string) => ({
+      status: "ready" as const,
+      workspace: { path, vaultId: "browser" },
+    }),
+    openWorkspace: async (path: string) => ({
+      status: "ready" as const,
+      workspace: { path, vaultId: "browser" },
+    }),
     onOpenLauncher: () => () => {},
     openAppViewer: async () => ({
       ok: false as const,

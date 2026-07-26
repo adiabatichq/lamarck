@@ -15,9 +15,16 @@ contextBridge.exposeInMainWorld("lamarckHost", {
   retryCore: () => ipcRenderer.invoke("core:retry"),
   rotateCorePort: () => ipcRenderer.invoke("core:rotatePort"),
   openExternal: (url) => ipcRenderer.invoke("shell:openExternal", url),
-  getWorkspacePath: () => ipcRenderer.invoke("workspace:get"),
-  chooseWorkspacePath: () => ipcRenderer.invoke("workspace:choose"),
-  setWorkspacePath: (path) => ipcRenderer.invoke("workspace:set", path),
+  getWorkspaceState: () => ipcRenderer.invoke("workspace:getState"),
+  chooseWorkspacePath: (purpose) => ipcRenderer.invoke("workspace:choose", purpose),
+  createWorkspace: (path, options) => ipcRenderer.invoke("workspace:create", {
+    path,
+    includeStarterApps: options.includeStarterApps,
+  }),
+  openWorkspace: (path, recoveryCode) => ipcRenderer.invoke("workspace:open", {
+    path,
+    ...(recoveryCode === undefined ? {} : { recoveryCode }),
+  }),
   onOpenLauncher: (callback) => {
     const listener = () => callback();
     ipcRenderer.on("shell:open-launcher", listener);

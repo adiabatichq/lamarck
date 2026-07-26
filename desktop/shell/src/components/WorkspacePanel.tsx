@@ -1,4 +1,4 @@
-// WorkspacePanel — shows the active workspace and lets the Electron host switch it.
+// WorkspacePanel — shows the active workspace and explicit create/open actions.
 
 import { useCallback, useEffect, useState } from "react";
 import { clearCoreBaseUrlCache, getWorkspace } from "../lib/api";
@@ -10,12 +10,14 @@ interface WorkspacePanelProps {
 }
 
 export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProps) {
-  const [workspacePath, setWorkspacePath] = useState("");
+  const [workspace, setWorkspace] = useState<HostWorkspaceDescriptor | null>(null);
   const [corePath, setCorePath] = useState("");
-  const [hostPath, setHostPath] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [coreBaseUrl, setCoreBaseUrl] = useState("");
+  const [includeStarterApps, setIncludeStarterApps] = useState(true);
+  const [pendingOpen, setPendingOpen] = useState<HostWorkspaceDescriptor | null>(null);
+  const [pendingRecoveryInput, setPendingRecoveryInput] = useState("");
   const [recoveryCode, setRecoveryCode] = useState("");
   const [recoveryInput, setRecoveryInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -25,15 +27,14 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
   const refresh = useCallback(async () => {
     setError(null);
     setMessage(null);
-    const [host, baseUrl, startError, runtime] = await Promise.all([
-      window.lamarckHost?.getWorkspacePath().catch(() => "") ?? Promise.resolve(""),
+    const [hostState, baseUrl, startError, runtime] = await Promise.all([
+      window.lamarckHost?.getWorkspaceState().catch(() => null) ?? Promise.resolve(null),
       window.lamarckHost?.getCoreBaseUrl().catch(() => "") ?? Promise.resolve(""),
       window.lamarckHost?.getCoreStartError().catch(() => null) ?? Promise.resolve(null),
       window.lamarckHost?.getCoreRuntimeState().catch(() => null) ?? Promise.resolve(null),
     ]);
-    setHostPath(host);
+    setWorkspace(hostState?.status === "ready" ? hostState.workspace : null);
     setCoreBaseUrl(baseUrl);
-    if (host) setWorkspacePath(host);
     if (runtime?.phase === "starting") {
       setCorePath("");
       return;
@@ -46,7 +47,6 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
     try {
       const core = await getWorkspace();
       setCorePath(core.path);
-      setWorkspacePath(host || core.path);
     } catch (err) {
       setCorePath("");
       setError(err instanceof Error ? err.message : String(err));
@@ -57,57 +57,93 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
     void refresh();
   }, [refresh, coreStatus]);
 
-  const switchWorkspace = useCallback(
-    async (nextPath: string) => {
-      if (!window.lamarckHost) return;
-      const normalized = nextPath.trim();
-      if (!normalized) {
-        setError("Workspace path is required.");
-        return;
-      }
-      setBusy(true);
-      setError(null);
-      setMessage("Switching workspace...");
-      try {
-        const result = await window.lamarckHost.setWorkspacePath(normalized);
-        clearCoreBaseUrlCache();
-        setWorkspacePath(result.path);
-        setHostPath(result.path);
-        setCorePath(result.path);
-        setMessage("Workspace switched. Reloading shell...");
-        await onCoreChanged();
-        window.setTimeout(() => window.location.reload(), 250);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-        setMessage(null);
-      } finally {
-        setBusy(false);
-      }
+  const finishWorkspaceSwitch = useCallback(
+    async (nextWorkspace: HostWorkspaceDescriptor) => {
+      clearCoreBaseUrlCache();
+      setWorkspace(nextWorkspace);
+      setCorePath(nextWorkspace.path);
+      setPendingOpen(null);
+      setPendingRecoveryInput("");
+      setRecoveryCode("");
+      setMessage("Workspace ready. Reloading shell...");
+      await onCoreChanged();
+      window.setTimeout(() => window.location.reload(), 250);
     },
     [onCoreChanged],
   );
 
-  const chooseWorkspace = useCallback(async () => {
+  const createWorkspace = useCallback(async () => {
     if (!window.lamarckHost) return;
     setBusy(true);
     setError(null);
     setMessage(null);
+    setPendingOpen(null);
+    setPendingRecoveryInput("");
     try {
-      const result = await window.lamarckHost.chooseWorkspacePath();
-      if (!result.path) return;
-      clearCoreBaseUrlCache();
-      setWorkspacePath(result.path);
-      setHostPath(result.path);
-      setCorePath(result.path);
-      setMessage("Workspace switched. Reloading shell...");
-      await onCoreChanged();
-      window.setTimeout(() => window.location.reload(), 250);
+      const selection = await window.lamarckHost.chooseWorkspacePath("create");
+      if (!selection.path) return;
+      setMessage("Creating workspace...");
+      const result = await window.lamarckHost.createWorkspace(selection.path, {
+        includeStarterApps,
+      });
+      await finishWorkspaceSwitch(result.workspace);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      setMessage(null);
     } finally {
       setBusy(false);
     }
-  }, [onCoreChanged]);
+  }, [finishWorkspaceSwitch, includeStarterApps]);
+
+  const openWorkspace = useCallback(async () => {
+    if (!window.lamarckHost) return;
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    setPendingOpen(null);
+    setPendingRecoveryInput("");
+    try {
+      const selection = await window.lamarckHost.chooseWorkspacePath("open");
+      if (!selection.path) return;
+      setMessage("Opening workspace...");
+      const result = await window.lamarckHost.openWorkspace(selection.path);
+      if (result.status === "recovery-required") {
+        setPendingOpen(result.workspace);
+        setMessage("This workspace needs its recovery code on this device.");
+        return;
+      }
+      await finishWorkspaceSwitch(result.workspace);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setMessage(null);
+    } finally {
+      setBusy(false);
+    }
+  }, [finishWorkspaceSwitch]);
+
+  const openWorkspaceWithRecovery = useCallback(async () => {
+    if (!window.lamarckHost || !pendingOpen || !pendingRecoveryInput.trim()) return;
+    setBusy(true);
+    setError(null);
+    setMessage("Unlocking workspace...");
+    try {
+      const result = await window.lamarckHost.openWorkspace(
+        pendingOpen.path,
+        pendingRecoveryInput.trim(),
+      );
+      if (result.status === "recovery-required") {
+        setError("The recovery code did not unlock this workspace.");
+        setMessage(null);
+        return;
+      }
+      await finishWorkspaceSwitch(result.workspace);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setMessage(null);
+    } finally {
+      setBusy(false);
+    }
+  }, [finishWorkspaceSwitch, pendingOpen, pendingRecoveryInput]);
 
   const retryCore = useCallback(async () => {
     if (!window.lamarckHost) return;
@@ -176,6 +212,8 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
     }
   }, [onCoreChanged, recoveryInput, refresh]);
 
+  const shownPath = workspace?.path || corePath;
+
   return (
     <div className={styles.panel}>
       <div className={styles.header}>
@@ -221,38 +259,94 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
         </section>
 
         <section className={styles.section}>
-          <div className={styles.label}>Path</div>
-          <input
-            className={styles.input}
-            value={workspacePath}
-            onChange={(event) => setWorkspacePath(event.target.value)}
-            readOnly={!hasHost || busy}
-            spellCheck={false}
-          />
+          <div className={styles.label}>Current Workspace</div>
+          <div className={styles.metaBlock}>
+            <div className={styles.metaRow}>
+              <span className={styles.metaLabel}>Path</span>
+              <span className={styles.metaValue} title={shownPath || "Unknown"}>
+                {shownPath || "Unknown"}
+              </span>
+            </div>
+            <div className={styles.metaRow}>
+              <span className={styles.metaLabel}>Workspace ID</span>
+              <span className={styles.metaValue} title={workspace?.vaultId || "Unavailable"}>
+                {workspace?.vaultId || "Unavailable"}
+              </span>
+            </div>
+          </div>
+
+          <label className={styles.checkboxRow}>
+            <input
+              type="checkbox"
+              checked={includeStarterApps}
+              onChange={(event) => setIncludeStarterApps(event.target.checked)}
+              disabled={!hasHost || busy}
+            />
+            <span>
+              Include starter apps
+              <small>Used only when creating a new workspace.</small>
+            </span>
+          </label>
+
           <div className={styles.buttonRow}>
-            <button className={styles.button} onClick={chooseWorkspace} disabled={!hasHost || busy}>
-              Choose Folder
+            <button className={styles.button} onClick={createWorkspace} disabled={!hasHost || busy}>
+              Create Workspace…
             </button>
-            <button
-              className={styles.button}
-              onClick={() => switchWorkspace(workspacePath)}
-              disabled={!hasHost || busy || workspacePath.trim() === hostPath}
-            >
-              Apply
+            <button className={styles.button} onClick={openWorkspace} disabled={!hasHost || busy}>
+              Open Workspace…
             </button>
           </div>
         </section>
 
+        {pendingOpen && (
+          <section className={styles.recoveryPrompt}>
+            <div className={styles.label}>Unlock Workspace</div>
+            <p>
+              Recovery is required for <strong>{pendingOpen.path}</strong>
+            </p>
+            <div className={styles.candidateId}>ID · {pendingOpen.vaultId}</div>
+            <input
+              className={styles.input}
+              type="password"
+              placeholder="workspace recovery code"
+              value={pendingRecoveryInput}
+              onChange={(event) => setPendingRecoveryInput(event.target.value)}
+              disabled={busy}
+              autoFocus
+            />
+            <div className={styles.buttonRow}>
+              <button
+                className={styles.button}
+                onClick={() => {
+                  setPendingOpen(null);
+                  setPendingRecoveryInput("");
+                  setMessage(null);
+                }}
+                disabled={busy}
+              >
+                Cancel
+              </button>
+              <button
+                className={styles.primaryButton}
+                onClick={openWorkspaceWithRecovery}
+                disabled={busy || !pendingRecoveryInput.trim()}
+              >
+                Unlock &amp; Open
+              </button>
+            </div>
+          </section>
+        )}
+
         {!hasHost && (
           <p className={styles.note}>
-            Workspace switching is available in the Electron shell. This browser session can still
+            Workspace management is available in the Electron shell. This browser session can still
             show the workspace that the local core is already running with.
           </p>
         )}
 
         {hasHost && (
           <section className={styles.section}>
-            <div className={styles.label}>Vault Recovery</div>
+            <div className={styles.label}>Current Workspace Recovery</div>
             {recoveryCode ? (
               <div className={styles.pathBox} title={recoveryCode}>{recoveryCode}</div>
             ) : (

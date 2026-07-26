@@ -3,7 +3,6 @@ import { join } from "path";
 
 export interface CoreSettings {
   allowCodingAgentSchemaDecisions?: boolean;
-  workspacePath?: string;
   corePort?: number;
   vaultId?: string;
 }

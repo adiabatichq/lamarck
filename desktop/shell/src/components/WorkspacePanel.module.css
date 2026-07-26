@@ -89,13 +89,85 @@
 .input:focus { border-color: rgba(79, 227, 193, 0.42); }
 .input:read-only { color: var(--system-muted, var(--color-text-secondary)); }
 
+.metaBlock {
+  border: 1px solid var(--system-line, var(--color-border));
+  background: rgba(7, 8, 12, 0.65);
+}
+
+.metaRow {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 9px 10px;
+}
+
+.metaRow + .metaRow {
+  border-top: 1px solid var(--system-line, var(--color-border));
+}
+
+.metaLabel {
+  color: var(--system-faint, var(--color-text-muted));
+  font-family: var(--font-mono);
+  font-size: 7px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.metaValue {
+  min-width: 0;
+  color: var(--system-text, var(--color-text-primary));
+  font-family: var(--font-mono);
+  font-size: 8px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.checkboxRow {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 9px 10px;
+  border: 1px solid var(--system-line, var(--color-border));
+  color: var(--system-muted, var(--color-text-secondary));
+  font-size: 8.5px;
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+.checkboxRow input {
+  width: 12px;
+  height: 12px;
+  margin: 1px 0 0;
+  flex: 0 0 auto;
+  accent-color: var(--system-active, #4fe3c1);
+}
+
+.checkboxRow span {
+  display: grid;
+  gap: 3px;
+}
+
+.checkboxRow small {
+  color: var(--system-faint, var(--color-text-muted));
+  font-family: var(--font-mono);
+  font-size: 7px;
+  font-weight: 400;
+}
+
+.checkboxRow:has(input:disabled) {
+  cursor: default;
+  opacity: 0.42;
+}
+
 .buttonRow {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;
 }
 
-.button {
+.button,
+.primaryButton {
   min-height: 31px;
   border: 1px solid var(--system-line-strong, var(--color-border));
   border-radius: 0;
@@ -105,8 +177,49 @@
   font-weight: 620;
 }
 
-.button:hover:not(:disabled) { border-color: var(--system-active, var(--color-accent)); color: var(--system-active, var(--color-accent)); }
-.button:disabled { opacity: 0.42; }
+.button:hover:not(:disabled),
+.primaryButton:hover:not(:disabled) {
+  border-color: var(--system-active, var(--color-accent));
+  color: var(--system-active, var(--color-accent));
+}
+
+.button:disabled,
+.primaryButton:disabled { opacity: 0.42; }
+
+.primaryButton {
+  border-color: rgba(79, 227, 193, 0.5);
+  background: rgba(79, 227, 193, 0.1);
+  color: var(--system-active, #4fe3c1);
+}
+
+.recoveryPrompt {
+  display: grid;
+  gap: 9px;
+  padding: 11px;
+  border: 1px solid rgba(232, 193, 90, 0.3);
+  background: rgba(232, 193, 90, 0.045);
+}
+
+.recoveryPrompt p {
+  margin: 0;
+  color: var(--system-muted, var(--color-text-secondary));
+  font-size: 8px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.recoveryPrompt strong {
+  color: var(--system-text, var(--color-text-primary));
+  font-family: var(--font-mono);
+  font-weight: 500;
+}
+
+.candidateId {
+  color: var(--system-faint, var(--color-text-muted));
+  font-family: var(--font-mono);
+  font-size: 7px;
+  overflow-wrap: anywhere;
+}
 
 .note,
 .message,

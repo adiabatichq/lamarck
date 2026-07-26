@@ -4,3 +4,34 @@
 #root {
   isolation: isolate;
 }
+
+.workspace-bootstrap-message {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-content: center;
+  gap: 10px;
+  background: var(--use-ground);
+  color: var(--use-muted);
+  text-align: center;
+}
+
+.workspace-bootstrap-message span {
+  color: var(--use-ink);
+  font-family: var(--font-display);
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.04em;
+}
+
+.workspace-bootstrap-message p {
+  max-width: 420px;
+  font-size: 12px;
+}
+
+.workspace-bootstrap-message button {
+  justify-self: center;
+  border-bottom: 1px solid currentColor;
+  color: var(--use-action);
+  font-size: 11px;
+}

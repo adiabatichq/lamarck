@@ -1,0 +1,529 @@
+.screen {
+  width: 100%;
+  height: 100%;
+  min-width: 320px;
+  overflow: auto;
+  background: var(--use-ground, #f3f0e8);
+  color: var(--use-ink, #151612);
+}
+
+.titlebar {
+  position: sticky;
+  z-index: 10;
+  top: 0;
+  display: flex;
+  height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--use-line, rgba(21, 22, 18, 0.105));
+  background: var(--use-chrome, #fdfbf7);
+  -webkit-app-region: drag;
+}
+
+.wordmark {
+  font-family: var(--font-display, "Avenir Next", sans-serif);
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.titlebarContext {
+  color: var(--use-faint, #9c978e);
+  font-family: var(--font-mono, "SFMono-Regular", monospace);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.canvas {
+  display: grid;
+  width: min(1040px, calc(100% - 72px));
+  min-height: calc(100% - 42px);
+  margin: 0 auto;
+  grid-template-columns: minmax(190px, 0.62fr) minmax(480px, 1.38fr);
+  gap: clamp(50px, 8vw, 116px);
+  align-items: center;
+  padding: 62px 0 76px;
+}
+
+.route {
+  align-self: stretch;
+  display: grid;
+  min-height: 520px;
+  grid-template-rows: auto 1fr auto;
+  color: var(--use-muted, #77736b);
+}
+
+.routeMark {
+  margin-left: -0.09em;
+  color: var(--use-ink, #151612);
+  font-family: var(--font-display, "Avenir Next", sans-serif);
+  font-size: clamp(88px, 12vw, 154px);
+  font-weight: 520;
+  line-height: 0.82;
+  letter-spacing: -0.095em;
+}
+
+.routeLine {
+  position: relative;
+  width: 1px;
+  min-height: 170px;
+  margin: 28px 0 22px 18px;
+  background: var(--use-line-strong, rgba(21, 22, 18, 0.2));
+}
+
+.routeNode {
+  position: absolute;
+  top: 42%;
+  left: -4px;
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--use-ground, #f3f0e8);
+  border-radius: 50%;
+  background: var(--use-action, #2563eb);
+  box-shadow: 0 0 0 1px var(--use-action, #2563eb);
+}
+
+.routeLabel {
+  width: 148px;
+  padding-top: 12px;
+  border-top: 1px solid var(--use-line-strong, rgba(21, 22, 18, 0.2));
+  font-family: var(--font-mono, "SFMono-Regular", monospace);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.setup {
+  width: 100%;
+  max-width: 650px;
+}
+
+.intro {
+  margin-bottom: 34px;
+}
+
+.eyebrow,
+.cardLabel,
+.fieldLabel {
+  font-family: var(--font-mono, "SFMono-Regular", monospace);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.105em;
+  text-transform: uppercase;
+}
+
+.eyebrow {
+  margin-bottom: 12px;
+  color: var(--use-action, #2563eb);
+}
+
+.intro h1 {
+  max-width: 620px;
+  font-family: var(--font-display, "Avenir Next", sans-serif);
+  font-size: clamp(38px, 5vw, 58px);
+  font-weight: 520;
+  line-height: 0.98;
+  letter-spacing: -0.05em;
+}
+
+.intro p {
+  max-width: 510px;
+  margin-top: 18px;
+  color: var(--use-muted, #77736b);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.previousNotice,
+.invalidNotice,
+.hostNotice,
+.error {
+  margin-bottom: 16px;
+  padding: 11px 13px;
+  border: 1px solid var(--use-line, rgba(21, 22, 18, 0.105));
+  background: rgba(253, 251, 247, 0.48);
+  color: var(--use-muted, #77736b);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.previousNotice {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 3px 6px;
+}
+
+.previousNotice code {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--use-ink-soft, #3f403a);
+  font-family: var(--font-mono, "SFMono-Regular", monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.choices {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(190px, 0.8fr);
+  border: 1px solid var(--use-line-strong, rgba(21, 22, 18, 0.2));
+  background: var(--use-surface, #fffefd);
+  box-shadow: 0 18px 45px rgba(48, 43, 34, 0.07);
+}
+
+.createCard,
+.openCard,
+.recoveryCard {
+  padding: 27px;
+}
+
+.openCard {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  border-left: 1px solid var(--use-line, rgba(21, 22, 18, 0.105));
+  background: var(--use-chrome, #fdfbf7);
+}
+
+.recoveryCard {
+  border: 1px solid var(--use-line-strong, rgba(21, 22, 18, 0.2));
+  background: var(--use-surface, #fffefd);
+  box-shadow: 0 18px 45px rgba(48, 43, 34, 0.07);
+}
+
+.cardHeading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.cardLabel {
+  margin-bottom: 8px;
+  color: var(--use-faint, #9c978e);
+}
+
+.createCard h2,
+.openCard h2,
+.recoveryCard h2 {
+  font-family: var(--font-display, "Avenir Next", sans-serif);
+  font-size: 22px;
+  font-weight: 560;
+  line-height: 1.1;
+  letter-spacing: -0.035em;
+}
+
+.cardCopy {
+  margin: 10px 0 22px;
+  color: var(--use-muted, #77736b);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.fieldLabel {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--use-ink-soft, #3f403a);
+}
+
+.pathField {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  border: 1px solid var(--use-line-strong, rgba(21, 22, 18, 0.2));
+  background: var(--use-chrome, #fdfbf7);
+}
+
+.pathField:focus-within {
+  border-color: var(--use-action, #2563eb);
+  box-shadow: inset 0 -2px 0 var(--use-action, #2563eb);
+}
+
+.pathField input,
+.recoveryInput {
+  min-width: 0;
+  padding: 11px 12px;
+  color: var(--use-ink, #151612);
+  font-family: var(--font-mono, "SFMono-Regular", monospace);
+  font-size: 11px;
+}
+
+.pathField input:focus-visible {
+  outline: none;
+}
+
+.pathField button {
+  margin: 5px;
+  padding: 0 9px;
+  border-left: 1px solid var(--use-line, rgba(21, 22, 18, 0.105));
+  color: var(--use-action, #2563eb);
+  font-family: var(--font-mono, "SFMono-Regular", monospace);
+  font-size: 9px;
+}
+
+.pathField button:disabled,
+.primaryButton:disabled,
+.secondaryButton:disabled,
+.textButton:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.pathRule {
+  margin-top: 8px;
+  color: var(--use-faint, #9c978e);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.checkbox {
+  display: grid;
+  margin: 18px 0;
+  grid-template-columns: 17px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  cursor: pointer;
+}
+
+.checkbox input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+}
+
+.checkmark {
+  display: grid;
+  width: 17px;
+  height: 17px;
+  margin-top: 1px;
+  place-items: center;
+  border: 1px solid var(--use-line-strong, rgba(21, 22, 18, 0.2));
+  background: var(--use-chrome, #fdfbf7);
+}
+
+.checkmark svg {
+  width: 10px;
+  fill: none;
+  stroke: white;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+  opacity: 0;
+}
+
+.checkbox input:checked + .checkmark {
+  border-color: var(--use-action, #2563eb);
+  background: var(--use-action, #2563eb);
+}
+
+.checkbox input:checked + .checkmark svg {
+  opacity: 1;
+}
+
+.checkbox input:focus-visible + .checkmark {
+  outline: 2px solid color-mix(in srgb, var(--use-action, #2563eb) 72%, white);
+  outline-offset: 2px;
+}
+
+.checkbox strong,
+.checkbox small {
+  display: block;
+}
+
+.checkbox strong {
+  color: var(--use-ink-soft, #3f403a);
+  font-size: 11px;
+  font-weight: 560;
+}
+
+.checkbox small {
+  margin-top: 2px;
+  color: var(--use-faint, #9c978e);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.primaryButton,
+.secondaryButton {
+  display: inline-flex;
+  min-height: 37px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 15px;
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.primaryButton {
+  width: 100%;
+  background: var(--use-ink, #151612);
+  color: var(--use-surface, #fffefd);
+}
+
+.primaryButton:hover:not(:disabled) {
+  background: var(--use-action, #2563eb);
+}
+
+.secondaryButton {
+  width: 100%;
+  margin-top: 26px;
+  border: 1px solid var(--use-line-strong, rgba(21, 22, 18, 0.2));
+  color: var(--use-ink-soft, #3f403a);
+}
+
+.secondaryButton:hover:not(:disabled) {
+  border-color: var(--use-action, #2563eb);
+  color: var(--use-action, #2563eb);
+}
+
+.textButton {
+  color: var(--use-action, #2563eb);
+  font-family: var(--font-mono, "SFMono-Regular", monospace);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.recoveryPath {
+  display: block;
+  overflow: hidden;
+  margin: -8px 0 22px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--use-line, rgba(21, 22, 18, 0.105));
+  color: var(--use-muted, #77736b);
+  font-family: var(--font-mono, "SFMono-Regular", monospace);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recoveryInput {
+  width: 100%;
+  margin-bottom: 14px;
+  border: 1px solid var(--use-line-strong, rgba(21, 22, 18, 0.2));
+  background: var(--use-chrome, #fdfbf7);
+}
+
+.recoveryInput:focus {
+  border-color: var(--use-action, #2563eb);
+}
+
+.invalidNotice,
+.hostNotice {
+  color: var(--use-attention, #8a5a17);
+}
+
+.hostNotice {
+  margin-top: 16px;
+  margin-bottom: 0;
+}
+
+.error {
+  margin-top: 16px;
+  margin-bottom: 0;
+  border-color: color-mix(in srgb, var(--use-danger, #c24132) 28%, transparent);
+  background: color-mix(in srgb, var(--use-danger, #c24132) 5%, var(--use-surface, #fffefd));
+  color: var(--use-danger, #c24132);
+}
+
+@media (max-width: 760px) {
+  .canvas {
+    display: block;
+    width: min(560px, calc(100% - 36px));
+    padding: 38px 0 54px;
+  }
+
+  .route {
+    display: flex;
+    min-height: auto;
+    margin-bottom: 30px;
+    align-items: center;
+  }
+
+  .routeMark {
+    font-size: 66px;
+  }
+
+  .routeLine {
+    width: 100%;
+    min-height: 1px;
+    height: 1px;
+    margin: 5px 14px 0 18px;
+  }
+
+  .routeNode {
+    top: -4px;
+    left: 54%;
+  }
+
+  .routeLabel {
+    width: 106px;
+    padding: 0;
+    border-top: 0;
+  }
+
+  .intro h1 {
+    font-size: 40px;
+  }
+
+  .choices {
+    grid-template-columns: 1fr;
+  }
+
+  .openCard {
+    border-top: 1px solid var(--use-line, rgba(21, 22, 18, 0.105));
+    border-left: 0;
+  }
+}
+
+@media (max-width: 440px) {
+  .titlebar {
+    padding: 0 14px;
+  }
+
+  .canvas {
+    width: calc(100% - 24px);
+    padding-top: 28px;
+  }
+
+  .routeLabel {
+    display: none;
+  }
+
+  .intro {
+    margin-bottom: 26px;
+  }
+
+  .intro h1 {
+    font-size: 34px;
+  }
+
+  .createCard,
+  .openCard,
+  .recoveryCard {
+    padding: 21px;
+  }
+
+  .cardHeading {
+    display: block;
+  }
+
+  .textButton {
+    margin-top: 10px;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .primaryButton,
+  .secondaryButton,
+  .pathField {
+    transition:
+      border-color 140ms ease,
+      background-color 140ms ease,
+      color 140ms ease,
+      box-shadow 140ms ease;
+  }
+}

@@ -1,6 +1,6 @@
 // Electron main process
 // - Launches the isolated Node Guard utility before the Node Core
-// - First-launch: copies template/ → ~/Lamarck/
+// - Keeps Workspace creation and opening as explicit user actions
 // - Opens renderer window
 
 import {
@@ -23,7 +23,6 @@ import { spawn, type ChildProcess } from "child_process";
 import { randomBytes } from "crypto";
 import {
   existsSync,
-  cpSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -31,7 +30,7 @@ import {
   writeFileSync,
 } from "fs";
 import { createServer } from "net";
-import { join, relative, sep } from "path";
+import { join } from "path";
 import { performance } from "perf_hooks";
 import { pathToFileURL } from "url";
 import {
@@ -68,6 +67,19 @@ import {
   WorkspaceVaultStateController,
   withEncryptedVaultRecord,
 } from "./workspace-vault-state";
+import {
+  createWorkspaceVaultVerifier,
+  isCanonicalWorkspaceVaultVerifier,
+  normalizeRecoveryCode,
+  validateWorkspaceVaultVerifier,
+} from "./workspace-vault-crypto";
+import {
+  WorkspaceValidationError,
+  initializeWorkspaceDirectory,
+  inspectWorkspaceForCreate,
+  inspectWorkspaceForOpen,
+  type WorkspaceDescriptor,
+} from "./workspace-files";
 
 app.setName("Lamarck");
 
@@ -100,6 +112,11 @@ let guardOrigin = "";
 let workspace = "";
 let corePort = 0;
 let coreStartError: string | null = null;
+let activeWorkspace: WorkspaceDescriptor | null = null;
+let rememberedWorkspace: RememberedWorkspace | null = null;
+let workspaceSetupReason: WorkspaceSetupReason = "first-run";
+let workspaceSetupDetail: string | null = null;
+let workspaceSelectionNeedsPersistence = false;
 const coreRuntime = new CoreRuntimeStateController(notifyCoreRuntimeState);
 const workspaceVault = new WorkspaceVaultStateController();
 let nextTerminalId = 1;
@@ -237,28 +254,166 @@ interface GuardPongMessage {
   nonce: number;
 }
 
+interface RememberedWorkspace {
+  lastKnownPath: string;
+  vaultId?: string;
+}
+
+type WorkspaceSetupReason = "first-run" | "missing" | "invalid";
+
+type WorkspaceHostState =
+  | {
+      status: "ready";
+      workspace: WorkspaceDescriptor;
+    }
+  | {
+      status: "setup";
+      reason: WorkspaceSetupReason;
+      suggestedPath: string;
+      previousWorkspace?: RememberedWorkspace;
+      detail?: string;
+    };
+
+type WorkspaceOpenResult =
+  | {
+      status: "ready";
+      workspace: WorkspaceDescriptor;
+    }
+  | {
+      status: "recovery-required";
+      workspace: WorkspaceDescriptor;
+    };
+
 interface AppSettings {
-  workspacePath?: string;
+  activeWorkspace?: {
+    vaultId?: unknown;
+    lastKnownPath?: unknown;
+  };
+  [key: string]: unknown;
 }
 
 interface WorkspaceSettings {
+  allowCodingAgentSchemaDecisions?: boolean;
   corePort?: number;
   vaultId?: string;
+  vaultKeyVerifier?: string;
 }
 
 function settingsPath(): string {
   return join(app.getPath("userData"), "settings.json");
 }
 
-function loadWorkspacePath(): string {
-  const fallback = join(app.getPath("home"), "Lamarck");
+function loadAppSettings(): AppSettings {
+  if (!existsSync(settingsPath())) return {};
+  let parsed: unknown;
   try {
-    const settings = JSON.parse(readFileSync(settingsPath(), "utf8")) as AppSettings;
-    if (settings.workspacePath) return settings.workspacePath;
-  } catch {}
+    parsed = JSON.parse(readFileSync(settingsPath(), "utf8"));
+  } catch (error) {
+    throw new Error("Lamarck settings are not valid JSON", { cause: error });
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Lamarck settings must be a JSON object");
+  }
+  return parsed as AppSettings;
+}
+
+function loadRememberedWorkspace(): RememberedWorkspace | null {
+  const settings = loadAppSettings();
+  const active = settings.activeWorkspace;
+  if (active !== undefined) {
+    if (
+      !active
+      || typeof active !== "object"
+      || typeof active.lastKnownPath !== "string"
+      || !active.lastKnownPath.trim()
+      || !isWorkspaceVaultId(active.vaultId)
+    ) {
+      throw new Error("Saved active Workspace is invalid");
+    }
+    return {
+      lastKnownPath: active.lastKnownPath,
+      vaultId: active.vaultId,
+    };
+  }
+  return null;
+}
+
+function saveActiveWorkspace(nextWorkspace: WorkspaceDescriptor): void {
+  const settings = loadAppSettings();
+  settings.activeWorkspace = {
+    vaultId: nextWorkspace.vaultId,
+    lastKnownPath: nextWorkspace.path,
+  };
   mkdirSync(app.getPath("userData"), { recursive: true });
-  writeFileSync(settingsPath(), JSON.stringify({ workspacePath: fallback }, null, 2) + "\n", "utf8");
-  return fallback;
+  atomicWriteText(settingsPath(), JSON.stringify(settings, null, 2) + "\n");
+}
+
+function workspaceHostState(): WorkspaceHostState {
+  if (activeWorkspace) {
+    return {
+      status: "ready",
+      workspace: { ...activeWorkspace },
+    };
+  }
+  return {
+    status: "setup",
+    reason: workspaceSetupReason,
+    suggestedPath: workspaceSetupReason === "invalid"
+      ? ""
+      : workspaceSetupReason === "missing"
+        ? rememberedWorkspace?.lastKnownPath ?? join(app.getPath("home"), "Lamarck")
+        : join(app.getPath("home"), "Lamarck"),
+    ...(rememberedWorkspace
+      ? { previousWorkspace: { ...rememberedWorkspace } }
+      : {}),
+    ...(workspaceSetupDetail ? { detail: workspaceSetupDetail } : {}),
+  };
+}
+
+function initializeWorkspaceSelection(): WorkspaceDescriptor | null {
+  workspaceSelectionNeedsPersistence = false;
+  try {
+    rememberedWorkspace = loadRememberedWorkspace();
+  } catch (error) {
+    rememberedWorkspace = null;
+    workspaceSetupReason = "invalid";
+    workspaceSetupDetail = errorMessage(error);
+    return null;
+  }
+  if (!rememberedWorkspace) {
+    workspaceSetupReason = "first-run";
+    workspaceSetupDetail = null;
+    return null;
+  }
+
+  try {
+    const savedWorkspace = rememberedWorkspace;
+    const descriptor = inspectWorkspaceForOpen(rememberedWorkspace.lastKnownPath);
+    if (
+      rememberedWorkspace.vaultId
+      && rememberedWorkspace.vaultId !== descriptor.vaultId
+    ) {
+      throw new Error("The folder at the saved path belongs to a different Workspace");
+    }
+    activeWorkspace = { ...descriptor };
+    workspaceSelectionNeedsPersistence = savedWorkspace.vaultId !== descriptor.vaultId
+      || savedWorkspace.lastKnownPath !== descriptor.path;
+    rememberedWorkspace = {
+      lastKnownPath: descriptor.path,
+      vaultId: descriptor.vaultId,
+    };
+    workspaceSetupReason = "first-run";
+    workspaceSetupDetail = null;
+    return descriptor;
+  } catch (error) {
+    activeWorkspace = null;
+    workspaceSetupReason = error instanceof WorkspaceValidationError
+      && error.code === "WORKSPACE_NOT_FOUND"
+      ? "missing"
+      : "invalid";
+    workspaceSetupDetail = errorMessage(error);
+    return null;
+  }
 }
 
 function workspaceSettingsPath(targetWorkspace = workspace): string {
@@ -266,11 +421,16 @@ function workspaceSettingsPath(targetWorkspace = workspace): string {
 }
 
 function loadWorkspaceSettings(targetWorkspace = workspace): WorkspaceSettings {
+  let parsed: unknown;
   try {
-    return JSON.parse(readFileSync(workspaceSettingsPath(targetWorkspace), "utf8")) as WorkspaceSettings;
-  } catch {
-    return {};
+    parsed = JSON.parse(readFileSync(workspaceSettingsPath(targetWorkspace), "utf8"));
+  } catch (error) {
+    throw new Error("Workspace settings are not valid JSON", { cause: error });
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Workspace settings must be a JSON object");
+  }
+  return parsed as WorkspaceSettings;
 }
 
 function saveWorkspaceSettings(settings: WorkspaceSettings, targetWorkspace = workspace): void {
@@ -287,16 +447,34 @@ function vaultRecordsPath(): string {
 }
 
 function loadVaultRecords(): Record<string, string> {
+  if (!existsSync(vaultRecordsPath())) return {};
+  let parsed: unknown;
   try {
-    return JSON.parse(readFileSync(vaultRecordsPath(), "utf8")) as Record<string, string>;
-  } catch {
-    return {};
+    parsed = JSON.parse(readFileSync(vaultRecordsPath(), "utf8"));
+  } catch (error) {
+    throw new Error("Workspace vault key records are not valid JSON", { cause: error });
   }
+  if (
+    !parsed
+    || typeof parsed !== "object"
+    || Array.isArray(parsed)
+    || Object.values(parsed).some((value) => typeof value !== "string")
+  ) {
+    throw new Error("Workspace vault key records are invalid");
+  }
+  return parsed as Record<string, string>;
 }
 
 function saveVaultRecords(records: Record<string, string>): void {
   mkdirSync(app.getPath("userData"), { recursive: true });
   atomicWriteText(vaultRecordsPath(), JSON.stringify(records, null, 2) + "\n");
+}
+
+function deleteVaultKeyRecord(nextVaultId: string): void {
+  const records = loadVaultRecords();
+  if (!Object.hasOwn(records, nextVaultId)) return;
+  delete records[nextVaultId];
+  saveVaultRecords(records);
 }
 
 function atomicWriteText(path: string, contents: string): void {
@@ -309,10 +487,7 @@ function atomicWriteText(path: string, contents: string): void {
   }
 }
 
-async function loadOrCreateVaultKey(
-  nextVaultId: string,
-  opts: { allowCreate: boolean },
-): Promise<string> {
+async function loadVaultKey(nextVaultId: string): Promise<string | null> {
   if (!(await safeStorage.isAsyncEncryptionAvailable())) {
     throw new Error("Electron safeStorage is unavailable; cannot unlock the workspace vault key");
   }
@@ -334,8 +509,16 @@ async function loadOrCreateVaultKey(
     }
     return decrypted.result;
   }
-  if (!opts.allowCreate) {
-    throw new Error("Workspace vault is locked on this device. Import the recovery code to unlock it.");
+  return null;
+}
+
+async function createVaultKey(nextVaultId: string): Promise<string> {
+  if (!(await safeStorage.isAsyncEncryptionAvailable())) {
+    throw new Error("Electron safeStorage is unavailable; cannot create the workspace vault key");
+  }
+  const records = loadVaultRecords();
+  if (Object.hasOwn(records, nextVaultId)) {
+    throw new Error("Workspace vault ID already has a local key record");
   }
   const recoveryCode = randomBytes(32).toString("base64url");
   saveVaultRecords(withEncryptedVaultRecord(
@@ -346,69 +529,171 @@ async function loadOrCreateVaultKey(
   return recoveryCode;
 }
 
-async function importVaultKey(nextVaultId: string, recoveryCode: string): Promise<string> {
-  const normalized = recoveryCode.trim();
-  const decoded = Buffer.from(normalized, "base64url");
-  if (decoded.length !== 32) {
-    throw new Error("Recovery code must decode to a 32-byte vault key");
+async function requireVaultKey(nextVaultId: string): Promise<string> {
+  const key = await loadVaultKey(nextVaultId);
+  if (!key) {
+    throw new Error("Workspace vault is locked on this device. Import the recovery code to unlock it.");
+  }
+  return key;
+}
+
+async function importVaultKey(
+  descriptor: WorkspaceDescriptor,
+  recoveryCode: string,
+): Promise<string> {
+  const normalized = normalizeRecoveryCode(recoveryCode);
+  const settings = loadWorkspaceSettings(descriptor.path);
+  const verifier = requireWorkspaceVaultVerifier(settings, descriptor.vaultId);
+  assertWorkspaceIdentityDoesNotConflict(descriptor, verifier);
+  if (!validateWorkspaceVaultVerifier(descriptor.vaultId, normalized, verifier)) {
+    throw new Error("Recovery code does not match this Workspace");
   }
   if (!(await safeStorage.isAsyncEncryptionAvailable())) {
     throw new Error("Electron safeStorage is unavailable; cannot store the workspace vault key");
   }
+
+  const encrypted = (await safeStorage.encryptStringAsync(normalized)).toString("base64");
+  const currentDescriptor = inspectWorkspaceForOpen(descriptor.path);
+  if (currentDescriptor.vaultId !== descriptor.vaultId) {
+    throw new Error("Workspace ID changed while its recovery code was being imported");
+  }
+  const currentSettings = loadWorkspaceSettings(currentDescriptor.path);
+  const currentVerifier = requireWorkspaceVaultVerifier(
+    currentSettings,
+    currentDescriptor.vaultId,
+  );
+  if (currentVerifier !== verifier) {
+    throw new Error("Workspace vault verifier changed while its recovery code was being imported");
+  }
+  assertWorkspaceIdentityDoesNotConflict(currentDescriptor, currentVerifier);
+
   const records = loadVaultRecords();
   saveVaultRecords(withEncryptedVaultRecord(
     records,
-    nextVaultId,
-    (await safeStorage.encryptStringAsync(normalized)).toString("base64"),
+    descriptor.vaultId,
+    encrypted,
   ));
   return normalized;
 }
 
-function saveWorkspacePath(nextWorkspace: string): void {
-  mkdirSync(app.getPath("userData"), { recursive: true });
-  writeFileSync(
-    settingsPath(),
-    JSON.stringify({ workspacePath: nextWorkspace }, null, 2) + "\n",
-    "utf8",
+function requireWorkspaceVaultVerifier(
+  settings: WorkspaceSettings,
+  expectedVaultId: string,
+): string {
+  if (settings.vaultId !== expectedVaultId) {
+    throw new Error("Workspace ID changed while its vault key was being verified");
+  }
+  if (!isCanonicalWorkspaceVaultVerifier(settings.vaultKeyVerifier)) {
+    throw new Error("Workspace vault key verifier is missing or invalid");
+  }
+  return settings.vaultKeyVerifier;
+}
+
+function assertWorkspaceVaultKeyMatches(
+  vaultId: string,
+  vaultKey: string,
+  verifier: string,
+): void {
+  if (!validateWorkspaceVaultVerifier(vaultId, vaultKey, verifier)) {
+    throw new Error(
+      "The stored vault key does not match this Workspace. Import its recovery code to continue.",
+    );
+  }
+}
+
+function assertWorkspaceIdentityDoesNotConflict(
+  descriptor: WorkspaceDescriptor,
+  verifier: string,
+): void {
+  if (
+    !activeWorkspace
+    || activeWorkspace.vaultId !== descriptor.vaultId
+    || activeWorkspace.path === descriptor.path
+  ) {
+    return;
+  }
+  const activeSettings = loadWorkspaceSettings(activeWorkspace.path);
+  const activeVerifier = requireWorkspaceVaultVerifier(
+    activeSettings,
+    activeWorkspace.vaultId,
   );
+  if (activeVerifier !== verifier) {
+    throw new Error(
+      "Another folder uses the active Workspace ID with a different vault identity",
+    );
+  }
 }
 
-function ensureWorkspace(targetWorkspace = workspace): void {
-  if (existsSync(targetWorkspace)) return;
-  console.log(`[electron] First launch — copying template to ${targetWorkspace}`);
-  // Built-in connectors are bundled catalog entries installed explicitly
-  // through Core. Top-level hidden state is Host-managed and recreated for the
-  // new workspace, so neither belongs in the user-facing template copy.
-  cpSync(TEMPLATE, targetWorkspace, {
-    recursive: true,
-    filter: (src) => {
-      const rel = relative(TEMPLATE, src);
-      const topLevel = rel.split(sep)[0] ?? "";
-      return topLevel !== "connectors" && !topLevel.startsWith(".");
-    },
-  });
+async function requireVerifiedWorkspaceVaultKey(
+  descriptor: WorkspaceDescriptor,
+): Promise<string> {
+  const settings = loadWorkspaceSettings(descriptor.path);
+  const verifier = requireWorkspaceVaultVerifier(settings, descriptor.vaultId);
+  assertWorkspaceIdentityDoesNotConflict(descriptor, verifier);
+  const vaultKey = await requireVaultKey(descriptor.vaultId);
+  assertWorkspaceVaultKeyMatches(descriptor.vaultId, vaultKey, verifier);
+  return vaultKey;
 }
 
-async function ensureWorkspaceRuntimeSettings(opts?: { rotatePort?: boolean }): Promise<void> {
+async function initializeWorkspace(
+  path: string,
+  options: { includeStarterApps: boolean },
+): Promise<WorkspaceDescriptor> {
+  inspectWorkspaceForCreate(path);
+  const vaultId = randomBytes(16).toString("base64url");
+  if (!isWorkspaceVaultId(vaultId)) {
+    throw new Error("Generated Workspace ID is invalid");
+  }
+  const corePort = await chooseAvailableCorePort();
+  // The recoverable local key record must exist before the Workspace refers
+  // to its ID. A crash may leave an unused record, but never an unrecoverable
+  // initialized Workspace.
+  let keyRecordCreated = false;
+  let workspaceCommitted = false;
+  try {
+    const recoveryCode = await createVaultKey(vaultId);
+    keyRecordCreated = true;
+    const vaultKeyVerifier = createWorkspaceVaultVerifier(vaultId, recoveryCode);
+    const initializedPath = initializeWorkspaceDirectory(path, TEMPLATE, {
+      ...options,
+      finalize(targetPath) {
+        saveWorkspaceSettings({ vaultId, vaultKeyVerifier, corePort }, targetPath);
+      },
+    });
+    workspaceCommitted = true;
+    return inspectWorkspaceForOpen(initializedPath);
+  } catch (error) {
+    if (keyRecordCreated && !workspaceCommitted) {
+      try {
+        deleteVaultKeyRecord(vaultId);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Workspace creation failed and its unused vault key could not be removed",
+          { cause: error },
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+async function ensureWorkspaceRuntimeSettings(opts?: {
+  expectedVaultId?: string;
+  rotatePort?: boolean;
+}): Promise<void> {
   const targetWorkspace = workspace;
   const settings = loadWorkspaceSettings(targetWorkspace);
-  if (settings.vaultId !== undefined && !isWorkspaceVaultId(settings.vaultId)) {
+  if (!isWorkspaceVaultId(settings.vaultId)) {
     workspaceVault.begin(targetWorkspace);
-    throw new Error("Workspace vault ID is invalid");
+    throw new Error("Workspace ID is missing or invalid");
   }
-  const createdVaultId = !settings.vaultId;
-  if (!settings.vaultId) {
-    settings.vaultId = randomBytes(16).toString("base64url");
+  if (opts?.expectedVaultId && settings.vaultId !== opts.expectedVaultId) {
+    workspaceVault.begin(targetWorkspace);
+    throw new Error("Workspace ID changed while it was being opened");
   }
   const nextVaultId = settings.vaultId;
-  // Existing vault identity is selected before any fallible port or Keychain
-  // work. A workspace transition can therefore never expose the previous
-  // Workspace's plaintext recovery key. A first-run ID remains private until
-  // both its encrypted record and Workspace settings have been persisted.
-  let vaultSelection = workspaceVault.begin(
-    targetWorkspace,
-    createdVaultId ? "" : nextVaultId,
-  );
+  const vaultSelection = workspaceVault.begin(targetWorkspace, nextVaultId);
 
   if (opts?.rotatePort || !settings.corePort || !isSupportedCorePort(settings.corePort)) {
     settings.corePort = await chooseAvailableCorePort(settings.corePort);
@@ -423,21 +708,15 @@ async function ensureWorkspaceRuntimeSettings(opts?: { rotatePort?: boolean }): 
   }
 
   const nextCorePort = settings.corePort;
-  const nextVaultKey = await loadOrCreateVaultKey(nextVaultId, {
-    allowCreate: createdVaultId,
-  });
+  const nextVaultKey = await requireVaultKey(nextVaultId);
+  const verifier = requireWorkspaceVaultVerifier(settings, nextVaultId);
+  assertWorkspaceVaultKeyMatches(nextVaultId, nextVaultKey, verifier);
   if (isQuitting) {
     throw new Error("Runtime startup was cancelled because Lamarck is quitting");
   }
-  // On first run the recoverable Keychain record must exist before the
-  // Workspace begins referring to its vaultId. A crash can leave an unused
-  // encrypted record, but never a Workspace that points at a missing key.
   saveWorkspaceSettings(settings, targetWorkspace);
   if (workspace !== targetWorkspace) {
     throw new Error("Workspace changed while its vault was being unlocked");
-  }
-  if (createdVaultId) {
-    vaultSelection = workspaceVault.begin(targetWorkspace, nextVaultId);
   }
   if (!workspaceVault.unlock(vaultSelection, nextVaultKey)) {
     throw new Error("Workspace vault unlock belonged to a stale selection");
@@ -940,7 +1219,10 @@ async function stopControlPlaneProcesses(
   throw failure;
 }
 
-async function startRuntime(opts?: { rotatePort?: boolean }): Promise<number> {
+async function startRuntime(opts?: {
+  expectedVaultId?: string;
+  rotatePort?: boolean;
+}): Promise<number> {
   // A Retry may already be queued when process loss is observed. Join the
   // exact old-generation teardown here so no new Core or Guard can overlap it.
   await controlPlaneTeardownBarrier;
@@ -997,27 +1279,144 @@ async function stopRuntime(): Promise<void> {
   }
 }
 
-async function switchWorkspace(nextWorkspace: string): Promise<string> {
-  const normalized = nextWorkspace.trim();
-  if (!normalized) {
-    throw new Error("Workspace path is required");
+async function activateWorkspace(
+  candidate: WorkspaceDescriptor,
+): Promise<WorkspaceDescriptor> {
+  if (
+    activeWorkspace?.path === candidate.path
+    && activeWorkspace.vaultId === candidate.vaultId
+    && coreRuntime.snapshot().phase === "ready"
+  ) {
+    return { ...activeWorkspace };
   }
-  if (normalized === workspace) return workspace;
-  markCoreStarting();
+
+  // Keychain and candidate validation happen while the current Workspace is
+  // still fully available. Expected recovery is therefore not a destructive
+  // switch attempt.
+  await requireVerifiedWorkspaceVaultKey(candidate);
+  const previous = activeWorkspace ? { ...activeWorkspace } : null;
+  let oldRuntimeStopped = false;
+  let candidateSelected = false;
+
   try {
-    disposeAllTerminals();
     await stopRuntime();
-    workspace = normalized;
-    workspaceVault.begin(workspace);
-    saveWorkspacePath(workspace);
-    ensureWorkspace(workspace);
-    const generation = await startRuntime();
+    oldRuntimeStopped = true;
+
+    // Re-read after releasing the old authority to close the inspection/start
+    // race. A replaced folder can never inherit the candidate's unlocked key.
+    const currentCandidate = inspectWorkspaceForOpen(candidate.path);
+    if (currentCandidate.vaultId !== candidate.vaultId) {
+      throw new Error("Workspace ID changed while it was being opened");
+    }
+    workspace = currentCandidate.path;
+    workspaceVault.begin(workspace, currentCandidate.vaultId);
+    candidateSelected = true;
+    const generation = await startRuntime({ expectedVaultId: currentCandidate.vaultId });
     await waitForCore(generation);
-    return workspace;
+
+    // Persistence is the commit point. The old active descriptor remains
+    // authoritative until the candidate runtime is proven ready.
+    saveActiveWorkspace(currentCandidate);
+    activeWorkspace = { ...currentCandidate };
+    workspaceSelectionNeedsPersistence = false;
+    rememberedWorkspace = {
+      lastKnownPath: currentCandidate.path,
+      vaultId: currentCandidate.vaultId,
+    };
+    workspaceSetupReason = "first-run";
+    workspaceSetupDetail = null;
+    disposeAllTerminals();
+    return { ...currentCandidate };
   } catch (error) {
-    markCoreFailed(error);
+    if (!oldRuntimeStopped) {
+      markCoreFailed(error);
+      throw error;
+    }
+
+    const failures: unknown[] = [error];
+    if (candidateSelected) {
+      try {
+        await stopRuntime();
+      } catch (cleanupError) {
+        failures.push(cleanupError);
+      }
+    }
+
+    // The persisted/active descriptor is still the previous Workspace until
+    // the candidate commits. Restore the in-process selection even when
+    // candidate teardown was incomplete and restarting is therefore unsafe.
+    if (previous) {
+      workspace = previous.path;
+      workspaceVault.begin(previous.path, previous.vaultId);
+    } else {
+      workspace = "";
+      corePort = 0;
+      workspaceVault.begin("");
+    }
+
+    if (failures.length === 1 && previous) {
+      try {
+        const generation = await startRuntime({ expectedVaultId: previous.vaultId });
+        await waitForCore(generation);
+      } catch (rollbackError) {
+        failures.push(rollbackError);
+      }
+    } else if (!previous) {
+      markCoreFailed(error);
+    }
+
+    if (failures.length > 1) {
+      const failure = new AggregateError(
+        failures,
+        previous
+          ? "Workspace switch failed and the previous Workspace could not be restored"
+          : "Workspace startup failed and cleanup was incomplete",
+      );
+      markCoreFailed(failure);
+      throw failure;
+    }
     throw error;
   }
+}
+
+async function createWorkspace(
+  path: string,
+  options: { includeStarterApps: boolean },
+): Promise<WorkspaceDescriptor> {
+  const candidate = await initializeWorkspace(path, options);
+  return activateWorkspace(candidate);
+}
+
+async function openWorkspace(
+  path: string,
+  recoveryCode?: string,
+): Promise<WorkspaceOpenResult> {
+  const candidate = inspectWorkspaceForOpen(path);
+  let key: string | null;
+  if (recoveryCode?.trim()) {
+    key = await importVaultKey(candidate, recoveryCode);
+  } else {
+    const settings = loadWorkspaceSettings(candidate.path);
+    const verifier = requireWorkspaceVaultVerifier(settings, candidate.vaultId);
+    assertWorkspaceIdentityDoesNotConflict(candidate, verifier);
+    key = await loadVaultKey(candidate.vaultId);
+    if (
+      key
+      && !validateWorkspaceVaultVerifier(candidate.vaultId, key, verifier)
+    ) {
+      key = null;
+    }
+  }
+  if (!key) {
+    return {
+      status: "recovery-required",
+      workspace: candidate,
+    };
+  }
+  return {
+    status: "ready",
+    workspace: await activateWorkspace(candidate),
+  };
 }
 
 function createTerminal(sender: WebContents): Promise<{ id: string }> {
@@ -1132,11 +1531,17 @@ function requireShellIpc(event: IpcMainEvent | IpcMainInvokeEvent): BrowserWindo
 }
 
 function appPartition(appId: string, browserChannelId: string): string {
-  return appViewerPartition(workspace, appId, browserChannelId);
+  return appViewerPartition(currentWorkspaceVaultId(), appId, browserChannelId);
 }
 
 function appOriginHost(appId: string, browserChannelId: string): string {
-  return appViewerOriginHost(workspace, appId, browserChannelId);
+  return appViewerOriginHost(currentWorkspaceVaultId(), appId, browserChannelId);
+}
+
+function currentWorkspaceVaultId(): string {
+  const selection = workspaceVault.current(workspace);
+  if (!selection?.vaultId) throw new Error("Workspace ID is unavailable");
+  return selection.vaultId;
 }
 
 async function configureAppWebContents(
@@ -2210,8 +2615,14 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
-  workspace = loadWorkspacePath();
-  workspaceVault.begin(workspace);
+  const initialWorkspace = initializeWorkspaceSelection();
+  if (initialWorkspace) {
+    workspace = initialWorkspace.path;
+    workspaceVault.begin(initialWorkspace.path, initialWorkspace.vaultId);
+  } else {
+    workspace = "";
+    workspaceVault.begin("");
+  }
   ipcMain.handle("auth:getCoreToken", (event) => {
     requireShellIpc(event);
     return CORE_TOKEN;
@@ -2226,14 +2637,18 @@ app.whenReady().then(async () => {
       const targetWorkspace = workspace;
       const selection = workspaceVault.current(targetWorkspace);
       if (!selection?.vaultId) throw new Error("Workspace vault is not initialized");
-      const importedKey = await importVaultKey(selection.vaultId, recoveryCode);
+      const descriptor = inspectWorkspaceForOpen(targetWorkspace);
+      if (descriptor.vaultId !== selection.vaultId) {
+        throw new Error("Workspace ID changed while its recovery code was being imported");
+      }
+      const importedKey = await importVaultKey(descriptor, recoveryCode);
       if (!workspaceVault.unlock(selection, importedKey)) {
         throw new Error("Workspace changed while its recovery code was being imported");
       }
       markCoreStarting();
       try {
         await stopRuntime();
-        const generation = await startRuntime();
+        const generation = await startRuntime({ expectedVaultId: descriptor.vaultId });
         await waitForCore(generation);
         return { coreBaseUrl: coreBaseUrl() };
       } catch (error) {
@@ -2267,30 +2682,76 @@ app.whenReady().then(async () => {
     const externalUrl = parseAllowedExternalUrl(rawUrl);
     return shell.openExternal(externalUrl.toString());
   });
-  ipcMain.handle("workspace:get", (event) => {
+  ipcMain.handle("workspace:getState", (event) => {
     requireShellIpc(event);
-    return workspace;
+    return workspaceHostState();
   });
-  ipcMain.handle("workspace:set", async (event, nextWorkspace: string) => {
-    requireShellIpc(event);
-    return enqueueRuntime(async () => {
-      const path = await switchWorkspace(nextWorkspace);
-      return { path };
-    });
-  });
-  ipcMain.handle("workspace:choose", async (event) => {
-    requireShellIpc(event);
-    const result = await dialog.showOpenDialog({
-      title: "Choose Lamarck system folder",
-      properties: ["openDirectory", "createDirectory"],
-    });
-    if (result.canceled || result.filePaths.length === 0) {
-      return { path: null };
+  ipcMain.handle("workspace:choose", async (
+    event,
+    purpose: "create" | "open",
+  ) => {
+    const owner = requireShellIpc(event);
+    if (purpose !== "create" && purpose !== "open") {
+      throw new Error("Workspace chooser purpose must be create or open");
     }
-    return enqueueRuntime(async () => {
-      const path = await switchWorkspace(result.filePaths[0]);
-      return { path };
+    const hostState = workspaceHostState();
+    const result = await dialog.showOpenDialog(owner, {
+      title: purpose === "create"
+        ? "Choose an empty folder for a new Workspace"
+        : "Open an existing Lamarck Workspace",
+      defaultPath: hostState.status === "setup"
+        ? hostState.suggestedPath
+        : activeWorkspace?.path,
+      properties: purpose === "create"
+        ? ["openDirectory", "createDirectory"]
+        : ["openDirectory"],
     });
+    return {
+      path: result.canceled || result.filePaths.length === 0
+        ? null
+        : result.filePaths[0],
+    };
+  });
+  ipcMain.handle("workspace:create", (event, payload: {
+    path?: unknown;
+    includeStarterApps?: unknown;
+  }) => {
+    requireShellIpc(event);
+    if (
+      !payload
+      || typeof payload.path !== "string"
+      || typeof payload.includeStarterApps !== "boolean"
+    ) {
+      throw new Error("Create Workspace request is invalid");
+    }
+    const nextPath = payload.path;
+    const includeStarterApps = payload.includeStarterApps;
+    return enqueueRuntime(async () => ({
+      status: "ready" as const,
+      workspace: await createWorkspace(nextPath, {
+        includeStarterApps,
+      }),
+    }));
+  });
+  ipcMain.handle("workspace:open", (event, payload: {
+    path?: unknown;
+    recoveryCode?: unknown;
+  }) => {
+    requireShellIpc(event);
+    if (
+      !payload
+      || typeof payload.path !== "string"
+      || (
+        payload.recoveryCode !== undefined
+        && typeof payload.recoveryCode !== "string"
+      )
+    ) {
+      throw new Error("Open Workspace request is invalid");
+    }
+    return enqueueRuntime(() => openWorkspace(
+      payload.path as string,
+      payload.recoveryCode as string | undefined,
+    ));
   });
   ipcMain.handle("app-viewer:open", async (event, appId: string) => {
     requireShellIpc(event);
@@ -2357,21 +2818,26 @@ app.whenReady().then(async () => {
     disposeTerminal(id);
     return { ok: true };
   });
-  ensureWorkspace();
   let releaseInitialStartup!: () => void;
   const shellReady = new Promise<void>((resolve) => {
     releaseInitialStartup = resolve;
   });
   // Reserve the first runtime-queue position before renderer IPC becomes
   // usable, but do not touch Keychain until the Shell window is present.
-  const initialStartup = enqueueRuntime(async () => {
-    await shellReady;
-    if (isQuitting) {
-      throw new Error("Runtime startup was cancelled because Lamarck is quitting");
-    }
-    const generation = await startRuntime();
-    await waitForCore(generation);
-  });
+  const initialStartup = initialWorkspace
+    ? enqueueRuntime(async () => {
+        await shellReady;
+        if (isQuitting) {
+          throw new Error("Runtime startup was cancelled because Lamarck is quitting");
+        }
+        const generation = await startRuntime({ expectedVaultId: initialWorkspace.vaultId });
+        await waitForCore(generation);
+        if (workspaceSelectionNeedsPersistence) {
+          saveActiveWorkspace(initialWorkspace);
+          workspaceSelectionNeedsPersistence = false;
+        }
+      })
+    : null;
   // The shell is useful even while Core is starting or unavailable. Create the
   // window first so Keychain prompts and recovery failures never block the UI.
   try {
@@ -2379,11 +2845,13 @@ app.whenReady().then(async () => {
   } finally {
     releaseInitialStartup();
   }
-  try {
-    await initialStartup;
-  } catch (err) {
-    const failure = markCoreFailed(err);
-    console.error(`[electron] Core failed to start: ${failure}`);
+  if (initialStartup) {
+    try {
+      await initialStartup;
+    } catch (err) {
+      const failure = markCoreFailed(err);
+      console.error(`[electron] Core failed to start: ${failure}`);
+    }
   }
 });
 

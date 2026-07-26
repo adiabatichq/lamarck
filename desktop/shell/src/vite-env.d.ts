@@ -5,6 +5,37 @@ declare module "*.module.css" {
   export default classes;
 }
 
+interface HostWorkspaceDescriptor {
+  path: string;
+  vaultId: string;
+}
+
+type HostWorkspaceState =
+  | {
+      status: "ready";
+      workspace: HostWorkspaceDescriptor;
+    }
+  | {
+      status: "setup";
+      reason: "first-run" | "missing" | "invalid";
+      suggestedPath: string;
+      previousWorkspace?: {
+        lastKnownPath: string;
+        vaultId?: string;
+      };
+      detail?: string;
+    };
+
+type HostWorkspaceOpenResult =
+  | {
+      status: "ready";
+      workspace: HostWorkspaceDescriptor;
+    }
+  | {
+      status: "recovery-required";
+      workspace: HostWorkspaceDescriptor;
+    };
+
 interface Window {
   lamarckHost?: {
     getCoreToken(): Promise<string>;
@@ -25,9 +56,13 @@ interface Window {
     retryCore(): Promise<{ coreBaseUrl: string }>;
     rotateCorePort(): Promise<{ coreBaseUrl: string }>;
     openExternal(url: string): Promise<void>;
-    getWorkspacePath(): Promise<string>;
-    chooseWorkspacePath(): Promise<{ path: string | null }>;
-    setWorkspacePath(path: string): Promise<{ path: string }>;
+    getWorkspaceState(): Promise<HostWorkspaceState>;
+    chooseWorkspacePath(purpose: "create" | "open"): Promise<{ path: string | null }>;
+    createWorkspace(
+      path: string,
+      options: { includeStarterApps: boolean },
+    ): Promise<{ status: "ready"; workspace: HostWorkspaceDescriptor }>;
+    openWorkspace(path: string, recoveryCode?: string): Promise<HostWorkspaceOpenResult>;
     onOpenLauncher(callback: () => void): () => void;
     openAppViewer(appId: string): Promise<
       | { ok: true; viewerId: string }

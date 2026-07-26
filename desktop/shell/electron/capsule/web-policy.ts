@@ -27,11 +27,11 @@ export const APP_VIEWER_CSP = [
  * disposable cache, never an authoritative or crash-durable state surface.
  */
 export function appViewerPartition(
-  workspacePath: string,
+  workspaceId: string,
   appId: string,
   browserChannelId: string,
 ): string {
-  return `lamarck-app-${appViewerIdentityDigest(workspacePath, appId, browserChannelId)}`;
+  return `lamarck-app-${appViewerIdentityDigest(workspaceId, appId, browserChannelId)}`;
 }
 
 /**
@@ -40,19 +40,19 @@ export function appViewerPartition(
  * WebContents that receives the replacement capability.
  */
 export function appViewerOriginHost(
-  workspacePath: string,
+  workspaceId: string,
   appId: string,
   browserChannelId: string,
 ): string {
-  return `${appViewerIdentityDigest(workspacePath, appId, browserChannelId)}.localhost`;
+  return `${appViewerIdentityDigest(workspaceId, appId, browserChannelId)}.localhost`;
 }
 
 function appViewerIdentityDigest(
-  workspacePath: string,
+  workspaceId: string,
   appId: string,
   generation?: string,
 ): string {
-  if (workspacePath.length < 1 || workspacePath.includes("\0")) {
+  if (workspaceId.length < 1 || workspaceId.includes("\0")) {
     throw new Error("Viewer workspace identity is invalid");
   }
   if (!/^[a-z0-9][a-z0-9-]*$/.test(appId)) throw new Error("Viewer App identity is invalid");
@@ -60,7 +60,7 @@ function appViewerIdentityDigest(
     throw new Error("Browser channel generation must be bounded and nonempty");
   }
   const hash = createHash("sha256")
-    .update(workspacePath, "utf8")
+    .update(workspaceId, "utf8")
     .update("\0", "utf8")
     .update(appId, "utf8");
   if (generation !== undefined) hash.update("\0", "utf8").update(generation, "utf8");

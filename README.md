@@ -100,11 +100,14 @@ The Capsule build produces an ad-hoc-signed local VM helper and stages the
 Guest into the Desktop resources. `npm start` then builds the canonical
 production Desktop output and launches it locally.
 
-On first launch, Lamarck creates a workspace at:
+On first launch, Lamarck asks you to either create a new Workspace or open an
+existing one. When creating a Workspace, the suggested location is:
 
 ```text
 ~/Lamarck
 ```
+
+Lamarck does not create the Workspace until you confirm the location.
 
 The Electron shell starts the dedicated Node Guard and Node Core services
 automatically.

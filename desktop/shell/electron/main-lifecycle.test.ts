@@ -21,7 +21,7 @@ describe("Shell window lifecycle", () => {
 describe("Shell Host configuration", () => {
   test("keeps Keychain work off the Electron main thread", () => {
     const load = mainSource.match(
-      /async function loadOrCreateVaultKey\([\s\S]*?\n\}\n\nasync function importVaultKey/,
+      /async function loadVaultKey\([\s\S]*?\n\}\n\nasync function createVaultKey/,
     )?.[0];
     if (!load) throw new Error("async vault-key loader is missing");
     expect(load).toContain("await safeStorage.isAsyncEncryptionAvailable()");
@@ -33,8 +33,17 @@ describe("Shell Host configuration", () => {
     expect(load).not.toMatch(/safeStorage\.decryptString\(/);
     expect(load).not.toMatch(/safeStorage\.encryptString\(/);
 
+    const created = mainSource.match(
+      /async function createVaultKey\([\s\S]*?\n\}\n\nasync function requireVaultKey/,
+    )?.[0];
+    if (!created) throw new Error("async vault-key creator is missing");
+    expect(created).toContain("await safeStorage.isAsyncEncryptionAvailable()");
+    expect(created).toContain("await safeStorage.encryptStringAsync");
+    expect(created).toContain("randomBytes(32)");
+    expect(created).toContain("Workspace vault ID already has a local key record");
+
     const imported = mainSource.match(
-      /async function importVaultKey\([\s\S]*?\n\}\n\nfunction saveWorkspacePath/,
+      /async function importVaultKey\([\s\S]*?\n\}\n\nfunction requireWorkspaceVaultVerifier/,
     )?.[0];
     if (!imported) throw new Error("async recovery-code importer is missing");
     expect(imported).toContain("await safeStorage.isAsyncEncryptionAvailable()");
@@ -42,6 +51,14 @@ describe("Shell Host configuration", () => {
     expect(imported).toContain('.toString("base64")');
     expect(imported).toContain("return normalized");
     expect(imported).toContain("withEncryptedVaultRecord");
+    const verifierCheck = imported.indexOf("validateWorkspaceVaultVerifier");
+    const encrypt = imported.indexOf("await safeStorage.encryptStringAsync");
+    const reinspection = imported.indexOf("inspectWorkspaceForOpen(descriptor.path)");
+    const persist = imported.indexOf("saveVaultRecords(withEncryptedVaultRecord");
+    expect(verifierCheck).toBeGreaterThan(-1);
+    expect(encrypt).toBeGreaterThan(verifierCheck);
+    expect(reinspection).toBeGreaterThan(encrypt);
+    expect(persist).toBeGreaterThan(reinspection);
     expect(imported).not.toContain("vaultKey =");
     expect(imported).not.toContain("safeStorage.isEncryptionAvailable()");
     expect(imported).not.toMatch(/safeStorage\.encryptString\(/);
@@ -50,7 +67,10 @@ describe("Shell Host configuration", () => {
       /async function ensureWorkspaceRuntimeSettings\([\s\S]*?\n\}\n\nasync function chooseAvailableCorePort/,
     )?.[0];
     if (!settings) throw new Error("Workspace runtime settings lifecycle is missing");
-    expect(settings.indexOf("await loadOrCreateVaultKey")).toBeLessThan(
+    expect(settings.indexOf("await requireVaultKey")).toBeLessThan(
+      settings.indexOf("saveWorkspaceSettings(settings"),
+    );
+    expect(settings.indexOf("assertWorkspaceVaultKeyMatches")).toBeLessThan(
       settings.indexOf("saveWorkspaceSettings(settings"),
     );
     expect(settings.indexOf("if (isQuitting)")).toBeLessThan(
@@ -63,8 +83,27 @@ describe("Shell Host configuration", () => {
       settings.indexOf("workspaceVault.unlock"),
     );
     expect(mainSource).toContain("renameSync(temporary, path)");
-    expect(mainSource).toContain("await importVaultKey(selection.vaultId, recoveryCode)");
+    expect(mainSource).toContain("await importVaultKey(descriptor, recoveryCode)");
     expect(mainSource).toContain("workspaceVault.recoveryCode(workspace)");
+    const initialization = mainSource.match(
+      /async function initializeWorkspace\([\s\S]*?\n\}\n\nasync function ensureWorkspaceRuntimeSettings/,
+    )?.[0];
+    if (!initialization) throw new Error("Workspace initialization lifecycle is missing");
+    const createKey = initialization.indexOf("await createVaultKey(vaultId)");
+    const createVerifier = initialization.indexOf(
+      "createWorkspaceVaultVerifier(vaultId, recoveryCode)",
+    );
+    const initializeDirectory = initialization.indexOf("initializeWorkspaceDirectory");
+    const settingsCommit = initialization.indexOf(
+      "saveWorkspaceSettings({ vaultId, vaultKeyVerifier, corePort }, targetPath)",
+    );
+    expect(createKey).toBeGreaterThan(-1);
+    expect(createVerifier).toBeGreaterThan(createKey);
+    expect(initializeDirectory).toBeGreaterThan(createVerifier);
+    expect(settingsCommit).toBeGreaterThan(initializeDirectory);
+    expect(mainSource).not.toMatch(
+      /async function openWorkspace\([\s\S]*?createVaultKey/,
+    );
     expect(mainSource).not.toMatch(/\blet vault(?:Id|Key) =/);
   });
 
@@ -231,26 +270,32 @@ describe("Shell Host configuration", () => {
     );
   });
 
-  test("reserves initial startup in the runtime queue before renderer IPC can race it", () => {
+  test("starts only a validated remembered Workspace and reserves it before renderer IPC can race", () => {
     const ready = mainSource.match(
       /app\.whenReady\(\)\.then\(async \(\) => \{[\s\S]*?\n\}\);/,
     )?.[0];
     if (!ready) throw new Error("app ready lifecycle is missing");
-    const initial = ready.indexOf("const initialStartup = enqueueRuntime");
+    const selection = ready.indexOf("const initialWorkspace = initializeWorkspaceSelection()");
+    const initial = ready.indexOf("const initialStartup = initialWorkspace");
+    const queue = ready.indexOf("? enqueueRuntime", initial);
     const window = ready.indexOf("await createWindow()");
     const release = ready.indexOf("releaseInitialStartup()");
     const awaitInitial = ready.indexOf("await initialStartup");
+    expect(selection).toBeGreaterThan(-1);
     expect(initial).toBeGreaterThan(-1);
-    expect(window).toBeGreaterThan(initial);
+    expect(queue).toBeGreaterThan(initial);
+    expect(window).toBeGreaterThan(queue);
     expect(release).toBeGreaterThan(window);
     expect(awaitInitial).toBeGreaterThan(release);
+    expect(ready).toContain(": null;");
+    expect(ready).not.toContain("ensureWorkspace()");
+    expect(ready).not.toContain("loadWorkspacePath()");
   });
 
-  test("resets runtime phase before retry, port rotation, workspace switch, and recovery restart", () => {
+  test("resets runtime phase before retry, port rotation, and recovery restart", () => {
     for (const [name, nextName] of [
       ["retryCore", "rotateCorePort"],
       ["rotateCorePort", "createWindow"],
-      ["switchWorkspace", "createTerminal"],
     ]) {
       const start = mainSource.indexOf(`async function ${name}(`);
       const end = mainSource.indexOf(`function ${nextName}(`, start + 1);
@@ -267,7 +312,72 @@ describe("Shell Host configuration", () => {
     expect(recovery.indexOf("await importVaultKey")).toBeLessThan(
       recovery.indexOf("markCoreStarting()"),
     );
+    expect(recovery).toContain("inspectWorkspaceForOpen(targetWorkspace)");
+    expect(recovery).toContain(
+      "await startRuntime({ expectedVaultId: descriptor.vaultId })",
+    );
     expect(recovery).toContain("markCoreFailed(error)");
+  });
+
+  test("commits a Workspace switch only after readiness and restores the old selection before rollback", () => {
+    const activation = mainSource.match(
+      /async function activateWorkspace\([\s\S]*?\n\}\n\nasync function createWorkspace/,
+    )?.[0];
+    if (!activation) throw new Error("Workspace activation lifecycle is missing");
+
+    const keyPreflight = activation.indexOf(
+      "await requireVerifiedWorkspaceVaultKey(candidate)",
+    );
+    const stopOld = activation.indexOf("await stopRuntime()");
+    const reinspection = activation.indexOf("inspectWorkspaceForOpen(candidate.path)");
+    const startCandidate = activation.indexOf(
+      "await startRuntime({ expectedVaultId: currentCandidate.vaultId })",
+    );
+    const candidateReady = activation.indexOf("await waitForCore(generation)", startCandidate);
+    const commit = activation.indexOf("saveActiveWorkspace(currentCandidate)");
+    const cleanupCandidate = activation.indexOf("if (candidateSelected)");
+    const restorePrevious = activation.indexOf("if (previous)", cleanupCandidate);
+    const restorePath = activation.indexOf("workspace = previous.path", restorePrevious);
+    const restoreVault = activation.indexOf(
+      "workspaceVault.begin(previous.path, previous.vaultId)",
+      restorePath,
+    );
+    const restartGate = activation.indexOf(
+      "if (failures.length === 1 && previous)",
+      restoreVault,
+    );
+    const restartPrevious = activation.indexOf(
+      "await startRuntime({ expectedVaultId: previous.vaultId })",
+      restartGate,
+    );
+    expect(keyPreflight).toBeGreaterThan(-1);
+    expect(stopOld).toBeGreaterThan(keyPreflight);
+    expect(reinspection).toBeGreaterThan(stopOld);
+    expect(startCandidate).toBeGreaterThan(reinspection);
+    expect(candidateReady).toBeGreaterThan(startCandidate);
+    expect(commit).toBeGreaterThan(candidateReady);
+    expect(cleanupCandidate).toBeGreaterThan(commit);
+    expect(restorePrevious).toBeGreaterThan(cleanupCandidate);
+    expect(restorePath).toBeGreaterThan(restorePrevious);
+    expect(restoreVault).toBeGreaterThan(restorePath);
+    expect(restartGate).toBeGreaterThan(restoreVault);
+    expect(restartPrevious).toBeGreaterThan(restartGate);
+    expect(activation).toContain("await waitForCore(generation)");
+  });
+
+  test("keeps Create and Open explicit and treats path as a locator", () => {
+    expect(mainSource).toContain(`ipcMain.handle("workspace:create"`);
+    expect(mainSource).toContain(`ipcMain.handle("workspace:open"`);
+    expect(mainSource).toContain(`ipcMain.handle("workspace:getState"`);
+    expect(mainSource).not.toContain(`ipcMain.handle("workspace:set"`);
+    expect(mainSource).toContain("saveActiveWorkspace(currentCandidate)");
+    expect(mainSource).toContain("lastKnownPath: currentCandidate.path");
+    expect(mainSource).toContain(
+      "appViewerPartition(currentWorkspaceVaultId(), appId, browserChannelId)",
+    );
+    expect(mainSource).toMatch(
+      /suggestedPath: workspaceSetupReason === "invalid"\s*\? ""\s*: workspaceSetupReason === "missing"\s*\? rememberedWorkspace\?\.lastKnownPath/,
+    );
   });
 
   test("exits Electron only after bounded runtime cleanup settles", () => {
@@ -536,7 +646,7 @@ describe("Shell Host configuration", () => {
 
   test("does not restart an in-process runtime after ambiguous Capsule shutdown", () => {
     const match = mainSource.match(
-      /async function stopRuntime\(\): Promise<void> \{[\s\S]*?\n\}\n\nasync function switchWorkspace/,
+      /async function stopRuntime\(\): Promise<void> \{[\s\S]*?\n\}\n\nasync function activateWorkspace/,
     );
     if (!match) throw new Error("runtime shutdown lifecycle is missing");
 

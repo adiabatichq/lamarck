@@ -102,7 +102,6 @@ const guard = RemoteGuard.fromEnvironment("system:server");
 await guard.health();
 const contentBlobStore = new ContentBlobStore(workspacePath);
 const settings = new SettingsStore(lamarckDir);
-await settings.update({ workspacePath });
 const vaultKey = process.env.LAMARCK_VAULT_KEY ?? encodeVaultKey(randomBytes(32));
 const secretStore = new SqliteEncryptedSecretStore(systemDb, vaultKey);
 const credentialStore = new CredentialStore(systemDb);
