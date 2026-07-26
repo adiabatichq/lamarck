@@ -16,7 +16,7 @@ const manifest: AppManifest = {
     services: { indexer: { command: ["node", "indexer.mjs"] } },
     jobs: { "daily-etl": { command: ["node", "etl.mjs"] } },
   },
-  permissions: { docs: [], tables: [] },
+  permissions: { writes: { docs: [], tables: [] } },
 };
 
 describe("App runtime policy", () => {

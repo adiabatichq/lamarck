@@ -7,10 +7,10 @@ describe("normalized App manifest authority", () => {
       manifestVersion: 1,
       id: "replay",
       runtime: { ui: { command: ["npm", "run", "start"], port: 3000 } },
-      permissions: { docs: [], tables: ["reviews"] },
+      permissions: { writes: { docs: [], tables: ["reviews"] } },
     };
     const reordered = {
-      permissions: { tables: ["reviews"], docs: [] },
+      permissions: { writes: { tables: ["reviews"], docs: [] } },
       runtime: { ui: { port: 3000, command: ["npm", "run", "start"] } },
       id: "replay",
       manifestVersion: 1,
@@ -22,7 +22,7 @@ describe("normalized App manifest authority", () => {
     })).not.toBe(digestNormalizedAppManifest(left));
     expect(digestNormalizedAppManifest({
       ...left,
-      permissions: { docs: [], tables: [] },
+      permissions: { writes: { docs: [], tables: [] } },
     })).not.toBe(digestNormalizedAppManifest(left));
   });
 });

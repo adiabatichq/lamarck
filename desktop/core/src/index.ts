@@ -1137,7 +1137,7 @@ const server = await serve<{ cwd: string }>({
           manifestGeneration: appManifestGeneration,
           manifestDigest: app.manifestDigest,
           writeTables: registry.getTableGrants(body.appId),
-          docGrants: appDocGrants(body.appId, app.manifest.permissions.docs),
+          docGrants: appDocGrants(body.appId, app.manifest.permissions.writes.docs),
         }));
       }
 
@@ -1230,8 +1230,10 @@ const server = await serve<{ cwd: string }>({
             },
           },
           permissions: {
-            docs: [],
-            tables: [],
+            writes: {
+              docs: [],
+              tables: [],
+            },
           },
         };
         await writeFile(

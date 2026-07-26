@@ -486,8 +486,8 @@ function SystemApps({ apps, onOpenApp }: { apps: AppInfo[]; onOpenApp: (appId: s
             </div>
             <div className={styles.badges}>{appWorkloads(app).map((workload) => <span key={workload}>{workload}</span>)}</div>
             <div className={styles.grants}>
-              <span><b>{app.permissions.docs.length}</b> docs</span>
-              <span><b>{app.permissions.tables.length}</b> tables</span>
+              <span><b>{app.permissions.writes.docs.length}</b> docs</span>
+              <span><b>{app.permissions.writes.tables.length}</b> tables</span>
             </div>
             <div>
               {app.runtime.ui ? (

@@ -281,7 +281,7 @@ async function writeAppManifest(appId: string, tables: string[]): Promise<void> 
     runtime: {
       ui: { command: ["node", "server.mjs"], port: 3000 },
     },
-    permissions: { docs: [], tables },
+    permissions: { writes: { docs: [], tables } },
   }, null, 2)}\n`, "utf8");
 }
 

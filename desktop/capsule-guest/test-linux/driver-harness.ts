@@ -287,7 +287,7 @@ async function runCapsuleCoreGuard(): Promise<void> {
       runtime: {
         ui: { command: ["/bin/capsule-runtime-probe", "system-rpc"], port: 3000 },
       },
-      permissions: { docs: [], tables: ["capsule_items"] },
+      permissions: { writes: { docs: [], tables: ["capsule_items"] } },
     }, null, 2)}\n`, "utf8");
     const db = new DatabaseSync(join(workspace, ".lamarck", "data.db"));
     try {

@@ -25,11 +25,13 @@ export interface AppManifest {
     jobs?: Record<string, AppWorkload>;
   };
   permissions: {
-    // D1 doc grants beyond the implicit home prefix `apps/<appId>/`.
-    // Each grant is a doc-id prefix ending in "/" or an exact doc id.
-    docs: string[];
-    // D2 tables this app can write to.
-    tables: string[];
+    writes: {
+      // D1 doc grants beyond the implicit home prefix `apps/<appId>/`.
+      // Each grant is a doc-id prefix ending in "/" or an exact doc id.
+      docs: string[];
+      // D2 tables this app can write to.
+      tables: string[];
+    };
   };
 }
 
@@ -71,7 +73,8 @@ const MANIFEST_FIELDS = new Set([
 const RUNTIME_FIELDS = new Set(["ui", "services", "jobs"]);
 const UI_FIELDS = new Set(["command", "port"]);
 const WORKLOAD_FIELDS = new Set(["command"]);
-const PERMISSION_FIELDS = new Set(["docs", "tables"]);
+const PERMISSION_FIELDS = new Set(["writes"]);
+const WRITE_PERMISSION_FIELDS = new Set(["docs", "tables"]);
 const MANIFEST_SETTLE_ATTEMPTS = 3;
 const MANIFEST_SETTLE_DELAY_MS = 20;
 
@@ -366,17 +369,27 @@ function validateManifest(value: unknown, directoryName: string): ValidationResu
   if (unexpectedPermissionField) {
     return invalid(`unknown permissions field "${unexpectedPermissionField}"`);
   }
-  const docs = value.permissions.docs;
+  if (!isObject(value.permissions.writes)) {
+    return invalid("permissions.writes must be an object");
+  }
+  const unexpectedWritePermissionField = findUnexpectedField(
+    value.permissions.writes,
+    WRITE_PERMISSION_FIELDS,
+  );
+  if (unexpectedWritePermissionField) {
+    return invalid(`unknown permissions.writes field "${unexpectedWritePermissionField}"`);
+  }
+  const docs = value.permissions.writes.docs;
   if (!Array.isArray(docs)) {
-    return invalid("permissions.docs must be an array");
+    return invalid("permissions.writes.docs must be an array");
   }
   const badDocGrant = docs.find((grant) => !isValidDocGrant(grant));
   if (badDocGrant !== undefined) {
     return invalid(`invalid D1 doc grant ${JSON.stringify(badDocGrant)}`);
   }
-  const tables = value.permissions.tables;
+  const tables = value.permissions.writes.tables;
   if (!Array.isArray(tables) || tables.some((table) => !isValidTableGrant(table))) {
-    return invalid("permissions.tables must contain only concrete, non-empty table names");
+    return invalid("permissions.writes.tables must contain only concrete, non-empty table names");
   }
 
   return {
@@ -388,8 +401,10 @@ function validateManifest(value: unknown, directoryName: string): ValidationResu
       description: value.description,
       runtime,
       permissions: {
-        docs: [...docs] as string[],
-        tables: [...tables] as string[],
+        writes: {
+          docs: [...docs] as string[],
+          tables: [...tables] as string[],
+        },
       },
     },
   };
@@ -478,14 +493,14 @@ function createRegistry(apps: Map<string, LoadedApp>): AppRegistry {
   return {
     apps,
     getTableGrants(appId: string): string[] {
-      return apps.get(appId)?.manifest.permissions.tables ?? [];
+      return apps.get(appId)?.manifest.permissions.writes.tables ?? [];
     },
     canWriteDoc(appId: string, id: string, _op: DocOp): boolean {
       const app = apps.get(appId);
       if (!app) return false;
       // Implicit home prefix: every app owns its own doc namespace,
       // materialized at pages/apps/<appId>/. Declared grants extend it.
-      const grants = [`apps/${appId}/`, ...app.manifest.permissions.docs];
+      const grants = [`apps/${appId}/`, ...app.manifest.permissions.writes.docs];
       return grants.some((grant) => grant.endsWith("/") ? id.startsWith(grant) : id === grant);
     },
   };

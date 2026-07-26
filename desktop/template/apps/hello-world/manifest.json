@@ -10,7 +10,9 @@
     }
   },
   "permissions": {
-    "docs": [],
-    "tables": ["greetings"]
+    "writes": {
+      "docs": [],
+      "tables": ["greetings"]
+    }
   }
 }

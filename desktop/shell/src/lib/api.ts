@@ -320,8 +320,10 @@ export interface AppInfo {
     jobs?: Record<string, { command: string[] }>;
   };
   permissions: {
-    docs: string[];
-    tables: string[];
+    writes: {
+      docs: string[];
+      tables: string[];
+    };
   };
 }
 

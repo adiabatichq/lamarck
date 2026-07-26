@@ -40,7 +40,7 @@ describe("App Loader", () => {
       name: id,
       description: `${id} description`,
       runtime: { ui: { command: ["npm", "run", "start"], port: 3000 } },
-      permissions: { docs: [], tables: [] },
+      permissions: { writes: { docs: [], tables: [] } },
     };
   }
 
@@ -80,8 +80,8 @@ describe("App Loader", () => {
     manifest.runtime.jobs = {
       "daily-etl": { command: ["npm", "run", "daily-etl", ""] },
     };
-    manifest.permissions.docs = ["notes/"];
-    manifest.permissions.tables = ["my_table"];
+    manifest.permissions.writes.docs = ["notes/"];
+    manifest.permissions.writes.tables = ["my_table"];
     writeApp("test-app", manifest);
 
     const registry = await loadApps(appsDir);
@@ -96,12 +96,12 @@ describe("App Loader", () => {
 
   test("derives one deterministic digest from the normalized authority manifest", async () => {
     const manifest = validManifest("authority");
-    manifest.permissions.tables = ["reviews"];
+    manifest.permissions.writes.tables = ["reviews"];
     writeApp("authority", manifest);
     const first = (await loadApps(appsDir)).apps.get("authority")!;
 
     writeFileSync(join(appsDir, "authority", "manifest.json"), JSON.stringify({
-      permissions: { tables: ["reviews"], docs: [] },
+      permissions: { writes: { tables: ["reviews"], docs: [] } },
       runtime: { ui: { port: 3000, command: ["npm", "run", "start"] } },
       description: "authority description",
       name: "authority",
@@ -113,7 +113,7 @@ describe("App Loader", () => {
 
     writeFileSync(join(appsDir, "authority", "manifest.json"), JSON.stringify({
       ...manifest,
-      permissions: { docs: [], tables: [] },
+      permissions: { writes: { docs: [], tables: [] } },
     }));
     expect((await loadApps(appsDir)).apps.get("authority")?.manifestDigest)
       .not.toBe(first.manifestDigest);
@@ -175,7 +175,7 @@ describe("App Loader", () => {
 
   test("canWriteDoc grants the implicit home prefix and declared grants", async () => {
     const manifest = validManifest("focus");
-    manifest.permissions.docs = ["notes/", "shared/pinned"];
+    manifest.permissions.writes.docs = ["notes/", "shared/pinned"];
     writeApp("focus", manifest);
 
     const registry = await loadApps(appsDir);
@@ -271,17 +271,21 @@ describe("App Loader", () => {
     expect(warnings.some((warning) => warning.includes('unknown runtime field "agents"'))).toBe(true);
   });
 
-  test("requires explicit docs and tables arrays", async () => {
+  test("requires an explicit writes object with docs and tables arrays", async () => {
     const missingPermissions = validManifest("missing-permissions") as unknown as Record<string, unknown>;
     delete missingPermissions.permissions;
     writeApp("missing-permissions", missingPermissions);
+    writeApp("missing-writes", {
+      ...validManifest("missing-writes"),
+      permissions: {},
+    });
     writeApp("missing-docs", {
       ...validManifest("missing-docs"),
-      permissions: { tables: [] },
+      permissions: { writes: { tables: [] } },
     });
     writeApp("missing-tables", {
       ...validManifest("missing-tables"),
-      permissions: { docs: [] },
+      permissions: { writes: { docs: [] } },
     });
     const registry = await loadApps(appsDir);
     expect(registry.apps.size).toBe(0);
@@ -290,23 +294,23 @@ describe("App Loader", () => {
   test("rejects invalid D1 and D2 grants", async () => {
     writeApp("docs-not-array", {
       ...validManifest("docs-not-array"),
-      permissions: { docs: "notes/", tables: [] },
+      permissions: { writes: { docs: "notes/", tables: [] } },
     });
     writeApp("unsafe-doc", {
       ...validManifest("unsafe-doc"),
-      permissions: { docs: ["../outside/"], tables: [] },
+      permissions: { writes: { docs: ["../outside/"], tables: [] } },
     });
     writeApp("tables-not-array", {
       ...validManifest("tables-not-array"),
-      permissions: { docs: [], tables: "focus_sessions" },
+      permissions: { writes: { docs: [], tables: "focus_sessions" } },
     });
     writeApp("wildcard-table", {
       ...validManifest("wildcard-table"),
-      permissions: { docs: [], tables: ["*"] },
+      permissions: { writes: { docs: [], tables: ["*"] } },
     });
     writeApp("padded-table", {
       ...validManifest("padded-table"),
-      permissions: { docs: [], tables: [" focus_sessions"] },
+      permissions: { writes: { docs: [], tables: [" focus_sessions"] } },
     });
 
     const registry = await loadApps(appsDir);
