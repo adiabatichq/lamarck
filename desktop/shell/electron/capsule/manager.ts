@@ -42,6 +42,20 @@ export interface OpenedAppViewer {
   capability: string;
 }
 
+export interface AppViewerOwner {
+  readonly webContentsId: number;
+  readonly rendererGeneration: number;
+}
+
+export class AppViewerBusyError extends Error {
+  readonly code = "APP_VIEWER_BUSY";
+
+  constructor(appId: string) {
+    super(`App "${appId}" already has an active viewer`);
+    this.name = "AppViewerBusyError";
+  }
+}
+
 export interface ReloadedBrowserBinding {
   readonly viewerId: string;
   readonly instanceId: string;
@@ -88,9 +102,20 @@ export interface ReloadedApp {
 }
 
 interface StoredViewer extends OpenedAppViewer {
-  ownerWebContentsId: number;
+  owner: AppViewerOwner;
   runtimeChannelId: string;
   runtimeSenderId: string;
+}
+
+interface OpeningViewerContext {
+  readonly appId: string;
+  readonly owner: AppViewerOwner;
+  readonly abortController: AbortController;
+}
+
+interface OpeningViewerOperation extends OpeningViewerContext {
+  readonly operation: Promise<OpenedAppViewer>;
+  cancellation: Promise<void> | null;
 }
 
 interface PendingUiOperation {
@@ -148,7 +173,7 @@ export interface CapsuleManagerOptions {
  * Host control-plane coordinator. It validates the manifest in Core, asks Core
  * for a launch-bound capability, and never gives the raw capability to the
  * Guest or renderer. Electron WebContents ownership is enforced by callers
- * through the owner id on every operation.
+ * through the owner renderer lease on every operation.
  */
 export class CapsuleManager {
   readonly #backend: CapsuleBackend;
@@ -162,7 +187,7 @@ export class CapsuleManager {
   readonly #onUiLost: CapsuleManagerOptions["onUiLost"];
   readonly #viewers = new Map<string, StoredViewer>();
   readonly #openingApps = new Set<string>();
-  readonly #openingOperations = new Map<string, Promise<unknown>>();
+  readonly #openingOperations = new Map<string, OpeningViewerOperation>();
   readonly #rebuildOperations = new Map<string, Promise<unknown>>();
   readonly #pendingUiOperations = new Map<string, PendingUiOperation>();
   readonly #stopOperations = new Map<string, Promise<void>>();
@@ -210,32 +235,51 @@ export class CapsuleManager {
 
   async openViewer(
     appId: string,
-    ownerWebContentsId: number,
+    ownerValue: AppViewerOwner,
     verifyPreparedViewer: VerifyPreparedViewer,
   ): Promise<OpenedAppViewer> {
     if (this.#terminalFailure) throw this.#terminalFailure;
     if (!APP_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    const owner = validatedViewerOwner(ownerValue);
     if (
       this.#stoppingAll
       || this.#openingApps.has(appId)
       || this.#stoppingApps.has(appId)
       || [...this.#viewers.values()].some((viewer) => viewer.appId === appId)
     ) {
-      throw new Error(`App "${appId}" already has an active viewer`);
+      throw new AppViewerBusyError(appId);
     }
     this.#openingApps.add(appId);
     const generation = this.#generation;
-    const operation = this.#openViewer(
+    const opening: OpeningViewerContext = {
       appId,
-      ownerWebContentsId,
+      owner,
+      abortController: new AbortController(),
+    };
+    let resolveOpening!: (viewer: OpenedAppViewer) => void;
+    let rejectOpening!: (error: unknown) => void;
+    const operation = new Promise<OpenedAppViewer>((resolve, reject) => {
+      resolveOpening = resolve;
+      rejectOpening = reject;
+    });
+    const tracked: OpeningViewerOperation = {
+      ...opening,
+      operation,
+      cancellation: null,
+    };
+    // Register ownership before invoking backend or Core code. Lifecycle
+    // replacement can therefore cancel even a synchronously reentrant launch.
+    this.#openingOperations.set(appId, tracked);
+    void this.#openViewer(
+      appId,
+      opening,
       generation,
       verifyPreparedViewer,
-    );
-    this.#openingOperations.set(appId, operation);
+    ).then(resolveOpening, rejectOpening);
     try {
       return await operation;
     } finally {
-      if (this.#openingOperations.get(appId) === operation) {
+      if (this.#openingOperations.get(appId) === tracked) {
         this.#openingOperations.delete(appId);
       }
       this.#openingApps.delete(appId);
@@ -244,12 +288,12 @@ export class CapsuleManager {
 
   async #openViewer(
     appId: string,
-    ownerWebContentsId: number,
+    opening: OpeningViewerContext,
     generation: number,
     verifyPreparedViewer: VerifyPreparedViewer,
   ): Promise<OpenedAppViewer> {
     const status = await this.#backend.status();
-    this.#assertGenerationCurrent(generation, "launch");
+    this.#assertOpeningCurrent(opening, generation);
     if (!status.available) {
       const message = `App Capsule unavailable: ${status.reason ?? status.backend}`;
       if (status.restartRequired) throw new CapsuleRestartRequiredError(message);
@@ -257,13 +301,15 @@ export class CapsuleManager {
     }
 
     const app = await this.#loadApp(appId);
-    this.#assertGenerationCurrent(generation, "launch");
+    this.#assertOpeningCurrent(opening, generation);
     this.#assertSupportedRuntime(app);
     if (!app.runtime.ui) throw new Error(`App "${appId}" does not declare a UI workload`);
     const runtimeIssued = await this.#issueCapability(appId, "ui", app);
-    if (generation !== this.#generation) {
+    try {
+      this.#assertOpeningCurrent(opening, generation);
+    } catch (error) {
       await this.#revokeCapability(runtimeIssued.channelId).catch(() => {});
-      throw new Error("App Capsule launch was cancelled");
+      throw error;
     }
     const runtimeSenderId = `capsule_${randomBytes(24).toString("base64url")}`;
     try {
@@ -272,10 +318,12 @@ export class CapsuleManager {
       await this.#revokeCapability(runtimeIssued.channelId).catch(() => {});
       throw error;
     }
-    if (generation !== this.#generation) {
+    try {
+      this.#assertOpeningCurrent(opening, generation);
+    } catch (error) {
       this.#unbindSystemSender(runtimeSenderId);
       await this.#revokeCapability(runtimeIssued.channelId).catch(() => {});
-      throw new Error("App Capsule launch was cancelled");
+      throw error;
     }
 
     const viewerId = `viewer_${randomBytes(16).toString("base64url")}`;
@@ -285,8 +333,9 @@ export class CapsuleManager {
       runtimeSenderId,
       viewerId,
       generation,
-    });
+    }, opening.abortController);
     try {
+      this.#assertPendingUiCurrent(pending, "launch");
       const prepared = await this.#backend.prepareUi({
         appId,
         manifestGeneration: app.manifestGeneration,
@@ -322,7 +371,7 @@ export class CapsuleManager {
         instanceId: instance.instanceId,
         channelId: browserIssued.channelId,
         capability: browserIssued.capability,
-        ownerWebContentsId,
+        owner: opening.owner,
         runtimeChannelId: runtimeIssued.channelId,
         runtimeSenderId,
       });
@@ -334,9 +383,9 @@ export class CapsuleManager {
     }
   }
 
-  getViewer(viewerId: string, ownerWebContentsId: number): OpenedAppViewer | null {
+  getViewer(viewerId: string, owner: AppViewerOwner): OpenedAppViewer | null {
     const viewer = this.#viewers.get(viewerId);
-    return viewer?.ownerWebContentsId === ownerWebContentsId ? viewer : null;
+    return viewer && sameViewerOwner(viewer.owner, owner) ? viewer : null;
   }
 
   openViewerStream(viewerId: string): Promise<Duplex> {
@@ -345,9 +394,9 @@ export class CapsuleManager {
     return this.#backend.openUiStream(viewer.instanceId);
   }
 
-  async closeViewer(viewerId: string, ownerWebContentsId: number): Promise<boolean> {
+  async closeViewer(viewerId: string, owner: AppViewerOwner): Promise<boolean> {
     const viewer = this.#viewers.get(viewerId);
-    if (!viewer || viewer.ownerWebContentsId !== ownerWebContentsId) return false;
+    if (!viewer || !sameViewerOwner(viewer.owner, owner)) return false;
     this.#viewers.delete(viewerId);
     const pending = this.#pendingUiOperations.get(viewer.appId);
     if (pending?.previousViewer === viewer || pending?.committedViewer === viewer) {
@@ -373,11 +422,83 @@ export class CapsuleManager {
     return true;
   }
 
-  async closeOwner(ownerWebContentsId: number): Promise<void> {
+  async closeOwner(ownerValue: AppViewerOwner): Promise<void> {
+    const owner = validatedViewerOwner(ownerValue);
+    const reason = new Error("App viewer owner renderer was replaced");
+    const openings = [...this.#openingOperations.values()]
+      .filter((opening) => sameViewerOwner(opening.owner, owner));
+    const cancelledOpenings = openings.map((opening) => (
+      this.#cancelOpeningOperation(opening, reason)
+    ));
     const ids = [...this.#viewers.values()]
-      .filter((viewer) => viewer.ownerWebContentsId === ownerWebContentsId)
+      .filter((viewer) => sameViewerOwner(viewer.owner, owner))
       .map((viewer) => viewer.viewerId);
-    await Promise.all(ids.map((id) => this.closeViewer(id, ownerWebContentsId)));
+    const closedViewers = ids.map((id) => this.closeViewer(id, owner));
+    const results = await Promise.allSettled([...cancelledOpenings, ...closedViewers]);
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "App viewer owner cleanup failed");
+    }
+  }
+
+  #cancelOpeningOperation(
+    opening: OpeningViewerOperation,
+    reason: Error,
+  ): Promise<void> {
+    if (opening.cancellation) return opening.cancellation;
+    let resolveCancellation!: () => void;
+    let rejectCancellation!: (error: unknown) => void;
+    const shared = new Promise<void>((resolve, reject) => {
+      resolveCancellation = resolve;
+      rejectCancellation = reject;
+    });
+    // Publish the shared settlement before calling backend or Core code, so a
+    // synchronous reentrant owner close joins this cancellation.
+    opening.cancellation = shared;
+    if (!opening.abortController.signal.aborted) {
+      opening.abortController.abort(reason);
+    }
+    const pending = this.#pendingUiOperations.get(opening.appId);
+    if (pending?.abortController === opening.abortController) {
+      this.#cancelPendingUiOperation(pending, reason);
+    }
+
+    let backendStop: Promise<void>;
+    try {
+      // A first launch has no committed instance whose stopUi() could abort
+      // the backend preparation. Stop this App identity to cancel work that
+      // has not returned a preparation id yet.
+      backendStop = this.#backend.stopApp(opening.appId);
+    } catch (error) {
+      backendStop = Promise.reject(error);
+    }
+    const initialRevocation = this.#controlPlaneLost
+      ? Promise.resolve()
+      : this.#revokeAppCapabilities(opening.appId);
+    void (async () => {
+      const [, backendResult, revokeResult] = await Promise.allSettled([
+        opening.operation,
+        backendStop,
+        initialRevocation,
+      ]);
+      const finalRevokeResult = this.#controlPlaneLost
+        ? ({ status: "fulfilled", value: undefined } as PromiseFulfilledResult<void>)
+        : (await Promise.allSettled([
+          this.#revokeAppCapabilities(opening.appId),
+        ]))[0]!;
+      const failures = [
+        backendResult,
+        ...(this.#controlPlaneLost ? [] : [revokeResult, finalRevokeResult]),
+      ]
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => result.reason);
+      if (failures.length > 0 && !this.#stoppingAll) {
+        await this.#collapseBackendBoundary(failures);
+      }
+    })().then(resolveCancellation, rejectCancellation);
+    return shared;
   }
 
   async reloadApp(
@@ -585,7 +706,7 @@ export class CapsuleManager {
 
   async #stopApp(appId: string): Promise<void> {
     const pending = [
-      this.#openingOperations.get(appId),
+      this.#openingOperations.get(appId)?.operation,
       this.#rebuildOperations.get(appId),
     ].filter((operation): operation is Promise<unknown> => operation !== undefined);
     const viewers = [...this.#viewers.values()].filter((viewer) => viewer.appId === appId);
@@ -653,7 +774,7 @@ export class CapsuleManager {
 
   async #retireApp(appId: string): Promise<void> {
     const pending = [
-      this.#openingOperations.get(appId),
+      this.#openingOperations.get(appId)?.operation,
       this.#rebuildOperations.get(appId),
       this.#stopOperations.get(appId),
     ].filter((operation): operation is Promise<unknown> => operation !== undefined);
@@ -700,7 +821,7 @@ export class CapsuleManager {
 
     try {
       const pending = [
-        ...this.#openingOperations.values(),
+        ...[...this.#openingOperations.values()].map((opening) => opening.operation),
         ...this.#rebuildOperations.values(),
         ...this.#stopOperations.values(),
         ...this.#retireOperations.values(),
@@ -883,6 +1004,7 @@ export class CapsuleManager {
       "cleanupTasks" | "cleanupFailures" | "queuedRevocations"
       | "commitContractViolated" | "preparationCommitted" | "preparationAbortStarted"
       | "abortController" | "runtimeUnbound" | "previousDetached">,
+    abortController = new AbortController(),
   ): PendingUiOperation {
     if (this.#pendingUiOperations.has(operation.appId)) {
       throw new Error(`App "${operation.appId}" already has a pending UI operation`);
@@ -895,7 +1017,7 @@ export class CapsuleManager {
       commitContractViolated: false,
       preparationCommitted: false,
       preparationAbortStarted: false,
-      abortController: new AbortController(),
+      abortController,
       runtimeUnbound: false,
       previousDetached: false,
     };
@@ -1059,6 +1181,20 @@ export class CapsuleManager {
   #assertGenerationCurrent(generation: number, operation: "launch" | "reload"): void {
     if (generation !== this.#generation || this.#stoppingAll) {
       throw new Error(`App Capsule ${operation} was cancelled`);
+    }
+  }
+
+  #assertOpeningCurrent(
+    opening: OpeningViewerContext,
+    generation: number,
+  ): void {
+    this.#assertGenerationCurrent(generation, "launch");
+    if (
+      opening.abortController.signal.aborted
+      || this.#openingOperations.get(opening.appId)?.abortController
+        !== opening.abortController
+    ) {
+      throw new Error("App Capsule launch was cancelled");
     }
   }
 
@@ -1306,6 +1442,27 @@ class ControlPlaneLostError extends Error {
     super("Core control plane is unavailable");
     this.name = "ControlPlaneLostError";
   }
+}
+
+function validatedViewerOwner(owner: AppViewerOwner): AppViewerOwner {
+  if (
+    !owner
+    || !Number.isSafeInteger(owner.webContentsId)
+    || owner.webContentsId < 1
+    || !Number.isSafeInteger(owner.rendererGeneration)
+    || owner.rendererGeneration < 0
+  ) {
+    throw new Error("Invalid App viewer owner");
+  }
+  return Object.freeze({
+    webContentsId: owner.webContentsId,
+    rendererGeneration: owner.rendererGeneration,
+  });
+}
+
+function sameViewerOwner(left: AppViewerOwner, right: AppViewerOwner): boolean {
+  return left.webContentsId === right.webContentsId
+    && left.rendererGeneration === right.rendererGeneration;
 }
 
 function errorMessage(error: unknown): string {

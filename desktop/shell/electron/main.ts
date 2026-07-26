@@ -34,7 +34,9 @@ import { join } from "path";
 import { performance } from "perf_hooks";
 import { pathToFileURL } from "url";
 import {
+  AppViewerBusyError,
   CapsuleManager,
+  type AppViewerOwner,
   type PreparedViewerBinding,
   type ReloadedBrowserBinding,
 } from "./capsule/manager";
@@ -137,11 +139,18 @@ const unspawnedCoreFailures = new WeakSet<ChildProcess>();
 const handledCoreLosses = new WeakSet<ChildProcess>();
 const handledGuardLosses = new WeakSet<UtilityProcess>();
 const terminalSessions = new Map<string, { proc: ChildProcess; ownerWebContentsId: number }>();
-const shellWebContents = new Map<number, (url: string) => boolean>();
+
+interface ShellWebContentsState {
+  readonly allowsUrl: (url: string) => boolean;
+  currentOwner: AppViewerOwner;
+  retirement: Promise<void>;
+}
+
+const shellWebContents = new Map<number, ShellWebContentsState>();
 
 interface AppViewerRecord {
   appId: string;
-  ownerWebContentsId: number;
+  ownerLease: AppViewerOwner;
   owner: BrowserWindow;
   view: WebContentsView;
   appWebContentsId: number;
@@ -1509,8 +1518,13 @@ function disposeAllTerminals(): void {
 
 function requireShellWindow(sender: WebContents, frameUrl = sender.getURL()): BrowserWindow {
   const owner = BrowserWindow.fromWebContents(sender);
-  const allowsUrl = shellWebContents.get(sender.id);
-  if (!owner || !allowsUrl || !allowsUrl(sender.getURL()) || !allowsUrl(frameUrl)) {
+  const state = shellWebContents.get(sender.id);
+  if (
+    !owner
+    || !state
+    || !state.allowsUrl(sender.getURL())
+    || !state.allowsUrl(frameUrl)
+  ) {
     throw new Error("Host Shell WebContents required");
   }
   return owner;
@@ -1528,6 +1542,46 @@ function requireShellIpc(event: IpcMainEvent | IpcMainInvokeEvent): BrowserWindo
     throw new Error("Host Shell main frame required");
   }
   return requireShellWindow(event.sender, event.senderFrame.url);
+}
+
+function requireShellRendererOwner(
+  event: IpcMainEvent | IpcMainInvokeEvent,
+): AppViewerOwner {
+  requireShellIpc(event);
+  const owner = shellWebContents.get(event.sender.id)?.currentOwner;
+  if (!owner) throw new Error("Host Shell renderer owner is unavailable");
+  return owner;
+}
+
+function assertShellRendererOwnerCurrent(
+  sender: WebContents,
+  owner: AppViewerOwner,
+): void {
+  const state = shellWebContents.get(owner.webContentsId);
+  if (
+    sender.id !== owner.webContentsId
+    || sender.isDestroyed()
+    || !state
+    || !sameAppViewerOwner(state.currentOwner, owner)
+  ) {
+    throw new Error("Shell renderer was replaced during App viewer launch");
+  }
+}
+
+async function awaitShellRendererRetirement(
+  sender: WebContents,
+  owner: AppViewerOwner,
+): Promise<void> {
+  const state = shellWebContents.get(owner.webContentsId);
+  if (!state) throw new Error("Host Shell renderer owner is unavailable");
+  const retirement = state.retirement;
+  await retirement;
+  assertShellRendererOwnerCurrent(sender, owner);
+}
+
+function sameAppViewerOwner(left: AppViewerOwner, right: AppViewerOwner): boolean {
+  return left.webContentsId === right.webContentsId
+    && left.rendererGeneration === right.rendererGeneration;
 }
 
 function appPartition(appId: string, browserChannelId: string): string {
@@ -1616,12 +1670,12 @@ function clearAppViewerBinding(protocolPartition: string, viewerId: string): voi
 function bindAppViewerCleanup(
   view: WebContentsView,
   viewerId: string,
-  ownerWebContentsId: number,
+  owner: AppViewerOwner,
 ): void {
   const contents = view.webContents;
   const cleanup = () => {
     if (expectedAppViewerCloses.has(contents)) return;
-    void closeAppViewer(viewerId, ownerWebContentsId).catch((error) => {
+    void closeAppViewer(viewerId, owner).catch((error) => {
       console.error(`[electron] App viewer cleanup failed: ${errorMessage(error)}`);
     });
   };
@@ -1996,12 +2050,17 @@ async function disposePreparedAppViewerSurface(
   }
 }
 
-async function openAppViewer(sender: WebContents, appId: string): Promise<{ viewerId: string }> {
+async function openAppViewer(
+  sender: WebContents,
+  ownerLease: AppViewerOwner,
+  appId: string,
+): Promise<{ viewerId: string }> {
   const owner = requireShellWindow(sender);
+  assertShellRendererOwnerCurrent(sender, ownerLease);
   let opened: Awaited<ReturnType<CapsuleManager["openViewer"]>> | null = null;
   let preparedSurface: PreparedAppViewerSurface | null = null;
   try {
-    opened = await capsuleManager.openViewer(appId, sender.id, async (binding) => {
+    opened = await capsuleManager.openViewer(appId, ownerLease, async (binding) => {
       preparedSurface = await prepareAppViewerSurface({
         appId,
         binding,
@@ -2010,19 +2069,22 @@ async function openAppViewer(sender: WebContents, appId: string): Promise<{ view
           if (owner.isDestroyed() || sender.isDestroyed()) {
             throw new Error("App viewer owner was destroyed during launch");
           }
+          assertShellRendererOwnerCurrent(sender, ownerLease);
         },
       });
     });
+    assertShellRendererOwnerCurrent(sender, ownerLease);
     const surface = preparedSurface as PreparedAppViewerSurface | null;
     if (!surface) throw new Error("App viewer committed without a prepared renderer");
     assertViewerAuthorityCurrent(
       opened,
-      capsuleManager.getViewer(opened.viewerId, sender.id),
+      capsuleManager.getViewer(opened.viewerId, ownerLease),
     );
     surface.assertHealthy();
+    assertShellRendererOwnerCurrent(sender, ownerLease);
     const record: AppViewerRecord = {
       appId,
-      ownerWebContentsId: sender.id,
+      ownerLease,
       owner,
       view: surface.view,
       appWebContentsId: surface.view.webContents.id,
@@ -2032,13 +2094,14 @@ async function openAppViewer(sender: WebContents, appId: string): Promise<{ view
       pendingReplacement: null,
     };
     appViewers.set(opened.viewerId, record);
-    bindAppViewerCleanup(surface.view, opened.viewerId, sender.id);
+    bindAppViewerCleanup(surface.view, opened.viewerId, ownerLease);
     if (appViewers.get(opened.viewerId) !== record) {
       throw new Error("App viewer was detached while its renderer was loading");
     }
     surface.assertHealthy();
     surface.stopHealthMonitoring();
     surface.assertHealthy();
+    assertShellRendererOwnerCurrent(sender, ownerLease);
     owner.contentView.addChildView(surface.view);
     return { viewerId: opened.viewerId };
   } catch (error) {
@@ -2055,7 +2118,7 @@ async function openAppViewer(sender: WebContents, appId: string): Promise<{ view
     if (opened) {
       appViewers.delete(opened.viewerId);
       try {
-        await capsuleManager.closeViewer(opened.viewerId, sender.id);
+        await capsuleManager.closeViewer(opened.viewerId, ownerLease);
       } catch (cleanupError) {
         cleanupFailures.push(cleanupError);
       }
@@ -2125,7 +2188,7 @@ function commitReloadedAppViewer(
   const previousVisible = previousView.getVisible();
   replacement.assertHealthy();
   replacement.view.setBounds(previousBounds);
-  bindAppViewerCleanup(replacement.view, binding.viewerId, record.ownerWebContentsId);
+  bindAppViewerCleanup(replacement.view, binding.viewerId, record.ownerLease);
   replacement.assertHealthy();
   replacement.stopHealthMonitoring();
   replacement.assertHealthy();
@@ -2243,7 +2306,7 @@ function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
       if (initialRecord && initialViewerId) {
         cleanup.push(capsuleManager.closeViewer(
           initialViewerId,
-          initialRecord.ownerWebContentsId,
+          initialRecord.ownerLease,
         ));
       } else {
         // A trusted Shell caller can race reload against the final Host-side
@@ -2281,7 +2344,7 @@ function assertCurrentAppViewer(
     throw new Error("App viewer replacement was superseded");
   }
   if (binding) {
-    const current = capsuleManager.getViewer(binding.viewerId, record.ownerWebContentsId);
+    const current = capsuleManager.getViewer(binding.viewerId, record.ownerLease);
     if (
       !current
       || current.appId !== record.appId
@@ -2294,16 +2357,17 @@ function assertCurrentAppViewer(
     }
   }
   if (record.owner.isDestroyed()) throw new Error("App viewer owner was destroyed during reload");
+  assertShellRendererOwnerCurrent(record.owner.webContents, record.ownerLease);
 }
 
-async function closeAppViewer(viewerId: string, ownerWebContentsId: number): Promise<boolean> {
+async function closeAppViewer(viewerId: string, owner: AppViewerOwner): Promise<boolean> {
   const record = appViewers.get(viewerId);
-  if (!record || record.ownerWebContentsId !== ownerWebContentsId) return false;
+  if (!record || !sameAppViewerOwner(record.ownerLease, owner)) return false;
   // Invalidate and detach synchronously. Manager close starts immediately so a
   // long build is aborted, while final settlement remains ordered after an
   // already-running reload lifecycle.
   const cleanup = detachAppViewerRecord(viewerId, record);
-  const managerClose = capsuleManager.closeViewer(viewerId, ownerWebContentsId);
+  const managerClose = capsuleManager.closeViewer(viewerId, owner);
   return appViewerLifecycle.runExclusive(record.appId, async () => {
     const results = await Promise.allSettled([...cleanup, managerClose]);
     const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -2362,11 +2426,11 @@ function detachAppViewerRecord(
 
 function setAppViewerBounds(
   viewerId: string,
-  ownerWebContentsId: number,
+  owner: AppViewerOwner,
   value: { x: number; y: number; width: number; height: number },
 ): void {
   const record = appViewers.get(viewerId);
-  if (!record || record.ownerWebContentsId !== ownerWebContentsId) return;
+  if (!record || !sameAppViewerOwner(record.ownerLease, owner)) return;
   const numbers = [value?.x, value?.y, value?.width, value?.height];
   if (!numbers.every((number) => Number.isFinite(number))) return;
   const contentBounds = record.owner.getContentBounds();
@@ -2378,19 +2442,21 @@ function setAppViewerBounds(
   record.view.setVisible(width > 0 && height > 0);
 }
 
-async function closeAppViewersForOwner(ownerWebContentsId: number): Promise<void> {
+async function closeAppViewersForOwner(owner: AppViewerOwner): Promise<void> {
   const ids = [...appViewers.entries()]
-    .filter(([, record]) => record.ownerWebContentsId === ownerWebContentsId)
+    .filter(([, record]) => sameAppViewerOwner(record.ownerLease, owner))
     .map(([viewerId]) => viewerId);
-  await Promise.allSettled(ids.map((viewerId) => closeAppViewer(viewerId, ownerWebContentsId)));
+  const published = ids.map((viewerId) => closeAppViewer(viewerId, owner));
+  const managerCleanup = capsuleManager.closeOwner(owner);
+  await Promise.allSettled([...published, managerCleanup]);
 }
 
 async function stopAppViewers(appId: string): Promise<void> {
   const entries = [...appViewers.entries()]
     .filter(([, record]) => record.appId === appId)
-    .map(([viewerId, record]) => ({ viewerId, ownerWebContentsId: record.ownerWebContentsId }));
+    .map(([viewerId, record]) => ({ viewerId, owner: record.ownerLease }));
   const results = await Promise.allSettled(
-    entries.map(({ viewerId, ownerWebContentsId }) => closeAppViewer(viewerId, ownerWebContentsId)),
+    entries.map(({ viewerId, owner }) => closeAppViewer(viewerId, owner)),
   );
   const failures = results
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
@@ -2573,7 +2639,29 @@ async function createWindow(): Promise<void> {
   });
   const shellContents = win.webContents;
   const shellWebContentsId = shellContents.id;
-  shellWebContents.set(shellWebContentsId, allowsShellUrl);
+  const shellState: ShellWebContentsState = {
+    allowsUrl: allowsShellUrl,
+    currentOwner: Object.freeze({
+      webContentsId: shellWebContentsId,
+      rendererGeneration: 0,
+    }),
+    retirement: Promise.resolve(),
+  };
+  shellWebContents.set(shellWebContentsId, shellState);
+  const replaceShellRenderer = () => {
+    const retiredOwner = shellState.currentOwner;
+    shellState.currentOwner = Object.freeze({
+      webContentsId: shellWebContentsId,
+      rendererGeneration: retiredOwner.rendererGeneration + 1,
+    });
+    // closeAppViewersForOwner synchronously fences Manager opens before its
+    // first await. New-generation IPC waits for this retirement settlement.
+    const cleanup = closeAppViewersForOwner(retiredOwner);
+    shellState.retirement = Promise.allSettled([
+      shellState.retirement,
+      cleanup,
+    ]).then(() => {});
+  };
   shellContents.on("before-input-event", (event, input) => {
     if (!isOpenLauncherShortcut(input)) return;
     event.preventDefault();
@@ -2584,13 +2672,21 @@ async function createWindow(): Promise<void> {
     if (!allowsShellUrl(url)) event.preventDefault();
   });
   shellContents.on("will-attach-webview", (event) => event.preventDefault());
+  shellContents.on("did-start-navigation", (details) => {
+    if (details.isSameDocument || !details.isMainFrame) return;
+    replaceShellRenderer();
+  });
+  shellContents.on("render-process-gone", () => {
+    replaceShellRenderer();
+  });
 
   win.on("closed", () => {
     // Electron destroys BrowserWindow before emitting "closed". Only use the
     // identifier captured while the window and its WebContents were alive.
     shellWebContents.delete(shellWebContentsId);
     disposeTerminalsForWebContents(shellWebContentsId);
-    void closeAppViewersForOwner(shellWebContentsId);
+    const cleanup = closeAppViewersForOwner(shellState.currentOwner);
+    void Promise.allSettled([shellState.retirement, cleanup]);
   });
 
   if (development || process.env.LAMARCK_DEBUG_RENDERER === "1") {
@@ -2754,9 +2850,10 @@ app.whenReady().then(async () => {
     ));
   });
   ipcMain.handle("app-viewer:open", async (event, appId: string) => {
-    requireShellIpc(event);
+    const owner = requireShellRendererOwner(event);
     try {
-      const opened = await openAppViewer(event.sender, appId);
+      await awaitShellRendererRetirement(event.sender, owner);
+      const opened = await openAppViewer(event.sender, owner, appId);
       return { ok: true as const, viewerId: opened.viewerId };
     } catch (error) {
       return {
@@ -2764,7 +2861,9 @@ app.whenReady().then(async () => {
         error: {
           code: isCapsuleRestartRequiredError(error)
             ? "CAPSULE_RESTART_REQUIRED"
-            : "APP_VIEWER_OPEN_FAILED",
+            : error instanceof AppViewerBusyError
+              ? "APP_VIEWER_BUSY"
+              : "APP_VIEWER_OPEN_FAILED",
           message: errorMessage(error),
           restartRequired: isCapsuleRestartRequiredError(error),
         },
@@ -2775,13 +2874,14 @@ app.whenReady().then(async () => {
     viewerId: string;
     bounds: { x: number; y: number; width: number; height: number };
   }) => {
-    try { requireShellIpc(event); } catch { return; }
+    let owner: AppViewerOwner;
+    try { owner = requireShellRendererOwner(event); } catch { return; }
     if (!payload || typeof payload.viewerId !== "string" || !payload.bounds) return;
-    setAppViewerBounds(payload.viewerId, event.sender.id, payload.bounds);
+    setAppViewerBounds(payload.viewerId, owner, payload.bounds);
   });
   ipcMain.handle("app-viewer:close", async (event, viewerId: string) => {
-    requireShellIpc(event);
-    if (typeof viewerId === "string") await closeAppViewer(viewerId, event.sender.id);
+    const owner = requireShellRendererOwner(event);
+    if (typeof viewerId === "string") await closeAppViewer(viewerId, owner);
     return { ok: true };
   });
   ipcMain.handle("app-runtime:reload", async (event, appId: string) => {

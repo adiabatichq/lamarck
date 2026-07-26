@@ -7,11 +7,23 @@ import type {
   CapsuleUiSpec,
 } from "./backend";
 import { CapsuleRestartRequiredError } from "./backend";
-import { CapsuleManager, type PreparedViewerBinding } from "./manager";
+import {
+  AppViewerBusyError,
+  CapsuleManager,
+  type AppViewerOwner,
+  type PreparedViewerBinding,
+} from "./manager";
 
 const MANIFEST_GENERATION = 7;
 const MANIFEST_DIGEST = `sha256:${"a".repeat(64)}`;
 const OTHER_MANIFEST_DIGEST = `sha256:${"b".repeat(64)}`;
+
+function viewerOwner(
+  webContentsId: number,
+  rendererGeneration = 1,
+): AppViewerOwner {
+  return { webContentsId, rendererGeneration };
+}
 
 class FakeBackend implements CapsuleBackend {
   starts: CapsuleUiSpec[] = [];
@@ -203,7 +215,7 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    const viewer = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const viewer = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     expect(viewer).toMatchObject({
       appId: "app-a",
       channelId: "channel-app-a-2",
@@ -245,7 +257,7 @@ describe("CapsuleManager", () => {
       reportVerificationStarted = resolve;
     });
 
-    const opening = manager.openViewer("app-a", 7, async (binding) => {
+    const opening = manager.openViewer("app-a", viewerOwner(7), async (binding) => {
       preparedBinding = binding;
       reportVerificationStarted();
       await verificationGate;
@@ -253,7 +265,7 @@ describe("CapsuleManager", () => {
     });
     await verificationStarted;
 
-    expect(manager.getViewer(preparedBinding.viewerId, 7)).toBeNull();
+    expect(manager.getViewer(preparedBinding.viewerId, viewerOwner(7))).toBeNull();
     expect(backend.committedPreparations).toEqual([]);
     expect(preparedBinding).toMatchObject({
       appId: "app-a",
@@ -269,13 +281,126 @@ describe("CapsuleManager", () => {
     const opened = await opening;
     expect(opened.viewerId).toBe(preparedBinding.viewerId);
     expect(backend.committedPreparations).toEqual(["preparation-1"]);
-    expect(manager.getViewer(opened.viewerId, 7)).toBe(opened);
+    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBe(opened);
     const committedStream = await preparedBinding.openUiStream();
     committedStream.destroy();
     expect(backend.openedStreams).toEqual([
       "instance-app-a",
       "instance-app-a",
     ]);
+  });
+
+  test("cancels a deferred preparation when its owner renderer is replaced", async () => {
+    const backend = new FakeBackend();
+    const normalPrepare = backend.prepareUi.bind(backend);
+    let firstPreparation = true;
+    let reportPreparationStarted!: () => void;
+    const preparationStarted = new Promise<void>((resolve) => {
+      reportPreparationStarted = resolve;
+    });
+    let rejectPreparation!: (error: Error) => void;
+    backend.prepareUi = async (spec, previousInstanceId) => {
+      if (!firstPreparation) return await normalPrepare(spec, previousInstanceId);
+      firstPreparation = false;
+      backend.starts.push(spec);
+      reportPreparationStarted();
+      return await new Promise<CapsuleUiPreparation>((_resolve, reject) => {
+        rejectPreparation = reject;
+      });
+    };
+    backend.stopApp = async (appId) => {
+      backend.appStops.push(appId);
+      rejectPreparation(new Error("launch cancelled for replaced renderer"));
+    };
+    const { fetch } = createFetch();
+    const bindings = systemBindings();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...bindings,
+    });
+    const retiredOwner = viewerOwner(7, 3);
+    const replacementOwner = viewerOwner(7, 4);
+
+    const opening = manager.openViewer(
+      "app-a",
+      retiredOwner,
+      verifyPreparedViewer,
+    );
+    const openingFailure = expect(opening).rejects.toThrow(
+      "launch cancelled for replaced renderer",
+    );
+    await preparationStarted;
+
+    await manager.closeOwner(retiredOwner);
+    await openingFailure;
+    expect(backend.appStops).toEqual(["app-a"]);
+    expect(backend.committedPreparations).toEqual([]);
+    expect(bindings.unbindSystemSender).toHaveBeenCalledWith(
+      backend.starts[0]!.sdkSenderId,
+    );
+
+    const replacement = await manager.openViewer(
+      "app-a",
+      replacementOwner,
+      verifyPreparedViewer,
+    );
+    expect(manager.getViewer(replacement.viewerId, retiredOwner)).toBeNull();
+    expect(manager.getViewer(replacement.viewerId, replacementOwner)).toBe(replacement);
+    await manager.closeOwner(retiredOwner);
+    expect(manager.getViewer(replacement.viewerId, replacementOwner)).toBe(replacement);
+  });
+
+  test("aborts hidden viewer verification owned by a retired renderer generation", async () => {
+    const backend = new FakeBackend();
+    const { fetch } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+    const retiredOwner = viewerOwner(7, 8);
+    const replacementOwner = viewerOwner(7, 9);
+    let preparedBinding!: PreparedViewerBinding;
+    let reportVerificationStarted!: () => void;
+    const verificationStarted = new Promise<void>((resolve) => {
+      reportVerificationStarted = resolve;
+    });
+    let releaseVerification!: () => void;
+    const verificationGate = new Promise<void>((resolve) => {
+      releaseVerification = resolve;
+    });
+
+    const opening = manager.openViewer("app-a", retiredOwner, async (binding) => {
+      preparedBinding = binding;
+      reportVerificationStarted();
+      await verificationGate;
+      binding.assertCurrent();
+    });
+    const openingFailure = expect(opening).rejects.toThrow("launch was cancelled");
+    await verificationStarted;
+
+    const retirement = manager.closeOwner(retiredOwner);
+    expect(preparedBinding.signal.aborted).toBe(true);
+    releaseVerification();
+    await openingFailure;
+    await retirement;
+
+    expect(backend.committedPreparations).toEqual([]);
+    expect(backend.abortedPreparations).toEqual(["preparation-1"]);
+    const replacement = await manager.openViewer(
+      "app-a",
+      replacementOwner,
+      verifyPreparedViewer,
+    );
+    expect(manager.getViewer(replacement.viewerId, retiredOwner)).toBeNull();
+    expect(manager.getViewer(replacement.viewerId, replacementOwner)).toBe(replacement);
   });
 
   test("aborts a failed prepared launch without publishing its viewer", async () => {
@@ -291,12 +416,12 @@ describe("CapsuleManager", () => {
     });
     let candidateViewerId = "";
 
-    await expect(manager.openViewer("app-a", 7, async (binding) => {
+    await expect(manager.openViewer("app-a", viewerOwner(7), async (binding) => {
       candidateViewerId = binding.viewerId;
       throw new Error("hidden document returned 503");
     })).rejects.toThrow("hidden document returned 503");
 
-    expect(manager.getViewer(candidateViewerId, 7)).toBeNull();
+    expect(manager.getViewer(candidateViewerId, viewerOwner(7))).toBeNull();
     expect(backend.committedPreparations).toEqual([]);
     expect(backend.abortedPreparations).toEqual(["preparation-1"]);
     for (const channel of [1, 2]) {
@@ -318,12 +443,12 @@ describe("CapsuleManager", () => {
     });
     let candidateViewerId = "";
 
-    await expect(manager.openViewer("app-a", 7, async (binding) => {
+    await expect(manager.openViewer("app-a", viewerOwner(7), async (binding) => {
       candidateViewerId = binding.viewerId;
       binding.invalidate(new Error("hidden renderer exited"));
     })).rejects.toThrow("launch was cancelled");
 
-    expect(manager.getViewer(candidateViewerId, 7)).toBeNull();
+    expect(manager.getViewer(candidateViewerId, viewerOwner(7))).toBeNull();
     expect(backend.committedPreparations).toEqual([]);
     expect(backend.abortedPreparations).toEqual(["preparation-1"]);
     for (const channel of [1, 2]) {
@@ -343,13 +468,13 @@ describe("CapsuleManager", () => {
       fetch,
       ...systemBindings(),
     });
-    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
 
     await expect(manager.reloadApp("app-a", async () => {
       throw new Error("replacement document was incomplete");
     }, publishReloadedViewer)).rejects.toThrow("replacement document was incomplete");
 
-    expect(manager.getViewer(opened.viewerId, 7)).toBe(opened);
+    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBe(opened);
     expect(backend.committedPreparations).toEqual(["preparation-1"]);
     expect(backend.abortedPreparations).toEqual(["preparation-2"]);
     for (const channel of [1, 2]) {
@@ -376,7 +501,7 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer))
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer))
       .rejects.toThrow("different App manifest authority");
     expect(backend.starts).toEqual([]);
     const issuance = calls.find((call) => (
@@ -402,11 +527,15 @@ describe("CapsuleManager", () => {
       fetch,
       ...systemBindings(),
     });
-    const viewer = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const viewer = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
 
-    expect(await manager.closeViewer(viewer.viewerId, 8)).toBe(false);
+    expect(await manager.closeViewer(viewer.viewerId, viewerOwner(8))).toBe(false);
+    expect(await manager.closeViewer(
+      viewer.viewerId,
+      viewerOwner(7, 2),
+    )).toBe(false);
     expect(backend.stops).toEqual([]);
-    expect(await manager.closeViewer(viewer.viewerId, 7)).toBe(true);
+    expect(await manager.closeViewer(viewer.viewerId, viewerOwner(7))).toBe(true);
     expect(backend.stops).toEqual(["instance-app-a"]);
     expect(calls.some((call) => call.url.endsWith("/channels/channel-app-a-1"))).toBe(true);
     expect(calls.some((call) => call.url.endsWith("/channels/channel-app-a-2"))).toBe(true);
@@ -435,7 +564,7 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).rejects.toThrow("no verified image");
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)).rejects.toThrow("no verified image");
     expect(calls).toEqual([]);
   });
 
@@ -457,7 +586,7 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer))
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer))
       .rejects.toBeInstanceOf(CapsuleRestartRequiredError);
     expect(calls).toEqual([]);
   });
@@ -493,17 +622,17 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
       onBackendBoundaryLost,
     });
-    const viewerA = await manager.openViewer("app-a", 7, verifyPreparedViewer);
-    const viewerB = await manager.openViewer("app-b", 8, verifyPreparedViewer);
+    const viewerA = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
+    const viewerB = await manager.openViewer("app-b", viewerOwner(8), verifyPreparedViewer);
     backend.failStopUi = true;
 
-    const failure = await rejectionOf(manager.closeViewer(viewerA.viewerId, 7));
+    const failure = await rejectionOf(manager.closeViewer(viewerA.viewerId, viewerOwner(7)));
     expect(failure.message).toContain("backend boundary was lost");
     expect(failure.message).toContain("stop failed");
 
     expect(onBackendBoundaryLost).toHaveBeenCalledOnce();
     expect(backend.stopAllCalls).toBe(1);
-    expect(manager.getViewer(viewerB.viewerId, 8)).toBeNull();
+    expect(manager.getViewer(viewerB.viewerId, viewerOwner(8))).toBeNull();
     expect(calls.some((call) => call.url.endsWith("/channels/channel-app-b-3"))).toBe(true);
     expect(calls.some((call) => call.url.endsWith("/channels/channel-app-b-4"))).toBe(true);
   });
@@ -522,7 +651,7 @@ describe("CapsuleManager", () => {
       ...bindings,
       onBackendBoundaryLost,
     });
-    const viewer = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const viewer = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
 
     backend.boundaryLostHandler?.(new Error("Guest control channel lost"));
     await vi.waitFor(() => expect(backend.stopAllCalls).toBe(1));
@@ -530,7 +659,7 @@ describe("CapsuleManager", () => {
     expect(onBackendBoundaryLost).toHaveBeenCalledWith(
       expect.objectContaining({ message: "Guest control channel lost" }),
     );
-    expect(manager.getViewer(viewer.viewerId, 7)).toBeNull();
+    expect(manager.getViewer(viewer.viewerId, viewerOwner(7))).toBeNull();
     expect(bindings.unbindSystemSender).toHaveBeenCalledWith(
       backend.starts[0]!.sdkSenderId,
     );
@@ -552,7 +681,7 @@ describe("CapsuleManager", () => {
       ...bindings,
       onUiLost,
     });
-    const viewer = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const viewer = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
 
     backend.uiLostHandler?.({
       instanceId: viewer.instanceId,
@@ -560,7 +689,7 @@ describe("CapsuleManager", () => {
       error: new Error("workload exited"),
     });
 
-    expect(manager.getViewer(viewer.viewerId, 7)).toBeNull();
+    expect(manager.getViewer(viewer.viewerId, viewerOwner(7))).toBeNull();
     expect(bindings.unbindSystemSender).toHaveBeenCalledWith(
       backend.starts[0]!.sdkSenderId,
     );
@@ -606,7 +735,7 @@ describe("CapsuleManager", () => {
       ...bindings,
     });
 
-    const opening = manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opening = manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     await browserCapabilityStarted;
     backend.uiLostHandler?.({
       instanceId: "instance-app-a",
@@ -643,7 +772,7 @@ describe("CapsuleManager", () => {
       ...bindings,
       onUiLost,
     });
-    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     backend.loseReplacementBeforeReturn = true;
 
     await expect(manager.reloadApp(
@@ -654,7 +783,7 @@ describe("CapsuleManager", () => {
       "replacement exited before publication",
     );
 
-    expect(manager.getViewer(opened.viewerId, 7)).toBe(opened);
+    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBe(opened);
     expect(onUiLost).not.toHaveBeenCalled();
     expect(backend.abortedPreparations).toContain("preparation-2");
     for (const channel of [3, 4]) {
@@ -681,7 +810,7 @@ describe("CapsuleManager", () => {
       ...bindings,
       onUiLost,
     });
-    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     backend.loseCommittedReplacementBeforeReturn = true;
 
     await expect(manager.reloadApp(
@@ -692,7 +821,7 @@ describe("CapsuleManager", () => {
       "committed replacement exited before Host publication",
     );
 
-    expect(manager.getViewer(opened.viewerId, 7)).toBeNull();
+    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
     expect(bindings.unbindSystemSender).toHaveBeenCalledWith(
       backend.starts[0]!.sdkSenderId,
     );
@@ -721,7 +850,7 @@ describe("CapsuleManager", () => {
       ...bindings,
       onUiLost,
     });
-    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     let prepared!: PreparedViewerBinding;
     let reportVerifierStarted!: () => void;
     const verifierStarted = new Promise<void>((resolve) => {
@@ -745,7 +874,7 @@ describe("CapsuleManager", () => {
     });
 
     expect(prepared.signal.aborted).toBe(true);
-    expect(manager.getViewer(opened.viewerId, 7)).toBeNull();
+    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
     expect(onUiLost).toHaveBeenCalledWith(expect.objectContaining({
       viewerId: opened.viewerId,
       instanceId: opened.instanceId,
@@ -784,14 +913,14 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
       onUiLost: vi.fn(),
     });
-    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
 
     const reload = manager.reloadApp(
       "app-a",
       verifyPreparedViewer,
       (binding) => {
         cutoverOrder.push("renderer-publication");
-        expect(manager.getViewer(binding.viewerId, 7)).toMatchObject({
+        expect(manager.getViewer(binding.viewerId, viewerOwner(7))).toMatchObject({
           instanceId: binding.instanceId,
           channelId: binding.channelId,
         });
@@ -810,7 +939,7 @@ describe("CapsuleManager", () => {
     releaseOldChannel();
 
     await expect(reload).rejects.toThrow("stopped before Host publication completed");
-    expect(manager.getViewer(opened.viewerId, 7)).toBeNull();
+    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
     await vi.waitFor(() => {
       expect(base.calls.some((call) => call.url.endsWith("/channels/channel-app-a-3"))).toBe(true);
       expect(base.calls.some((call) => call.url.endsWith("/channels/channel-app-a-4"))).toBe(true);
@@ -831,7 +960,7 @@ describe("CapsuleManager", () => {
       ...bindings,
       onUiLost,
     });
-    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
 
     await expect(manager.reloadApp(
       "app-a",
@@ -841,7 +970,7 @@ describe("CapsuleManager", () => {
       },
     )).rejects.toThrow("renderer cutover failed");
 
-    expect(manager.getViewer(opened.viewerId, 7)).toBeNull();
+    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
     expect(backend.stops).toContain("instance-app-a-replacement");
     expect(onUiLost).toHaveBeenCalledWith(expect.objectContaining({
       viewerId: opened.viewerId,
@@ -864,7 +993,7 @@ describe("CapsuleManager", () => {
       fetch,
       ...systemBindings(),
     });
-    await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
 
     await expect(manager.reloadApp(
       "app-a",
@@ -898,8 +1027,8 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).rejects.toThrow("declares services");
-    await expect(manager.openViewer("app-b", 7, verifyPreparedViewer)).rejects.toThrow("declares jobs");
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)).rejects.toThrow("declares services");
+    await expect(manager.openViewer("app-b", viewerOwner(7), verifyPreparedViewer)).rejects.toThrow("declares jobs");
     expect(backend.starts).toEqual([]);
     expect(calls.filter((call) => call.url.endsWith("/api/app-runtime/channels")))
       .toEqual([]);
@@ -918,7 +1047,7 @@ describe("CapsuleManager", () => {
       fetch,
       ...systemBindings(),
     });
-    await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
 
     const rebuild = manager.reloadApp(
       "app-a",
@@ -947,7 +1076,7 @@ describe("CapsuleManager", () => {
       fetch,
       ...systemBindings(),
     });
-    await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     let reportVerificationStarted!: () => void;
     const verificationStarted = new Promise<void>((resolve) => {
       reportVerificationStarted = resolve;
@@ -1005,7 +1134,7 @@ describe("CapsuleManager", () => {
       ...bindings,
     });
 
-    const opening = manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opening = manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     const openingFailure = expect(opening).rejects.toThrow("launch cancelled by stopAll");
     await launchStarted;
 
@@ -1039,7 +1168,7 @@ describe("CapsuleManager", () => {
       fetch,
       ...bindings,
     });
-    await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     const callCountBeforeStop = calls.length;
 
     await manager.stopAll({ controlPlaneLost: true });
@@ -1049,7 +1178,7 @@ describe("CapsuleManager", () => {
     expect(calls.slice(callCountBeforeStop).some((call) => (
       call.init?.method === "DELETE"
     ))).toBe(false);
-    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer))
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer))
       .resolves.toMatchObject({ appId: "app-a" });
   });
 
@@ -1075,7 +1204,7 @@ describe("CapsuleManager", () => {
       fetch,
       ...systemBindings(),
     });
-    await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
 
     const stopping = manager.stopAll();
     await deleteStarted;
@@ -1084,7 +1213,7 @@ describe("CapsuleManager", () => {
     expect(upgraded).toBe(stopping);
     await stopping;
     expect(backend.stopAllCalls).toBe(1);
-    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer))
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer))
       .resolves.toMatchObject({ appId: "app-a" });
   });
 
@@ -1119,7 +1248,7 @@ describe("CapsuleManager", () => {
         return hostCleanup;
       },
     });
-    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     backend.uiLostHandler?.({
       instanceId: opened.instanceId,
       appId: opened.appId,
@@ -1136,7 +1265,7 @@ describe("CapsuleManager", () => {
     releaseHostCleanup();
     await stopping;
     expect(deleteCalls).toBe(2);
-    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer))
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer))
       .resolves.toMatchObject({ appId: "app-a" });
     expect(deleteCalls).toBe(2);
   });
@@ -1194,7 +1323,7 @@ describe("CapsuleManager", () => {
       ...bindings,
     });
 
-    const opening = manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opening = manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     const openingFailure = expect(opening).rejects.toThrow("launch was cancelled");
     await issuanceStarted;
     const stopping = manager.stopAll();
@@ -1270,7 +1399,7 @@ describe("CapsuleManager", () => {
         available: false,
         restartRequired: true,
       });
-      await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).rejects.toMatchObject({
+      await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)).rejects.toMatchObject({
         restartRequired: true,
       });
     } finally {
@@ -1293,7 +1422,11 @@ describe("CapsuleManager", () => {
     });
 
     manager.beginAppRetirement("app-a");
-    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).rejects.toThrow("active viewer");
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)).rejects.toMatchObject({
+      name: "AppViewerBusyError",
+      code: "APP_VIEWER_BUSY",
+      message: expect.stringContaining("active viewer"),
+    } satisfies Partial<AppViewerBusyError>);
     await expect(manager.reloadApp(
       "app-a",
       verifyPreparedViewer,
@@ -1311,9 +1444,9 @@ describe("CapsuleManager", () => {
 
     releaseRetirement();
     await first;
-    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).rejects.toThrow("active viewer");
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)).rejects.toThrow("active viewer");
     manager.finishAppRetirement("app-a");
-    await expect(manager.openViewer("app-a", 7, verifyPreparedViewer)).resolves.toMatchObject({ appId: "app-a" });
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)).resolves.toMatchObject({ appId: "app-a" });
   });
 
   test("rotates runtime and browser channels before replacing a live UI", async () => {
@@ -1328,7 +1461,7 @@ describe("CapsuleManager", () => {
       fetch,
       ...bindings,
     });
-    const opened = await manager.openViewer("app-a", 7, verifyPreparedViewer);
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
 
     const reloaded = await manager.reloadApp(
       "app-a",
@@ -1357,7 +1490,7 @@ describe("CapsuleManager", () => {
         sdkSenderId: expect.stringMatching(/^capsule_/),
       },
     }]);
-    expect(manager.getViewer(opened.viewerId, 7)?.instanceId)
+    expect(manager.getViewer(opened.viewerId, viewerOwner(7))?.instanceId)
       .toBe("instance-app-a-replacement");
     expect(bindings.unbindSystemSender).toHaveBeenCalledWith(
       backend.starts[0]!.sdkSenderId,

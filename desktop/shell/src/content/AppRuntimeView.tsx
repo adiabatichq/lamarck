@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { AppMark } from "../components/AppMark";
+import {
+  viewerOpenRetryDelay,
+  type ViewerOpenFailure,
+} from "../lib/app-viewer-open";
 import styles from "./AppRuntimeView.module.css";
 
 interface AppRuntimeViewProps {
@@ -7,13 +11,6 @@ interface AppRuntimeViewProps {
   appName?: string;
   /** Zero the native viewer bounds without closing it, so DOM surfaces above can show. */
   hidden?: boolean;
-}
-
-const MAX_OPEN_ATTEMPTS = 4;
-
-interface ViewerOpenFailure {
-  message: string;
-  restartRequired: boolean;
 }
 
 export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRuntimeViewProps) {
@@ -35,14 +32,24 @@ export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRu
     const longTimer = window.setTimeout(() => setTakingLong(true), 1_200);
 
     async function open(attempt = 1): Promise<void> {
+      const retry = (failure: ViewerOpenFailure): boolean => {
+        const delay = viewerOpenRetryDelay(failure, attempt);
+        if (delay === null) return false;
+        retryTimer = window.setTimeout(() => void open(attempt + 1), delay);
+        return true;
+      };
+
       try {
         const result = await window.lamarckHost?.openAppViewer(appId);
         if (!result) throw new Error("App Capsule Host is unavailable");
         if (!result.ok) {
-          setError({
+          if (cancelled) return;
+          const failure = {
+            code: result.error.code,
             message: result.error.message,
             restartRequired: result.error.restartRequired,
-          });
+          };
+          if (!retry(failure)) setError(failure);
           return;
         }
         openedViewerId = result.viewerId;
@@ -55,11 +62,8 @@ export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRu
       } catch (reason) {
         if (cancelled) return;
         const message = reason instanceof Error ? reason.message : String(reason);
-        if (attempt < MAX_OPEN_ATTEMPTS && /already has an active viewer|already has an active/i.test(message)) {
-          retryTimer = window.setTimeout(() => void open(attempt + 1), attempt * 140);
-          return;
-        }
-        setError({ message, restartRequired: false });
+        const failure = { message, restartRequired: false };
+        if (!retry(failure)) setError(failure);
       }
     }
 

@@ -12,9 +12,59 @@ describe("Shell window lifecycle", () => {
     expect(mainSource).toContain("const shellWebContentsId = shellContents.id;");
     expect(handler).toContain("shellWebContents.delete(shellWebContentsId)");
     expect(handler).toContain("disposeTerminalsForWebContents(shellWebContentsId)");
-    expect(handler).toContain("closeAppViewersForOwner(shellWebContentsId)");
+    expect(handler).toContain("closeAppViewersForOwner(shellState.currentOwner)");
     expect(handler).not.toContain("win.");
     expect(handler).not.toContain("webContents");
+  });
+
+  test("rotates the owner generation before retiring a replaced Shell renderer", () => {
+    const setup = mainSource.match(
+      /const shellContents = win\.webContents;[\s\S]*?await win\.loadURL/,
+    )?.[0];
+    if (!setup) throw new Error("Shell BrowserWindow setup is missing");
+
+    expect(setup).toMatch(
+      /const replaceShellRenderer = \(\) => \{[\s\S]*?const retiredOwner = shellState\.currentOwner;[\s\S]*?rendererGeneration: retiredOwner\.rendererGeneration \+ 1,[\s\S]*?closeAppViewersForOwner\(retiredOwner\)/,
+    );
+    expect(setup).toMatch(
+      /shellState\.retirement = Promise\.allSettled\(\[[\s\S]*?shellState\.retirement,[\s\S]*?cleanup,[\s\S]*?\]\)\.then/,
+    );
+    expect(setup).toMatch(
+      /on\("did-start-navigation",[\s\S]*?if \(details\.isSameDocument \|\| !details\.isMainFrame\) return;[\s\S]*?replaceShellRenderer\(\)/,
+    );
+    expect(setup).toMatch(
+      /on\("render-process-gone",[\s\S]*?replaceShellRenderer\(\)/,
+    );
+  });
+});
+
+describe("App viewer IPC contract", () => {
+  test("serializes a busy Host state for bounded renderer retry", () => {
+    const handler = mainSource.match(
+      /ipcMain\.handle\("app-viewer:open",[\s\S]*?\n  \}\);/,
+    )?.[0];
+    if (!handler) throw new Error("App viewer open IPC handler is missing");
+
+    expect(handler).toContain("error instanceof AppViewerBusyError");
+    expect(handler).toContain('"APP_VIEWER_BUSY"');
+    expect(handler).toContain("const owner = requireShellRendererOwner(event)");
+    expect(handler).toContain("await awaitShellRendererRetirement(event.sender, owner)");
+    expect(handler).toContain("openAppViewer(event.sender, owner, appId)");
+  });
+
+  test("rechecks the renderer owner before publishing a prepared viewer", () => {
+    const open = mainSource.match(
+      /async function openAppViewer\([\s\S]*?\n\}\n\nasync function prepareReloadedAppViewer/,
+    )?.[0];
+    if (!open) throw new Error("App viewer open lifecycle is missing");
+
+    expect(open).toContain("capsuleManager.openViewer(appId, ownerLease");
+    const managerReturn = open.indexOf("opened = await capsuleManager.openViewer");
+    const publication = open.indexOf("appViewers.set(opened.viewerId, record)");
+    expect(managerReturn).toBeGreaterThan(-1);
+    expect(publication).toBeGreaterThan(managerReturn);
+    expect(open.slice(managerReturn, publication))
+      .toContain("assertShellRendererOwnerCurrent(sender, ownerLease)");
   });
 });
 

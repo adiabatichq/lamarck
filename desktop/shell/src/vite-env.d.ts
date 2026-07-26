@@ -69,7 +69,10 @@ interface Window {
       | {
           ok: false;
           error: {
-            code: "CAPSULE_RESTART_REQUIRED" | "APP_VIEWER_OPEN_FAILED";
+            code:
+              | "CAPSULE_RESTART_REQUIRED"
+              | "APP_VIEWER_BUSY"
+              | "APP_VIEWER_OPEN_FAILED";
             message: string;
             restartRequired: boolean;
           };
