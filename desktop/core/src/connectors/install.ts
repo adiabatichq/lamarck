@@ -1,7 +1,11 @@
 import { randomUUID } from "crypto";
 import { cp, mkdir, readdir, rename, rm, stat } from "fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "path";
-import { loadConnectorManifest, validateConnectorId } from "./manifest";
+import {
+  loadConnectorEventCatalog,
+  loadConnectorManifest,
+  validateConnectorId,
+} from "./manifest";
 import { hashConnectorPackage } from "./registry";
 import type { ConnectorManifest } from "./types";
 import type { ConnectorSupervisor } from "./supervisor";
@@ -139,6 +143,7 @@ export async function listAvailableBuiltIns(
       if (manifest.id !== entry.name) {
         throw new Error(`Connector manifest id "${manifest.id}" must match folder "${entry.name}"`);
       }
+      await loadConnectorEventCatalog(dir, manifest);
       available.push({ manifest, dir });
     } catch (err) {
       if (!onError) throw err;
@@ -295,6 +300,7 @@ async function prepareConnectorMaterialization(
 }> {
   const sourceDir = resolve(opts.sourceDir);
   const manifest = await loadConnectorManifest(sourceDir);
+  await loadConnectorEventCatalog(sourceDir, manifest);
   if (opts.connectorId && opts.connectorId !== manifest.id) {
     throw new Error(
       `Connector manifest id "${manifest.id}" does not match requested id "${opts.connectorId}"`,
@@ -316,7 +322,8 @@ async function stageConnectorPackage(
   const stagingDir = join(connectorsDir, `.${action}-staging-${randomUUID()}`);
   try {
     await cp(sourceDir, stagingDir, { recursive: true });
-    await loadConnectorManifest(stagingDir);
+    const manifest = await loadConnectorManifest(stagingDir);
+    await loadConnectorEventCatalog(stagingDir, manifest);
     await hashConnectorPackage(stagingDir);
     return stagingDir;
   } catch (err) {

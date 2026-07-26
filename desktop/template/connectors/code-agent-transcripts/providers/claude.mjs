@@ -36,13 +36,12 @@ export const claudeAdapter = {
       provider: "claude-code",
       records: input.records,
       ids: input.ids,
-      maxInlineBytes: input.config["max-inline-bytes"],
       forceBlob: true,
     });
   },
 };
 
-function scanClaudeRecord(record, ctx, scan, session, config) {
+function scanClaudeRecord(record, ctx, scan, session) {
   if (isClaudeHumanRecord(record)) {
     const rawId = stringFrom(record.uuid) ?? fallbackRecordId(session, ctx);
     const providerInteractionId = stringFrom(record.promptId) ?? rawId;
@@ -80,7 +79,6 @@ function scanClaudeRecord(record, ctx, scan, session, config) {
       record,
       lineIndex: ctx.lineIndex,
       session,
-      config,
       ids: compactObject({
         sessionId: session.id,
         promptId: stringFrom(record.promptId),

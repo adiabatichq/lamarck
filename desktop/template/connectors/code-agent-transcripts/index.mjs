@@ -29,7 +29,6 @@ const DEFAULTS = {
   "codex-root": "~/.codex/sessions",
   "claude-root": "~/.claude/projects",
   "lookback-days": 30,
-  "max-inline-bytes": 8192,
 };
 
 const INTERNAL = {
@@ -382,7 +381,7 @@ async function buildAgentTurnEvent(input) {
       interactionId: interactionKey(providerName, input.session, providerInteractionId),
       status: input.closed.status,
       content: projection.finalText
-        ? contentPayload(projection.finalText, input.config)
+        ? contentPayload(projection.finalText)
         : undefined,
       raw,
     }),
@@ -523,7 +522,6 @@ function transcriptSearchDirs(root, opts) {
 
 function normalizeConfig(input) {
   const value = isObject(input) ? input : {};
-  const legacyInlineLimit = value["max-content-chars"];
   return {
     "include-codex": typeof value["include-codex"] === "boolean" ? value["include-codex"] : DEFAULTS["include-codex"],
     "include-claude": typeof value["include-claude"] === "boolean" ? value["include-claude"] : DEFAULTS["include-claude"],
@@ -531,7 +529,6 @@ function normalizeConfig(input) {
     "codex-root": readString(value["codex-root"], DEFAULTS["codex-root"]),
     "claude-root": readString(value["claude-root"], DEFAULTS["claude-root"]),
     "lookback-days": integerInRange(value["lookback-days"], 0, 3650, DEFAULTS["lookback-days"]),
-    "max-inline-bytes": integerInRange(value["max-inline-bytes"] ?? legacyInlineLimit, 0, 100_000, DEFAULTS["max-inline-bytes"]),
   };
 }
 

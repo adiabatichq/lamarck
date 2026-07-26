@@ -1,6 +1,8 @@
 manifestVersion: 1
 id: oura
 name: Oura
+description: Imports sleep, readiness, activity, heart-rate, and related health records from Oura.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: poll

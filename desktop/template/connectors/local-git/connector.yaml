@@ -1,6 +1,8 @@
 manifestVersion: 1
 id: local-git
 name: Local Git
+description: Captures commits from user-selected local Git repositories.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: watch

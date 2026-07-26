@@ -15,6 +15,7 @@ export interface AppManifest {
   manifestVersion: 1;
   id: string;
   name: string;
+  description: string;
   runtime: {
     ui?: {
       command: string[];
@@ -59,7 +60,14 @@ type ValidationResult =
   | { ok: false; error: string };
 
 const APP_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
-const MANIFEST_FIELDS = new Set(["manifestVersion", "id", "name", "runtime", "permissions"]);
+const MANIFEST_FIELDS = new Set([
+  "manifestVersion",
+  "id",
+  "name",
+  "description",
+  "runtime",
+  "permissions",
+]);
 const RUNTIME_FIELDS = new Set(["ui", "services", "jobs"]);
 const UI_FIELDS = new Set(["command", "port"]);
 const WORKLOAD_FIELDS = new Set(["command"]);
@@ -301,6 +309,13 @@ function validateManifest(value: unknown, directoryName: string): ValidationResu
   if (typeof value.name !== "string" || value.name.length === 0 || value.name.trim() !== value.name) {
     return invalid("name must be a non-empty, trimmed string");
   }
+  if (
+    typeof value.description !== "string"
+    || value.description.length === 0
+    || value.description.trim() !== value.description
+  ) {
+    return invalid("description must be a non-empty, trimmed string");
+  }
 
   if (!isObject(value.runtime)) {
     return invalid("runtime must be an object");
@@ -370,6 +385,7 @@ function validateManifest(value: unknown, directoryName: string): ValidationResu
       manifestVersion: 1,
       id: value.id,
       name: value.name,
+      description: value.description,
       runtime,
       permissions: {
         docs: [...docs] as string[],

@@ -283,6 +283,7 @@ async function runCapsuleCoreGuard(): Promise<void> {
       manifestVersion: 1,
       id: "app-a",
       name: "App A",
+      description: "Linux Capsule guest test App.",
       runtime: {
         ui: { command: ["/bin/capsule-runtime-probe", "system-rpc"], port: 3000 },
       },

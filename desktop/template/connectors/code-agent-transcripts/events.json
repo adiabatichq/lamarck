@@ -1,0 +1,158 @@
+{
+  "catalogVersion": 1,
+  "eventTypes": {
+    "code_agent.human_message": {
+      "description": "A human-authored message selected from a root coding-agent conversation.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/$defs/messagePayload",
+        "$defs": {
+          "messagePayload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider", "conversationKey", "interactionId", "content", "raw"],
+            "properties": {
+              "provider": {
+                "type": "string",
+                "enum": ["codex", "claude-code"],
+                "description": "Logical coding-agent provider."
+              },
+              "conversationKey": {
+                "type": "string",
+                "description": "Stable provider-and-root-transcript key used to group a conversation."
+              },
+              "interactionId": {
+                "type": "string",
+                "description": "Stable connector-generated ID shared by the human message and its agent turn."
+              },
+              "content": {
+                "$ref": "#/$defs/content",
+                "description": "Redacted message text and its size, hash, and truncation metadata."
+              },
+              "raw": {
+                "$ref": "#/$defs/raw",
+                "description": "Redacted provider-native record metadata and inline records or a content reference."
+              }
+            }
+          },
+          "content": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["text", "chars", "bytes", "hash", "truncated"],
+            "properties": {
+              "text": {
+                "type": "string",
+                "description": "Complete redacted text or a UTF-8-safe preview."
+              },
+              "chars": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "JavaScript character count of the complete redacted text."
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "UTF-8 byte count of the complete redacted text."
+              },
+              "hash": {
+                "type": "string",
+                "description": "SHA-256 digest of the complete redacted text."
+              },
+              "truncated": {
+                "type": "boolean",
+                "description": "Whether text contains only an inline preview."
+              }
+            }
+          },
+          "raw": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["format", "recordCount", "bytes", "hash"],
+            "properties": {
+              "format": {
+                "type": "string",
+                "description": "Provider-native raw representation format."
+              },
+              "recordCount": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Number of selected root records represented."
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "UTF-8 byte count of the complete redacted raw representation."
+              },
+              "hash": {
+                "type": "string",
+                "description": "SHA-256 digest of the complete redacted raw representation."
+              }
+            }
+          }
+        }
+      }
+    },
+    "code_agent.agent_turn": {
+      "description": "A completed, interrupted, or failed root coding-agent interaction.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "allOf": [
+          {
+            "$ref": "#/$defs/messagePayload"
+          },
+          {
+            "type": "object",
+            "required": ["status"],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": ["completed", "interrupted", "failed"],
+                "description": "Terminal state inferred from the provider transcript."
+              },
+              "content": {
+                "$ref": "#/$defs/content",
+                "description": "Optional redacted final-answer projection for the root agent."
+              }
+            }
+          }
+        ],
+        "$defs": {
+          "messagePayload": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["provider", "conversationKey", "interactionId", "status", "raw"],
+            "properties": {
+              "provider": {
+                "type": "string",
+                "enum": ["codex", "claude-code"],
+                "description": "Logical coding-agent provider."
+              },
+              "conversationKey": {
+                "type": "string",
+                "description": "Stable provider-and-root-transcript key used to group a conversation."
+              },
+              "interactionId": {
+                "type": "string",
+                "description": "Stable connector-generated interaction ID."
+              },
+              "status": {
+                "type": "string",
+                "description": "Terminal interaction state."
+              },
+              "raw": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Redacted root-turn bundle metadata and content reference."
+              }
+            }
+          },
+          "content": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Redacted final-answer text and its size, hash, and truncation metadata."
+          }
+        }
+      }
+    }
+  }
+}

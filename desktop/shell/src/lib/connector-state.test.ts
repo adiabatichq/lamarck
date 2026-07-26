@@ -14,6 +14,7 @@ function source(overrides: Partial<ConnectorIntegrationView> = {}): ConnectorInt
     id: "source-1",
     connectorId: "example",
     name: "Example",
+    description: "Example Source.",
     mode: "poll",
     integrationsMode: "singleton",
     status: "idle",

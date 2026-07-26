@@ -1,0 +1,114 @@
+{
+  "catalogVersion": 1,
+  "eventTypes": {
+    "local_git.commit": {
+      "description": "A commit observed in a user-selected local Git repository.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "captureMethod",
+          "repo",
+          "objectFormat",
+          "commitSha",
+          "authoredAt",
+          "committedAt",
+          "author",
+          "committer",
+          "authoredByUser",
+          "committedByUser",
+          "message",
+          "diffstat",
+          "codeDiff"
+        ],
+        "properties": {
+          "schema": {
+            "const": "local_git.commit.v1",
+            "description": "Connector-owned payload contract discriminator."
+          },
+          "provider": {
+            "const": "git",
+            "description": "Upstream protocol that produced the record."
+          },
+          "captureMethod": {
+            "const": "git.log.all",
+            "description": "Git traversal used to discover the commit."
+          },
+          "repo": {
+            "type": "object",
+            "description": "Configured local repository identity and display metadata.",
+            "additionalProperties": false,
+            "required": ["path", "label"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Local repository path with the home directory collapsed to '~'."
+              },
+              "label": {
+                "type": "string",
+                "description": "User-facing repository label."
+              },
+              "normalizedOriginUrl": {
+                "type": "string",
+                "description": "Normalized origin URL when the repository has one."
+              }
+            }
+          },
+          "objectFormat": {
+            "type": "string",
+            "enum": ["sha1", "sha256"],
+            "description": "Git object hash format used by the repository."
+          },
+          "commitSha": {
+            "type": "string",
+            "description": "Full Git object ID of the commit."
+          },
+          "authoredAt": {
+            "type": "string",
+            "description": "Git author timestamp."
+          },
+          "committedAt": {
+            "type": "string",
+            "description": "Git committer timestamp."
+          },
+          "author": {
+            "type": "object",
+            "description": "Author identity, subject to the configured email capture policy.",
+            "additionalProperties": true
+          },
+          "committer": {
+            "type": "object",
+            "description": "Committer identity, subject to the configured email capture policy.",
+            "additionalProperties": true
+          },
+          "authoredByUser": {
+            "type": "boolean",
+            "description": "Whether the author email matches a configured user identity."
+          },
+          "committedByUser": {
+            "type": "boolean",
+            "description": "Whether the committer email matches a configured user identity."
+          },
+          "message": {
+            "type": "object",
+            "description": "Commit-message capture result under the configured privacy mode.",
+            "additionalProperties": true
+          },
+          "diffstat": {
+            "type": "object",
+            "description": "Diffstat capture result under the configured privacy mode.",
+            "additionalProperties": true
+          },
+          "codeDiff": {
+            "type": "object",
+            "description": "Code-diff capture result, which may contain an inline summary or content reference.",
+            "additionalProperties": true
+          }
+        }
+      }
+    }
+  }
+}

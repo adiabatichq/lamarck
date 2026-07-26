@@ -10,6 +10,7 @@ const manifest: AppManifest = {
   manifestVersion: 1,
   id: "app-a",
   name: "App A",
+  description: "App runtime policy test fixture.",
   runtime: {
     ui: { command: ["npm", "run", "start"], port: 3000 },
     services: { indexer: { command: ["node", "indexer.mjs"] } },

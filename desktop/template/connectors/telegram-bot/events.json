@@ -1,0 +1,96 @@
+{
+  "catalogVersion": 1,
+  "eventTypes": {
+    "telegram.message.received": {
+      "description": "An inbound Telegram message update accepted by the configured bot and pairing policy.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "transport",
+          "telegram",
+          "messageKey",
+          "chatKey",
+          "message",
+          "text",
+          "textKind",
+          "attachmentTypes",
+          "mediaRefs"
+        ],
+        "properties": {
+          "schema": {
+            "const": "telegram.message.v1",
+            "description": "Connector-owned payload contract discriminator."
+          },
+          "provider": {
+            "const": "telegram",
+            "description": "Upstream service that produced the message."
+          },
+          "transport": {
+            "const": "telegram-bot-api",
+            "description": "API used to receive the update."
+          },
+          "telegram": {
+            "type": "object",
+            "description": "Telegram-specific bot and update identity.",
+            "additionalProperties": false,
+            "required": ["botId", "updateId", "updateType"],
+            "properties": {
+              "botId": {
+                "type": "number",
+                "description": "Telegram bot user ID."
+              },
+              "updateId": {
+                "type": "number",
+                "description": "Telegram update ID."
+              },
+              "updateType": {
+                "type": "string",
+                "description": "Telegram update field that contained the message."
+              }
+            }
+          },
+          "messageKey": {
+            "type": "string",
+            "description": "Stable bot-scoped message identity."
+          },
+          "chatKey": {
+            "type": "string",
+            "description": "Stable bot-scoped chat identity."
+          },
+          "message": {
+            "type": "object",
+            "description": "Provider-native Telegram message object.",
+            "additionalProperties": true
+          },
+          "text": {
+            "type": ["string", "null"],
+            "description": "Normalized text or caption when one exists."
+          },
+          "textKind": {
+            "type": ["string", "null"],
+            "description": "Whether normalized text came from message text or a caption."
+          },
+          "attachmentTypes": {
+            "type": "array",
+            "description": "Kinds of attachments present on the message.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mediaRefs": {
+            "type": "array",
+            "description": "Telegram file identifiers and metadata for message media.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -310,6 +310,7 @@ export interface AppInfo {
   manifestVersion: 1;
   id: string;
   name: string;
+  description: string;
   runtime: {
     ui?: {
       command: string[];
@@ -332,10 +333,14 @@ export function getAppSource(appId: string): Promise<Record<string, string>> {
   return request(`/api/apps/${encodeURIComponent(appId)}/source`);
 }
 
-export function createApp(id: string, name: string): Promise<{ ok: true; id: string }> {
+export function createApp(
+  id: string,
+  name: string,
+  description: string,
+): Promise<{ ok: true; id: string }> {
   return request("/api/apps", {
     method: "POST",
-    body: JSON.stringify({ id, name }),
+    body: JSON.stringify({ id, name, description }),
   });
 }
 
@@ -460,6 +465,7 @@ export interface ConnectorConfigPanelView {
 export interface InstalledConnectorView {
   connectorId: string;
   name: string;
+  description: string;
   mode: "watch" | "poll" | "manual";
   integrationsMode: "singleton" | "multiple";
   supported: boolean;
@@ -472,6 +478,7 @@ export interface ConnectorIntegrationView {
   connectorId: string;
   integrationKey?: string;
   name: string;
+  description?: string;
   mode: "watch" | "poll" | "manual" | "unknown";
   integrationsMode: "singleton" | "multiple";
   // Observed runtime activity/health. Source lifecycle comes only from
@@ -521,6 +528,7 @@ export function listConnectors(): Promise<{
 export interface AvailableConnectorView {
   connectorId: string;
   name: string;
+  description: string;
   mode: "watch" | "poll" | "manual";
   integrationsMode: "singleton" | "multiple";
   authType: ConnectorAuthType;

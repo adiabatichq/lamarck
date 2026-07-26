@@ -1,6 +1,8 @@
 manifestVersion: 1
 id: code-agent-transcripts
 name: Code Agent Transcripts
+description: Captures human messages and completed agent turns from local coding-agent transcripts.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: watch
@@ -37,7 +39,3 @@ config:
     type: number
     label: Lookback days
     default: 30
-  max-inline-bytes:
-    type: number
-    label: Max inline bytes
-    default: 8192

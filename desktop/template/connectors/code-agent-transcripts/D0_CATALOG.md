@@ -57,7 +57,7 @@ A point event for one provider-authored human message. It has `startedAt` and no
 }
 ```
 
-`content` is fully inline through `max-inline-bytes` (default 8192). Above the limit, `text` is a UTF-8-safe preview, `truncated` is true, and `contentRef` resolves the complete redacted text.
+`content` is fully inline through the connector's fixed 8192-byte limit. Above the limit, `text` is a UTF-8-safe preview, `truncated` is true, and `contentRef` resolves the complete redacted text.
 
 Human raw is one provider record. It stays inline through the same limit. Above it, `records` is omitted, `format` becomes `<provider>-jsonl`, and `raw.contentRef` resolves JSONL text containing `{ sourceLineIndex, record }` wrappers.
 

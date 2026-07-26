@@ -1,8 +1,12 @@
 import type { DatabaseSync } from "node:sqlite";
 import { createHash } from "crypto";
-import { readFile, readdir } from "fs/promises";
-import { basename, isAbsolute, join, relative, resolve } from "path";
-import { loadConnectorManifest, validateConnectorId } from "./manifest";
+import { lstat, readFile, readlink, readdir } from "fs/promises";
+import { basename, isAbsolute, join, relative, resolve, sep } from "path";
+import {
+  loadConnectorEventCatalog,
+  loadConnectorManifest,
+  validateConnectorId,
+} from "./manifest";
 import type {
   ConnectorOfficialCatalogEntry,
   ConnectorPackageRecord,
@@ -84,13 +88,15 @@ export class WorkspaceConnectorRegistry {
       throw new Error(`Connector manifest id "${manifest.id}" must match folder "${folderId}"`);
     }
 
-    const entryPath = resolveConnectorEntry(dir, manifest.entry);
+    const entryPath = await resolveConnectorEntry(dir, manifest.entry);
+    const eventCatalog = await loadConnectorEventCatalog(dir, manifest);
     const contentHash = await hashConnectorPackage(dir);
     const trust = this.classify(manifest.id, contentHash);
     return {
       connectorId: manifest.id,
       dir,
       manifest,
+      eventCatalog,
       entryPath,
       contentHash,
       trust,
@@ -152,12 +158,37 @@ export function trustStatusForIntegration(trust: ConnectorPackageTrust): Connect
   return trust.status;
 }
 
-export function resolveConnectorEntry(connectorDir: string, entry: string): string {
+export async function resolveConnectorEntry(connectorDir: string, entry: string): Promise<string> {
   const root = resolve(connectorDir);
   const target = resolve(root, entry);
   const rel = relative(root, target);
   if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
     throw new Error(`Connector entry must stay inside connector directory: ${entry}`);
+  }
+
+  let current = root;
+  const segments = rel.split(sep);
+  for (const [index, segment] of segments.entries()) {
+    current = join(current, segment);
+    let file;
+    try {
+      file = await lstat(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        throw new Error(`Connector entry not found: ${entry}`);
+      }
+      throw error;
+    }
+    if (file.isSymbolicLink()) {
+      throw new Error(`Connector entry path must not contain symlinks: ${entry}`);
+    }
+    const isFinal = index === segments.length - 1;
+    if (!isFinal && !file.isDirectory()) {
+      throw new Error(`Connector entry path component must be a directory: ${entry}`);
+    }
+    if (isFinal && !file.isFile()) {
+      throw new Error(`Connector entry must be a regular file: ${entry}`);
+    }
   }
   return target;
 }
@@ -165,19 +196,30 @@ export function resolveConnectorEntry(connectorDir: string, entry: string): stri
 export async function hashConnectorPackage(connectorDir: string): Promise<string> {
   const root = resolve(connectorDir);
   const hash = createHash("sha256");
-  const files = await listPackageFiles(root);
-  for (const file of files) {
-    const rel = relative(root, file).replace(/\\/g, "/");
+  const entries = await listPackageEntries(root);
+  for (const entry of entries) {
+    const rel = relative(root, entry.path).replace(/\\/g, "/");
+    hash.update(entry.kind);
+    hash.update("\0");
     hash.update(rel);
     hash.update("\0");
-    hash.update(await readFile(file));
+    hash.update(
+      entry.kind === "file"
+        ? await readFile(entry.path)
+        : await readlink(entry.path),
+    );
     hash.update("\0");
   }
   return `sha256:${hash.digest("hex")}`;
 }
 
-async function listPackageFiles(root: string): Promise<string[]> {
-  const files: string[] = [];
+interface ConnectorPackageHashEntry {
+  kind: "file" | "symlink";
+  path: string;
+}
+
+async function listPackageEntries(root: string): Promise<ConnectorPackageHashEntry[]> {
+  const packageEntries: ConnectorPackageHashEntry[] = [];
 
   async function walk(dir: string): Promise<void> {
     const entries = await readdir(dir, { withFileTypes: true });
@@ -187,11 +229,13 @@ async function listPackageFiles(root: string): Promise<string[]> {
       if (entry.isDirectory()) {
         await walk(fullPath);
       } else if (entry.isFile()) {
-        files.push(fullPath);
+        packageEntries.push({ kind: "file", path: fullPath });
+      } else if (entry.isSymbolicLink()) {
+        packageEntries.push({ kind: "symlink", path: fullPath });
       }
     }
   }
 
   await walk(root);
-  return files.sort();
+  return packageEntries.sort((a, b) => a.path.localeCompare(b.path));
 }

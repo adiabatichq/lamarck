@@ -1,6 +1,8 @@
 manifestVersion: 1
 id: telegram-bot
 name: Telegram Bot
+description: Captures inbound Telegram messages received by a configured bot.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: watch

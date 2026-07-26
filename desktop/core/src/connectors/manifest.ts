@@ -1,5 +1,7 @@
-import { readFile, readdir } from "fs/promises";
-import { join } from "path";
+import { constants } from "node:fs";
+import { lstat, open, readdir } from "fs/promises";
+import { isAbsolute, join, relative, resolve } from "path";
+import { assertJsonValue } from "../json";
 import type {
   ConnectorAuthSpec,
   ConnectorConfigField,
@@ -8,6 +10,8 @@ import type {
   ConnectorConfigFieldType,
   ConnectorIntegrationMode,
   ConnectorIntegrationsSpec,
+  ConnectorEventCatalog,
+  ConnectorEventTypeDefinition,
   ConnectorManifest,
   ConnectorPlatform,
   ConnectorPlatformsSpec,
@@ -18,6 +22,7 @@ import { validateConnectorSchedule } from "./schedule";
 
 const CONNECTOR_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const INTEGRATION_KEY_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const EVENT_TYPE_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 const CONNECTOR_MODES = new Set<ConnectorRuntimeMode>(["watch", "poll", "manual"]);
 const INTEGRATION_MODES = new Set<ConnectorIntegrationMode>(["singleton", "multiple"]);
 const CONNECTOR_PLATFORMS = new Set<ConnectorPlatform>([
@@ -37,6 +42,8 @@ const MANIFEST_FIELDS = new Set([
   "manifestVersion",
   "id",
   "name",
+  "description",
+  "eventCatalog",
   "entry",
   "runtime",
   "integrations",
@@ -61,6 +68,9 @@ const OAUTH_PUBLIC_AUTH_FIELDS = new Set([
   "clientId",
   "scope",
 ]);
+const EVENT_CATALOG_FIELDS = new Set(["catalogVersion", "eventTypes"]);
+const EVENT_TYPE_FIELDS = new Set(["description", "payloadSchema"]);
+const EVENT_CATALOG_MAX_BYTES = 1024 * 1024;
 
 type PlainObject = Record<string, unknown>;
 
@@ -90,6 +100,14 @@ export function validateConnectorManifest(value: unknown): ConnectorManifest {
   if (typeof manifest.name !== "string" || !manifest.name || manifest.name.trim() !== manifest.name) {
     throw new Error(`Connector ${connectorId} requires a valid name`);
   }
+  if (
+    typeof manifest.description !== "string"
+    || !manifest.description
+    || manifest.description.trim() !== manifest.description
+  ) {
+    throw new Error(`Connector ${connectorId} requires a valid description`);
+  }
+  const eventCatalog = validateConnectorEventCatalogPath(connectorId, manifest.eventCatalog);
   if (typeof manifest.entry !== "string" || !manifest.entry || manifest.entry.trim() !== manifest.entry) {
     throw new Error(`Connector ${connectorId} requires an entry`);
   }
@@ -105,6 +123,8 @@ export function validateConnectorManifest(value: unknown): ConnectorManifest {
     manifestVersion: 1,
     id: connectorId,
     name: manifest.name,
+    description: manifest.description,
+    eventCatalog,
     entry: manifest.entry,
     runtime,
     integrations,
@@ -113,6 +133,161 @@ export function validateConnectorManifest(value: unknown): ConnectorManifest {
     ...(config === undefined ? {} : { config }),
     ...(configPanels === undefined ? {} : { configPanels }),
   };
+}
+
+function validateConnectorEventCatalogPath(connectorId: string, value: unknown): string {
+  if (typeof value !== "string" || !value || value.trim() !== value) {
+    throw new Error(`Connector ${connectorId} requires an eventCatalog JSON path`);
+  }
+  if (
+    isAbsolute(value)
+    || value.includes("\\")
+    || value.includes("?")
+    || value.includes("#")
+    || !value.toLowerCase().endsWith(".json")
+  ) {
+    throw new Error(`Connector ${connectorId} eventCatalog must be a package-relative JSON path`);
+  }
+  const segments = value.replace(/^\.\//, "").split("/");
+  if (
+    segments.length === 0
+    || segments.some((segment) => !segment || segment === "." || segment === "..")
+  ) {
+    throw new Error(`Connector ${connectorId} eventCatalog must be a package-relative JSON path`);
+  }
+  return value;
+}
+
+export function validateConnectorEventCatalog(value: unknown): ConnectorEventCatalog {
+  const catalog = requirePlainObject(value, "Connector event catalog");
+  assertAllowedFields(catalog, EVENT_CATALOG_FIELDS, "Connector event catalog");
+  if (catalog.catalogVersion !== 1) {
+    throw new Error("Connector event catalogVersion must be 1");
+  }
+  const eventTypes = requirePlainObject(
+    catalog.eventTypes,
+    "Connector event catalog eventTypes",
+    "Connector event catalog eventTypes must be a non-empty map",
+  );
+  if (Object.keys(eventTypes).length === 0) {
+    throw new Error("Connector event catalog eventTypes must be a non-empty map");
+  }
+
+  const normalized: Record<string, ConnectorEventTypeDefinition> = Object.create(null);
+  for (const [eventType, rawDefinition] of Object.entries(eventTypes)) {
+    if (!EVENT_TYPE_PATTERN.test(eventType)) {
+      throw new Error(`Connector event catalog has invalid event type: ${eventType}`);
+    }
+    const context = `Connector event catalog event type "${eventType}"`;
+    const definition = requirePlainObject(rawDefinition, context);
+    assertAllowedFields(definition, EVENT_TYPE_FIELDS, context);
+    if (
+      typeof definition.description !== "string"
+      || !definition.description
+      || definition.description.trim() !== definition.description
+    ) {
+      throw new Error(`${context} requires a valid description`);
+    }
+    if (
+      definition.payloadSchema !== true
+      && definition.payloadSchema !== false
+      && (
+        definition.payloadSchema === null
+        || typeof definition.payloadSchema !== "object"
+        || Array.isArray(definition.payloadSchema)
+      )
+    ) {
+      throw new Error(`${context} payloadSchema must be a JSON Schema object or boolean`);
+    }
+    assertJsonValue(definition.payloadSchema, `${context} payloadSchema`);
+    normalized[eventType] = {
+      description: definition.description,
+      payloadSchema: definition.payloadSchema as ConnectorEventTypeDefinition["payloadSchema"],
+    };
+  }
+
+  return {
+    catalogVersion: 1,
+    eventTypes: normalized,
+  };
+}
+
+export async function loadConnectorEventCatalog(
+  connectorDir: string,
+  manifest: ConnectorManifest,
+): Promise<ConnectorEventCatalog> {
+  const root = resolve(connectorDir);
+  const path = resolve(root, manifest.eventCatalog);
+  const rel = relative(root, path);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error(
+      `Connector ${manifest.id} eventCatalog must stay inside connector directory: ${manifest.eventCatalog}`,
+    );
+  }
+  await assertEventCatalogPathHasNoSymlinks(root, manifest.eventCatalog, manifest.id);
+
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      throw new Error(`Connector ${manifest.id} eventCatalog not found: ${manifest.eventCatalog}`);
+    }
+    if ((error as NodeJS.ErrnoException)?.code === "ELOOP") {
+      throw new Error(`Connector ${manifest.id} eventCatalog must not be a symlink`);
+    }
+    throw error;
+  }
+  try {
+    const file = await handle.stat();
+    if (!file.isFile()) {
+      throw new Error(`Connector ${manifest.id} eventCatalog must be a regular file`);
+    }
+    if (file.size < 1 || file.size > EVENT_CATALOG_MAX_BYTES) {
+      throw new Error(
+        `Connector ${manifest.id} eventCatalog must be between 1 and ${EVENT_CATALOG_MAX_BYTES} bytes`,
+      );
+    }
+    const bytes = await handle.readFile();
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new Error(`Connector ${manifest.id} eventCatalog is not valid UTF-8`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error(`Connector ${manifest.id} eventCatalog is not valid JSON`);
+    }
+    return validateConnectorEventCatalog(parsed);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function assertEventCatalogPathHasNoSymlinks(
+  root: string,
+  relativePath: string,
+  connectorId: string,
+): Promise<void> {
+  let current = root;
+  for (const segment of relativePath.replace(/^\.\//, "").split("/")) {
+    current = join(current, segment);
+    let entry;
+    try {
+      entry = await lstat(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        throw new Error(`Connector ${connectorId} eventCatalog not found: ${relativePath}`);
+      }
+      throw error;
+    }
+    if (entry.isSymbolicLink()) {
+      throw new Error(`Connector ${connectorId} eventCatalog path must not contain symlinks`);
+    }
+  }
 }
 
 function validateRuntimeSpec(connectorId: string, value: unknown): ConnectorRuntimeSpec {
@@ -364,7 +539,26 @@ export async function loadConnectorManifest(connectorDir: string): Promise<Conne
     throw new Error(`Connector manifest not found in ${connectorDir}`);
   }
 
-  const text = await readFile(join(connectorDir, filename), "utf8");
+  const manifestPath = join(connectorDir, filename);
+  let handle;
+  try {
+    handle = await open(manifestPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ELOOP") {
+      throw new Error(`Connector manifest must not be a symlink: ${filename}`);
+    }
+    throw error;
+  }
+  let text: string;
+  try {
+    const file = await handle.stat();
+    if (!file.isFile()) {
+      throw new Error(`Connector manifest must be a regular file: ${filename}`);
+    }
+    text = await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
   const raw = filename.endsWith(".json") ? JSON.parse(text) : parseSimpleYaml(text);
   return validateConnectorManifest(raw);
 }

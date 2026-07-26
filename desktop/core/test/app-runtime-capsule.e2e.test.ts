@@ -277,6 +277,7 @@ async function writeAppManifest(appId: string, tables: string[]): Promise<void> 
     manifestVersion: 1,
     id: appId,
     name: appId === "app-a" ? "App A" : "App B",
+    description: `${appId} end-to-end test App.`,
     runtime: {
       ui: { command: ["node", "server.mjs"], port: 3000 },
     },

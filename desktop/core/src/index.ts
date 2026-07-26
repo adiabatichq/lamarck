@@ -850,6 +850,7 @@ const server = await serve<{ cwd: string }>({
           return {
             connectorId: entry.manifest.id,
             name: entry.manifest.name,
+            description: entry.manifest.description,
             mode: entry.manifest.runtime.mode,
             integrationsMode: entry.manifest.integrations.mode,
             authType: entry.manifest.auth?.type ?? "none",
@@ -1164,6 +1165,7 @@ const server = await serve<{ cwd: string }>({
           manifestVersion: a.manifest.manifestVersion,
           id: a.manifest.id,
           name: a.manifest.name,
+          description: a.manifest.description,
           runtime: a.manifest.runtime,
           permissions: a.manifest.permissions,
           manifestGeneration: appManifestGeneration,
@@ -1188,7 +1190,7 @@ const server = await serve<{ cwd: string }>({
 
       // -- Create App --
       if (path === "/api/apps" && method === "POST") {
-        const body = await readBody<{ id: string; name?: string }>(req);
+        const body = await readBody<{ id: string; name?: string; description: string }>(req);
         const id = body.id;
 
         // Validate id: lowercase, alphanumeric + hyphens
@@ -1202,6 +1204,16 @@ const server = await serve<{ cwd: string }>({
           return json({ error: "Invalid app name. Use a non-empty name without surrounding whitespace." }, 400);
         }
         const name = body.name ?? id;
+        if (
+          typeof body.description !== "string"
+          || body.description.length === 0
+          || body.description.trim() !== body.description
+        ) {
+          return json({
+            error: "Invalid app description. Use a non-empty description without surrounding whitespace.",
+          }, 400);
+        }
+        const description = body.description;
 
         const appDir = join(appsDir, id);
         await mkdir(appDir, { recursive: true });
@@ -1210,6 +1222,7 @@ const server = await serve<{ cwd: string }>({
           manifestVersion: 1,
           id,
           name,
+          description,
           runtime: {
             ui: {
               command: ["npm", "run", "start"],

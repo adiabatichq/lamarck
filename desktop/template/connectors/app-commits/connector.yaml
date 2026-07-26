@@ -1,6 +1,8 @@
 manifestVersion: 1
 id: app-commits
 name: App Commits
+description: Captures commits made inside Lamarck App source repositories.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: watch

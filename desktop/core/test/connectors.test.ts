@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { ContentBlobStore } from "../src/blob-store";
 import { openTestDatabases as openDatabases } from "./support/test-databases";
@@ -18,6 +19,7 @@ import {
   installConnectorFromSource,
   isPlatformSupported,
   listAvailableBuiltIns,
+  loadConnectorEventCatalog,
   loadConnectorManifest,
   materializeBuiltInConnector,
   registerWorkspaceConnectors,
@@ -26,12 +28,44 @@ import {
   resolveConnectorEntry,
   sourceForConnector,
   updateConnectorFromSource,
+  validateConnectorEventCatalog,
   validateConnectorManifest,
   nextCronRunAt,
   type ConnectorDefinition,
   type ConnectorManifest,
 } from "../src/connectors";
 import { MemorySecretStore } from "../src/credentials";
+
+const TEST_EVENT_CATALOG = {
+  catalogVersion: 1,
+  eventTypes: {
+    "test.event": {
+      description: "A test event.",
+      payloadSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          value: {
+            type: "string",
+            description: "Test value.",
+          },
+        },
+      },
+    },
+  },
+} as const;
+
+function writeTestEventCatalog(connectorDir: string): void {
+  writeFileSync(
+    join(connectorDir, "events.json"),
+    `${JSON.stringify(TEST_EVENT_CATALOG, null, 2)}\n`,
+  );
+}
+
+function writeConnectorManifestFixture(path: string, contents: string): void {
+  writeFileSync(path, contents);
+  writeTestEventCatalog(dirname(path));
+}
 
 const telegramBotApiReference = JSON.parse(readFileSync(
   new URL("../../template/connectors/telegram-bot/api-reference.json", import.meta.url),
@@ -123,11 +157,13 @@ describe("Connector system", () => {
   test("loads and validates a connector manifest from YAML", async () => {
     const dir = join(workspace, "connectors", "calendar");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: calendar
 name: Calendar
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: poll
@@ -158,6 +194,8 @@ auth:
       manifestVersion: 1,
       id: "calendar",
       name: "Calendar",
+      description: "Test connector manifest.",
+      eventCatalog: "./events.json",
       entry: "./index.mjs",
 	      runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
 	      integrations: { mode: "multiple" },
@@ -179,6 +217,52 @@ auth:
         scope: ["https://www.googleapis.com/auth/calendar.readonly"],
       },
     });
+    expect(await loadConnectorEventCatalog(dir, manifest)).toMatchObject(TEST_EVENT_CATALOG);
+  });
+
+  test("rejects a symlinked Connector manifest", async () => {
+    const connectorDir = join(workspace, "connectors", "linked-manifest");
+    const externalManifest = join(workspace, "external-connector.yaml");
+    mkdirSync(connectorDir, { recursive: true });
+    writeFileSync(
+      externalManifest,
+      `manifestVersion: 1
+id: linked-manifest
+name: Linked Manifest
+description: A Connector whose manifest is stored outside its package.
+eventCatalog: ./events.json
+entry: ./index.mjs
+runtime:
+  mode: manual
+integrations:
+  mode: singleton
+auth:
+  type: none
+`,
+    );
+    symlinkSync(externalManifest, join(connectorDir, "connector.yaml"), "file");
+
+    await expect(loadConnectorManifest(connectorDir)).rejects.toThrow(
+      "Connector manifest must not be a symlink",
+    );
+  });
+
+  test("keeps bundled Connector templates valid under the V1 package contract", async () => {
+    const templatesDir = fileURLToPath(new URL("../../template/connectors", import.meta.url));
+    const available = await listAvailableBuiltIns(templatesDir);
+
+    expect(available.map(({ manifest }) => manifest.id).sort()).toEqual([
+      "app-commits",
+      "code-agent-transcripts",
+      "local-git",
+      "macos-ax",
+      "oura",
+      "telegram-bot",
+    ]);
+    for (const entry of available) {
+      const catalog = await loadConnectorEventCatalog(entry.dir, entry.manifest);
+      expect(Object.keys(catalog.eventTypes).length).toBeGreaterThan(0);
+    }
   });
 
   test("rejects invalid manifest ids, modes, schedules, auth, and platforms", () => {
@@ -186,6 +270,8 @@ auth:
       manifestVersion: 1,
       id: "demo",
       name: "Demo",
+      description: "Test connector manifest.",
+      eventCatalog: "./events.json",
       entry: "./index.ts",
       runtime: { mode: "poll" },
       integrations: { mode: "singleton" },
@@ -429,6 +515,8 @@ auth:
       manifestVersion: 1,
       id: "strict-demo",
       name: "Strict Demo",
+      description: "Test connector manifest.",
+      eventCatalog: "./events.json",
       entry: "./index.mjs",
       runtime: { mode: "manual" },
       integrations: { mode: "singleton" },
@@ -438,6 +526,29 @@ auth:
     const missingVersion = { ...base } as Record<string, unknown>;
     delete missingVersion.manifestVersion;
     expect(() => validateConnectorManifest(missingVersion)).toThrow("manifestVersion must be 1");
+    const missingDescription = { ...base } as Record<string, unknown>;
+    delete missingDescription.description;
+    expect(() => validateConnectorManifest(missingDescription)).toThrow("requires a valid description");
+    expect(() => validateConnectorManifest({ ...base, description: " Padded " })).toThrow(
+      "requires a valid description",
+    );
+    const missingEventCatalog = { ...base } as Record<string, unknown>;
+    delete missingEventCatalog.eventCatalog;
+    expect(() => validateConnectorManifest(missingEventCatalog)).toThrow(
+      "requires an eventCatalog JSON path",
+    );
+    for (const eventCatalog of [
+      "/events.json",
+      "../events.json",
+      "./nested/../events.json",
+      ".\\events.json",
+      "./events.yaml",
+      "./events.json?raw=1",
+    ]) {
+      expect(() => validateConnectorManifest({ ...base, eventCatalog })).toThrow(
+        "eventCatalog must be a package-relative JSON path",
+      );
+    }
     expect(() => validateConnectorManifest({ ...base, manifestVersion: 2 })).toThrow(
       "manifestVersion must be 1",
     );
@@ -506,12 +617,106 @@ auth:
       manifestVersion: 1,
       id: "strict-demo",
       name: "Strict Demo",
+      description: "Test connector manifest.",
+      eventCatalog: "./events.json",
       entry: "./index.mjs",
       runtime: { mode: "manual" },
       integrations: { mode: "singleton" },
       platforms: {},
       auth: { type: "none" },
     });
+  });
+
+  test("strictly validates connector event catalogs", () => {
+    expect(validateConnectorEventCatalog(TEST_EVENT_CATALOG)).toMatchObject(TEST_EVENT_CATALOG);
+    expect(() => validateConnectorEventCatalog({
+      ...TEST_EVENT_CATALOG,
+      catalogVersion: 2,
+    })).toThrow("catalogVersion must be 1");
+    expect(() => validateConnectorEventCatalog({
+      ...TEST_EVENT_CATALOG,
+      unexpected: true,
+    })).toThrow("unknown field: unexpected");
+    expect(() => validateConnectorEventCatalog({
+      catalogVersion: 1,
+      eventTypes: {},
+    })).toThrow("must be a non-empty map");
+    expect(() => validateConnectorEventCatalog({
+      catalogVersion: 1,
+      eventTypes: {
+        "Bad Event": TEST_EVENT_CATALOG.eventTypes["test.event"],
+      },
+    })).toThrow("invalid event type");
+    expect(() => validateConnectorEventCatalog({
+      catalogVersion: 1,
+      eventTypes: {
+        "test.event": {
+          description: "",
+          payloadSchema: {},
+        },
+      },
+    })).toThrow("requires a valid description");
+    expect(() => validateConnectorEventCatalog({
+      catalogVersion: 1,
+      eventTypes: {
+        "test.event": {
+          description: "Test",
+          payloadSchema: [],
+        },
+      },
+    })).toThrow("payloadSchema must be a JSON Schema object or boolean");
+  });
+
+  test("rejects event catalogs reached through an intermediate symlink", async () => {
+    const connectorDir = join(workspace, "connectors", "linked-catalog");
+    const externalDir = join(workspace, "external-catalog");
+    mkdirSync(connectorDir, { recursive: true });
+    mkdirSync(externalDir, { recursive: true });
+    writeTestEventCatalog(externalDir);
+    symlinkSync(
+      externalDir,
+      join(connectorDir, "catalog"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const manifest = validateConnectorManifest({
+      manifestVersion: 1,
+      id: "linked-catalog",
+      name: "Linked Catalog",
+      description: "Connector with an external event catalog.",
+      eventCatalog: "./catalog/events.json",
+      entry: "./index.mjs",
+      runtime: { mode: "manual" },
+      integrations: { mode: "singleton" },
+      auth: { type: "none" },
+    });
+
+    await expect(loadConnectorEventCatalog(connectorDir, manifest)).rejects.toThrow(
+      "eventCatalog path must not contain symlinks",
+    );
+  });
+
+  test("reports missing event catalogs with Connector context", async () => {
+    const connectorDir = join(workspace, "connectors", "missing-catalog");
+    mkdirSync(connectorDir, { recursive: true });
+
+    for (const eventCatalog of ["./events.json", "./missing/events.json"]) {
+      const manifest = validateConnectorManifest({
+        manifestVersion: 1,
+        id: "missing-catalog",
+        name: "Missing Catalog",
+        description: "Connector whose event catalog is missing.",
+        eventCatalog,
+        entry: "./index.mjs",
+        runtime: { mode: "manual" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      });
+
+      await expect(loadConnectorEventCatalog(connectorDir, manifest)).rejects.toThrow(
+        `Connector missing-catalog eventCatalog not found: ${eventCatalog}`,
+      );
+    }
   });
 
   test("runs a connector with bound guard, config, and persistent state", async () => {
@@ -536,6 +741,8 @@ auth:
         manifestVersion: 1,
         id: "app-commits",
         name: "App Commits",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -580,12 +787,14 @@ auth:
     expect(JSON.parse(storedState.sync_state)).toEqual({ cursor: "abc123" });
   });
 
-  test("recovers stale running observations after a core restart", () => {
+  test("recovers stale running observations after a core restart", async () => {
     supervisor.register(
       {
         manifestVersion: 1,
         id: "restart-recovery",
         name: "Restart Recovery",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -608,6 +817,7 @@ auth:
       platform: "darwin",
     });
     expect(restarted.getIntegration(source.id)?.status).toBe("idle");
+    expect((await restarted.list())[0]).not.toHaveProperty("description");
     expect(systemDb.prepare(
       "SELECT status, ended_at, error FROM connector_runs WHERE id = 'stale-run'",
     ).get()).toEqual(expect.objectContaining({
@@ -646,6 +856,8 @@ auth:
         manifestVersion: 1,
         id: "blob-writer",
         name: "Blob Writer",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -769,6 +981,8 @@ auth:
         manifestVersion: 1,
         id: "cfg-merge",
         name: "Cfg Merge",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -827,6 +1041,8 @@ auth:
 	        manifestVersion: 1,
 	        id: "cfg-ui",
 	        name: "Config UI",
+	        description: "Test connector manifest.",
+	        eventCatalog: "./events.json",
 	        entry: "./index.ts",
 	        runtime: { mode: "manual" },
 	        integrations: { mode: "singleton" },
@@ -884,6 +1100,8 @@ auth:
         manifestVersion: 1,
         id: "configured-feed",
         name: "Configured Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
         integrations: { mode: "singleton" },
@@ -941,6 +1159,8 @@ auth:
         manifestVersion: 1,
         id: "calendar",
         name: "Calendar",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "multiple" },
@@ -971,6 +1191,8 @@ auth:
         manifestVersion: 1,
         id: "singleton-source",
         name: "Singleton Source",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
         integrations: { mode: "singleton" },
@@ -983,6 +1205,8 @@ auth:
         manifestVersion: 1,
         id: "many-sources",
         name: "Many Sources",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
         integrations: { mode: "multiple" },
@@ -1029,6 +1253,8 @@ auth:
         manifestVersion: 1,
         id: "calendar",
         name: "Calendar",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "multiple" },
@@ -1088,6 +1314,8 @@ auth:
         manifestVersion: 1,
         id: "oura",
         name: "Oura",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -1128,6 +1356,8 @@ auth:
         manifestVersion: 1,
         id: "json-feed",
         name: "JSON Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
         integrations: { mode: "singleton" },
@@ -1164,6 +1394,8 @@ auth:
         manifestVersion: 1,
         id: "id-feed",
         name: "ID Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
         integrations: { mode: "singleton" },
@@ -1191,6 +1423,8 @@ auth:
         manifestVersion: 1,
         id: "retry-feed",
         name: "Retry Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -1233,6 +1467,8 @@ auth:
         manifestVersion: 1,
         id: "warning-feed",
         name: "Warning Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
         integrations: { mode: "singleton" },
@@ -1283,6 +1519,8 @@ auth:
         manifestVersion: 1,
         id: "revoked-feed",
         name: "Revoked Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -1317,6 +1555,8 @@ auth:
         manifestVersion: 1,
         id: "auth-watch",
         name: "Auth Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
         integrations: { mode: "singleton" },
@@ -1367,6 +1607,8 @@ auth:
         manifestVersion: 1,
         id: "crashy-watch",
         name: "Crashy Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
         integrations: { mode: "singleton" },
@@ -1419,6 +1661,8 @@ auth:
         manifestVersion: 1,
         id: "guarded-feed",
         name: "Guarded Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -1438,6 +1682,8 @@ auth:
         manifestVersion: 1,
         id: "oura",
         name: "Oura",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -1471,6 +1717,8 @@ auth:
         manifestVersion: 1,
         id: "macos-ax",
         name: "macOS Accessibility",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
         integrations: { mode: "multiple" },
@@ -1500,6 +1748,8 @@ auth:
         manifestVersion: 1,
         id: "ax-watch",
         name: "AX Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -1580,6 +1830,8 @@ auth:
         manifestVersion: 1,
         id: "auth-ax",
         name: "Auth AX",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -1644,6 +1896,8 @@ auth:
         manifestVersion: 1,
         id: "no-handler",
         name: "No Handler",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -1670,11 +1924,13 @@ auth:
   test("requirement checks pass the trust gate before importing connector code", async () => {
     const sourceDir = join(workspace, "connectors", "untrusted-ax");
     mkdirSync(sourceDir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(sourceDir, "connector.yaml"),
       `manifestVersion: 1
 id: untrusted-ax
 name: Untrusted AX
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: poll
@@ -1726,6 +1982,8 @@ auth:
         manifestVersion: 1,
         id: "terminal",
         name: "Terminal",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
         integrations: { mode: "singleton" },
@@ -1768,6 +2026,8 @@ auth:
         manifestVersion: 1,
         id: "watch-feed",
         name: "Watch Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
         integrations: { mode: "singleton" },
@@ -1805,6 +2065,8 @@ auth:
         manifestVersion: 1,
         id: "pausable-watch",
         name: "Pausable Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
         integrations: { mode: "singleton" },
@@ -1847,6 +2109,8 @@ auth:
         manifestVersion: 1,
         id: "slow-poll",
         name: "Slow Poll",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
         integrations: { mode: "singleton" },
@@ -1888,6 +2152,8 @@ auth:
         manifestVersion: 1,
         id: "stubborn-watch",
         name: "Stubborn Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
         integrations: { mode: "singleton" },
@@ -1917,6 +2183,8 @@ auth:
         manifestVersion: 1,
         id: "poll-feed",
         name: "Poll Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
         integrations: { mode: "singleton" },
@@ -1962,6 +2230,8 @@ auth:
         manifestVersion: 1,
         id: "timed-poll",
         name: "Timed Poll",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
         integrations: { mode: "singleton" },
@@ -1992,6 +2262,8 @@ auth:
         manifestVersion: 1,
         id: "paused-manual",
         name: "Paused Manual",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
         integrations: { mode: "singleton" },
@@ -2015,6 +2287,8 @@ auth:
         manifestVersion: 1,
         id: "manual-in-flight",
         name: "Manual In Flight",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
         integrations: { mode: "singleton" },
@@ -2049,6 +2323,8 @@ auth:
         manifestVersion: 1,
         id: "invalid-schedule-feed",
         name: "Invalid Schedule Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
         integrations: { mode: "singleton" },
@@ -2089,11 +2365,13 @@ auth:
   test("scheduler does not run untrusted workspace connector packages", async () => {
     const sourceDir = join(workspace, "connectors", "untrusted-feed");
     mkdirSync(sourceDir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(sourceDir, "connector.yaml"),
       `manifestVersion: 1
 id: untrusted-feed
 name: Untrusted Feed
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: poll
@@ -3262,7 +3540,6 @@ auth:
       "include-claude": false,
       "codex-root": codexRoot,
       "lookback-days": 30,
-      "max-inline-bytes": 8192,
     });
     const observedAt = Date.UTC(2026, 6, 1, 3);
     await syncOnce(run.context, { now: observedAt });
@@ -3958,7 +4235,6 @@ auth:
       "include-claude": false,
       "codex-root": codexRoot,
       "lookback-days": 30,
-      "max-inline-bytes": 8192,
     });
     const observedAt = Date.UTC(2026, 6, 1, 3);
     await syncOnce(run.context, { now: observedAt });
@@ -4090,7 +4366,6 @@ auth:
       },
       config: {
         "include-reasoning": false,
-        "max-inline-bytes": 8192,
       },
       signal: new AbortController().signal,
       async *readLinesImpl() {
@@ -4752,7 +5027,6 @@ auth:
       "include-claude": false,
       "codex-root": codexRoot,
       "lookback-days": 30,
-      "max-inline-bytes": 8192,
     });
 
     await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
@@ -4828,7 +5102,6 @@ auth:
       "include-claude": false,
       "codex-root": codexRoot,
       "lookback-days": 30,
-      "max-inline-bytes": 8192,
     });
     const originalBufferConcat = Buffer.concat;
     let concatenatedBytes = 0;
@@ -6722,11 +6995,13 @@ auth:
   test("installs connectors as workspace folders, registers them, and removes the folder", async () => {
     const sourceDir = join(workspace, "source-connectors", "calendar");
     mkdirSync(sourceDir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(sourceDir, "connector.yaml"),
       `manifestVersion: 1
 id: calendar
 name: Calendar
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
@@ -6796,6 +7071,8 @@ auth:
         manifestVersion: 1,
         id: "app-commits",
         name: "App Commits",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.mjs",
         runtime: { mode: "watch" },
         integrations: { mode: "singleton" },
@@ -6807,6 +7084,7 @@ auth:
       join(sourceDir, "index.mjs"),
       "export default { async run() {} };\n",
     );
+    writeTestEventCatalog(sourceDir);
 
     const installed = await materializeBuiltInConnector({ sourceDir, workspacePath: workspace });
     expect(installed.dir).toBe(join(workspace, "connectors", "app-commits"));
@@ -6829,6 +7107,8 @@ auth:
         manifestVersion: 1,
         id: "removed-outside-core",
         name: "Removed Outside Core",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
         integrations: { mode: "singleton" },
@@ -6861,11 +7141,13 @@ auth:
   ): string {
     const dir = join(builtinsDir, id);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: ${id}
 name: ${id}
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
@@ -6886,6 +7168,8 @@ auth:
       manifestVersion: 1,
       id: "anywhere",
       name: "Anywhere",
+      description: "Test connector manifest.",
+      eventCatalog: "./events.json",
       entry: "./index.mjs",
       runtime: { mode: "manual" },
       integrations: { mode: "singleton" },
@@ -7159,11 +7443,13 @@ auth:
   test("loads connector runtime from directory entry", async () => {
     const dir = join(workspace, "connectors", "demo");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: demo
 name: Demo
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
@@ -7213,6 +7499,8 @@ auth:
         manifestVersion: 1,
         id: "managed-feed",
         name: "Managed Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "multiple" },
@@ -7277,6 +7565,8 @@ auth:
         manifestVersion: 1,
         id: "cascade-feed",
         name: "Cascade Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
         integrations: { mode: "multiple" },
@@ -7314,6 +7604,8 @@ auth:
         manifestVersion: 1,
         id: "oauth-feed",
         name: "OAuth Feed",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -7374,6 +7666,8 @@ auth:
         manifestVersion: 1,
         id: "oauth-bind",
         name: "OAuth Bind",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -7426,6 +7720,8 @@ auth:
         manifestVersion: 1,
         id: "oauth-remove",
         name: "OAuth Remove",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -7478,6 +7774,8 @@ auth:
         manifestVersion: 1,
         id: "oauth-in-flight-remove",
         name: "OAuth In-flight Remove",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
         integrations: { mode: "singleton" },
@@ -7560,6 +7858,8 @@ auth:
           manifestVersion: 1,
           id: "oauth-public",
           name: "OAuth Public",
+          description: "Test connector manifest.",
+          eventCatalog: "./events.json",
           entry: "./index.ts",
           runtime: { mode: "poll" },
           integrations: { mode: "singleton" },
@@ -7583,6 +7883,8 @@ auth:
           manifestVersion: 1,
           id: "managed-oura",
           name: "Managed Oura",
+          description: "Test connector manifest.",
+          eventCatalog: "./events.json",
           entry: "./index.ts",
           runtime: { mode: "poll" },
           integrations: { mode: "singleton" },
@@ -7624,11 +7926,13 @@ auth:
   test("emits D0 audit events for connector approve and remove", async () => {
     const dir = join(workspace, "connectors", "audited");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: audited
 name: Audited
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
@@ -7682,11 +7986,13 @@ auth:
   test("runs workspace package connectors with only the allowlisted OS environment", async () => {
     const dir = join(workspace, "connectors", "pid-probe");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: pid-probe
 name: PID Probe
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
@@ -7783,11 +8089,13 @@ auth:
   test("workspace package connectors can write text blobs over runner RPC", async () => {
     const dir = join(workspace, "connectors", "blob-rpc");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: blob-rpc
 name: Blob RPC
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
@@ -7863,11 +8171,13 @@ export default {
 	  test("workspace package connectors can patch config from config UI sessions", async () => {
 	    const dir = join(workspace, "connectors", "config-ui-rpc");
 	    mkdirSync(dir, { recursive: true });
-	    writeFileSync(
+	    writeConnectorManifestFixture(
 	      join(dir, "connector.yaml"),
 	      `manifestVersion: 1
 id: config-ui-rpc
 name: Config UI RPC
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
@@ -7935,11 +8245,13 @@ auth:
 	  test("workspace package connectors can report warnings over runner RPC", async () => {
     const dir = join(workspace, "connectors", "warning-rpc");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: warning-rpc
 name: Warning RPC
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
@@ -7993,11 +8305,13 @@ auth:
     });
     const dir = join(workspace, "connectors", "stubborn");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: stubborn
 name: Stubborn
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: watch
@@ -8036,11 +8350,13 @@ export default {
   test("package runner abort is cooperative: the connector cleans up before any kill", async () => {
     const dir = join(workspace, "connectors", "tidy");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: tidy
 name: Tidy
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: watch
@@ -8101,11 +8417,13 @@ auth:
     });
     const dir = join(workspace, "connectors", "import-hang");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: import-hang
 name: Import Hang
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: poll
@@ -8138,11 +8456,13 @@ export default { async run() {} };
   test("isolates runner process crashes from the core", async () => {
     const dir = join(workspace, "connectors", "crasher");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(
+    writeConnectorManifestFixture(
       join(dir, "connector.yaml"),
       `manifestVersion: 1
 id: crasher
 name: Crasher
+description: Test connector manifest.
+eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: poll
@@ -8175,8 +8495,55 @@ auth:
     expect(stored?.lastError).toContain("exited unexpectedly");
   });
 
-  test("rejects connector entries outside connector directory", () => {
-    expect(() => resolveConnectorEntry("/tmp/connector", "../outside.mjs")).toThrow("inside connector directory");
+  test("rejects Connector entries outside the package or reached through symlinks", async () => {
+    const connectorDir = join(workspace, "connectors", "linked-entry");
+    const externalDir = join(workspace, "external-entry");
+    mkdirSync(connectorDir, { recursive: true });
+    mkdirSync(externalDir, { recursive: true });
+    writeFileSync(join(externalDir, "index.mjs"), "export default {};\n");
+
+    await expect(resolveConnectorEntry(connectorDir, "../outside.mjs")).rejects.toThrow(
+      "inside connector directory",
+    );
+
+    symlinkSync(
+      join(externalDir, "index.mjs"),
+      join(connectorDir, "index.mjs"),
+      "file",
+    );
+    await expect(resolveConnectorEntry(connectorDir, "./index.mjs")).rejects.toThrow(
+      "entry path must not contain symlinks",
+    );
+
+    rmSync(join(connectorDir, "index.mjs"));
+    symlinkSync(
+      externalDir,
+      join(connectorDir, "lib"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    await expect(resolveConnectorEntry(connectorDir, "./lib/index.mjs")).rejects.toThrow(
+      "entry path must not contain symlinks",
+    );
+  });
+
+  test("includes symbolic-link identity in the Connector package hash", async () => {
+    const connectorDir = join(workspace, "connectors", "linked-package-material");
+    mkdirSync(connectorDir, { recursive: true });
+    writeFileSync(join(connectorDir, "a.txt"), "a\n");
+    writeFileSync(join(connectorDir, "b.txt"), "b\n");
+    const link = join(connectorDir, "current.txt");
+    symlinkSync("a.txt", link, "file");
+
+    const first = await hashConnectorPackage(connectorDir);
+    expect(await hashConnectorPackage(connectorDir)).toBe(first);
+
+    rmSync(link);
+    symlinkSync("b.txt", link, "file");
+    const retargeted = await hashConnectorPackage(connectorDir);
+    expect(retargeted).not.toBe(first);
+
+    rmSync(link);
+    expect(await hashConnectorPackage(connectorDir)).not.toBe(retargeted);
   });
 
   test("uses the connector source namespace helper", () => {

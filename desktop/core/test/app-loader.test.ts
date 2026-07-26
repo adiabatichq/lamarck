@@ -38,6 +38,7 @@ describe("App Loader", () => {
       manifestVersion: 1,
       id,
       name: id,
+      description: `${id} description`,
       runtime: { ui: { command: ["npm", "run", "start"], port: 3000 } },
       permissions: { docs: [], tables: [] },
     };
@@ -102,6 +103,7 @@ describe("App Loader", () => {
     writeFileSync(join(appsDir, "authority", "manifest.json"), JSON.stringify({
       permissions: { tables: ["reviews"], docs: [] },
       runtime: { ui: { port: 3000, command: ["npm", "run", "start"] } },
+      description: "authority description",
       name: "authority",
       id: "authority",
       manifestVersion: 1,
@@ -200,11 +202,22 @@ describe("App Loader", () => {
     expect(registry.apps.size).toBe(0);
   });
 
-  test("strictly validates id, directory match, and name", async () => {
+  test("strictly validates id, directory match, name, and description", async () => {
     writeApp("bad-id", { ...validManifest("bad-id"), id: "Bad_ID" });
     writeApp("mismatch", { ...validManifest("mismatch"), id: "other" });
     writeApp("empty-name", { ...validManifest("empty-name"), name: "" });
     writeApp("padded-name", { ...validManifest("padded-name"), name: " Padded " });
+    const missingDescription = validManifest("missing-description") as unknown as Record<string, unknown>;
+    delete missingDescription.description;
+    writeApp("missing-description", missingDescription);
+    writeApp("empty-description", {
+      ...validManifest("empty-description"),
+      description: "",
+    });
+    writeApp("padded-description", {
+      ...validManifest("padded-description"),
+      description: " Padded ",
+    });
 
     const registry = await loadApps(appsDir);
     expect(registry.apps.size).toBe(0);

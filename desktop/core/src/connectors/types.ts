@@ -106,6 +106,10 @@ export interface ConnectorManifest {
   manifestVersion: 1;
   id: string;
   name: string;
+  description: string;
+  // Package-relative JSON file containing the connector's declared D0 output
+  // event types and payload JSON Schemas.
+  eventCatalog: string;
   entry: string;
   runtime: ConnectorRuntimeSpec;
   // Required: source identity cardinality is an explicit author decision.
@@ -122,6 +126,16 @@ export interface ConnectorManifest {
   // process for each panel; the connector owns the UI and any complex payload
   // schema stored in integration config.
   configPanels?: Record<string, ConnectorConfigPanel>;
+}
+
+export interface ConnectorEventTypeDefinition {
+  description: string;
+  payloadSchema: JsonObject | boolean;
+}
+
+export interface ConnectorEventCatalog {
+  catalogVersion: 1;
+  eventTypes: Record<string, ConnectorEventTypeDefinition>;
 }
 
 export interface ConnectorEventInput {
@@ -318,6 +332,7 @@ export interface ConnectorPackageRecord {
   connectorId: string;
   dir: string;
   manifest: ConnectorManifest;
+  eventCatalog: ConnectorEventCatalog;
   entryPath: string;
   contentHash: string;
   trust: ConnectorPackageTrust;
@@ -328,6 +343,7 @@ export interface ConnectorPackageRecord {
 export interface InstalledConnectorView {
   connectorId: string;
   name: string;
+  description: string;
   mode: ConnectorRuntimeMode;
   integrationsMode: "singleton" | "multiple";
   supported: boolean;

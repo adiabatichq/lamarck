@@ -1,0 +1,127 @@
+{
+  "catalogVersion": 1,
+  "eventTypes": {
+    "desktop.context": {
+      "description": "A privacy-filtered aggregate of desktop presence, visible windows, attention spans, and captured content over a time interval.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "schema",
+          "platform",
+          "sampleIntervalMs",
+          "sampleCount",
+          "presence",
+          "displays",
+          "windows",
+          "attentionSpans",
+          "observations",
+          "contents"
+        ],
+        "properties": {
+          "schema": {
+            "const": "desktop.context.aggregate.v0",
+            "description": "Connector-owned payload contract discriminator."
+          },
+          "platform": {
+            "const": "macos",
+            "description": "Desktop platform observed by this connector."
+          },
+          "sampleIntervalMs": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Nominal interval between Accessibility snapshots."
+          },
+          "sampleCount": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of selected snapshots represented."
+          },
+          "presence": {
+            "type": "object",
+            "description": "Time attributed to active, idle, AFK, locked, missing, and unattributed states.",
+            "additionalProperties": true
+          },
+          "displays": {
+            "type": "object",
+            "description": "Display aggregates keyed by privacy-safe display identity.",
+            "additionalProperties": true
+          },
+          "windows": {
+            "type": "object",
+            "description": "Window aggregates after app-level privacy policy is applied.",
+            "additionalProperties": true
+          },
+          "attentionSpans": {
+            "type": "array",
+            "description": "Ordered spans describing foreground attention.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "observations": {
+            "type": "array",
+            "description": "Privacy-filtered sampled observations used by the aggregate.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "contents": {
+            "type": "object",
+            "description": "Deduplicated captured content fragments keyed by content identity.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "desktop.presence": {
+      "description": "A continuous macOS active, idle, AFK, locked, or missing presence segment.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema", "platform", "state", "durationMs", "sampleCount", "presenceModel"],
+        "properties": {
+          "schema": {
+            "const": "desktop.presence.segment.v0",
+            "description": "Connector-owned payload contract discriminator."
+          },
+          "platform": {
+            "const": "macos",
+            "description": "Desktop platform observed by this connector."
+          },
+          "state": {
+            "type": "string",
+            "description": "Presence state represented by the segment."
+          },
+          "durationMs": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Segment duration."
+          },
+          "sampleCount": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Number of observations represented."
+          },
+          "presenceModel": {
+            "type": "object",
+            "description": "Input source and thresholds used to classify presence.",
+            "additionalProperties": true
+          },
+          "recovered": {
+            "type": "boolean",
+            "description": "Whether the segment was recovered from persisted watcher state."
+          },
+          "endReason": {
+            "type": "string",
+            "description": "Reason the connector closed the segment, when available."
+          }
+        }
+      }
+    }
+  }
+}

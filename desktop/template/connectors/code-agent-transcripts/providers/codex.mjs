@@ -52,7 +52,7 @@ export const codexAdapter = {
   },
 };
 
-function scanCodexRecord(record, ctx, scan, session, config) {
+function scanCodexRecord(record, ctx, scan, session) {
   const payload = isObject(record.payload) ? record.payload : {};
   if (record.type !== "event_msg") return;
 
@@ -85,7 +85,6 @@ function scanCodexRecord(record, ctx, scan, session, config) {
       record,
       lineIndex: ctx.lineIndex,
       session: interactionSession,
-      config,
       ids: compactObject({
         sessionId: interactionSession.id,
         turnId: scan.activeInteractionId,

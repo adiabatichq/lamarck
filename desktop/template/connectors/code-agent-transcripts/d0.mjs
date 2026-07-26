@@ -4,6 +4,7 @@ import { redactString, redactValue } from "./redaction.mjs";
 
 const FULL_BLOB_TEXT = Symbol("fullBlobText");
 const FULL_BLOB_MEDIA_TYPE = Symbol("fullBlobMediaType");
+export const MAX_INLINE_BYTES = 8192;
 
 export function buildHumanMessageEvent(input) {
   const conversationKeyValue = conversationKey(input.provider, input.session);
@@ -20,25 +21,23 @@ export function buildHumanMessageEvent(input) {
       provider: input.provider,
       conversationKey: conversationKeyValue,
       interactionId,
-      content: contentPayload(input.text, input.config),
+      content: contentPayload(input.text),
       raw: rawPayload({
         provider: input.provider,
         records: [wrapper],
         ids: input.ids,
-        maxInlineBytes: input.config["max-inline-bytes"],
         forceBlob: false,
       }),
     },
   };
 }
 
-export function contentPayload(text, config) {
+export function contentPayload(text) {
   const redacted = redactString(typeof text === "string" ? text : "");
   const fullBytes = Buffer.byteLength(redacted);
-  const maxInlineBytes = Math.max(0, config["max-inline-bytes"]);
-  const truncated = fullBytes > maxInlineBytes;
+  const truncated = fullBytes > MAX_INLINE_BYTES;
   const payload = {
-    text: truncated ? utf8Prefix(redacted, maxInlineBytes) : redacted,
+    text: truncated ? utf8Prefix(redacted, MAX_INLINE_BYTES) : redacted,
     chars: redacted.length,
     bytes: fullBytes,
     hash: `sha256:${sha256(redacted)}`,
@@ -51,7 +50,7 @@ export function contentPayload(text, config) {
 export function rawPayload(input) {
   const text = input.records.map((record) => JSON.stringify(record)).join("\n") + (input.records.length ? "\n" : "");
   const bytes = Buffer.byteLength(text);
-  const inline = !input.forceBlob && bytes <= input.maxInlineBytes;
+  const inline = !input.forceBlob && bytes <= MAX_INLINE_BYTES;
   const payload = compactObject({
     format: `${input.provider}-${inline ? "records" : "jsonl"}`,
     recordCount: input.records.length,

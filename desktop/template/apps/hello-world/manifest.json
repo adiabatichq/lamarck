@@ -2,6 +2,7 @@
   "manifestVersion": 1,
   "id": "hello-world",
   "name": "Hello World",
+  "description": "A minimal App that demonstrates Lamarck UI and D2 access.",
   "runtime": {
     "ui": {
       "command": ["npm", "run", "start"],

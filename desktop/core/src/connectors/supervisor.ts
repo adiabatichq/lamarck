@@ -623,6 +623,7 @@ export class ConnectorSupervisor {
       .map((registration) => ({
         connectorId: registration.manifest.id,
         name: registration.manifest.name,
+        description: registration.manifest.description,
         mode: registration.manifest.runtime.mode,
         integrationsMode: registration.manifest.integrations.mode,
         supported: isPlatformSupported(registration.manifest, this.platform),
@@ -634,6 +635,7 @@ export class ConnectorSupervisor {
 
   async list(): Promise<Array<ConnectorIntegration & {
     name: string;
+    description?: string;
     mode: string;
     integrationsMode: "singleton" | "multiple";
     source: string | undefined;
@@ -694,6 +696,7 @@ export class ConnectorSupervisor {
           ? setupPending.length > 0 ? "setup" : "ready"
           : integration.setupStatus,
         name: registration?.manifest.name ?? integration.connectorId,
+        ...(registration ? { description: registration.manifest.description } : {}),
         mode: registration?.manifest.runtime.mode ?? "unknown",
         integrationsMode,
         source: hasSourceIdentity

@@ -1,0 +1,716 @@
+{
+  "catalogVersion": 1,
+  "eventTypes": {
+    "oura.daily_activity": {
+      "description": "An Oura daily activity summary.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.daily_sleep": {
+      "description": "An Oura daily sleep summary.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.daily_readiness": {
+      "description": "An Oura daily readiness summary.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.daily_spo2": {
+      "description": "An Oura daily blood-oxygen summary.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.daily_stress": {
+      "description": "An Oura daily stress summary.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.daily_resilience": {
+      "description": "An Oura daily resilience summary.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.daily_cardiovascular_age": {
+      "description": "An Oura daily cardiovascular-age record.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.sleep_time": {
+      "description": "An Oura recommended sleep-time record.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.vo2_max": {
+      "description": "An Oura VO2 max record.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.sleep": {
+      "description": "An Oura sleep session.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.workout": {
+      "description": "An Oura workout.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.session": {
+      "description": "An Oura guided or unguided session.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.tag": {
+      "description": "An Oura legacy tag.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.enhanced_tag": {
+      "description": "An Oura enhanced tag.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.rest_mode_period": {
+      "description": "An Oura rest-mode period.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.ring_configuration": {
+      "description": "An Oura ring configuration record.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string",
+            "description": "Connector-owned payload contract discriminator in the form oura.<stream>.v1."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "type": "string",
+            "description": "Oura API stream represented by the event."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura stream record.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.heartrate.batch": {
+      "description": "A time-bucketed batch of Oura heart-rate samples.",
+      "payloadSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "bucketMs",
+          "sampleCount",
+          "sourceCounts",
+          "samples"
+        ],
+        "properties": {
+          "schema": {
+            "const": "oura.heartrate.batch.v1",
+            "description": "Connector-owned payload contract discriminator."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the records."
+          },
+          "stream": {
+            "const": "heartrate",
+            "description": "Oura API stream represented by the batch."
+          },
+          "bucketMs": {
+            "type": "integer",
+            "description": "Width of the time bucket in milliseconds."
+          },
+          "sampleCount": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Number of heart-rate samples in the batch."
+          },
+          "sourceCounts": {
+            "type": "object",
+            "description": "Sample counts grouped by Oura measurement source.",
+            "additionalProperties": {
+              "type": "integer"
+            }
+          },
+          "samples": {
+            "type": "array",
+            "description": "Provider-native Oura heart-rate samples.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "oura.ring_battery.low": {
+      "description": "The Oura ring battery crossed below the low threshold.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "kind",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "const": "oura.ring_battery.transition.v1",
+            "description": "Connector-owned payload contract discriminator."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "const": "ring_battery_level",
+            "description": "Oura API stream used to detect the transition."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "low",
+              "critical",
+              "recovered"
+            ],
+            "description": "Battery threshold transition."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura battery sample that caused or confirmed the transition.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.ring_battery.critical": {
+      "description": "The Oura ring battery crossed below the critical threshold.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "kind",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "const": "oura.ring_battery.transition.v1",
+            "description": "Connector-owned payload contract discriminator."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "const": "ring_battery_level",
+            "description": "Oura API stream used to detect the transition."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "low",
+              "critical",
+              "recovered"
+            ],
+            "description": "Battery threshold transition."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura battery sample that caused or confirmed the transition.",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "oura.ring_battery.recovered": {
+      "description": "The Oura ring battery recovered above the recovery threshold after charging.",
+      "payloadSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "schema",
+          "provider",
+          "stream",
+          "kind",
+          "record"
+        ],
+        "properties": {
+          "schema": {
+            "const": "oura.ring_battery.transition.v1",
+            "description": "Connector-owned payload contract discriminator."
+          },
+          "provider": {
+            "const": "oura",
+            "description": "Upstream service that produced the record."
+          },
+          "stream": {
+            "const": "ring_battery_level",
+            "description": "Oura API stream used to detect the transition."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "low",
+              "critical",
+              "recovered"
+            ],
+            "description": "Battery threshold transition."
+          },
+          "record": {
+            "type": "object",
+            "description": "Provider-native Oura battery sample that caused or confirmed the transition.",
+            "additionalProperties": true
+          }
+        }
+      }
+    }
+  }
+}
