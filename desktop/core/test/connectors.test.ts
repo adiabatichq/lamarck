@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "fs";
@@ -2674,6 +2674,83 @@ auth:
       releasePoll();
       await starting;
       await scheduler.stop();
+    }
+  });
+
+  test("watch reconciliation uses exponential retry capped at 60 seconds", async () => {
+    vi.useFakeTimers();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let requestReconcile: ((instanceId: string) => void) | undefined;
+    let failList = false;
+    const failureTimes: number[] = [];
+    const fakeSupervisor = {
+      resumeExpiredPauses() {},
+      async list() {
+        if (failList) {
+          failureTimes.push(Date.now());
+          throw new Error("temporary list failure");
+        }
+        return [];
+      },
+      onRuntimeReconcileRequested(listener: (instanceId: string) => void) {
+        requestReconcile = listener;
+        return () => {
+          requestReconcile = undefined;
+        };
+      },
+    } as unknown as ConnectorSupervisor;
+    const scheduler = new ConnectorScheduler({
+      supervisor: fakeSupervisor,
+      tickMs: 1_000_000,
+    });
+
+    try {
+      await scheduler.start();
+      const startedAt = Date.now();
+      failList = true;
+
+      requestReconcile?.("watch-source");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(failureTimes.map((time) => time - startedAt)).toEqual([0]);
+
+      // A fresh notification bypasses the pending one-second timer, but does
+      // not reset the failure streak. Its next retry therefore waits 2 seconds.
+      await vi.advanceTimersByTimeAsync(500);
+      requestReconcile?.("watch-source");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(failureTimes.map((time) => time - startedAt)).toEqual([0, 500]);
+
+      for (const delay of [2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000]) {
+        await vi.advanceTimersByTimeAsync(delay);
+      }
+      expect(failureTimes.map((time) => time - startedAt)).toEqual([
+        0,
+        500,
+        2_500,
+        6_500,
+        14_500,
+        30_500,
+        62_500,
+        122_500,
+        182_500,
+      ]);
+
+      // A successful pass resets the next failure to the one-second base.
+      failList = false;
+      await vi.advanceTimersByTimeAsync(60_000);
+      failList = true;
+      requestReconcile?.("watch-source");
+      await vi.advanceTimersByTimeAsync(0);
+      const failuresAfterReset = failureTimes.length;
+      await vi.advanceTimersByTimeAsync(999);
+      expect(failureTimes).toHaveLength(failuresAfterReset);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(failureTimes.at(-1)! - failureTimes.at(-2)!).toBe(1_000);
+    } finally {
+      failList = false;
+      await scheduler.stop();
+      errorSpy.mockRestore();
+      vi.useRealTimers();
     }
   });
 

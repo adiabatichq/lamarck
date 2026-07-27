@@ -17,6 +17,7 @@ export interface ConnectorSchedulerOptions {
   tickMs?: number;
   stopTimeoutMs?: number;
   watchReconcileRetryMs?: number;
+  watchReconcileMaxRetryMs?: number;
   now?: () => number;
   onError?: (error: unknown, integration: ScheduledConnector) => void;
 }
@@ -24,6 +25,7 @@ export interface ConnectorSchedulerOptions {
 const DEFAULT_TICK_MS = 60_000;
 const DEFAULT_STOP_TIMEOUT_MS = 10_000;
 const DEFAULT_WATCH_RECONCILE_RETRY_MS = 1_000;
+const DEFAULT_WATCH_RECONCILE_MAX_RETRY_MS = 60_000;
 const RUNNABLE_TRUST = new Set(["official", "custom"]);
 
 export class ConnectorScheduler {
@@ -31,6 +33,8 @@ export class ConnectorScheduler {
   private tickMs: number;
   private stopTimeoutMs: number;
   private watchReconcileRetryMs: number;
+  private watchReconcileMaxRetryMs: number;
+  private nextWatchReconcileRetryMs: number;
   private now: () => number;
   private onError?: (error: unknown, integration: ScheduledConnector) => void;
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -50,6 +54,11 @@ export class ConnectorScheduler {
     this.stopTimeoutMs = opts.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
     this.watchReconcileRetryMs = opts.watchReconcileRetryMs
       ?? DEFAULT_WATCH_RECONCILE_RETRY_MS;
+    this.watchReconcileMaxRetryMs = Math.max(
+      this.watchReconcileRetryMs,
+      opts.watchReconcileMaxRetryMs ?? DEFAULT_WATCH_RECONCILE_MAX_RETRY_MS,
+    );
+    this.nextWatchReconcileRetryMs = this.watchReconcileRetryMs;
     this.now = opts.now ?? Date.now;
     this.onError = opts.onError;
   }
@@ -64,6 +73,7 @@ export class ConnectorScheduler {
     } catch (err) {
       this.started = false;
       this.cancelWatchReconcileRetry();
+      this.resetWatchReconcileBackoff();
       this.unsubscribeRuntimeReconcileRequests();
       throw err;
     }
@@ -97,6 +107,7 @@ export class ConnectorScheduler {
     this.watchReconcileAllPending = false;
     this.pendingWatchIntegrationIds.clear();
     this.cancelWatchReconcileRetry();
+    this.resetWatchReconcileBackoff();
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = undefined;
@@ -231,6 +242,7 @@ export class ConnectorScheduler {
       this.pendingWatchIntegrationIds.clear();
       try {
         await this.startWatchConnectors(reconcileAll ? undefined : targetIntegrationIds);
+        this.resetWatchReconcileBackoff();
       } catch (err) {
         if (!this.stopped) {
           if (reconcileAll) {
@@ -286,19 +298,28 @@ export class ConnectorScheduler {
 
   private scheduleWatchReconcileRetry(): void {
     if (this.stopped || !this.started || this.watchReconcileRetryTimer) return;
+    const retryMs = this.nextWatchReconcileRetryMs;
+    this.nextWatchReconcileRetryMs = Math.min(
+      retryMs * 2,
+      this.watchReconcileMaxRetryMs,
+    );
     this.watchReconcileRetryTimer = setTimeout(() => {
       this.watchReconcileRetryTimer = undefined;
       if (this.stopped || !this.started) return;
       void this.ensureWatchReconcile().catch((err) => {
         console.error("[connectors] watch reconciliation failed:", err);
       });
-    }, this.watchReconcileRetryMs);
+    }, retryMs);
   }
 
   private cancelWatchReconcileRetry(): void {
     if (!this.watchReconcileRetryTimer) return;
     clearTimeout(this.watchReconcileRetryTimer);
     this.watchReconcileRetryTimer = undefined;
+  }
+
+  private resetWatchReconcileBackoff(): void {
+    this.nextWatchReconcileRetryMs = this.watchReconcileRetryMs;
   }
 }
 
