@@ -599,15 +599,11 @@ export function restartConnectorIntegration(
   );
 }
 
-// Trigger a one-off run on demand (manual connectors; or any connector's
-// explicit run). Optional config rides as a one-off run override.
-export function runConnectorIntegration(
-  integrationId: string,
-  config?: Record<string, unknown>,
-): Promise<{ ok: true }> {
+// Trigger an explicit run using the latest stored Source config.
+export function runConnectorIntegration(integrationId: string): Promise<{ ok: true }> {
   return request(
     `/api/connectors/integrations/${encodeURIComponent(integrationId)}/run`,
-    { method: "POST", body: JSON.stringify(config !== undefined ? { config } : {}) },
+    { method: "POST", body: JSON.stringify({}) },
   );
 }
 

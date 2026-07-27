@@ -96,7 +96,6 @@ interface Registration {
 interface ActiveRunIntent {
   instanceId: string;
   trigger: ConnectorRunTrigger;
-  configOverride: unknown;
   controller: AbortController;
   attemptController: AbortController | undefined;
   runtimeGeneration: number;
@@ -785,12 +784,12 @@ export class ConnectorSupervisor {
 	    }));
 	  }
 
-  async run(instanceId: string, opts?: { config?: unknown; trigger?: ConnectorRunTrigger }): Promise<void> {
+  async run(instanceId: string, opts?: { trigger?: ConnectorRunTrigger }): Promise<void> {
     const active = this.createRun(instanceId, opts);
     await active.promise;
   }
 
-  start(instanceId: string, opts?: { config?: unknown; trigger?: ConnectorRunTrigger }): ConnectorRunHandle {
+  start(instanceId: string, opts?: { trigger?: ConnectorRunTrigger }): ConnectorRunHandle {
     return this.createRun(instanceId, opts);
   }
 
@@ -1219,7 +1218,7 @@ export class ConnectorSupervisor {
     }
   }
 
-  private createRun(instanceId: string, opts?: { config?: unknown; trigger?: ConnectorRunTrigger }): ActiveRunIntent {
+  private createRun(instanceId: string, opts?: { trigger?: ConnectorRunTrigger }): ActiveRunIntent {
     if (this.activeRuns.has(instanceId)) {
       throw new Error(`Connector integration already running: ${instanceId}`);
     }
@@ -1251,7 +1250,7 @@ export class ConnectorSupervisor {
     }
     if (!this.configSatisfiedFor(
       registration.manifest,
-      mergeConfig(schemaDefaults(registration.manifest), integration.config, opts?.config),
+      mergeConfig(schemaDefaults(registration.manifest), integration.config),
     )) {
       this.store.update(instanceId, { setupStatus: "setup" });
       throw new Error(`Connector ${integration.connectorId} required configuration is missing`);
@@ -1267,7 +1266,6 @@ export class ConnectorSupervisor {
     const active: ActiveRunIntent = {
       instanceId,
       trigger,
-      configOverride: opts?.config,
       controller,
       attemptController: undefined,
       runtimeGeneration: 0,
@@ -1322,11 +1320,7 @@ export class ConnectorSupervisor {
           session = await this.openTrustedSession(registration, attemptController.signal);
           await this.assertRunRequirements(registration, integration, session);
           await session.run({
-            config: mergeConfig(
-              schemaDefaults(registration.manifest),
-              integration.config,
-              active.configOverride,
-            ),
+            config: mergeConfig(schemaDefaults(registration.manifest), integration.config),
             host: this.host,
             signal: attemptController.signal,
             capabilities: this.buildRunCapabilities(registration, integration),
@@ -1389,7 +1383,7 @@ export class ConnectorSupervisor {
     if (manifest.integrations.mode === "multiple" && !integration.integrationKey) return false;
     return this.configSatisfiedFor(
       manifest,
-      mergeConfig(schemaDefaults(manifest), integration.config, active.configOverride),
+      mergeConfig(schemaDefaults(manifest), integration.config),
     );
   }
 
@@ -1510,8 +1504,8 @@ export class ConnectorSupervisor {
 }
 
 // Author defaults declared in the manifest config schema. They form the base
-// layer of the run-time config merge (schema defaults -> integration overrides
-// -> one-off run override), so connector code reads merged values directly.
+// layer of the run-time config merge (schema defaults -> stored Source config),
+// so connector code reads merged values directly.
 function schemaDefaults(manifest: ConnectorManifest): Record<string, unknown> | undefined {
   const schema = manifest.config;
   if (!schema) return undefined;

@@ -723,7 +723,7 @@ auth:
     const definition: ConnectorDefinition<{ label: string; extra?: boolean }, { cursor: string }> = {
       async run({ guard, state, config, host }) {
         expect(await state.get()).toBeUndefined();
-        expect(config).toEqual({ label: "override", extra: true });
+        expect(config).toEqual({ label: "integration", extra: true });
         expect(host.workspacePath).toBe(workspace);
         expect(host.lamarckApiOrigin).toBe("https://dev-api.example.test");
         await guard.writeEvent({
@@ -756,12 +756,12 @@ auth:
     });
 
     expect(integration.id).not.toBe("app-commits");
-    await supervisor.run(integration.id, { config: { label: "override" } });
+    await supervisor.run(integration.id);
 
     const event = dataDb.prepare("SELECT * FROM events WHERE type = ?").get("app.commit") as any;
     expect(event.source).toBe("connector:app-commits");
     expect(event.external_id).toBe("abc123");
-    expect(JSON.parse(event.payload)).toEqual({ sha: "abc123", label: "override" });
+    expect(JSON.parse(event.payload)).toEqual({ sha: "abc123", label: "integration" });
 
     const stored = supervisor.getIntegration<unknown, { cursor: string }>(integration.id);
     expect(stored?.status).toBe("idle");
@@ -969,7 +969,7 @@ auth:
     });
   });
 
-	  test("merges config-schema defaults under integration and run overrides", async () => {
+  test("merges config-schema defaults with stored Source config", async () => {
     let received: unknown;
     const definition: ConnectorDefinition = {
       async run({ config }) {
@@ -997,13 +997,13 @@ auth:
     );
     const integration = supervisor.ensureIntegration({
       connectorId: "cfg-merge",
-      config: { label: "integration" },
+      config: { label: "integration", extra: true },
     });
-    await supervisor.run(integration.id, { config: { extra: true } });
+    await supervisor.run(integration.id);
 
-    // interval = schema default, label = integration override, extra = run override
-	    expect(received).toEqual({ interval: 5000, label: "integration", extra: true });
-	  });
+    // interval = schema default; label and extra = stored Source config.
+    expect(received).toEqual({ interval: 5000, label: "integration", extra: true });
+  });
 
 	  test("starts connector-owned config UI and preserves opaque config payload", async () => {
 	    const definition: ConnectorDefinition = {
@@ -2447,10 +2447,7 @@ auth:
       connectorId: "reconfigurable-manual",
       config: { label: "old" },
     });
-    const handle = supervisor.start(integration.id, {
-      trigger: "manual",
-      config: { operation: "backfill" },
-    });
+    const handle = supervisor.start(integration.id, { trigger: "manual" });
     while (configs.length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
     let settled = false;
     void handle.promise.finally(() => {
@@ -2465,8 +2462,8 @@ auth:
     expect(handle.signal.aborted).toBe(false);
     expect(settled).toBe(false);
     expect(configs).toEqual([
-      { label: "old", operation: "backfill" },
-      { label: "new", operation: "backfill" },
+      { label: "old" },
+      { label: "new" },
     ]);
 
     finishReplacement();

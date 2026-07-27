@@ -1073,16 +1073,27 @@ const server = await serve<{ cwd: string }>({
         return json({ integration });
       }
 
-      // Trigger a one-off run on demand: the only execution path for a manual
-      // connector, and how any connector takes an explicit run (e.g. backfill).
+      // Trigger an explicit run on demand: the only execution path for a manual
+      // connector, and how any connector runs outside its normal schedule.
       // Non-blocking — the run proceeds in the background; status shows on the
-      // integration. The optional config body rides as a one-off run override.
+      // integration. Runtime config always comes from the latest stored Source.
       const runIntegrationMatch = path.match(/^\/api\/connectors\/integrations\/([^/]+)\/run$/);
       if (runIntegrationMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const body = await readBody<{ config?: unknown }>(req).catch(() => ({} as { config?: unknown }));
+        const body = await readBody<unknown>(req).catch(() => ({}));
+        if (
+          body === null
+          || typeof body !== "object"
+          || Array.isArray(body)
+          || Object.keys(body).length > 0
+        ) {
+          return json(
+            { error: "Run does not accept parameters; update the Source config before running" },
+            400,
+          );
+        }
         const instanceId = decodeURIComponent(runIntegrationMatch[1]);
-        connectorSupervisor.start(instanceId, { config: body.config, trigger: "manual" });
+        connectorSupervisor.start(instanceId, { trigger: "manual" });
         return json({ ok: true });
       }
 
