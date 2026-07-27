@@ -133,6 +133,50 @@ describe("Secret store and connector credential broker", () => {
     expect(opened.dataDb.prepare("SELECT * FROM events WHERE type LIKE 'auth.%'").all()).toEqual([]);
   });
 
+  test("auth attempts own runtime reconciliation claims and expire them with bounded retention", async () => {
+    let now = 1_000;
+    const manager = new ConnectorAuthManager(
+      new SqliteEncryptedSecretStore(opened.systemDb, createVaultKey()),
+      {
+        attemptTtlMs: 100,
+        now: () => now,
+        fetchImpl: async () => jsonResponse({
+          access_token: "access-1",
+          refresh_token: "refresh-1",
+          expires_in: 3600,
+        }),
+      },
+    );
+    const auth = {
+      type: "oauth2-public" as const,
+      authorizationEndpoint: "https://provider.example/authorize",
+      tokenEndpoint: "https://provider.example/token",
+      clientId: "client-id",
+    };
+
+    const started = manager.startOAuth(integration("oauth-ref"), auth, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    await expect(
+      manager.completeOAuthCallback(new URLSearchParams({ state, code: "code-1" })),
+    ).resolves.toMatchObject({ status: "connected" });
+
+    expect(manager.claimConnectedAttemptFinalization(started.attemptId)).toBe(true);
+    expect(manager.claimConnectedAttemptFinalization(started.attemptId)).toBe(false);
+    manager.releaseConnectedAttemptFinalization(started.attemptId);
+    expect(manager.claimConnectedAttemptFinalization(started.attemptId)).toBe(true);
+
+    now += 201;
+    manager.startOAuth(integration("next-oauth-ref"), auth, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    expect(manager.claimConnectedAttemptFinalization(started.attemptId)).toBe(false);
+    await expect(
+      manager.getOAuthAttempt("integration-1", started.attemptId),
+    ).resolves.toEqual({ status: "failed", error: "Auth attempt not found" });
+  });
+
   test("oauth refresh single-flights concurrent getToken calls", async () => {
     let calls = 0;
     const manager = new ConnectorAuthManager(

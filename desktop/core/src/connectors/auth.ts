@@ -64,6 +64,8 @@ interface OAuthAttempt {
   expiresAt: number;
   generation: number;
   status: OAuthAttemptStatus;
+  terminalAt?: number;
+  finalizationClaimed?: boolean;
   credentialId?: string;
   error?: string;
 }
@@ -76,6 +78,8 @@ interface ManagedProviderAttempt {
   expiresAt: number;
   generation: number;
   status: OAuthAttemptStatus;
+  terminalAt?: number;
+  finalizationClaimed?: boolean;
   credentialId?: string;
   error?: string;
 }
@@ -114,6 +118,7 @@ interface ConnectorAuthManagerOptions {
   fetchImpl?: typeof fetch;
   refreshSkewMs?: number;
   attemptTtlMs?: number;
+  now?: () => number;
   managedProviderApiOrigin?: string;
   lamarckSession?: LamarckSessionCapability;
 }
@@ -123,6 +128,7 @@ export class ConnectorAuthManager {
   private fetchImpl: typeof fetch;
   private refreshSkewMs: number;
   private attemptTtlMs: number;
+  private now: () => number;
   private managedProviderApiOrigin: string | undefined;
   private lamarckSession: LamarckSessionCapability | undefined;
   private attemptsById = new Map<string, OAuthAttempt>();
@@ -141,6 +147,7 @@ export class ConnectorAuthManager {
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.refreshSkewMs = opts.refreshSkewMs ?? 60_000;
     this.attemptTtlMs = opts.attemptTtlMs ?? 10 * 60_000;
+    this.now = opts.now ?? Date.now;
     this.managedProviderApiOrigin = opts.managedProviderApiOrigin;
     this.lamarckSession = opts.lamarckSession;
   }
@@ -247,10 +254,12 @@ export class ConnectorAuthManager {
     auth: ConnectorOAuthAuthSpec,
     input: { redirectUri: string },
   ): OAuthStartResult {
+    const now = this.now();
+    this.pruneAuthAttempts(now);
     const codeVerifier = base64url(randomBytes(32));
     const state = base64url(randomBytes(32));
     const attemptId = base64url(randomBytes(16));
-    const expiresAt = Date.now() + this.attemptTtlMs;
+    const expiresAt = now + this.attemptTtlMs;
     const authRef = integration.authRef ?? `connector-integration:${integration.id}:auth`;
     const attempt: OAuthAttempt = {
       id: attemptId,
@@ -294,8 +303,10 @@ export class ConnectorAuthManager {
     auth: ConnectorManagedProviderAuthSpec,
     input: { appOrigin: string },
   ): Promise<OAuthStartResult> {
+    const now = this.now();
+    this.pruneAuthAttempts(now);
     const attemptId = base64url(randomBytes(16));
-    const expiresAt = Date.now() + this.attemptTtlMs;
+    const expiresAt = now + this.attemptTtlMs;
     const authRef = integration.authRef ?? `connector-integration:${integration.id}:auth`;
     const attempt: ManagedProviderAttempt = {
       id: attemptId,
@@ -330,15 +341,18 @@ export class ConnectorAuthManager {
   }
 
   async getOAuthAttempt(integrationId: string, attemptId: string): Promise<OAuthAttemptView> {
+    const now = this.now();
+    this.pruneAuthAttempts(now);
     const attempt = this.attemptsById.get(attemptId);
     if (!attempt) {
-      return this.getManagedProviderAttempt(integrationId, attemptId);
+      return this.getManagedProviderAttempt(integrationId, attemptId, now);
     }
     if (attempt.integrationId !== integrationId) {
       return { status: "failed", error: "Auth attempt not found" };
     }
-    if (attempt.status === "pending" && Date.now() > attempt.expiresAt) {
+    if (attempt.status === "pending" && now > attempt.expiresAt) {
       attempt.status = "expired";
+      attempt.terminalAt = now;
       attempt.error = "OAuth attempt expired";
       this.attemptsByState.delete(attempt.state);
     }
@@ -352,13 +366,38 @@ export class ConnectorAuthManager {
     };
   }
 
-  private async getManagedProviderAttempt(integrationId: string, attemptId: string): Promise<OAuthAttemptView> {
+  claimConnectedAttemptFinalization(attemptId: string): boolean {
+    const attempt = this.authAttemptById(attemptId);
+    if (
+      !attempt
+      || attempt.status !== "connected"
+      || attempt.finalizationClaimed
+    ) {
+      return false;
+    }
+    attempt.finalizationClaimed = true;
+    return true;
+  }
+
+  releaseConnectedAttemptFinalization(attemptId: string): void {
+    const attempt = this.authAttemptById(attemptId);
+    if (attempt?.status === "connected") {
+      attempt.finalizationClaimed = false;
+    }
+  }
+
+  private async getManagedProviderAttempt(
+    integrationId: string,
+    attemptId: string,
+    now: number,
+  ): Promise<OAuthAttemptView> {
     const attempt = this.managedAttemptsById.get(attemptId);
     if (!attempt || attempt.integrationId !== integrationId) {
       return { status: "failed", error: "Auth attempt not found" };
     }
-    if (attempt.status === "pending" && Date.now() > attempt.expiresAt) {
+    if (attempt.status === "pending" && now > attempt.expiresAt) {
       attempt.status = "expired";
+      attempt.terminalAt = now;
       attempt.error = "Managed provider auth attempt expired";
     }
     if (attempt.status === "pending") {
@@ -372,10 +411,12 @@ export class ConnectorAuthManager {
           generation: attempt.generation,
         });
         attempt.status = "connected";
+        attempt.terminalAt = this.now();
         attempt.credentialId = attempt.authRef;
       } catch (err) {
         if (!(err instanceof ManagedProviderNotConnectedError) && !isLamarckSessionNotSignedInError(err)) {
           attempt.status = "failed";
+          attempt.terminalAt = this.now();
           attempt.error = err instanceof Error ? err.message : String(err);
         }
       }
@@ -390,17 +431,45 @@ export class ConnectorAuthManager {
     };
   }
 
+  private authAttemptById(
+    attemptId: string,
+  ): OAuthAttempt | ManagedProviderAttempt | undefined {
+    return this.attemptsById.get(attemptId)
+      ?? this.managedAttemptsById.get(attemptId);
+  }
+
+  private pruneAuthAttempts(now: number): void {
+    // Pending attempts remain pollable for one TTL after expiry, and terminal
+    // attempts for one TTL after completion. The finalization claim lives on
+    // the attempt record, so pruning the attempt also prunes its dedup state.
+    for (const [attemptId, attempt] of this.attemptsById) {
+      const retentionStartedAt = attempt.terminalAt ?? attempt.expiresAt;
+      if (now <= retentionStartedAt + this.attemptTtlMs) continue;
+      this.attemptsById.delete(attemptId);
+      this.attemptsByState.delete(attempt.state);
+    }
+    for (const [attemptId, attempt] of this.managedAttemptsById) {
+      const retentionStartedAt = attempt.terminalAt ?? attempt.expiresAt;
+      if (now > retentionStartedAt + this.attemptTtlMs) {
+        this.managedAttemptsById.delete(attemptId);
+      }
+    }
+  }
+
   async completeOAuthCallback(params: URLSearchParams): Promise<OAuthAttemptView> {
     const state = params.get("state") ?? "";
     const code = params.get("code") ?? "";
     const providerError = params.get("error");
+    const now = this.now();
+    this.pruneAuthAttempts(now);
     const attempt = this.attemptsByState.get(state);
     if (!attempt || attempt.status !== "pending") {
       return { status: "failed", error: "OAuth state is invalid or already used" };
     }
     this.attemptsByState.delete(state);
-    if (Date.now() > attempt.expiresAt) {
+    if (now > attempt.expiresAt) {
       attempt.status = "expired";
+      attempt.terminalAt = now;
       attempt.error = "OAuth attempt expired";
       return {
         status: "expired",
@@ -412,6 +481,7 @@ export class ConnectorAuthManager {
     }
     if (providerError) {
       attempt.status = "failed";
+      attempt.terminalAt = now;
       attempt.error = params.get("error_description") ?? providerError;
       return {
         status: "failed",
@@ -423,6 +493,7 @@ export class ConnectorAuthManager {
     }
     if (!code) {
       attempt.status = "failed";
+      attempt.terminalAt = now;
       attempt.error = "OAuth callback did not include a code";
       return {
         status: "failed",
@@ -438,6 +509,7 @@ export class ConnectorAuthManager {
       this.assertIntegrationAuthActive(attempt.integrationId, attempt.generation);
       await this.persistOAuthToken(attempt, token);
       attempt.status = "connected";
+      attempt.terminalAt = this.now();
       attempt.credentialId = attempt.authRef;
       return {
         status: "connected",
@@ -448,6 +520,7 @@ export class ConnectorAuthManager {
       };
     } catch (err) {
       attempt.status = "failed";
+      attempt.terminalAt = this.now();
       attempt.error = err instanceof Error ? err.message : String(err);
       return {
         status: "failed",
@@ -502,7 +575,7 @@ export class ConnectorAuthManager {
     payload: Extract<SecretPayload, { kind: "oauth2" }>,
     integrationId: string,
   ): Promise<string> {
-    if (!payload.expiresAt || payload.expiresAt - Date.now() > this.refreshSkewMs) {
+    if (!payload.expiresAt || payload.expiresAt - this.now() > this.refreshSkewMs) {
       return payload.accessToken;
     }
     const existing = this.refreshFlights.get(authRef);
@@ -653,7 +726,7 @@ export class ConnectorAuthManager {
         ...payload,
         accessToken: requireAccessToken(token),
         refreshToken: token.refresh_token ?? payload.refreshToken,
-        expiresAt: tokenExpiresAt(token),
+        expiresAt: tokenExpiresAt(token, this.now()),
         tokenType: token.token_type ?? payload.tokenType,
       };
       await this.writePayload(authRef, nextPayload);
@@ -732,7 +805,7 @@ export class ConnectorAuthManager {
       kind: "oauth2",
       accessToken: requireAccessToken(token),
       refreshToken: token.refresh_token,
-      expiresAt: tokenExpiresAt(token),
+      expiresAt: tokenExpiresAt(token, this.now()),
       tokenType: token.token_type,
     };
     await this.writePayload(attempt.authRef, payload);
@@ -836,9 +909,9 @@ function requireAccessToken(token: TokenResponse): string {
   return token.access_token;
 }
 
-function tokenExpiresAt(token: TokenResponse): number | undefined {
+function tokenExpiresAt(token: TokenResponse, now: number): number | undefined {
   if (typeof token.expires_at === "number") return token.expires_at;
-  if (typeof token.expires_in === "number") return Date.now() + token.expires_in * 1000;
+  if (typeof token.expires_in === "number") return now + token.expires_in * 1000;
   return undefined;
 }
 

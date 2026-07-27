@@ -2156,6 +2156,76 @@ auth:
     expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ stopped: true });
   });
 
+  test("scheduler releases runtime reconcile listeners while stopped and resubscribes on restart", async () => {
+    let watchStarts = 0;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "restartable-scheduler-watch",
+        name: "Restartable Scheduler Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+        config: {
+          label: { type: "string", label: "Label" },
+        },
+      },
+      {
+        async run({ signal }) {
+          watchStarts += 1;
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({
+      connectorId: "restartable-scheduler-watch",
+    });
+    const originalSubscribe = supervisor.onRuntimeReconcileRequested.bind(supervisor);
+    let subscriptions = 0;
+    let disposals = 0;
+    supervisor.onRuntimeReconcileRequested = (listener) => {
+      subscriptions += 1;
+      const dispose = originalSubscribe(listener);
+      let disposed = false;
+      return () => {
+        if (disposed) return;
+        disposed = true;
+        disposals += 1;
+        dispose();
+      };
+    };
+
+    const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
+    expect(subscriptions).toBe(0);
+
+    await scheduler.start();
+    expect(subscriptions).toBe(1);
+    expect(disposals).toBe(0);
+    expect(watchStarts).toBe(0);
+
+    await scheduler.stop();
+    expect(disposals).toBe(1);
+
+    await scheduler.start();
+    expect(subscriptions).toBe(2);
+
+    await supervisor.configureIntegration(integration.id, {
+      config: { label: "ready" },
+    });
+    expect(await waitWithTestTimeout((async () => {
+      while (watchStarts < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+
+    await scheduler.stop();
+    expect(disposals).toBe(2);
+  });
+
   test("effective config changes replace an active watch attempt without replacing its run intent", async () => {
     const configs: Array<Record<string, unknown>> = [];
     const signals: AbortSignal[] = [];

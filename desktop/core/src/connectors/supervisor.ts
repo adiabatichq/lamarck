@@ -153,7 +153,6 @@ export class ConnectorSupervisor {
     instanceId: string,
     reason: ConnectorRuntimeReconcileReason,
   ) => void>();
-  private reconciledAuthAttemptIds = new Set<string>();
   private activeConfigUiSessions = new Map<string, ActiveConfigUiSession>();
   private store: ConnectorIntegrationStore;
   private authManager: ConnectorAuthManager;
@@ -830,9 +829,11 @@ export class ConnectorSupervisor {
     if (!integration) return;
 
     const attemptId = result.attemptId;
-    if (attemptId) {
-      if (this.reconciledAuthAttemptIds.has(attemptId)) return;
-      this.reconciledAuthAttemptIds.add(attemptId);
+    if (
+      attemptId
+      && !this.authManager.claimConnectedAttemptFinalization(attemptId)
+    ) {
+      return;
     }
 
     try {
@@ -842,7 +843,9 @@ export class ConnectorSupervisor {
       await this.refreshSetupStatus(integration.id);
       this.requestRuntimeReconcile(integration.id, "credential_connected");
     } catch (err) {
-      if (attemptId) this.reconciledAuthAttemptIds.delete(attemptId);
+      if (attemptId) {
+        this.authManager.releaseConnectedAttemptFinalization(attemptId);
+      }
       throw err;
     }
   }

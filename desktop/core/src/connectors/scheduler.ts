@@ -40,6 +40,7 @@ export class ConnectorScheduler {
   private watchReconcileRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private watchReconcileAllPending = false;
   private pendingWatchIntegrationIds = new Set<string>();
+  private disposeRuntimeReconcileListener: (() => void) | undefined;
   private started = false;
   private stopped = false;
 
@@ -51,20 +52,19 @@ export class ConnectorScheduler {
       ?? DEFAULT_WATCH_RECONCILE_RETRY_MS;
     this.now = opts.now ?? Date.now;
     this.onError = opts.onError;
-    this.supervisor.onRuntimeReconcileRequested((instanceId) => {
-      this.queueWatchReconcile(instanceId);
-    });
   }
 
   async start(): Promise<void> {
     if (this.started || this.timer) return;
     this.stopped = false;
     this.started = true;
+    this.subscribeRuntimeReconcileRequests();
     try {
       await this.tick();
     } catch (err) {
       this.started = false;
       this.cancelWatchReconcileRetry();
+      this.unsubscribeRuntimeReconcileRequests();
       throw err;
     }
     if (this.stopped) {
@@ -93,6 +93,7 @@ export class ConnectorScheduler {
   async stop(): Promise<void> {
     this.stopped = true;
     this.started = false;
+    this.unsubscribeRuntimeReconcileRequests();
     this.watchReconcileAllPending = false;
     this.pendingWatchIntegrationIds.clear();
     this.cancelWatchReconcileRetry();
@@ -267,6 +268,20 @@ export class ConnectorScheduler {
     void this.reconcileWatchConnectors(instanceId).catch((err) => {
       console.error("[connectors] watch reconciliation failed:", err);
     });
+  }
+
+  private subscribeRuntimeReconcileRequests(): void {
+    if (this.disposeRuntimeReconcileListener) return;
+    this.disposeRuntimeReconcileListener = this.supervisor.onRuntimeReconcileRequested(
+      (instanceId) => {
+        this.queueWatchReconcile(instanceId);
+      },
+    );
+  }
+
+  private unsubscribeRuntimeReconcileRequests(): void {
+    this.disposeRuntimeReconcileListener?.();
+    this.disposeRuntimeReconcileListener = undefined;
   }
 
   private scheduleWatchReconcileRetry(): void {
