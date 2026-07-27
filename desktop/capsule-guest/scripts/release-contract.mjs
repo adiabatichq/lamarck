@@ -29,6 +29,7 @@ const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const PUBLIC_KEY_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 128 * 1024 * 1024 * 1024;
+const MAX_SOURCE_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024;
 
 export async function validateGuestRelease(rootValue, options = {}) {
   const root = await requireDirectory(rootValue, "Guest release root");
@@ -126,24 +127,19 @@ export async function validateGuestRelease(rootValue, options = {}) {
   }
   const bundledSourcePaths = [...compliancePaths]
     .filter((path) => path.startsWith("compliance/corresponding-source/"));
-  if (descriptor.schemaVersion === 1 && bundledSourcePaths.length === 0) {
-    throw new Error("legacy release contains no bundled corresponding source");
-  }
-  if (descriptor.schemaVersion === 2 && bundledSourcePaths.length !== 0) {
+  if (bundledSourcePaths.length !== 0) {
     throw new Error("detached-source release bundles corresponding source in the runtime");
   }
-  if (descriptor.schemaVersion === 2) {
-    const offer = exactSourceOffer(JSON.parse(await readSmallRegularFile(
-      join(bundle, "compliance", "corresponding-source-offer.json"),
-      MAX_JSON_BYTES,
-    )));
-    if (
-      offer.subject.imageVersion !== manifest.imageVersion
-      || offer.subject.architecture !== descriptor.architecture
-      || !correspondingSourceMatches(offer.fulfillment.archive, sourceArchive)
-    ) {
-      throw new Error("corresponding-source offer does not match the Guest release");
-    }
+  const offer = exactSourceOffer(JSON.parse(await readSmallRegularFile(
+    join(bundle, "compliance", "corresponding-source-offer.json"),
+    MAX_JSON_BYTES,
+  )));
+  if (
+    offer.subject.imageVersion !== manifest.imageVersion
+    || offer.subject.architecture !== descriptor.architecture
+    || !correspondingSourceMatches(offer.fulfillment.archive, sourceArchive)
+  ) {
+    throw new Error("corresponding-source offer does not match the Guest release");
   }
   const actualCompliance = (await listRegularFiles(join(bundle, "compliance")))
     .map((path) => `compliance/${path}`);
@@ -297,20 +293,14 @@ export function publicKeyFromRaw(raw) {
 }
 
 function exactReleaseDescriptor(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("$ must be an object");
-  }
-  const schemaVersion = value.schemaVersion;
-  const fields = [
+  const object = exactObject(value, "$", [
     "schemaVersion", "vmWireVersion", "guestProtocolVersion", "architecture",
     "bundleRelativePath", "manifestDigest", "pinnedEd25519PublicKey", "supervisorVersion",
     "features", "runtimeAbi", "nodeVersion", "nodeModulesAbi", "libc", "cpuCount",
-    "memorySizeBytes", "stateFormatVersion",
-  ];
-  if (schemaVersion === 2) fields.push("correspondingSource");
-  const object = exactObject(value, "$", fields);
+    "memorySizeBytes", "stateFormatVersion", "correspondingSource",
+  ]);
   if (
-    ![1, 2].includes(object.schemaVersion)
+    object.schemaVersion !== 1
     || object.vmWireVersion !== 2
     || object.guestProtocolVersion !== 2
   ) {
@@ -334,12 +324,10 @@ function exactReleaseDescriptor(value) {
     || object.memorySizeBytes !== 4 * 1024 * 1024 * 1024
     || object.stateFormatVersion !== 1
   ) throw new Error("Guest runtime descriptor does not match the pinned runtime");
-  if (object.schemaVersion === 2) {
-    object.correspondingSource = exactCorrespondingSource(
-      object.correspondingSource,
-      "$.correspondingSource",
-    );
-  }
+  object.correspondingSource = exactCorrespondingSource(
+    object.correspondingSource,
+    "$.correspondingSource",
+  );
   return object;
 }
 
@@ -353,6 +341,7 @@ function exactCorrespondingSource(value, label) {
   if (
     typeof object.file !== "string"
     || !/^Lamarck-Capsule-Guest-[A-Za-z0-9._-]+-Open-Source\.tar\.gz$/.test(object.file)
+    || object.file !== `Lamarck-Capsule-Guest-${object.imageVersion}-Open-Source.tar.gz`
   ) {
     throw new Error(`${label}.file is invalid`);
   }
@@ -361,7 +350,11 @@ function exactCorrespondingSource(value, label) {
     throw new Error(`${label}.url does not name its source archive`);
   }
   digest(object.sha256, `${label}.sha256`);
-  if (!Number.isSafeInteger(object.bytes) || object.bytes < 1 || object.bytes > MAX_ARTIFACT_BYTES) {
+  if (
+    !Number.isSafeInteger(object.bytes)
+    || object.bytes < 1
+    || object.bytes > MAX_SOURCE_ARCHIVE_BYTES
+  ) {
     throw new Error(`${label}.bytes is invalid`);
   }
   if (object.mediaType !== "application/gzip" || object.format !== "tar+gzip") {

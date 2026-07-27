@@ -1,6 +1,6 @@
 import { mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import {
   CAPSULE_GUEST_RELEASE_DESCRIPTOR_FILE,
@@ -11,6 +11,8 @@ import {
 
 const DIGEST = `sha256:${"a".repeat(64)}`;
 const PUBLIC_KEY = Buffer.alloc(32, 7).toString("base64");
+const SOURCE_DIGEST = `sha256:${"b".repeat(64)}`;
+const SOURCE_FILE = "Lamarck-Capsule-Guest-0.1.4-Open-Source.tar.gz";
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -18,6 +20,24 @@ afterEach(async () => {
 });
 
 describe("Capsule Guest release descriptor", () => {
+  test.skipIf(!process.env.LAMARCK_GUEST_RELEASE_ROOT)(
+    "loads the descriptor produced by the Guest release pipeline",
+    async () => {
+      const stateRoot = await createRoot();
+      const loaded = await loadCapsuleGuestRelease({
+        resourcesRoot: resolve(process.env.LAMARCK_GUEST_RELEASE_ROOT!),
+        stateDirectory: join(stateRoot, "host-state"),
+        hostArchitecture: "arm64",
+      });
+
+      expect(loaded.descriptor.schemaVersion).toBe(1);
+      expect(loaded.descriptor.correspondingSource).toMatchObject({
+        mediaType: "application/gzip",
+        format: "tar+gzip",
+      });
+    },
+  );
+
   test("loads an exact app-bundled descriptor into VM, handshake, and ABI expectations", async () => {
     const fixture = await createFixture();
     const loaded = await loadCapsuleGuestRelease({
@@ -57,6 +77,15 @@ describe("Capsule Guest release descriptor", () => {
       nodeModulesAbi: "137",
       libc: "glibc-2.43",
     });
+    expect(loaded.descriptor.correspondingSource).toEqual({
+      imageVersion: "0.1.4",
+      file: SOURCE_FILE,
+      url: `https://releases.lamarck.ai/guest/macos/arm64/digest/${SOURCE_FILE}`,
+      sha256: SOURCE_DIGEST,
+      bytes: 512 * 1024 * 1024,
+      mediaType: "application/gzip",
+      format: "tar+gzip",
+    });
     expect(Object.isFrozen(loaded.handshake.expectedFeatures)).toBe(true);
   });
 
@@ -64,6 +93,7 @@ describe("Capsule Guest release descriptor", () => {
     const invalidDescriptors: Array<[string, (value: Record<string, unknown>) => void]> = [
       ["unknown field", (value) => { value.imageVersion = "0.1.0"; }],
       ["missing field", (value) => { delete value.runtimeAbi; }],
+      ["descriptor version", (value) => { value.schemaVersion = 2; }],
       ["wire version", (value) => { value.vmWireVersion = 1; }],
       ["Guest protocol version", (value) => { value.guestProtocolVersion = 1; }],
       ["manifest digest", (value) => { value.manifestDigest = `sha256:${"A".repeat(64)}`; }],
@@ -86,6 +116,26 @@ describe("Capsule Guest release descriptor", () => {
       ["memory alignment", (value) => { value.memorySizeBytes = 4 * 1024 * 1024 * 1024 + 1; }],
       ["unsafe bundle path", (value) => { value.bundleRelativePath = "../guest"; }],
       ["backslash bundle path", (value) => { value.bundleRelativePath = "images\\guest"; }],
+      ["missing corresponding source", (value) => { delete value.correspondingSource; }],
+      ["corresponding source unknown field", (value) => {
+        (value.correspondingSource as Record<string, unknown>).unexpected = true;
+      }],
+      ["corresponding source URL", (value) => {
+        (value.correspondingSource as Record<string, unknown>).url = "http://releases.lamarck.ai/source";
+      }],
+      ["corresponding source file mismatch", (value) => {
+        (value.correspondingSource as Record<string, unknown>).url =
+          "https://releases.lamarck.ai/not-the-source.tar.gz";
+      }],
+      ["corresponding source image version mismatch", (value) => {
+        (value.correspondingSource as Record<string, unknown>).imageVersion = "0.1.5";
+      }],
+      ["corresponding source digest", (value) => {
+        (value.correspondingSource as Record<string, unknown>).sha256 = `sha256:${"B".repeat(64)}`;
+      }],
+      ["corresponding source size", (value) => {
+        (value.correspondingSource as Record<string, unknown>).bytes = 0;
+      }],
     ];
 
     for (const [label, mutate] of invalidDescriptors) {
@@ -232,5 +282,14 @@ function validDescriptor(): CapsuleGuestReleaseDescriptor {
     cpuCount: 4,
     memorySizeBytes: 4 * 1024 * 1024 * 1024,
     stateFormatVersion: 1,
+    correspondingSource: {
+      imageVersion: "0.1.4",
+      file: SOURCE_FILE,
+      url: `https://releases.lamarck.ai/guest/macos/arm64/digest/${SOURCE_FILE}`,
+      sha256: SOURCE_DIGEST,
+      bytes: 512 * 1024 * 1024,
+      mediaType: "application/gzip",
+      format: "tar+gzip",
+    },
   };
 }

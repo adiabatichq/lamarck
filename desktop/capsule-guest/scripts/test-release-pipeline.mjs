@@ -478,7 +478,7 @@ try {
   const releaseDescriptor = JSON.parse(
     await readFile(join(release, "capsule-guest-release.json"), "utf8"),
   );
-  assert(releaseDescriptor.schemaVersion === 2, "detached-source Guest descriptor was not emitted");
+  assert(releaseDescriptor.schemaVersion === 1, "Guest release descriptor v1 was not emitted");
   const sourceArchive = releaseDescriptor.correspondingSource;
   assert(sourceArchive?.format === "tar+gzip", "source archive metadata is incomplete");
   assert(

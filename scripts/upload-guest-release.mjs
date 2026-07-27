@@ -54,7 +54,7 @@ const inventory = [];
 for (const relativePath of files) {
   const key = `${objectPrefix}/${relativePath}`;
   const uploaded = await store.putFileImmutable(key, join(source, relativePath), {
-    contentType: relativePath === descriptor.correspondingSource?.file
+    contentType: relativePath === descriptor.correspondingSource.file
       ? descriptor.correspondingSource.mediaType
       : "application/octet-stream",
     cacheControl: IMMUTABLE_CACHE,
@@ -81,9 +81,7 @@ await writeFile(pinPath, `${JSON.stringify({
   manifestDigest: digest,
   inventorySha256: `sha256:${inventoryResult.sha256}`,
   objectPrefix,
-  ...(descriptor.correspondingSource
-    ? { correspondingSource: descriptor.correspondingSource }
-    : {}),
+  correspondingSource: descriptor.correspondingSource,
 }, null, 2)}\n`, "utf8");
 console.log(`[guest] Wrote ${pinPath}; commit it so CI builds against this release`);
 

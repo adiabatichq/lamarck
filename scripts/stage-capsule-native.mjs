@@ -55,7 +55,7 @@ export async function stageCapsuleNative(rootValue = defaultRoot, options = {}) 
   const stagingParent = await mkdtemp(join(nativeRoot, ".capsule-guest-stage-"));
   const stagingRelease = join(stagingParent, "release");
   try {
-    // Schema-v2 Guest releases keep corresponding source beside the runtime
+    // Guest releases keep corresponding source beside the runtime
     // release. Stage only the descriptor and signed runtime bundle into the
     // App; the descriptor's signed offer retains the immutable public URL.
     await mkdir(stagingRelease, { mode: 0o700 });

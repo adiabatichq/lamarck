@@ -176,7 +176,7 @@ await writeExclusive(join(bundle, "compliance-manifest.json"), complianceManifes
 await writeExclusive(join(bundle, "compliance-manifest.ed25519"), complianceSignature);
 
 const release = {
-  schemaVersion: 2,
+  schemaVersion: 1,
   vmWireVersion: 2,
   guestProtocolVersion: 2,
   architecture: ARCHITECTURE,

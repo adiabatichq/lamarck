@@ -77,6 +77,13 @@ jobs:
           SOURCE_DATE_EPOCH: "0"
         run: npm run capsule-guest:image
 
+      - name: Verify Guest descriptor with Desktop Host
+        env:
+          LAMARCK_GUEST_RELEASE_ROOT: ${{ github.workspace }}/.lamarck/build/capsule-guest/release
+        run: |
+          npm ci --ignore-scripts --audit=false --fund=false
+          npm --workspace @lamarck/shell test -- guest-release.test.ts
+
       - name: Publish immutable Guest release to R2
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}

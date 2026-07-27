@@ -10,7 +10,18 @@ export const CAPSULE_GUEST_RELEASE_DESCRIPTOR_FILE = "capsule-guest-release.json
 const MAX_DESCRIPTOR_BYTES = 64 * 1024;
 const MINIMUM_VM_MEMORY_BYTES = 512 * 1024 * 1024;
 const MAXIMUM_VM_MEMORY_BYTES = 64 * 1024 * 1024 * 1024;
+const MAXIMUM_SOURCE_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024;
 const MEMORY_ALIGNMENT_BYTES = 1024 * 1024;
+
+export interface CapsuleGuestCorrespondingSource {
+  imageVersion: string;
+  file: string;
+  url: string;
+  sha256: string;
+  bytes: number;
+  mediaType: "application/gzip";
+  format: "tar+gzip";
+}
 
 export interface CapsuleGuestReleaseDescriptor {
   schemaVersion: 1;
@@ -29,6 +40,7 @@ export interface CapsuleGuestReleaseDescriptor {
   cpuCount: number;
   memorySizeBytes: number;
   stateFormatVersion: 1;
+  correspondingSource: CapsuleGuestCorrespondingSource;
 }
 
 export interface CapsuleGuestRuntimeExpectation {
@@ -255,6 +267,7 @@ function parseDescriptor(source: string): CapsuleGuestReleaseDescriptor {
     "cpuCount",
     "memorySizeBytes",
     "stateFormatVersion",
+    "correspondingSource",
   ]);
 
   literal(object.schemaVersion, 1, "$.schemaVersion");
@@ -308,6 +321,7 @@ function parseDescriptor(source: string): CapsuleGuestReleaseDescriptor {
     invalid("$.memorySizeBytes", "memory size must be aligned to one MiB");
   }
   literal(object.stateFormatVersion, 1, "$.stateFormatVersion");
+  const correspondingSource = canonicalCorrespondingSource(object.correspondingSource);
 
   return {
     schemaVersion: 1,
@@ -326,6 +340,7 @@ function parseDescriptor(source: string): CapsuleGuestReleaseDescriptor {
     cpuCount,
     memorySizeBytes,
     stateFormatVersion: 1,
+    correspondingSource,
   };
 }
 
@@ -417,6 +432,53 @@ function canonicalFeatures(value: unknown): string[] {
   return features;
 }
 
+function canonicalCorrespondingSource(value: unknown): CapsuleGuestCorrespondingSource {
+  const object = exactObject(value, "$.correspondingSource", [
+    "imageVersion",
+    "file",
+    "url",
+    "sha256",
+    "bytes",
+    "mediaType",
+    "format",
+  ]);
+  const imageVersion = patternedString(
+    object.imageVersion,
+    "$.correspondingSource.imageVersion",
+    /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/,
+  );
+  const file = patternedString(
+    object.file,
+    "$.correspondingSource.file",
+    /^Lamarck-Capsule-Guest-[A-Za-z0-9._-]+-Open-Source\.tar\.gz$/,
+  );
+  if (file !== `Lamarck-Capsule-Guest-${imageVersion}-Open-Source.tar.gz`) {
+    invalid("$.correspondingSource.file", "file does not match the image version");
+  }
+  const url = validatedHttpsUrl(object.url, "$.correspondingSource.url");
+  if (!new URL(url).pathname.endsWith(`/${file}`)) {
+    invalid("$.correspondingSource.url", "URL does not name the source archive");
+  }
+  const sha256 = validatedDigest(object.sha256, "$.correspondingSource.sha256");
+  const bytes = boundedInteger(
+    object.bytes,
+    "$.correspondingSource.bytes",
+    1,
+    MAXIMUM_SOURCE_ARCHIVE_BYTES,
+  );
+  literal(object.mediaType, "application/gzip", "$.correspondingSource.mediaType");
+  literal(object.format, "tar+gzip", "$.correspondingSource.format");
+  return {
+    imageVersion,
+    file,
+    url,
+    sha256,
+    bytes,
+    mediaType: "application/gzip",
+    format: "tar+gzip",
+  };
+}
+
 function exactObject(
   value: unknown,
   path: string,
@@ -448,6 +510,26 @@ function stringEnum<const T extends readonly string[]>(
 
 function patternedString(value: unknown, path: string, pattern: RegExp): string {
   if (typeof value !== "string" || !pattern.test(value)) invalid(path, "invalid string value");
+  return value;
+}
+
+function validatedHttpsUrl(value: unknown, path: string): string {
+  if (typeof value !== "string") invalid(path, "expected a public HTTPS URL");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    invalid(path, "expected a public HTTPS URL");
+  }
+  if (
+    url.protocol !== "https:"
+    || url.username
+    || url.password
+    || url.search
+    || url.hash
+  ) {
+    invalid(path, "expected a public HTTPS URL");
+  }
   return value;
 }
 

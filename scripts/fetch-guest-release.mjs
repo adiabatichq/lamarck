@@ -26,15 +26,17 @@ const includeSource = process.argv.includes("--include-source");
 
 const pin = JSON.parse(await readFile(pinPath, "utf8"));
 if (
-  ![1, 2].includes(pin.schemaVersion)
+  pin.schemaVersion !== 1
   || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(pin.imageVersion ?? "")
   || !/^sha256:[a-f0-9]{64}$/.test(pin.manifestDigest ?? "")
   || !/^sha256:[a-f0-9]{64}$/.test(pin.inventorySha256 ?? "")
   || !/^guest\/[a-z0-9/-]+\/[a-f0-9]{16}$/.test(pin.objectPrefix ?? "")
 ) throw new Error(`${pinPath} is not a valid guest pin`);
-const correspondingSource = pin.schemaVersion === 2
-  ? validateCorrespondingSource(pin.correspondingSource, pin, publicBase)
-  : undefined;
+const correspondingSource = validateCorrespondingSource(
+  pin.correspondingSource,
+  pin,
+  publicBase,
+);
 
 if (existsSync(destination)) {
   try {
@@ -154,6 +156,7 @@ function validateCorrespondingSource(value, pinValue, base) {
     value.imageVersion !== pinValue.imageVersion
     || typeof value.file !== "string"
     || !/^Lamarck-Capsule-Guest-[A-Za-z0-9._-]+-Open-Source\.tar\.gz$/.test(value.file)
+    || value.file !== `Lamarck-Capsule-Guest-${value.imageVersion}-Open-Source.tar.gz`
     || value.url !== expectedUrl
     || !/^sha256:[a-f0-9]{64}$/.test(value.sha256 ?? "")
     || !Number.isSafeInteger(value.bytes)
