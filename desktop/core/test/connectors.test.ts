@@ -1884,6 +1884,10 @@ auth:
 
     // First integration must not be ready while requirements are unchecked.
     const integration = supervisor.ensureIntegration({ connectorId: "ax-watch" });
+    const reconcileReasons: string[] = [];
+    supervisor.onRuntimeReconcileRequested((instanceId, reason) => {
+      if (instanceId === integration.id) reconcileReasons.push(reason);
+    });
     expect(integration.setupStatus).toBe("setup");
     await expect(supervisor.run(integration.id)).rejects.toThrow("not set up");
 
@@ -1901,6 +1905,7 @@ auth:
       expect.objectContaining({ id: "macos-accessibility", status: "missing" }),
     ]);
     expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("setup");
+    expect(reconcileReasons).toEqual([]);
 
     // request() resolves the requirement and the evaluator promotes to ready.
     const requested = await supervisor.requestIntegrationRequirement(
@@ -1909,6 +1914,7 @@ auth:
     );
     expect(requested.status).toBe("satisfied");
     expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("ready");
+    expect(reconcileReasons).toEqual(["readiness_changed"]);
 
     await supervisor.run(integration.id);
     const event = dataDb.prepare("SELECT source, type FROM events").get() as any;
@@ -2154,6 +2160,53 @@ auth:
     expect((await supervisor.list())[0].running).toBe(false);
     expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
     expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ stopped: true });
+  });
+
+  test("integration-key readiness promotion immediately wakes an idle watch Source", async () => {
+    let starts = 0;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "identity-watch",
+        name: "Identity Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "multiple" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ signal }) {
+          starts += 1;
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "identity-watch" });
+    const reconcileReasons: string[] = [];
+    supervisor.onRuntimeReconcileRequested((instanceId, reason) => {
+      if (instanceId === integration.id) reconcileReasons.push(reason);
+    });
+    const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
+
+    await scheduler.start();
+    expect(integration.setupStatus).toBe("setup");
+    expect(starts).toBe(0);
+
+    const ready = await supervisor.configureIntegration(integration.id, {
+      integrationKey: "device-a",
+    });
+    expect(ready.setupStatus).toBe("ready");
+    expect(reconcileReasons).toEqual(["readiness_changed"]);
+    expect(await waitWithTestTimeout((async () => {
+      while (starts < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+
+    await scheduler.stop();
   });
 
   test("scheduler releases runtime reconcile listeners while stopped and resubscribes on restart", async () => {

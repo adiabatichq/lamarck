@@ -74,7 +74,10 @@ export interface ConnectorRequirementView {
 }
 
 export type ConnectorSetupPendingReason = "integration_key" | "auth" | "requirements" | "config";
-export type ConnectorRuntimeReconcileReason = "config_changed" | "credential_connected";
+export type ConnectorRuntimeReconcileReason =
+  | "config_changed"
+  | "credential_connected"
+  | "readiness_changed";
 
 export class ConnectorLifecycleConflictError extends Error {
   constructor(message: string) {
@@ -548,14 +551,10 @@ export class ConnectorSupervisor {
       }
       throw err;
     }
-    if (
-      persisted.effectiveConfigChanged
-      || (
-        input.config !== undefined
-        && persisted.updated.setupStatus !== refreshed.setupStatus
-      )
-    ) {
+    if (persisted.effectiveConfigChanged) {
       this.requestRuntimeReconcile(instanceId, "config_changed");
+    } else if (persisted.updated.setupStatus !== refreshed.setupStatus) {
+      this.requestRuntimeReconcile(instanceId, "readiness_changed");
     }
     return refreshed as ConnectorIntegration<TConfig, TState>;
   }
@@ -965,7 +964,9 @@ export class ConnectorSupervisor {
   async refreshIntegrationSetup<TConfig = unknown, TState = unknown>(
     instanceId: string,
   ): Promise<ConnectorIntegration<TConfig, TState>> {
-    return (await this.refreshSetupStatus(instanceId)) as ConnectorIntegration<TConfig, TState>;
+    return (
+      await this.refreshSetupStatus(instanceId, { reconcileTransition: true })
+    ) as ConnectorIntegration<TConfig, TState>;
   }
 
   // Explicit human recovery for a crashed run. Crashed ready integrations stay
@@ -1013,7 +1014,7 @@ export class ConnectorSupervisor {
     const session = await this.openTrustedSession(registration);
     try {
       const records = await this.evaluateRequirements(registration, integration, session, requirementIds);
-      await this.refreshSetupStatus(instanceId);
+      await this.refreshSetupStatus(instanceId, { reconcileTransition: true });
       return records;
     } finally {
       await session.close();
@@ -1053,7 +1054,7 @@ export class ConnectorSupervisor {
           lastCheckedAt: Date.now(),
         };
         this.persistRequirementRecords(instanceId, { [requirementId]: record });
-        await this.refreshSetupStatus(instanceId);
+        await this.refreshSetupStatus(instanceId, { reconcileTransition: true });
         return record;
       }
 
@@ -1067,7 +1068,7 @@ export class ConnectorSupervisor {
         record = { ...requestStatus, lastCheckedAt: record.lastCheckedAt };
         this.persistRequirementRecords(instanceId, { [requirementId]: record });
       }
-      await this.refreshSetupStatus(instanceId);
+      await this.refreshSetupStatus(instanceId, { reconcileTransition: true });
       return record;
     } finally {
       await session.close();
@@ -1129,7 +1130,10 @@ export class ConnectorSupervisor {
   // Unified setup evaluator: ready requires source identity + auth + active
   // platform requirements all satisfied. Demotes ready integrations whose
   // requirements regressed; promotes setup integrations once everything passes.
-  private async refreshSetupStatus(instanceId: string): Promise<ConnectorIntegration> {
+  private async refreshSetupStatus(
+    instanceId: string,
+    opts: { reconcileTransition?: boolean } = {},
+  ): Promise<ConnectorIntegration> {
     let integration = this.store.get(instanceId);
     if (!integration) {
       throw new Error(`Connector integration not found: ${instanceId}`);
@@ -1164,10 +1168,18 @@ export class ConnectorSupervisor {
     const eligible = sourceReady && requirementsReady && authReady && configReady;
 
     if (integration.setupStatus === "ready" && !eligible) {
-      return this.store.update(instanceId, { setupStatus: "setup" });
+      const refreshed = this.store.update(instanceId, { setupStatus: "setup" });
+      if (opts.reconcileTransition) {
+        this.requestRuntimeReconcile(instanceId, "readiness_changed");
+      }
+      return refreshed;
     }
     if (integration.setupStatus === "setup" && eligible) {
-      return this.store.update(instanceId, { setupStatus: "ready" });
+      const refreshed = this.store.update(instanceId, { setupStatus: "ready" });
+      if (opts.reconcileTransition) {
+        this.requestRuntimeReconcile(instanceId, "readiness_changed");
+      }
+      return refreshed;
     }
     return integration;
   }
