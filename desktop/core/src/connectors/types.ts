@@ -202,6 +202,9 @@ export interface ConnectorRunContext<TConfig = unknown, TState = unknown> {
   auth: ConnectorAuthHandle;
   state: ConnectorStateHandle<TState>;
   warnings: ConnectorWarningsHandle;
+  // Immutable for this process attempt. An effective Source config change or
+  // explicit credential connection aborts signal and resumes the same run
+  // intent in a fresh attempt.
   config: TConfig;
   host: ConnectorHostContext;
   signal: AbortSignal;

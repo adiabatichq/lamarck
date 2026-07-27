@@ -757,6 +757,22 @@ function setupHtml() {
       align-items: flex-start;
       margin-bottom: 18px;
     }
+    .saveActions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+    .saveStatus {
+      min-width: 108px;
+      max-width: 240px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.3;
+      text-align: right;
+    }
+    .saveStatus.success { color: var(--accent); }
+    .saveStatus.error { color: var(--warn); }
     h1 {
       margin: 0;
       font-size: 22px;
@@ -886,6 +902,15 @@ function setupHtml() {
       .repoCapture { grid-template-columns: 1fr; }
       .rootActions { grid-template-columns: 1fr; }
     }
+    @media (max-width: 600px) {
+      header { flex-direction: column; }
+      .saveActions { justify-content: flex-start; }
+      .saveStatus {
+        order: 2;
+        min-width: 0;
+        text-align: left;
+      }
+    }
   </style>
 </head>
 <body>
@@ -895,7 +920,10 @@ function setupHtml() {
         <h1>Local Git</h1>
         <div class="sub">Scan code roots for git repositories and record commits that match your configured identities.</div>
       </div>
-      <button id="save" class="primary">Save</button>
+      <div class="saveActions">
+        <span id="saveStatus" class="saveStatus" role="status" aria-live="polite"></span>
+        <button id="save" class="primary">Save</button>
+      </div>
     </header>
     <div class="grid">
       <main>
@@ -978,6 +1006,7 @@ function setupHtml() {
     let config = null;
     let discoveredRepos = [];
     let identitySuggestions = [];
+    let saveResetTimer = null;
 
     const el = (id) => document.getElementById(id);
     const api = (path, opts = {}) => fetch(path + "?token=" + encodeURIComponent(token), {
@@ -999,6 +1028,17 @@ function setupHtml() {
       };
     }
     function setStatus(text) { el("status").textContent = text || ""; }
+    function setSaveStatus(text, tone) {
+      const node = el("saveStatus");
+      node.textContent = text || "";
+      node.className = "saveStatus" + (tone ? " " + tone : "");
+    }
+    function resetSaveFeedback() {
+      const button = el("save");
+      button.textContent = "Save";
+      setSaveStatus("");
+      saveResetTimer = null;
+    }
     function addRootPath(path) {
       const value = String(path || "").trim();
       if (!value) return false;
@@ -1285,13 +1325,33 @@ function setupHtml() {
       }
     };
     el("save").onclick = async () => {
+      const button = el("save");
+      if (saveResetTimer !== null) {
+        window.clearTimeout(saveResetTimer);
+        saveResetTimer = null;
+      }
       config.global.capture = captureFromForm("");
-      setStatus("Saving...");
-      const data = await api("/api/config", { method: "POST", body: JSON.stringify({ localGit: config }) });
-      config = data.config;
-      render();
-      setStatus("Saved.");
-      setTimeout(() => setStatus(""), 1400);
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      button.textContent = "Saving…";
+      setSaveStatus("Saving…");
+      try {
+        const data = await api("/api/config", {
+          method: "POST",
+          body: JSON.stringify({ localGit: config })
+        });
+        config = data.config;
+        render();
+        button.textContent = "Saved ✓";
+        setSaveStatus("Settings saved.", "success");
+        saveResetTimer = window.setTimeout(resetSaveFeedback, 1800);
+      } catch (err) {
+        button.textContent = "Retry";
+        setSaveStatus("Save failed: " + (err.message || String(err)), "error");
+      } finally {
+        button.disabled = false;
+        button.removeAttribute("aria-busy");
+      }
     };
     load().catch((err) => setStatus(err.message || String(err)));
   </script>

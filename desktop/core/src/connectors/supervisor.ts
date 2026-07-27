@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { isDeepStrictEqual } from "node:util";
 import { ulid } from "../utils/ulid";
 import { assertJsonValue } from "../json";
 import { ContentBlobStore } from "../blob-store";
@@ -73,6 +74,7 @@ export interface ConnectorRequirementView {
 }
 
 export type ConnectorSetupPendingReason = "integration_key" | "auth" | "requirements" | "config";
+export type ConnectorRuntimeReconcileReason = "config_changed" | "credential_connected";
 
 export class ConnectorLifecycleConflictError extends Error {
   constructor(message: string) {
@@ -88,13 +90,17 @@ interface Registration {
   trust: ConnectorPackageTrust;
 }
 
-interface ActiveRun {
+interface ActiveRunIntent {
   instanceId: string;
   trigger: ConnectorRunTrigger;
+  configOverride: unknown;
   controller: AbortController;
+  attemptController: AbortController | undefined;
+  runtimeGeneration: number;
   signal: AbortSignal;
   promise: Promise<void>;
   abort(): void;
+  invalidateRuntime(): void;
 }
 
 interface ActiveConfigUiSession {
@@ -125,6 +131,12 @@ export interface ConnectorSupervisorOptions {
   managedProviderAppOrigin?: string;
 }
 
+export interface ConnectIntegrationInput {
+  authRef?: string;
+}
+
+type NonConfigIntegrationUpdateInput = Omit<UpdateIntegrationInput<never>, "config">;
+
 const DEFAULT_MANAGED_PROVIDER_APP_ORIGIN = "https://app.lamarck.ai";
 
 const MANUAL_TRUST: ConnectorPackageTrust = {
@@ -136,7 +148,12 @@ const MANUAL_TRUST: ConnectorPackageTrust = {
 export class ConnectorSupervisor {
   private registrations = new Map<string, Registration>();
   private updatingConnectorIds = new Set<string>();
-  private activeRuns = new Map<string, ActiveRun>();
+  private activeRuns = new Map<string, ActiveRunIntent>();
+  private runtimeReconcileListeners = new Set<(
+    instanceId: string,
+    reason: ConnectorRuntimeReconcileReason,
+  ) => void>();
+  private reconciledAuthAttemptIds = new Set<string>();
   private activeConfigUiSessions = new Map<string, ActiveConfigUiSession>();
   private store: ConnectorIntegrationStore;
   private authManager: ConnectorAuthManager;
@@ -427,21 +444,15 @@ export class ConnectorSupervisor {
     throw new Error(`Connector ${existing.connectorId} does not use browser auth`);
   }
 
-  getOAuthAttempt(instanceId: string, attemptId: string): Promise<OAuthAttemptView> {
-    return this.authManager.getOAuthAttempt(instanceId, attemptId);
+  async getOAuthAttempt(instanceId: string, attemptId: string): Promise<OAuthAttemptView> {
+    const result = await this.authManager.getOAuthAttempt(instanceId, attemptId);
+    await this.finalizeConnectedAuthAttempt(result);
+    return result;
   }
 
   async completeOAuthCallback(params: URLSearchParams): Promise<OAuthAttemptView> {
     const result = await this.authManager.completeOAuthCallback(params);
-    if (result.status === "connected" && result.integrationId && result.authRef) {
-      const integration = this.store.get(result.integrationId);
-      if (integration) {
-        if (integration.authRef !== result.authRef) {
-          this.store.update(integration.id, { authRef: result.authRef });
-        }
-        await this.refreshSetupStatus(integration.id);
-      }
-    }
+    await this.finalizeConnectedAuthAttempt(result);
     return result;
   }
 
@@ -512,8 +523,51 @@ export class ConnectorSupervisor {
 
   updateIntegration<TConfig = unknown, TState = unknown>(
     instanceId: string,
-    input: UpdateIntegrationInput<TConfig>,
+    input: NonConfigIntegrationUpdateInput,
   ): ConnectorIntegration<TConfig, TState> {
+    if ("config" in input) {
+      throw new Error(
+        `Connector integration ${instanceId} config changes must use configureIntegration`,
+      );
+    }
+    return this.persistIntegrationUpdate<TConfig, TState>(instanceId, input).updated;
+  }
+
+  async configureIntegration<TConfig = unknown, TState = unknown>(
+    instanceId: string,
+    input: UpdateIntegrationInput<TConfig>,
+  ): Promise<ConnectorIntegration<TConfig, TState>> {
+    const persisted = this.persistIntegrationUpdate<TConfig, TState>(instanceId, input);
+    let refreshed: ConnectorIntegration;
+    try {
+      refreshed = await this.refreshSetupStatus(instanceId);
+    } catch (err) {
+      // The config is already durable. Do not leave an active attempt on the
+      // stale value just because an asynchronous readiness check failed.
+      if (persisted.effectiveConfigChanged) {
+        this.requestRuntimeReconcile(instanceId, "config_changed");
+      }
+      throw err;
+    }
+    if (
+      persisted.effectiveConfigChanged
+      || (
+        input.config !== undefined
+        && persisted.updated.setupStatus !== refreshed.setupStatus
+      )
+    ) {
+      this.requestRuntimeReconcile(instanceId, "config_changed");
+    }
+    return refreshed as ConnectorIntegration<TConfig, TState>;
+  }
+
+  private persistIntegrationUpdate<TConfig = unknown, TState = unknown>(
+    instanceId: string,
+    input: UpdateIntegrationInput<TConfig>,
+  ): {
+    updated: ConnectorIntegration<TConfig, TState>;
+    effectiveConfigChanged: boolean;
+  } {
     const existing = this.store.get(instanceId);
     if (!existing) {
       throw new Error(`Connector integration not found: ${instanceId}`);
@@ -529,6 +583,10 @@ export class ConnectorSupervisor {
     const mode = registration.manifest.integrations.mode;
     const requiresAuth = (registration.manifest.auth ?? { type: "none" }).type !== "none";
     const nextConfig = input.config === undefined ? existing.config : input.config;
+    const previousEffectiveConfig = mergeConfig(
+      schemaDefaults(registration.manifest),
+      existing.config,
+    );
     const requirementsSatisfied = this.requirementsSatisfiedFor(registration.manifest, existing);
     const configSatisfied = this.configSatisfiedFor(registration.manifest, nextConfig);
     const keepCurrentSetupStatus = requirementsSatisfied && configSatisfied;
@@ -542,15 +600,24 @@ export class ConnectorSupervisor {
       requirementsSatisfied,
       configSatisfied,
     });
-	    return this.store.update<TConfig, TState>(instanceId, {
-	      ...input,
-	      setupStatus,
-	    });
+    const updated = this.store.update<TConfig, TState>(instanceId, {
+      ...input,
+      setupStatus,
+    });
+    const nextEffectiveConfig = mergeConfig(
+      schemaDefaults(registration.manifest),
+      updated.config,
+    );
+    return {
+      updated,
+      effectiveConfigChanged: input.config !== undefined
+        && !isDeepStrictEqual(previousEffectiveConfig, nextEffectiveConfig),
+    };
   }
 
   async connectIntegration<TConfig = unknown, TState = unknown>(
     instanceId: string,
-    input: UpdateIntegrationInput<TConfig> = {},
+    input: ConnectIntegrationInput = {},
   ): Promise<ConnectorIntegration<TConfig, TState>> {
     const existing = this.store.get(instanceId);
     if (!existing) {
@@ -568,25 +635,22 @@ export class ConnectorSupervisor {
     if (!authRef || !(await this.authManager.hasToken(authRef))) {
       throw new Error(`Connector integration ${instanceId} requires credentials before it can be ready`);
     }
-    validateScheduleInput(input.scheduleCron);
     // Validate source identity constraints without forcing ready: connect only
     // binds credentials. The unified evaluator decides ready, so auth can be
     // connected before platform requirements are granted (and vice versa).
     validateIntegrationLifecycle({
       connectorId: existing.connectorId,
       mode: registration.manifest.integrations.mode,
-      integrationKey: input.integrationKey ?? existing.integrationKey,
+      integrationKey: existing.integrationKey,
       setupStatus: "setup",
       requiresAuth: true,
       authReady: true,
       requirementsSatisfied: this.requirementsSatisfiedFor(registration.manifest, existing),
     });
-    const { setupStatus: _ignored, ...rest } = input;
-    this.store.update(instanceId, {
-      ...rest,
-      authRef,
-    });
-    return (await this.refreshSetupStatus(instanceId)) as ConnectorIntegration<TConfig, TState>;
+    this.store.update(instanceId, { authRef });
+    const connected = await this.refreshSetupStatus(instanceId);
+    this.requestRuntimeReconcile(instanceId, "credential_connected");
+    return connected as ConnectorIntegration<TConfig, TState>;
   }
 
   async disconnectIntegration<TConfig = unknown, TState = unknown>(
@@ -732,9 +796,56 @@ export class ConnectorSupervisor {
     return this.createRun(instanceId, opts);
   }
 
-	  abort(instanceId: string): void {
-	    this.activeRuns.get(instanceId)?.controller.abort();
-	  }
+  abort(instanceId: string): void {
+    this.activeRuns.get(instanceId)?.abort();
+  }
+
+  onRuntimeReconcileRequested(
+    listener: (
+      instanceId: string,
+      reason: ConnectorRuntimeReconcileReason,
+    ) => void,
+  ): () => void {
+    this.runtimeReconcileListeners.add(listener);
+    return () => this.runtimeReconcileListeners.delete(listener);
+  }
+
+  private requestRuntimeReconcile(
+    instanceId: string,
+    reason: ConnectorRuntimeReconcileReason,
+  ): void {
+    this.activeRuns.get(instanceId)?.invalidateRuntime();
+    for (const listener of this.runtimeReconcileListeners) {
+      try {
+        listener(instanceId, reason);
+      } catch (err) {
+        console.warn("[connectors] runtime reconcile listener failed:", err);
+      }
+    }
+  }
+
+  private async finalizeConnectedAuthAttempt(result: OAuthAttemptView): Promise<void> {
+    if (result.status !== "connected" || !result.integrationId || !result.authRef) return;
+    const integration = this.store.get(result.integrationId);
+    if (!integration) return;
+
+    const attemptId = result.attemptId;
+    if (attemptId) {
+      if (this.reconciledAuthAttemptIds.has(attemptId)) return;
+      this.reconciledAuthAttemptIds.add(attemptId);
+    }
+
+    try {
+      if (integration.authRef !== result.authRef) {
+        this.store.update(integration.id, { authRef: result.authRef });
+      }
+      await this.refreshSetupStatus(integration.id);
+      this.requestRuntimeReconcile(integration.id, "credential_connected");
+    } catch (err) {
+      if (attemptId) this.reconciledAuthAttemptIds.delete(attemptId);
+      throw err;
+    }
+  }
 
   async pauseIntegration<TConfig = unknown, TState = unknown>(
     instanceId: string,
@@ -1016,7 +1127,7 @@ export class ConnectorSupervisor {
   // platform requirements all satisfied. Demotes ready integrations whose
   // requirements regressed; promotes setup integrations once everything passes.
   private async refreshSetupStatus(instanceId: string): Promise<ConnectorIntegration> {
-    const integration = this.store.get(instanceId);
+    let integration = this.store.get(instanceId);
     if (!integration) {
       throw new Error(`Connector integration not found: ${instanceId}`);
     }
@@ -1025,11 +1136,28 @@ export class ConnectorSupervisor {
     const mode = manifest.integrations.mode;
     const requiresAuth = (manifest.auth ?? { type: "none" }).type !== "none";
 
+    let authReady = true;
+    if (requiresAuth) {
+      // Secret-store reads are asynchronous. Re-read the Source afterwards so
+      // concurrent config writes cannot promote or demote readiness from a
+      // stale snapshot. If authRef itself changed, evaluate the latest ref.
+      while (true) {
+        const evaluatedAuthRef = integration.authRef;
+        authReady = Boolean(
+          evaluatedAuthRef && (await this.authManager.hasToken(evaluatedAuthRef)),
+        );
+        const latest = this.store.get(instanceId);
+        if (!latest) {
+          throw new Error(`Connector integration not found: ${instanceId}`);
+        }
+        integration = latest;
+        if (integration.authRef === evaluatedAuthRef) break;
+      }
+    }
+
     const sourceReady = mode === "singleton" || Boolean(integration.integrationKey);
     const requirementsReady = this.requirementsSatisfiedFor(manifest, integration);
     const configReady = this.configSatisfiedFor(manifest, integration.config);
-    const authReady = !requiresAuth
-      || Boolean(integration.authRef && (await this.authManager.hasToken(integration.authRef)));
     const eligible = sourceReady && requirementsReady && authReady && configReady;
 
     if (integration.setupStatus === "ready" && !eligible) {
@@ -1076,7 +1204,7 @@ export class ConnectorSupervisor {
     }
   }
 
-  private createRun(instanceId: string, opts?: { config?: unknown; trigger?: ConnectorRunTrigger }): ActiveRun {
+  private createRun(instanceId: string, opts?: { config?: unknown; trigger?: ConnectorRunTrigger }): ActiveRunIntent {
     if (this.activeRuns.has(instanceId)) {
       throw new Error(`Connector integration already running: ${instanceId}`);
     }
@@ -1121,49 +1249,133 @@ export class ConnectorSupervisor {
     });
     this.store.setStatus(instanceId, "running");
 
-    const promise = (async () => {
-      let session: RunnerSession | undefined;
-      try {
-        await this.assertRunAuth(registration, integration);
-        // The abort signal is bound from the very first phase: an abort during
-        // a hanging top-level import or requirement check kills the child.
-        session = await this.openTrustedSession(registration, controller.signal);
-        await this.assertRunRequirements(registration, integration, session);
-        await session.run({
-          config: mergeConfig(schemaDefaults(registration.manifest), integration.config, opts?.config),
-          host: this.host,
-          signal: controller.signal,
-          capabilities: this.buildRunCapabilities(registration, integration),
-        });
-        this.store.setStatus(instanceId, "idle");
-        this.store.finishRun(runRecord.id, "success");
-      } catch (err) {
-        if (controller.signal.aborted) {
-          this.store.setStatus(instanceId, "idle");
-          this.store.finishRun(runRecord.id, "aborted");
-          return;
-        }
-        const message = err instanceof Error ? err.message : String(err);
-        this.store.setStatus(instanceId, "error", message);
-        this.store.finishRun(runRecord.id, "error", message);
-        throw err;
-      } finally {
-        await session?.close().catch(() => {});
-        this.activeRuns.delete(instanceId);
-      }
-    })();
-    promise.catch(() => {});
-
-    const active = {
+    const active: ActiveRunIntent = {
       instanceId,
       trigger,
+      configOverride: opts?.config,
       controller,
+      attemptController: undefined,
+      runtimeGeneration: 0,
       signal: controller.signal,
-      promise,
-      abort: () => controller.abort(),
+      promise: Promise.resolve(),
+      abort() {
+        controller.abort();
+        this.attemptController?.abort();
+      },
+      invalidateRuntime() {
+        this.runtimeGeneration += 1;
+        this.attemptController?.abort();
+      },
     };
     this.activeRuns.set(instanceId, active);
+    active.promise = this.executeRunIntent(active, runRecord.id);
+    active.promise.catch(() => {});
     return active;
+  }
+
+  private async executeRunIntent(active: ActiveRunIntent, runRecordId: string): Promise<void> {
+    try {
+      while (!active.signal.aborted) {
+        const integration = this.store.get(active.instanceId);
+        if (!integration) {
+          active.abort();
+          this.store.finishRun(runRecordId, "aborted");
+          return;
+        }
+        const registration = this.requireRegistration(integration.connectorId);
+        if (!this.canContinueRunIntent(active, integration, registration.manifest)) {
+          active.abort();
+          this.store.setStatus(active.instanceId, "idle");
+          this.store.finishRun(runRecordId, "aborted");
+          return;
+        }
+
+        const attemptGeneration = active.runtimeGeneration;
+        const attemptController = new AbortController();
+        active.attemptController = attemptController;
+        if (active.signal.aborted) attemptController.abort();
+
+        let attemptResult:
+          | { ok: true }
+          | { ok: false; error: unknown };
+        let session: RunnerSession | undefined;
+        try {
+          await this.assertRunAuth(registration, integration);
+          // The attempt signal is bound from the very first phase: a runtime
+          // input generation change can replace a hanging import/check as well
+          // as a connector that has already entered run(context).
+          session = await this.openTrustedSession(registration, attemptController.signal);
+          await this.assertRunRequirements(registration, integration, session);
+          await session.run({
+            config: mergeConfig(
+              schemaDefaults(registration.manifest),
+              integration.config,
+              active.configOverride,
+            ),
+            host: this.host,
+            signal: attemptController.signal,
+            capabilities: this.buildRunCapabilities(registration, integration),
+          });
+          attemptResult = { ok: true };
+        } catch (err) {
+          attemptResult = { ok: false, error: err };
+        } finally {
+          await session?.close().catch(() => {});
+          if (active.attemptController === attemptController) {
+            active.attemptController = undefined;
+          }
+        }
+
+        if (active.signal.aborted) {
+          this.store.setStatus(active.instanceId, "idle");
+          this.store.finishRun(runRecordId, "aborted");
+          return;
+        }
+
+        // Runtime inputs are persisted before invalidation. If config or an
+        // explicit credential connection changed during this attempt, discard
+        // its outcome and start once from the latest stored generation.
+        if (active.runtimeGeneration !== attemptGeneration) {
+          continue;
+        }
+
+        if (!attemptResult.ok) {
+          const message = attemptResult.error instanceof Error
+            ? attemptResult.error.message
+            : String(attemptResult.error);
+          this.store.setStatus(active.instanceId, "error", message);
+          this.store.finishRun(runRecordId, "error", message);
+          throw attemptResult.error;
+        }
+
+        this.store.setStatus(active.instanceId, "idle");
+        this.store.finishRun(runRecordId, "success");
+        return;
+      }
+
+      this.store.setStatus(active.instanceId, "idle");
+      this.store.finishRun(runRecordId, "aborted");
+    } finally {
+      if (this.activeRuns.get(active.instanceId) === active) {
+        this.activeRuns.delete(active.instanceId);
+      }
+    }
+  }
+
+  private canContinueRunIntent(
+    active: ActiveRunIntent,
+    integration: ConnectorIntegration,
+    manifest: ConnectorManifest,
+  ): boolean {
+    if (this.updatingConnectorIds.has(integration.connectorId)) return false;
+    if (active.trigger !== "manual" && isIntegrationPaused(integration)) return false;
+    if (integration.setupStatus !== "ready") return false;
+    if (!isPlatformSupported(manifest, this.platform)) return false;
+    if (manifest.integrations.mode === "multiple" && !integration.integrationKey) return false;
+    return this.configSatisfiedFor(
+      manifest,
+      mergeConfig(schemaDefaults(manifest), integration.config, active.configOverride),
+    );
   }
 
   // Opens a runner session for trusted connector code. Workspace packages are
@@ -1243,7 +1455,7 @@ export class ConnectorSupervisor {
 	      configGet: async () => this.store.get(instanceId)?.config,
 	      configReplace: async (value) => {
 	        const next = normalizeJsonObject(value, "Connector config replacement");
-	        this.updateIntegration(instanceId, { config: next });
+	        await this.configureIntegration(instanceId, { config: next });
 	      },
 	      configPatch: async (value) => {
 	        const patch = normalizeConfigPatch(value);
@@ -1253,7 +1465,7 @@ export class ConnectorSupervisor {
 	          delete next[key];
 	        }
 	        Object.assign(next, patch.set ?? {});
-	        this.updateIntegration(instanceId, { config: next });
+	        await this.configureIntegration(instanceId, { config: next });
 	        return this.store.get(instanceId)?.config;
 	      },
 	      stateGet: () => stateHandle.get(),

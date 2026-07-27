@@ -1128,17 +1128,73 @@ auth:
     expect(runs).toBe(0);
     expect(supervisor.getIntegration(integration.id)?.nextRunAt).toBeUndefined();
 
-    supervisor.updateIntegration(integration.id, { config: { name: "" } });
-    expect((await supervisor.refreshIntegrationSetup(integration.id)).setupStatus).toBe("setup");
+    expect(
+      (await supervisor.configureIntegration(integration.id, { config: { name: "" } })).setupStatus
+    ).toBe("setup");
 
-    supervisor.updateIntegration(integration.id, { config: { name: "ready" } });
-    expect((await supervisor.refreshIntegrationSetup(integration.id)).setupStatus).toBe("ready");
+    expect(
+      (await supervisor.configureIntegration(integration.id, { config: { name: "ready" } })).setupStatus
+    ).toBe("ready");
     await scheduler.tick();
 
     expect(runs).toBe(1);
     const event = dataDb.prepare("SELECT type, payload FROM events WHERE type = ?").get("configured.sample") as any;
     expect(event.type).toBe("configured.sample");
     expect(JSON.parse(event.payload)).toEqual({ name: "ready" });
+  });
+
+  test("config-panel writes promote required setup before waking an idle watch", async () => {
+    let runs = 0;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "configured-panel-watch",
+        name: "Configured Panel Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+        config: {
+          identity: { type: "string", label: "Identity", required: true },
+        },
+        configPanels: {
+          setup: { label: "Setup" },
+        },
+      },
+      {
+        async run() {
+          runs += 1;
+        },
+        async configUi({ configStore }) {
+          await configStore.replace({ identity: "person@example.com" });
+          return { url: "http://127.0.0.1:49321/panel?token=abcdefghijklmnop" };
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({
+      connectorId: "configured-panel-watch",
+    });
+    const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
+    await scheduler.start();
+    let configSessionId: string | undefined;
+
+    try {
+      expect(integration.setupStatus).toBe("setup");
+      expect(runs).toBe(0);
+
+      const started = await supervisor.startConfigUi(integration.id, "setup");
+      configSessionId = started.sessionId;
+
+      expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("ready");
+      expect(await waitWithTestTimeout((async () => {
+        while (runs < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+      })(), 2_000)).toBe(true);
+    } finally {
+      if (configSessionId) await supervisor.stopConfigUiSession(configSessionId);
+      await scheduler.stop();
+    }
   });
 
   test("supports multiple connector instances with separate sources and state", async () => {
@@ -1274,7 +1330,7 @@ auth:
       supervisor.updateIntegration(setup.id, { setupStatus: "ready" })
     ).toThrow("requires an integration_key");
 
-    const ready = supervisor.updateIntegration<{ externalId: string }, { seen: string }>(setup.id, {
+    const ready = await supervisor.configureIntegration<{ externalId: string }, { seen: string }>(setup.id, {
       integrationKey: "work",
       setupStatus: "ready",
       config: { externalId: "event-1" },
@@ -1332,16 +1388,18 @@ auth:
     await supervisor.getAuthManager().setToken(integration.authRef!, "secret-token");
     const ready = await supervisor.connectIntegration(integration.id);
     expect(
-      supervisor.updateIntegration(ready.id, { config: { sample: true } }).setupStatus
+      (await supervisor.configureIntegration(ready.id, { config: { sample: true } })).setupStatus
     ).toBe("ready");
     expect(() =>
       supervisor.updateIntegration(ready.id, { authRef: "missing-token-ref" })
     ).toThrow("authRef changes must use connectIntegration");
 
     await supervisor.getAuthManager().setToken("rotated-ref", "rotated-token");
-    const rotated = await supervisor.connectIntegration(ready.id, { authRef: "rotated-ref" });
+    // @ts-expect-error connectIntegration is credential-only; config writes use configureIntegration.
+    const rotated = await supervisor.connectIntegration(ready.id, { authRef: "rotated-ref", config: { smuggled: true } });
     expect(rotated.setupStatus).toBe("ready");
     expect(rotated.authRef).toBe("rotated-ref");
+    expect(rotated.config).toEqual({ sample: true });
 
     await supervisor.run(rotated.id);
 
@@ -1653,6 +1711,46 @@ auth:
     expect((await supervisor.list())[0].running).toBe(true);
     expect(() => supervisor.restartIntegration(integration.id)).toThrow("already running");
     await scheduler.stop();
+  });
+
+  test("records a rejected run without an error value as an error", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "undefined-rejection",
+        name: "Undefined Rejection",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run() {
+          await Promise.reject();
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({
+      connectorId: "undefined-rejection",
+    });
+    let rejected = false;
+
+    try {
+      await supervisor.run(integration.id);
+    } catch (error) {
+      rejected = true;
+      expect(error).toBeUndefined();
+    }
+
+    expect(rejected).toBe(true);
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
+    expect(supervisor.getIntegration(integration.id)?.lastError).toBe("undefined");
+    expect((await supervisor.list())[0].recentRuns[0]).toMatchObject({
+      status: "error",
+      error: "undefined",
+    });
   });
 
   test("restart guards Sources that still need setup", async () => {
@@ -2056,6 +2154,407 @@ auth:
     expect((await supervisor.list())[0].running).toBe(false);
     expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
     expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ stopped: true });
+  });
+
+  test("effective config changes replace an active watch attempt without replacing its run intent", async () => {
+    const configs: Array<Record<string, unknown>> = [];
+    const signals: AbortSignal[] = [];
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "reconfigurable-watch",
+        name: "Reconfigurable Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+        config: {
+          label: { type: "string", label: "Label", default: "old" },
+        },
+      },
+      {
+        async run({ config, signal }) {
+          configs.push(config as Record<string, unknown>);
+          signals.push(signal);
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({
+      connectorId: "reconfigurable-watch",
+      config: {
+        label: "old",
+        opaque: { first: 1, second: 2 },
+      },
+    });
+    const scheduler = new ConnectorScheduler({ supervisor });
+
+    await scheduler.start();
+    while (configs.length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+
+    // JSON object key order is not an effective config change.
+    await supervisor.configureIntegration(integration.id, {
+      config: {
+        opaque: { second: 2, first: 1 },
+        label: "old",
+      },
+    });
+    expect(signals[0].aborted).toBe(false);
+    expect(configs).toHaveLength(1);
+
+    const intermediateWrite = supervisor.configureIntegration(integration.id, {
+      config: {
+        label: "intermediate",
+        opaque: { first: 1, second: 2 },
+      },
+    });
+    const latestWrite = supervisor.configureIntegration(integration.id, {
+      config: {
+        label: "new",
+        opaque: { first: 1, second: 2 },
+      },
+    });
+    await Promise.all([intermediateWrite, latestWrite]);
+    expect(signals[0].aborted).toBe(true);
+    expect(await waitWithTestTimeout((async () => {
+      while (configs.length < 2) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+    expect(configs[1]).toMatchObject({ label: "new" });
+
+    const duringReplacement = (await supervisor.list())[0];
+    expect(duringReplacement.running).toBe(true);
+    expect(duringReplacement.recentRuns).toHaveLength(1);
+    expect(duringReplacement.recentRuns[0].status).toBe("running");
+
+    await scheduler.stop();
+    expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
+    expect((await supervisor.list())[0].recentRuns[0].status).toBe("aborted");
+  });
+
+  test("explicit credential connect wakes an idle watch and reconnect replaces its active attempt", async () => {
+    const tokens: string[] = [];
+    const signals: AbortSignal[] = [];
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "credential-watch",
+        name: "Credential Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "apiKey" },
+      },
+      {
+        async run({ auth, signal }) {
+          if (auth.type === "none") throw new Error("expected auth");
+          tokens.push(await auth.getToken());
+          signals.push(signal);
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({ connectorId: "credential-watch" });
+    const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
+
+    await scheduler.start();
+    expect(tokens).toEqual([]);
+
+    await supervisor.connectIntegrationWithToken(integration.id, "old-token");
+    expect(await waitWithTestTimeout((async () => {
+      while (tokens.length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+    expect(tokens).toEqual(["old-token"]);
+
+    await supervisor.connectIntegrationWithToken(integration.id, "new-token");
+    expect(signals[0].aborted).toBe(true);
+    expect(await waitWithTestTimeout((async () => {
+      while (tokens.length < 2) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+    expect(tokens).toEqual(["old-token", "new-token"]);
+
+    const reconnected = (await supervisor.list())[0];
+    expect(reconnected.running).toBe(true);
+    expect(reconnected.recentRuns).toHaveLength(1);
+    expect(reconnected.recentRuns[0].status).toBe("running");
+
+    await scheduler.stop();
+    expect((await supervisor.list())[0].recentRuns[0].status).toBe("aborted");
+  });
+
+  test("config changes resume a long manual run under the original handle", async () => {
+    const configs: Array<Record<string, unknown>> = [];
+    let finishReplacement!: () => void;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "reconfigurable-manual",
+        name: "Reconfigurable Manual",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+        config: {
+          label: { type: "string", label: "Label", default: "old" },
+        },
+      },
+      {
+        async run({ config, signal }) {
+          configs.push(config as Record<string, unknown>);
+          await new Promise<void>((resolve) => {
+            if (configs.length > 1) finishReplacement = resolve;
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({
+      connectorId: "reconfigurable-manual",
+      config: { label: "old" },
+    });
+    const handle = supervisor.start(integration.id, {
+      trigger: "manual",
+      config: { operation: "backfill" },
+    });
+    while (configs.length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+    let settled = false;
+    void handle.promise.finally(() => {
+      settled = true;
+    });
+
+    await supervisor.configureIntegration(integration.id, { config: { label: "new" } });
+    expect(await waitWithTestTimeout((async () => {
+      while (configs.length < 2) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+
+    expect(handle.signal.aborted).toBe(false);
+    expect(settled).toBe(false);
+    expect(configs).toEqual([
+      { label: "old", operation: "backfill" },
+      { label: "new", operation: "backfill" },
+    ]);
+
+    finishReplacement();
+    await handle.promise;
+    const completed = (await supervisor.list())[0];
+    expect(completed.status).toBe("idle");
+    expect(completed.recentRuns).toHaveLength(1);
+    expect(completed.recentRuns[0].status).toBe("success");
+  });
+
+  test("a config change that removes readiness stops rather than restarts the run intent", async () => {
+    let attempts = 0;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "invalidated-manual",
+        name: "Invalidated Manual",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+        config: {
+          identity: { type: "string", label: "Identity" },
+        },
+      },
+      {
+        async run({ signal }) {
+          attempts += 1;
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({
+      connectorId: "invalidated-manual",
+      config: { identity: "person@example.com" },
+    });
+    const handle = supervisor.start(integration.id, { trigger: "manual" });
+    while (attempts < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+
+    await supervisor.configureIntegration(integration.id, { config: { identity: "" } });
+    await handle.promise;
+
+    const stopped = (await supervisor.list())[0];
+    expect(attempts).toBe(1);
+    expect(handle.signal.aborted).toBe(true);
+    expect(stopped.running).toBe(false);
+    expect(stopped.setupStatus).toBe("setup");
+    expect(stopped.recentRuns[0].status).toBe("aborted");
+  });
+
+  test("an effective config change wakes an idle watch without waiting for the next timer tick", async () => {
+    const labels: unknown[] = [];
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "idle-config-watch",
+        name: "Idle Config Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+        config: {
+          label: { type: "string", label: "Label", default: "old" },
+        },
+      },
+      {
+        async run({ config, warnings }) {
+          const label = (config as Record<string, unknown>).label;
+          if (label === "old") {
+            await warnings.set({ key: "old-config", message: "Old config is incomplete" });
+          } else {
+            await warnings.clear("old-config");
+          }
+          labels.push(label);
+        },
+      },
+    );
+    const integration = supervisor.ensureIntegration({
+      connectorId: "idle-config-watch",
+      config: { label: "old" },
+    });
+    const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
+
+    await scheduler.start();
+    while ((await supervisor.list())[0].running) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    await Promise.resolve();
+    expect(labels).toEqual(["old"]);
+    expect(supervisor.getIntegration(integration.id)?.warnings).toHaveLength(1);
+
+    await supervisor.configureIntegration(integration.id, { config: { label: "new" } });
+    expect(await waitWithTestTimeout((async () => {
+      while (labels.length < 2) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+    expect(labels).toEqual(["old", "new"]);
+    expect(supervisor.getIntegration(integration.id)?.warnings).toBeUndefined();
+
+    await scheduler.stop();
+    await supervisor.configureIntegration(integration.id, { config: { label: "after-stop" } });
+    await Promise.resolve();
+    expect(labels).toEqual(["old", "new"]);
+  });
+
+  test("a failed watch reconciliation retries independently of an active scheduler poll", async () => {
+    let watchStarts = 0;
+    let pollStarted = false;
+    let pollFinished = false;
+    let failNextList = false;
+    let failedLists = 0;
+    let releasePoll!: () => void;
+    const pollGate = new Promise<void>((resolve) => {
+      releasePoll = resolve;
+    });
+
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "wake-during-poll-watch",
+        name: "Wake During Poll Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+        config: {
+          label: { type: "string", label: "Label", default: "old" },
+        },
+      },
+      {
+        async run() {
+          watchStarts += 1;
+        },
+      },
+    );
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "blocking-poll",
+        name: "Blocking Poll",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
+        integrations: { mode: "singleton" },
+        auth: { type: "none" },
+      },
+      {
+        async run() {
+          pollStarted = true;
+          await pollGate;
+          pollFinished = true;
+        },
+      },
+    );
+
+    const watch = supervisor.ensureIntegration({
+      connectorId: "wake-during-poll-watch",
+      config: { label: "old" },
+    });
+    supervisor.ensureIntegration({ connectorId: "blocking-poll" });
+    const originalList = supervisor.list;
+    supervisor.list = async function listWithOneFailure() {
+      if (failNextList) {
+        failNextList = false;
+        failedLists += 1;
+        throw new Error("temporary list failure");
+      }
+      return originalList.call(this);
+    };
+    const scheduler = new ConnectorScheduler({
+      supervisor,
+      tickMs: 60_000,
+      watchReconcileRetryMs: 5,
+    });
+    const starting = scheduler.start();
+
+    try {
+      expect(await waitWithTestTimeout((async () => {
+        while (!pollStarted || watchStarts < 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+      })(), 2_000)).toBe(true);
+      while ((await supervisor.list()).find((source) => source.id === watch.id)?.running) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      failNextList = true;
+      await supervisor.configureIntegration(watch.id, {
+        config: { label: "new" },
+      });
+      expect(await waitWithTestTimeout((async () => {
+        while (watchStarts < 2) await new Promise((resolve) => setTimeout(resolve, 1));
+      })(), 2_000)).toBe(true);
+      expect(failedLists).toBe(1);
+      expect(pollFinished).toBe(false);
+    } finally {
+      supervisor.list = originalList;
+      releasePoll();
+      await starting;
+      await scheduler.stop();
+    }
   });
 
   test("Pause stops an active watch and Resume lets the scheduler start it again", async () => {
@@ -7523,7 +8022,7 @@ auth:
     expect(connected.setupStatus).toBe("ready");
     expect(await supervisor.getAuthManager().hasToken(connected.authRef!)).toBe(true);
 
-    supervisor.updateIntegration(integration.id, {
+    await supervisor.configureIntegration(integration.id, {
       config: { folder: "inbox" },
       scheduleCron: "0 * * * *",
     });
@@ -7812,6 +8311,8 @@ auth:
   test("browser auth manifest flows expose the intended runtime handles", async () => {
     const seenAuthTypes: string[] = [];
     const seenTokens: string[] = [];
+    const reconciledIntegrationIds: string[] = [];
+    let directOAuthTokenCalls = 0;
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
@@ -7837,16 +8338,21 @@ auth:
               headers: { "Content-Type": "application/json" },
             });
           }
+          directOAuthTokenCalls += 1;
+          const refreshing = String(init?.body ?? "").includes("grant_type=refresh_token");
           return new Response(JSON.stringify({
-            access_token: "access-token",
+            access_token: refreshing ? "refreshed-access-token" : "expired-access-token",
             refresh_token: "refresh-token",
-            expires_in: 3600,
+            expires_in: refreshing ? 3600 : -1,
           }), {
             status: 200,
             headers: { "Content-Type": "application/json" },
           });
         },
       }),
+    });
+    supervisor.onRuntimeReconcileRequested((instanceId, reason) => {
+      if (reason === "credential_connected") reconciledIntegrationIds.push(instanceId);
     });
 
     const manifests: Array<{
@@ -7876,6 +8382,7 @@ auth:
           });
           const state = new URL(started.authorizationUrl).searchParams.get("state")!;
           await supervisor.completeOAuthCallback(new URLSearchParams({ state, code: "code-1" }));
+          await supervisor.getOAuthAttempt(integrationId, started.attemptId);
         },
       },
       {
@@ -7894,17 +8401,17 @@ auth:
           },
         },
         connect: async (integrationId) => {
-          const authRef = `managed:${integrationId}`;
-          await secrets.set(authRef, JSON.stringify({
-            kind: "managedProvider",
-            providerId: "oura",
-            integrationId,
-          }));
-          await supervisor.connectIntegration(integrationId, { authRef });
+          const started = await supervisor.startAuthIntegration(integrationId, {
+            redirectUri: "http://localhost:32123/oauth/callback",
+          });
+          await expect(supervisor.getOAuthAttempt(integrationId, started.attemptId))
+            .resolves.toMatchObject({ status: "connected" });
+          await supervisor.getOAuthAttempt(integrationId, started.attemptId);
         },
       },
     ];
 
+    const integrationIds: string[] = [];
     for (const { manifest, connect } of manifests) {
       supervisor.register(manifest, {
         async run({ auth }) {
@@ -7915,12 +8422,15 @@ auth:
         },
       });
       const integration = supervisor.ensureIntegration({ connectorId: manifest.id });
+      integrationIds.push(integration.id);
       await connect(integration.id);
       await supervisor.run(integration.id);
     }
 
     expect(seenAuthTypes).toEqual(["oauth2", "managedProvider"]);
-    expect(seenTokens).toEqual(["access-token", "lamarck-capability-token"]);
+    expect(seenTokens).toEqual(["refreshed-access-token", "lamarck-capability-token"]);
+    expect(directOAuthTokenCalls).toBe(2);
+    expect(reconciledIntegrationIds).toEqual(integrationIds);
   });
 
   test("emits D0 audit events for connector approve and remove", async () => {
@@ -8223,7 +8733,7 @@ auth:
 
 	    await supervisor.registerDirectory(dir);
 	    const integration = supervisor.ensureIntegration({ connectorId: "config-ui-rpc" });
-	    supervisor.updateIntegration(integration.id, { config: { opaque: { keep: true } } });
+	    await supervisor.configureIntegration(integration.id, { config: { opaque: { keep: true } } });
 	    await supervisor.approveCurrentPackage("config-ui-rpc");
 
 	    const started = await supervisor.startConfigUi(integration.id, "privacy-controls");
@@ -8241,6 +8751,95 @@ auth:
 	    });
 	    expect(await supervisor.stopConfigUiSession(started.sessionId)).toBe(true);
 	  });
+
+  test("config replacement restarts a package process while preserving its manual run intent", async () => {
+    const reconfigSupervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      runnerKillGraceMs: 150,
+    });
+    const dir = join(workspace, "connectors", "process-reconfigure");
+    mkdirSync(dir, { recursive: true });
+    writeConnectorManifestFixture(
+      join(dir, "connector.yaml"),
+      `manifestVersion: 1
+id: process-reconfigure
+name: Process Reconfigure
+description: Test connector manifest.
+eventCatalog: ./events.json
+entry: ./index.mjs
+runtime:
+  mode: manual
+integrations:
+  mode: singleton
+config:
+  label:
+    type: string
+    label: Label
+    default: old
+platforms:
+  darwin: {}
+auth:
+  type: none
+`,
+    );
+    writeFileSync(
+      join(dir, "index.mjs"),
+      `export default {
+  async run({ config, state, signal }) {
+    const previous = await state.get() ?? { attempts: [] };
+    await state.set({
+      attempts: [...previous.attempts, { label: config.label, pid: process.pid }],
+    });
+    if (config.label === "old") {
+      await new Promise(() => {});
+      return;
+    }
+    await new Promise((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", resolve, { once: true });
+    });
+  },
+};
+`,
+    );
+
+    await reconfigSupervisor.registerDirectory(dir);
+    const integration = reconfigSupervisor.ensureIntegration({
+      connectorId: "process-reconfigure",
+      config: { label: "old" },
+    });
+    await reconfigSupervisor.approveCurrentPackage("process-reconfigure");
+    const handle = reconfigSupervisor.start(integration.id, { trigger: "manual" });
+    expect(await waitWithTestTimeout((async () => {
+      while (
+        ((reconfigSupervisor.getIntegration(integration.id)?.syncState as any)?.attempts?.length ?? 0) < 1
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+    })(), 3_000)).toBe(true);
+
+    await reconfigSupervisor.configureIntegration(integration.id, { config: { label: "new" } });
+    expect(await waitWithTestTimeout((async () => {
+      while (
+        ((reconfigSupervisor.getIntegration(integration.id)?.syncState as any)?.attempts?.length ?? 0) < 2
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+    })(), 3_000)).toBe(true);
+
+    const attempts = (reconfigSupervisor.getIntegration(integration.id)?.syncState as any).attempts;
+    expect(attempts.map((attempt: any) => attempt.label)).toEqual(["old", "new"]);
+    expect(attempts[0].pid).not.toBe(attempts[1].pid);
+    expect(handle.signal.aborted).toBe(false);
+    expect((await reconfigSupervisor.list())[0].recentRuns).toHaveLength(1);
+
+    handle.abort();
+    await handle.promise;
+    expect((await reconfigSupervisor.list())[0].recentRuns[0].status).toBe("aborted");
+  });
 
 	  test("workspace package connectors can report warnings over runner RPC", async () => {
     const dir = join(workspace, "connectors", "warning-rpc");

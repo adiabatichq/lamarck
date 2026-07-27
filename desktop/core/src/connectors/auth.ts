@@ -28,6 +28,7 @@ export interface OAuthStartResult {
 
 export interface OAuthAttemptView {
   status: OAuthAttemptStatus;
+  attemptId?: string;
   integrationId?: string;
   authRef?: string;
   credentialId?: string;
@@ -343,6 +344,7 @@ export class ConnectorAuthManager {
     }
     return {
       status: attempt.status,
+      attemptId: attempt.id,
       integrationId: attempt.integrationId,
       authRef: attempt.authRef,
       credentialId: attempt.credentialId,
@@ -380,6 +382,7 @@ export class ConnectorAuthManager {
     }
     return {
       status: attempt.status,
+      attemptId: attempt.id,
       integrationId: attempt.integrationId,
       authRef: attempt.authRef,
       credentialId: attempt.credentialId,
@@ -401,6 +404,7 @@ export class ConnectorAuthManager {
       attempt.error = "OAuth attempt expired";
       return {
         status: "expired",
+        attemptId: attempt.id,
         integrationId: attempt.integrationId,
         authRef: attempt.authRef,
         error: attempt.error,
@@ -411,6 +415,7 @@ export class ConnectorAuthManager {
       attempt.error = params.get("error_description") ?? providerError;
       return {
         status: "failed",
+        attemptId: attempt.id,
         integrationId: attempt.integrationId,
         authRef: attempt.authRef,
         error: attempt.error,
@@ -421,6 +426,7 @@ export class ConnectorAuthManager {
       attempt.error = "OAuth callback did not include a code";
       return {
         status: "failed",
+        attemptId: attempt.id,
         integrationId: attempt.integrationId,
         authRef: attempt.authRef,
         error: attempt.error,
@@ -435,6 +441,7 @@ export class ConnectorAuthManager {
       attempt.credentialId = attempt.authRef;
       return {
         status: "connected",
+        attemptId: attempt.id,
         integrationId: attempt.integrationId,
         authRef: attempt.authRef,
         credentialId: attempt.authRef,
@@ -444,6 +451,7 @@ export class ConnectorAuthManager {
       attempt.error = err instanceof Error ? err.message : String(err);
       return {
         status: "failed",
+        attemptId: attempt.id,
         integrationId: attempt.integrationId,
         authRef: attempt.authRef,
         error: attempt.error,

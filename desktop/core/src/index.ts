@@ -953,12 +953,11 @@ const server = await serve<{ cwd: string }>({
           config?: unknown;
         }>(req);
         const instanceId = decodeURIComponent(integrationMatch[1]);
-        connectorSupervisor.updateIntegration(instanceId, {
+        const integration = await connectorSupervisor.configureIntegration(instanceId, {
           scheduleCron: body.scheduleCron,
           integrationKey: body.integrationKey,
           config: body.config,
         });
-        const integration = await connectorSupervisor.refreshIntegrationSetup(instanceId);
         return json({ integration });
       }
 	      if (integrationMatch && method === "DELETE") {

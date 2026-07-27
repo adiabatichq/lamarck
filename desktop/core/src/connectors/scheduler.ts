@@ -16,38 +16,61 @@ export interface ConnectorSchedulerOptions {
   supervisor: ConnectorSupervisor;
   tickMs?: number;
   stopTimeoutMs?: number;
+  watchReconcileRetryMs?: number;
   now?: () => number;
   onError?: (error: unknown, integration: ScheduledConnector) => void;
 }
 
 const DEFAULT_TICK_MS = 60_000;
 const DEFAULT_STOP_TIMEOUT_MS = 10_000;
+const DEFAULT_WATCH_RECONCILE_RETRY_MS = 1_000;
 const RUNNABLE_TRUST = new Set(["official", "custom"]);
 
 export class ConnectorScheduler {
   private supervisor: ConnectorSupervisor;
   private tickMs: number;
   private stopTimeoutMs: number;
+  private watchReconcileRetryMs: number;
   private now: () => number;
   private onError?: (error: unknown, integration: ScheduledConnector) => void;
   private timer: ReturnType<typeof setInterval> | undefined;
   private tickPromise: Promise<void> | undefined;
   private activeRuns = new Map<string, ConnectorRunHandle>();
+  private watchReconcilePromise: Promise<void> | undefined;
+  private watchReconcileRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private watchReconcileAllPending = false;
+  private pendingWatchIntegrationIds = new Set<string>();
+  private started = false;
   private stopped = false;
 
   constructor(opts: ConnectorSchedulerOptions) {
     this.supervisor = opts.supervisor;
     this.tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
     this.stopTimeoutMs = opts.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
+    this.watchReconcileRetryMs = opts.watchReconcileRetryMs
+      ?? DEFAULT_WATCH_RECONCILE_RETRY_MS;
     this.now = opts.now ?? Date.now;
     this.onError = opts.onError;
+    this.supervisor.onRuntimeReconcileRequested((instanceId) => {
+      this.queueWatchReconcile(instanceId);
+    });
   }
 
   async start(): Promise<void> {
-    if (this.timer) return;
+    if (this.started || this.timer) return;
     this.stopped = false;
-    await this.tick();
-    if (this.stopped) return;
+    this.started = true;
+    try {
+      await this.tick();
+    } catch (err) {
+      this.started = false;
+      this.cancelWatchReconcileRetry();
+      throw err;
+    }
+    if (this.stopped) {
+      this.started = false;
+      return;
+    }
     this.timer = setInterval(() => {
       this.tick().catch((err) => {
         console.error("[connectors] scheduler tick failed:", err);
@@ -59,7 +82,7 @@ export class ConnectorScheduler {
     if (this.tickPromise) return this.tickPromise;
     this.tickPromise = (async () => {
       this.supervisor.resumeExpiredPauses(this.now());
-      await this.startWatchConnectors();
+      await this.reconcileWatchConnectors();
       await this.runDuePollConnectors();
     })().finally(() => {
       this.tickPromise = undefined;
@@ -69,6 +92,10 @@ export class ConnectorScheduler {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.started = false;
+    this.watchReconcileAllPending = false;
+    this.pendingWatchIntegrationIds.clear();
+    this.cancelWatchReconcileRetry();
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = undefined;
@@ -82,6 +109,9 @@ export class ConnectorScheduler {
     if (this.tickPromise) {
       pending.push(this.tickPromise.catch(() => {}));
     }
+    if (this.watchReconcilePromise) {
+      pending.push(this.watchReconcilePromise.catch(() => {}));
+    }
 
     const finished = await waitWithTimeout(Promise.all(pending), this.stopTimeoutMs);
     if (!finished) {
@@ -93,9 +123,12 @@ export class ConnectorScheduler {
     this.activeRuns.clear();
   }
 
-  private async startWatchConnectors(): Promise<void> {
+  private async startWatchConnectors(
+    targetIntegrationIds?: ReadonlySet<string>,
+  ): Promise<void> {
     for (const integration of (await this.supervisor.list()) as ScheduledConnector[]) {
       if (this.stopped) return;
+      if (targetIntegrationIds && !targetIntegrationIds.has(integration.id)) continue;
       if (integration.mode !== "watch") continue;
       if (!canSchedule(integration, this.now())) continue;
       if (integration.running || this.activeRuns.has(integration.id) || integration.status !== "idle") continue;
@@ -160,6 +193,97 @@ export class ConnectorScheduler {
       return;
     }
     console.error(`[connectors] ${integration.connectorId} scheduler error:`, err);
+  }
+
+  private reconcileWatchConnectors(instanceId?: string): Promise<void> {
+    // A fresh scheduler tick or runtime notification supersedes a pending
+    // backoff and gets an immediate attempt.
+    this.cancelWatchReconcileRetry();
+    if (instanceId === undefined) {
+      this.watchReconcileAllPending = true;
+      this.pendingWatchIntegrationIds.clear();
+    } else if (!this.watchReconcileAllPending) {
+      this.pendingWatchIntegrationIds.add(instanceId);
+    }
+    return this.ensureWatchReconcile();
+  }
+
+  private ensureWatchReconcile(): Promise<void> {
+    if (this.watchReconcilePromise) return this.watchReconcilePromise;
+
+    const promise = this.drainWatchReconciles();
+    this.watchReconcilePromise = promise;
+    promise.then(
+      () => this.finishWatchReconcile(promise),
+      () => this.finishWatchReconcile(promise),
+    );
+    return promise;
+  }
+
+  private async drainWatchReconciles(): Promise<void> {
+    while (!this.stopped) {
+      const reconcileAll = this.watchReconcileAllPending;
+      const targetIntegrationIds = new Set(this.pendingWatchIntegrationIds);
+      if (!reconcileAll && targetIntegrationIds.size === 0) return;
+
+      this.watchReconcileAllPending = false;
+      this.pendingWatchIntegrationIds.clear();
+      try {
+        await this.startWatchConnectors(reconcileAll ? undefined : targetIntegrationIds);
+      } catch (err) {
+        if (!this.stopped) {
+          if (reconcileAll) {
+            this.watchReconcileAllPending = true;
+            this.pendingWatchIntegrationIds.clear();
+          } else if (!this.watchReconcileAllPending) {
+            for (const instanceId of targetIntegrationIds) {
+              this.pendingWatchIntegrationIds.add(instanceId);
+            }
+          }
+          this.scheduleWatchReconcileRetry();
+        }
+        throw err;
+      }
+    }
+  }
+
+  private finishWatchReconcile(promise: Promise<void>): void {
+    if (this.watchReconcilePromise !== promise) return;
+    this.watchReconcilePromise = undefined;
+    if (
+      this.stopped
+      || this.watchReconcileRetryTimer
+      || (!this.watchReconcileAllPending && this.pendingWatchIntegrationIds.size === 0)
+    ) {
+      return;
+    }
+    void this.ensureWatchReconcile().catch((err) => {
+      console.error("[connectors] watch reconciliation failed:", err);
+    });
+  }
+
+  private queueWatchReconcile(instanceId: string): void {
+    if (!this.started || this.stopped) return;
+    void this.reconcileWatchConnectors(instanceId).catch((err) => {
+      console.error("[connectors] watch reconciliation failed:", err);
+    });
+  }
+
+  private scheduleWatchReconcileRetry(): void {
+    if (this.stopped || !this.started || this.watchReconcileRetryTimer) return;
+    this.watchReconcileRetryTimer = setTimeout(() => {
+      this.watchReconcileRetryTimer = undefined;
+      if (this.stopped || !this.started) return;
+      void this.ensureWatchReconcile().catch((err) => {
+        console.error("[connectors] watch reconciliation failed:", err);
+      });
+    }, this.watchReconcileRetryMs);
+  }
+
+  private cancelWatchReconcileRetry(): void {
+    if (!this.watchReconcileRetryTimer) return;
+    clearTimeout(this.watchReconcileRetryTimer);
+    this.watchReconcileRetryTimer = undefined;
   }
 }
 
