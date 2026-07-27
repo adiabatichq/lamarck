@@ -116,7 +116,11 @@ export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRu
   }, [viewerId, hidden]);
 
   return (
-    <div ref={hostElement} className={styles.host}>
+    <div
+      ref={hostElement}
+      className={`${styles.host} ${hidden ? styles.hidden : ""}`}
+      aria-hidden={hidden || undefined}
+    >
       {error ? (
         <div className={styles.error} role="alert">
           <span className={styles.errorCode}>VIEWER / FAILED</span>

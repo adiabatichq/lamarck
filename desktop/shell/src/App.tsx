@@ -24,8 +24,12 @@ import {
   type CoreStatus,
 } from "./lib/core-availability";
 import {
+  closeUseApp,
   loadUseState,
+  openUseApp,
+  reconcileUseState,
   type StoredUseState,
+  toggleUseAppPin,
   useWorkspaceStateKey,
 } from "./lib/use-workspace-state";
 import { SystemRoom } from "./system/SystemRoom";
@@ -116,6 +120,9 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
     window.localStorage,
     workspace.vaultId,
   ));
+  const [mountedAppIds, setMountedAppIds] = useState<string[]>(() => (
+    workspaceState.activeAppId ? [workspaceState.activeAppId] : []
+  ));
   const appRefreshSequence = useRef(0);
 
   const uiApps = useMemo(() => apps.filter(isUiApp), [apps]);
@@ -123,6 +130,12 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
     () => uiApps.find((app) => app.id === workspaceState.activeAppId) ?? null,
     [uiApps, workspaceState.activeAppId],
   );
+  const mountedApps = useMemo(() => {
+    const byId = new Map(uiApps.map((app) => [app.id, app]));
+    return mountedAppIds
+      .map((id) => byId.get(id))
+      .filter((app): app is AppInfo => Boolean(app));
+  }, [mountedAppIds, uiApps]);
 
   useEffect(() => {
     try {
@@ -218,22 +231,19 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
     // workspace state intact until Core has actually answered successfully.
     if (appsLoading || coreStatus !== "connected") return;
     const validIds = new Set(uiApps.map((app) => app.id));
-    setWorkspaceState((current) => {
-      const next = {
-        pinnedIds: current.pinnedIds.filter((id) => validIds.has(id)),
-        recentIds: current.recentIds.filter((id) => validIds.has(id)),
-        activeAppId: current.activeAppId && validIds.has(current.activeAppId)
-          ? current.activeAppId
-          : null,
-      };
-      if (
-        next.activeAppId === current.activeAppId
-        && arraysEqual(next.pinnedIds, current.pinnedIds)
-        && arraysEqual(next.recentIds, current.recentIds)
-      ) return current;
-      return next;
-    });
+    setWorkspaceState((current) => reconcileUseState(current, validIds));
+    setMountedAppIds((current) => current.filter((id) => validIds.has(id)));
   }, [appsLoading, coreStatus, uiApps]);
+
+  useEffect(() => {
+    const activeAppId = workspaceState.activeAppId;
+    if (!activeAppId) return;
+    // Restored background Apps stay lazy. The active one is mounted on demand;
+    // once mounted, switching away only hides its native surface.
+    setMountedAppIds((current) => (
+      current.includes(activeAppId) ? current : [...current, activeAppId]
+    ));
+  }, [workspaceState.activeAppId]);
 
   useEffect(() => {
     if (coreStatus !== "connected") return;
@@ -299,22 +309,21 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
   }, [openLauncher]);
 
   const openApp = useCallback((appId: string) => {
-    setWorkspaceState((current) => ({
-      ...current,
-      activeAppId: appId,
-      recentIds: [appId, ...current.recentIds.filter((id) => id !== appId)].slice(0, 8),
-    }));
+    setMountedAppIds((current) => (
+      current.includes(appId) ? current : [...current, appId]
+    ));
+    setWorkspaceState((current) => openUseApp(current, appId));
     setLauncherOpen(false);
     setMode("use");
   }, []);
 
   const togglePin = useCallback((appId: string) => {
-    setWorkspaceState((current) => ({
-      ...current,
-      pinnedIds: current.pinnedIds.includes(appId)
-        ? current.pinnedIds.filter((id) => id !== appId)
-        : [...current.pinnedIds, appId],
-    }));
+    setWorkspaceState((current) => toggleUseAppPin(current, appId));
+  }, []);
+
+  const closeApp = useCallback((appId: string) => {
+    setMountedAppIds((current) => current.filter((id) => id !== appId));
+    setWorkspaceState((current) => closeUseApp(current, appId));
   }, []);
 
   const handleApproveSchema = useCallback(async (id: string, remember: boolean) => {
@@ -361,6 +370,7 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
           apps={uiApps}
           activeApp={activeApp}
           pinnedIds={workspaceState.pinnedIds}
+          openIds={workspaceState.openIds}
           launcherOpen={launcherOpen}
           launcher={(
             <AppLauncher
@@ -374,18 +384,19 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
               onClose={() => setLauncherOpen(false)}
             />
           )}
-          appSurface={activeApp ? (
+          appSurface={mountedApps.map((app) => (
             <AppRuntimeView
-              key={activeApp.id}
-              appId={activeApp.id}
-              appName={activeApp.name}
-              hidden={viewerOccluded}
+              key={app.id}
+              appId={app.id}
+              appName={app.name}
+              hidden={viewerOccluded || app.id !== activeApp?.id}
             />
-          ) : null}
+          ))}
           coreStatus={coreStatus}
           systemNeedsAttention={systemNeedsAttention}
           onToggleLauncher={() => setLauncherOpen((open) => !open)}
           onOpenApp={openApp}
+          onCloseApp={closeApp}
           onTogglePin={togglePin}
           onOpenSystem={() => {
             setLauncherOpen(false);
@@ -422,8 +433,4 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
       />
     </>
   );
-}
-
-function arraysEqual(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
 }

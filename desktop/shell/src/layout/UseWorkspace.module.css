@@ -93,6 +93,9 @@
 }
 
 .titleStatus {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   justify-self: end;
 }
 
@@ -124,6 +127,34 @@
 
 .coreState.offline > span {
   background: var(--use-danger);
+}
+
+.closeApp {
+  display: grid;
+  width: 27px;
+  height: 27px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--use-muted);
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+  -webkit-app-region: no-drag;
+}
+
+.closeApp svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.45;
+  stroke-linecap: round;
+}
+
+.closeApp:hover,
+.closeApp:focus-visible {
+  border-color: var(--use-line);
+  background: rgba(21, 22, 18, 0.045);
+  color: var(--use-ink);
 }
 
 .rail {
@@ -221,6 +252,14 @@
 
 .pins::-webkit-scrollbar { display: none; }
 
+.openRule {
+  width: 22px;
+  height: 1px;
+  margin: 3px 0;
+  flex: 0 0 auto;
+  background: var(--use-line);
+}
+
 .appPin {
   position: relative;
   display: grid;
@@ -239,6 +278,15 @@
 
 .appPinActive {
   background: rgba(37, 99, 235, 0.065);
+}
+
+.appPinDormant {
+  opacity: 0.58;
+}
+
+.appPinDormant:hover,
+.appPinDormant:focus-visible {
+  opacity: 1;
 }
 
 .appPinActive :global(span[class*="mark"]) {

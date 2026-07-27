@@ -11,6 +11,7 @@ interface UseWorkspaceProps {
   apps: AppInfo[];
   activeApp: AppInfo | null;
   pinnedIds: string[];
+  openIds: string[];
   launcherOpen: boolean;
   launcher: ReactNode;
   appSurface: ReactNode;
@@ -18,6 +19,7 @@ interface UseWorkspaceProps {
   systemNeedsAttention: boolean;
   onToggleLauncher: () => void;
   onOpenApp: (appId: string) => void;
+  onCloseApp: (appId: string) => void;
   onTogglePin: (appId: string) => void;
   onOpenSystem: () => void;
 }
@@ -26,6 +28,7 @@ export function UseWorkspace({
   apps,
   activeApp,
   pinnedIds,
+  openIds,
   launcherOpen,
   launcher,
   appSurface,
@@ -33,11 +36,18 @@ export function UseWorkspace({
   systemNeedsAttention,
   onToggleLauncher,
   onOpenApp,
+  onCloseApp,
   onTogglePin,
   onOpenSystem,
 }: UseWorkspaceProps) {
   const byId = new Map(apps.map((app) => [app.id, app]));
+  const open = new Set(openIds);
+  const pinned = new Set(pinnedIds);
   const pinnedApps = pinnedIds.map((id) => byId.get(id)).filter((app): app is AppInfo => Boolean(app));
+  const openApps = openIds
+    .filter((id) => !pinned.has(id))
+    .map((id) => byId.get(id))
+    .filter((app): app is AppInfo => Boolean(app));
 
   return (
     <div className={`${styles.workspace} ${launcherOpen ? styles.launcherOpen : ""}`}>
@@ -63,6 +73,17 @@ export function UseWorkspace({
               {coreStatus === "checking" ? "Connecting" : "System offline"}
             </span>
           )}
+          {activeApp && (
+            <button
+              type="button"
+              className={styles.closeApp}
+              onClick={() => onCloseApp(activeApp.id)}
+              aria-label={`Close ${activeApp.name}`}
+              title={`Close ${activeApp.name}`}
+            >
+              <CloseIcon />
+            </button>
+          )}
         </div>
       </header>
 
@@ -81,26 +102,36 @@ export function UseWorkspace({
           </button>
 
           <div className={styles.pinRule} />
-          <div className={styles.pins} aria-label="Pinned apps">
+          <div className={styles.pins} aria-label="Open and pinned apps">
             {pinnedApps.map((app) => {
               const active = app.id === activeApp?.id;
               return (
-                <button
-                  type="button"
+                <RailApp
                   key={app.id}
-                  className={`${styles.appPin} ${active ? styles.appPinActive : ""}`}
-                  onClick={() => onOpenApp(app.id)}
-                  onContextMenu={(event) => {
-                    event.preventDefault();
-                    onTogglePin(app.id);
-                  }}
-                  aria-label={`Open ${app.name}`}
-                  aria-current={active ? "page" : undefined}
-                  title={`${app.name}\nRight-click to unpin`}
-                >
-                  <AppMark appId={app.id} name={app.name} size="medium" />
-                  {active && <span className={styles.activePip} />}
-                </button>
+                  app={app}
+                  active={active}
+                  open={open.has(app.id)}
+                  pinned
+                  onOpen={onOpenApp}
+                  onTogglePin={onTogglePin}
+                />
+              );
+            })}
+            {pinnedApps.length > 0 && openApps.length > 0 && (
+              <div className={styles.openRule} aria-hidden="true" />
+            )}
+            {openApps.map((app) => {
+              const active = app.id === activeApp?.id;
+              return (
+                <RailApp
+                  key={app.id}
+                  app={app}
+                  active={active}
+                  open
+                  pinned={false}
+                  onOpen={onOpenApp}
+                  onTogglePin={onTogglePin}
+                />
               );
             })}
           </div>
@@ -132,6 +163,44 @@ export function UseWorkspace({
         )}
       </main>
     </div>
+  );
+}
+
+function RailApp({
+  app,
+  active,
+  open,
+  pinned,
+  onOpen,
+  onTogglePin,
+}: {
+  app: AppInfo;
+  active: boolean;
+  open: boolean;
+  pinned: boolean;
+  onOpen: (appId: string) => void;
+  onTogglePin: (appId: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={[
+        styles.appPin,
+        active ? styles.appPinActive : "",
+        !open ? styles.appPinDormant : "",
+      ].filter(Boolean).join(" ")}
+      onClick={() => onOpen(app.id)}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        onTogglePin(app.id);
+      }}
+      aria-label={`${open ? "Switch to" : "Open"} ${app.name}`}
+      aria-current={active ? "page" : undefined}
+      title={`${app.name}\nRight-click to ${pinned ? "unpin" : "pin"}`}
+    >
+      <AppMark appId={app.id} name={app.name} size="medium" />
+      {active && <span className={styles.activePip} />}
+    </button>
   );
 }
 
@@ -183,6 +252,14 @@ function OpenIcon() {
       <circle cx="10.5" cy="10.5" r="5.8" />
       <path d="m15 15 4 4" />
       <path d="M10.5 7.8v5.4M7.8 10.5h5.4" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="m6 6 8 8M14 6l-8 8" />
     </svg>
   );
 }

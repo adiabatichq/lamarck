@@ -1,8 +1,12 @@
 import { describe, expect, test } from "vitest";
 import {
+  closeUseApp,
   EMPTY_USE_STATE,
   loadUseState,
+  openUseApp,
   readUseState,
+  reconcileUseState,
+  toggleUseAppPin,
   type UseWorkspaceStorage,
   useWorkspaceStateKey,
 } from "./use-workspace-state";
@@ -37,6 +41,7 @@ describe("vault-scoped Use workspace state", () => {
 
     expect(readUseState(storage, "key")).toEqual({
       pinnedIds: ["mail", "notes"],
+      openIds: [],
       recentIds: [],
       activeAppId: null,
     });
@@ -59,11 +64,13 @@ describe("vault-scoped Use workspace state", () => {
     const storage = new MemoryStorage({
       [useWorkspaceStateKey("vault-a")]: JSON.stringify({
         pinnedIds: ["mail"],
+        openIds: ["mail"],
         recentIds: [],
         activeAppId: "mail",
       }),
       [useWorkspaceStateKey("vault-b")]: JSON.stringify({
         pinnedIds: ["notes"],
+        openIds: ["notes"],
         recentIds: ["notes"],
         activeAppId: "notes",
       }),
@@ -71,14 +78,97 @@ describe("vault-scoped Use workspace state", () => {
 
     expect(loadUseState(storage, "vault-a")).toEqual({
       pinnedIds: ["mail"],
+      openIds: ["mail"],
       recentIds: [],
       activeAppId: "mail",
     });
     expect(loadUseState(storage, "vault-b")).toEqual({
       pinnedIds: ["notes"],
+      openIds: ["notes"],
       recentIds: ["notes"],
       activeAppId: "notes",
     });
   });
 
+  test("migrates the former active-only state into an open App", () => {
+    const storage = new MemoryStorage({
+      key: JSON.stringify({
+        pinnedIds: ["mail", "mail"],
+        recentIds: ["mail"],
+        activeAppId: "mail",
+      }),
+    });
+
+    expect(readUseState(storage, "key")).toEqual({
+      pinnedIds: ["mail"],
+      openIds: ["mail"],
+      recentIds: ["mail"],
+      activeAppId: "mail",
+    });
+  });
+
+  test("keeps open Apps alive while switching and retains a closed pin", () => {
+    const initial = {
+      pinnedIds: ["mail"],
+      openIds: ["mail"],
+      recentIds: ["mail"],
+      activeAppId: "mail",
+    };
+    const withNotes = openUseApp(initial, "notes");
+
+    expect(withNotes).toEqual({
+      pinnedIds: ["mail"],
+      openIds: ["mail", "notes"],
+      recentIds: ["notes", "mail"],
+      activeAppId: "notes",
+    });
+    expect(closeUseApp(withNotes, "mail")).toEqual({
+      pinnedIds: ["mail"],
+      openIds: ["notes"],
+      recentIds: ["notes", "mail"],
+      activeAppId: "notes",
+    });
+  });
+
+  test("returns to the most recently used open App when closing the active one", () => {
+    const state = openUseApp(openUseApp({
+      pinnedIds: [],
+      openIds: ["mail"],
+      recentIds: ["mail"],
+      activeAppId: "mail",
+    }, "notes"), "tasks");
+    const switched = openUseApp(state, "notes");
+
+    expect(closeUseApp(switched, "notes").activeAppId).toBe("tasks");
+  });
+
+  test("moves Apps between pinned and open-only rail sections without closing them", () => {
+    const state = {
+      pinnedIds: [],
+      openIds: ["mail"],
+      recentIds: ["mail"],
+      activeAppId: "mail",
+    };
+
+    expect(toggleUseAppPin(state, "mail")).toEqual({
+      ...state,
+      pinnedIds: ["mail"],
+    });
+  });
+
+  test("reconciles every App reference and chooses a surviving active App", () => {
+    const state = {
+      pinnedIds: ["removed", "mail"],
+      openIds: ["removed", "mail"],
+      recentIds: ["removed", "mail"],
+      activeAppId: "removed",
+    };
+
+    expect(reconcileUseState(state, new Set(["mail"]))).toEqual({
+      pinnedIds: ["mail"],
+      openIds: ["mail"],
+      recentIds: ["mail"],
+      activeAppId: "mail",
+    });
+  });
 });
