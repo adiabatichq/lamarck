@@ -77,6 +77,7 @@ export type ConnectorSetupPendingReason = "integration_key" | "auth" | "requirem
 export type ConnectorRuntimeReconcileReason =
   | "config_changed"
   | "credential_connected"
+  | "source_created"
   | "readiness_changed";
 
 export class ConnectorLifecycleConflictError extends Error {
@@ -516,10 +517,14 @@ export class ConnectorSupervisor {
 
     // Force a new row id so unnamed setup drafts for a multiple-Source
     // Connector do not collapse into the first NULL-key draft.
-    return this.ensureIntegration<TConfig, TState>({
+    const created = this.ensureIntegration<TConfig, TState>({
       ...input,
       id: newIntegrationId(),
     });
+    if (created.setupStatus === "ready") {
+      this.requestRuntimeReconcile(created.id, "source_created");
+    }
+    return created;
   }
 
   updateIntegration<TConfig = unknown, TState = unknown>(

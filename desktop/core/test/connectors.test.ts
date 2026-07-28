@@ -2162,6 +2162,70 @@ auth:
     expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ stopped: true });
   });
 
+  test("creating a ready Source immediately wakes its idle watch without a timer tick", async () => {
+    let starts = 0;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "new-source-watch",
+        name: "New Source Watch",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        integrations: { mode: "multiple" },
+        auth: { type: "none" },
+      },
+      {
+        async run({ signal, warnings }) {
+          starts += 1;
+          await warnings.set({
+            key: "setup-needed",
+            message: "Finish connector setup.",
+          });
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const reconcileReasons: Array<{ instanceId: string; reason: string }> = [];
+    supervisor.onRuntimeReconcileRequested((instanceId, reason) => {
+      reconcileReasons.push({ instanceId, reason });
+    });
+    const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
+
+    await scheduler.start();
+    const draft = supervisor.addIntegration({ connectorId: "new-source-watch" });
+    expect(draft.setupStatus).toBe("setup");
+    expect(reconcileReasons).toEqual([]);
+    expect(starts).toBe(0);
+
+    const ready = supervisor.addIntegration({
+      connectorId: "new-source-watch",
+      integrationKey: "device-a",
+    });
+    expect(ready.setupStatus).toBe("ready");
+    expect(reconcileReasons).toEqual([
+      { instanceId: ready.id, reason: "source_created" },
+    ]);
+    expect(await waitWithTestTimeout((async () => {
+      while (!supervisor.getIntegration(ready.id)?.warnings?.length) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+    })(), 2_000)).toBe(true);
+    expect(starts).toBe(1);
+    expect(supervisor.getIntegration(ready.id)?.warnings).toEqual([
+      expect.objectContaining({
+        key: "setup-needed",
+        message: "Finish connector setup.",
+      }),
+    ]);
+
+    await scheduler.stop();
+  });
+
   test("integration-key readiness promotion immediately wakes an idle watch Source", async () => {
     let starts = 0;
     supervisor.register(
