@@ -3356,6 +3356,85 @@ auth:
     expect(Object.keys((syncState as any).repos)).toHaveLength(1);
   });
 
+  test("local-git limits commit writes to the configured backfill days", async () => {
+    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(localGitUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<void>;
+    };
+    const rootDir = join(workspace, "Projects");
+    const repoDir = join(rootDir, "backfill-repo");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["-C", repoDir, "init"], { stdio: "ignore" });
+
+    const commitAt = (message: string, date: string) => {
+      execFileSync("git", ["-C", repoDir, "commit", "--allow-empty", "-m", message], {
+        stdio: "ignore",
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "Test User",
+          GIT_AUTHOR_EMAIL: "test@example.com",
+          GIT_AUTHOR_DATE: date,
+          GIT_COMMITTER_NAME: "Test User",
+          GIT_COMMITTER_EMAIL: "test@example.com",
+          GIT_COMMITTER_DATE: date,
+        },
+      });
+      return execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    };
+    const oldSha = commitAt("Outside default backfill", "2026-06-18T00:00:00Z");
+    const recentSha = commitAt("Inside default backfill", "2026-07-08T00:00:00Z");
+
+    let syncState: any;
+    const events: any[] = [];
+    const context: any = {
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${index}`) };
+        },
+      },
+      warnings: {
+        async set() {},
+        async clear() {},
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      config: {
+        localGit: {
+          global: {
+            capture: {
+              commitMessage: "none",
+              diffstat: "none",
+              codeDiff: false,
+              emailInEvents: "hash",
+            },
+          },
+          roots: [{ path: rootDir }],
+          identities: [{ email: "test@example.com", label: "test" }],
+        },
+      },
+      signal: new AbortController().signal,
+    };
+
+    const now = () => Date.parse("2026-07-28T00:00:00Z");
+    await syncOnce(context, { now });
+
+    expect(events.map((event) => event.payload.commitSha)).toEqual([recentSha]);
+    expect(Object.values(syncState.repos)[0]).toMatchObject({ backfillDays: 30 });
+
+    context.config.localGit.global.backfillDays = 60;
+    await syncOnce(context, { now });
+
+    expect(events.map((event) => event.payload.commitSha)).toEqual([recentSha, oldSha]);
+    expect(Object.values(syncState.repos)[0]).toMatchObject({ backfillDays: 60 });
+  });
+
   test("local-git applies explicit repo capture overrides", async () => {
     const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(localGitUrl) as {
@@ -3636,6 +3715,7 @@ auth:
       config: {
         localGit: {
           global: {
+            backfillDays: 3650,
             capture: {
               commitMessage: "full",
               diffstat: "aggregate",

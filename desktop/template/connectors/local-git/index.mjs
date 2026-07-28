@@ -9,10 +9,13 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 const SCAN_INTERVAL_MS = 5 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
 const OVERLAP_MS = 24 * 60 * 60 * 1000;
 const EVENT_BATCH_SIZE = 100;
 const RECENT_SHA_LIMIT = 2000;
 const DISCOVERY_MAX_DEPTH = 10;
+const DEFAULT_BACKFILL_DAYS = 30;
+const MAX_BACKFILL_DAYS = 3650;
 const GIT_LOG_FORMAT = "%H%x1f%aI%x1f%cI%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B";
 
 const SKIP_DIRS = new Set([
@@ -89,9 +92,13 @@ export async function syncOnce(context, deps = {}) {
     throwIfAborted(context.signal);
     const repoState = normalizeRepoState(next.repos[repo.scanKey]);
     const identityChanged = repoState.identityFingerprint !== identityFingerprint;
-    const since = !identityChanged && repoState.lastScannedAt
-      ? new Date(Math.max(0, repoState.lastScannedAt - OVERLAP_MS)).toISOString()
-      : undefined;
+    const backfillDays = config.global.backfillDays;
+    const backfillCutoffMs = Math.max(0, nowMs - backfillDays * DAY_MS);
+    const backfillChanged = repoState.backfillDays !== backfillDays;
+    const incrementalSinceMs = !identityChanged && !backfillChanged && repoState.lastScannedAt
+      ? repoState.lastScannedAt - OVERLAP_MS
+      : backfillCutoffMs;
+    const since = new Date(Math.max(backfillCutoffMs, incrementalSinceMs)).toISOString();
     const recent = new Set(repoState.recentShas);
     const capture = captureForRepo(config, repo.path);
     const commits = await readGitLog(repo.path, { since, signal: context.signal, execFileImpl: deps.execFileImpl });
@@ -100,6 +107,7 @@ export async function syncOnce(context, deps = {}) {
     for (const commit of commits) {
       throwIfAborted(context.signal);
       if (recent.has(commit.sha)) continue;
+      if (!isCommitWithinBackfill(commit, backfillCutoffMs)) continue;
       if (!isUserRelatedCommit(commit, identities)) continue;
       const event = await eventFromCommit({
         repo,
@@ -128,6 +136,7 @@ export async function syncOnce(context, deps = {}) {
       scanKey: repo.scanKey,
       normalizedOriginUrl: repo.normalizedOriginUrl,
       identityFingerprint,
+      backfillDays,
       lastScannedAt: nowMs,
       recentShas: [...recent],
     };
@@ -141,6 +150,7 @@ export function normalizeConfig(input) {
   return {
     version: 1,
     global: {
+      backfillDays: integerInRange(global.backfillDays, 1, MAX_BACKFILL_DAYS, DEFAULT_BACKFILL_DAYS),
       capture: normalizeCapture(global.capture),
     },
     roots: normalizePathItems(source.roots),
@@ -490,6 +500,11 @@ function isUserRelatedCommit(commit, identities) {
   return identities.has(normalizeEmail(commit.authorEmail)) || identities.has(normalizeEmail(commit.committerEmail));
 }
 
+function isCommitWithinBackfill(commit, cutoffMs) {
+  const commitTimeMs = timestampFromIso(commit.authorTime) ?? timestampFromIso(commit.committerTime);
+  return commitTimeMs === undefined || commitTimeMs >= cutoffMs;
+}
+
 function identityEmailSet(config) {
   return new Set(config.identities.map((identity) => normalizeEmail(identity.email)).filter(Boolean));
 }
@@ -587,6 +602,7 @@ function normalizeRepoState(input) {
     scanKey: stringFrom(source.scanKey) ?? stringFrom(source.repoKey),
     normalizedOriginUrl: stringFrom(source.normalizedOriginUrl),
     identityFingerprint: stringFrom(source.identityFingerprint),
+    backfillDays: integerInRange(source.backfillDays, 1, MAX_BACKFILL_DAYS, undefined),
     lastScannedAt: Number.isFinite(source.lastScannedAt) ? source.lastScannedAt : undefined,
     recentShas,
   };
@@ -940,6 +956,13 @@ function setupHtml() {
 
         <section class="panel">
           <h2>Privacy / Capture</h2>
+          <h3>History</h3>
+          <div class="row">
+            <label for="backfillDays">Backfill days</label>
+            <input id="backfillDays" type="number" min="1" max="3650" step="1">
+          </div>
+          <div class="muted">Only commits from this many days ago or newer can be written. Defaults to 30 days.</div>
+
           <h3>Global Capture</h3>
           <div class="row">
             <label for="commitMessage">Commit message</label>
@@ -1064,6 +1087,7 @@ function setupHtml() {
     }
 
     function render() {
+      el("backfillDays").value = String(config.global.backfillDays);
       el("commitMessage").value = config.global.capture.commitMessage;
       el("diffstat").value = config.global.capture.diffstat;
       el("emailInEvents").value = config.global.capture.emailInEvents;
@@ -1330,6 +1354,7 @@ function setupHtml() {
         window.clearTimeout(saveResetTimer);
         saveResetTimer = null;
       }
+      config.global.backfillDays = Number(el("backfillDays").value);
       config.global.capture = captureFromForm("");
       button.disabled = true;
       button.setAttribute("aria-busy", "true");
@@ -1496,6 +1521,10 @@ function readNowMs(now) {
   if (typeof now === "function") return Number(now());
   if (Number.isFinite(now)) return Number(now);
   return Date.now();
+}
+
+function integerInRange(value, min, max, fallback) {
+  return Number.isInteger(value) && value >= min && value <= max ? value : fallback;
 }
 
 function compactObject(input) {
