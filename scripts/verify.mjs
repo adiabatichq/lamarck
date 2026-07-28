@@ -21,6 +21,7 @@ const gates = [
   ["System SDK consumer alignment", ["run", "verify:system-sdk-consumers"]],
   ["System SDK consumer sync tests", ["run", "test:system-sdk-consumer-sync"]],
   ["R2 object store tests", ["run", "test:r2-object-store"]],
+  ["Guest download retry tests", ["run", "test:guest-download"]],
   ["Desktop production build", ["run", "build"]],
   ["Core typecheck", ["--workspace", "@lamarck/core", "run", "typecheck"]],
   ["Core tests", ["--workspace", "@lamarck/core", "run", "test"]],

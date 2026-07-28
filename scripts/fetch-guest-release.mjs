@@ -10,11 +10,11 @@
 //     [--include-source]
 
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { pipeline } from "node:stream/promises";
 import { validateGuestRelease } from "../desktop/capsule-guest/scripts/release-contract.mjs";
+import { downloadVerifiedFile } from "./download-verified-file.mjs";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const publicBase = validatedPublicBase(process.env.RELEASES_PUBLIC_BASE ?? "https://releases.lamarck.ai");
@@ -104,28 +104,13 @@ try {
     const target = join(staging, entry.path);
     await mkdir(dirname(target), { recursive: true });
     console.log(`[guest] GET ${entry.path} (${entry.size} bytes)`);
-    const response = await fetchWithRetry(
-      `${publicBase}/${pin.objectPrefix}/${entry.path}`,
-      `guest file ${entry.path}`,
-    );
-    if (!response.body) throw new Error(`guest file response has no body: ${entry.path}`);
-    const digest = createHash("sha256");
-    let bytes = 0;
-    await pipeline(
-      response.body,
-      async function* verify(sourceStream) {
-        for await (const chunk of sourceStream) {
-          digest.update(chunk);
-          bytes += chunk.byteLength;
-          if (bytes > entry.size) throw new Error(`guest file exceeded its inventory size: ${entry.path}`);
-          yield chunk;
-        }
-      },
-      createWriteStream(target, { flags: "wx" }),
-    );
-    if (bytes !== entry.size || digest.digest("hex") !== entry.sha256) {
-      throw new Error(`guest file failed verification: ${entry.path}`);
-    }
+    await downloadVerifiedFile({
+      url: `${publicBase}/${pin.objectPrefix}/${entry.path}`,
+      label: `guest file ${entry.path}`,
+      target,
+      expectedBytes: entry.size,
+      expectedSha256: entry.sha256,
+    });
   }
   if (correspondingSource && !sourceInventoryEntry) {
     throw new Error("guest inventory omits the pinned source archive");

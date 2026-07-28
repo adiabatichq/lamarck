@@ -56,6 +56,7 @@ jobs:
       - name: Verify release tooling
         run: |
           node --test scripts/r2-object-store.test.mjs
+          node --test scripts/download-verified-file.test.mjs
           node desktop/capsule-guest/scripts/test-release-pipeline.mjs
 
       - name: Materialize Guest signing key

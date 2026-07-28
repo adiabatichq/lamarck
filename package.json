@@ -22,6 +22,7 @@
     "verify:system-sdk-consumers": "node scripts/verify-system-sdk-consumers.mjs",
     "test:system-sdk-consumer-sync": "node --test scripts/update-system-sdk-consumers.test.mjs",
     "test:r2-object-store": "node --test scripts/r2-object-store.test.mjs",
+    "test:guest-download": "node --test scripts/download-verified-file.test.mjs",
     "capsule:test": "node scripts/test-capsule.mjs",
     "capsule-guest:image": "desktop/capsule-guest/scripts/build-guest-image.sh",
     "capsule-guest:verify": "node desktop/capsule-guest/scripts/verify-guest-release.mjs .lamarck/build/capsule-guest/release",
