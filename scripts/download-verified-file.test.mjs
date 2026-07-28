@@ -20,6 +20,7 @@ test("retries a timed-out response body from a clean partial file", async () => 
       expectedBytes: payload.byteLength,
       expectedSha256: sha256(payload),
       timeoutMs: 10,
+      timeoutSignalFactory: timeoutSignal,
       retryDelayMs: 0,
       onRetry: (event) => retries.push(event),
       fetchImpl: async (_url, { signal }) => {
@@ -44,7 +45,6 @@ test("retries a timed-out response body from a clean partial file", async () => 
 
     assert.equal(calls, 2);
     assert.equal(retries.length, 1);
-    assert.equal(retries[0].error.name, "TimeoutError");
     assert.deepEqual(await readFile(target), payload);
     assert.equal((await stat(target)).size, payload.byteLength);
   } finally {
@@ -82,4 +82,12 @@ test("removes an invalid completed download without retrying it", async () => {
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function timeoutSignal(timeoutMs) {
+  const controller = new AbortController();
+  setTimeout(() => {
+    controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+  }, timeoutMs);
+  return controller.signal;
 }

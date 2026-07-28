@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { unlink } from "node:fs/promises";
+import { open, unlink } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 
 const DEFAULT_ATTEMPTS = 4;
@@ -19,6 +19,7 @@ export async function downloadVerifiedFile({
   retryDelayMs = DEFAULT_RETRY_DELAY_MS,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   fetchImpl = fetch,
+  timeoutSignalFactory = AbortSignal.timeout,
   onRetry = ({ attempt, error }) => {
     console.warn(`[guest] RETRY ${label} after attempt ${attempt}: ${error.message}`);
   },
@@ -29,7 +30,7 @@ export async function downloadVerifiedFile({
     try {
       const response = await fetchImpl(url, {
         redirect: "error",
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: timeoutSignalFactory(timeoutMs),
       });
       if (!response.ok) {
         await response.body?.cancel();
@@ -43,24 +44,30 @@ export async function downloadVerifiedFile({
 
       const digest = createHash("sha256");
       let bytes = 0;
-      const destination = createWriteStream(target, { flags: "wx" });
-      destination.once("open", () => {
-        destinationOpened = true;
+      const destinationHandle = await open(target, "wx");
+      destinationOpened = true;
+      const destination = createWriteStream(target, {
+        fd: destinationHandle.fd,
+        autoClose: false,
       });
-      await pipeline(
-        response.body,
-        async function* verify(sourceStream) {
-          for await (const chunk of sourceStream) {
-            digest.update(chunk);
-            bytes += chunk.byteLength;
-            if (bytes > expectedBytes) {
-              throw new NonRetryableDownloadError(`${label} exceeded its inventory size`);
+      try {
+        await pipeline(
+          response.body,
+          async function* verify(sourceStream) {
+            for await (const chunk of sourceStream) {
+              digest.update(chunk);
+              bytes += chunk.byteLength;
+              if (bytes > expectedBytes) {
+                throw new NonRetryableDownloadError(`${label} exceeded its inventory size`);
+              }
+              yield chunk;
             }
-            yield chunk;
-          }
-        },
-        destination,
-      );
+          },
+          destination,
+        );
+      } finally {
+        await destinationHandle.close();
+      }
       if (bytes !== expectedBytes || digest.digest("hex") !== expectedSha256) {
         throw new NonRetryableDownloadError(`${label} failed verification`);
       }
