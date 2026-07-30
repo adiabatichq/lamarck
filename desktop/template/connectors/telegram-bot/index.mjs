@@ -148,7 +148,12 @@ export async function syncOnce(context, deps = {}) {
 
 export function eventFromUpdate(update, opts = {}) {
   const message = messageFromUpdate(update);
-  const startedAt = timestampFromMessage(message) ?? Date.now();
+  // No fallback: D0 is append-only and cannot express an unknown timestamp, so
+  // an update we cannot time must fail the run rather than be dated "now".
+  const startedAt = timestampFromMessage(message);
+  if (startedAt === undefined) {
+    throw new Error(`Telegram update ${update?.update_id} has no usable message date`);
+  }
   const updateType = updateTypeFromUpdate(update);
   const botKey = botKeyFromBot(opts.bot);
   return {
@@ -576,11 +581,20 @@ function summarizeChat(chat) {
 }
 
 function externalIdForUpdate(update, bot) {
+  if (update?.update_id === undefined) {
+    throw new Error("Telegram update has no update_id; cannot derive a stable event id");
+  }
   return `bot:${botKeyFromBot(bot)}:update:${update.update_id}`;
 }
 
 function botKeyFromBot(bot) {
-  return bot?.id ?? bot?.username ?? "unknown";
+  // The bot key is part of externalId. A placeholder would make the same update
+  // dedup differently once the real identity is known, permanently duplicating it.
+  const key = bot?.id ?? bot?.username;
+  if (key === undefined || key === null || key === "") {
+    throw new Error("Telegram bot identity is unavailable; cannot derive a stable event id");
+  }
+  return key;
 }
 
 function messageKeyFromMessage(message, botKey) {

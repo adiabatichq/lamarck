@@ -89,7 +89,9 @@ const STREAMS = [
     path: "/v1/streams/ring_configuration",
     range: "none",
     syncIntervalDays: RING_CONFIGURATION_SYNC_INTERVAL_DAYS,
-    startedAt: (record) => timestampFromAny(record.set_up_at) ?? 0,
+    // No `?? 0` fallback: it would satisfy the finite-timestamp check below and
+    // date the event 1970-01-01 instead of failing on a record we cannot time.
+    startedAt: (record) => timestampFromAny(record.set_up_at),
   },
   {
     id: "heartrate",
