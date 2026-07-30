@@ -12,6 +12,7 @@ const SCAN_INTERVAL_MS = 5 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const OVERLAP_MS = 24 * 60 * 60 * 1000;
 const EVENT_BATCH_SIZE = 100;
+const UNTIMED_REPORT_LIMIT = 20;
 const RECENT_SHA_LIMIT = 2000;
 const DISCOVERY_MAX_DEPTH = 10;
 const DEFAULT_BACKFILL_DAYS = 30;
@@ -81,6 +82,7 @@ export async function syncOnce(context, deps = {}) {
     repos: { ...previous.repos },
   };
   const nowMs = readNowMs(deps.now);
+  const untimedShas = [];
   const repos = await discoverConfiguredRepos(config, {
     signal: context.signal,
     readdirImpl: deps.readdirImpl,
@@ -107,11 +109,20 @@ export async function syncOnce(context, deps = {}) {
     for (const commit of commits) {
       throwIfAborted(context.signal);
       if (recent.has(commit.sha)) continue;
-      if (!isCommitWithinBackfill(commit, backfillCutoffMs)) continue;
+      // A commit whose time cannot be read is skipped, never stamped with the
+      // current time: D0 is append-only and cannot express "unknown", so a
+      // fabricated timestamp would be indistinguishable from a real one forever.
+      const commitTimeMs = commitTimestampMs(commit);
+      if (commitTimeMs === undefined) {
+        untimedShas.push(`${repo.label ?? collapseHome(repo.path)}@${commit.sha.slice(0, 12)}`);
+        continue;
+      }
+      if (commitTimeMs < backfillCutoffMs) continue;
       if (!isUserRelatedCommit(commit, identities)) continue;
       const event = await eventFromCommit({
         repo,
         commit,
+        startedAt: commitTimeMs,
         capture,
         identities,
         guard: context.guard,
@@ -141,6 +152,16 @@ export async function syncOnce(context, deps = {}) {
       recentShas: [...recent],
     };
     await context.state.set(next);
+  }
+
+  if (untimedShas.length) {
+    await context.warnings?.set?.({
+      key: "local-git-untimed-commits",
+      message: `Skipped ${untimedShas.length} commit(s) with an unreadable commit time.`,
+      details: { commits: untimedShas.slice(0, UNTIMED_REPORT_LIMIT) },
+    });
+  } else {
+    await context.warnings?.clear?.("local-git-untimed-commits");
   }
 }
 
@@ -390,10 +411,9 @@ async function readGitLog(repoPath, opts = {}) {
 }
 
 async function eventFromCommit(opts) {
-  const { repo, commit, capture, identities, guard, signal, execFileImpl } = opts;
+  const { repo, commit, startedAt, capture, identities, guard, signal, execFileImpl } = opts;
   const authoredByUser = identities.has(normalizeEmail(commit.authorEmail));
   const committedByUser = identities.has(normalizeEmail(commit.committerEmail));
-  const startedAt = timestampFromIso(commit.authorTime) ?? timestampFromIso(commit.committerTime) ?? Date.now();
   const diffstat = await readDiffstat(repo.path, commit.sha, capture.diffstat, { signal, execFileImpl });
   const codeDiff = await readCodeDiff(repo.path, commit.sha, capture.codeDiff, { guard, signal, execFileImpl });
 
@@ -500,9 +520,8 @@ function isUserRelatedCommit(commit, identities) {
   return identities.has(normalizeEmail(commit.authorEmail)) || identities.has(normalizeEmail(commit.committerEmail));
 }
 
-function isCommitWithinBackfill(commit, cutoffMs) {
-  const commitTimeMs = timestampFromIso(commit.authorTime) ?? timestampFromIso(commit.committerTime);
-  return commitTimeMs === undefined || commitTimeMs >= cutoffMs;
+function commitTimestampMs(commit) {
+  return timestampFromIso(commit.authorTime) ?? timestampFromIso(commit.committerTime);
 }
 
 function identityEmailSet(config) {
