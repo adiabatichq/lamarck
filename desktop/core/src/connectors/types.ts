@@ -65,10 +65,10 @@ export interface ConnectorRuntimeSpec {
   defaultSchedule?: string;
 }
 
-export type ConnectorIntegrationMode = "singleton" | "multiple";
+export type ConnectorSourceIdentityKind = "single" | "device" | "connector";
 
-export interface ConnectorIntegrationsSpec {
-  mode: ConnectorIntegrationMode;
+export interface ConnectorSourceSpec {
+  identity: ConnectorSourceIdentityKind;
 }
 
 export interface ConnectorPlatformSpec {
@@ -112,9 +112,9 @@ export interface ConnectorManifest {
   eventCatalog: string;
   entry: string;
   runtime: ConnectorRuntimeSpec;
-  // Required: source identity cardinality is an explicit author decision.
-  // The parser rejects manifests that omit it; there is no singleton default.
-  integrations: ConnectorIntegrationsSpec;
+  // Required: what distinguishes two Sources is an explicit author decision.
+  // The parser rejects manifests that omit it; there is no default.
+  source: ConnectorSourceSpec;
   platforms?: ConnectorPlatformsSpec;
   auth?: ConnectorAuthSpec;
   // Config schema: user-facing fields (type/label/default). Author defaults live
@@ -167,8 +167,13 @@ export interface BoundConnectorGuard {
 export type ConnectorAuthHandle =
   | { type: "none" }
   | {
-      type: "apiKey" | "oauth2" | "managedProvider";
+      type: "apiKey" | "oauth2";
       getToken(): Promise<string>;
+    }
+  | {
+      type: "managedProvider";
+      getToken(): Promise<string>;
+      providerOrigin: string;
     };
 
 export interface ConnectorStateHandle<TState = unknown> {
@@ -248,7 +253,6 @@ export interface ConnectorRequirementRecord extends ConnectorRequirementStatus {
 export interface ConnectorRequirementContext {
   connectorId: string;
   integrationId: string;
-  integrationKey: string | undefined;
   platform: ConnectorPlatform;
   host: ConnectorHostContext;
 }
@@ -260,16 +264,35 @@ export interface ConnectorRequirementHandler {
   request?(ctx: ConnectorRequirementContext): MaybePromise<ConnectorRequirementStatus>;
 }
 
+export interface ConnectorSourceIdentityContext<TConfig = unknown> {
+  connectorId: string;
+  auth: ConnectorAuthHandle;
+  config: TConfig;
+  signal: AbortSignal;
+}
+
+export interface ConnectorSourceIdentityResult {
+  key: string;
+  label?: string;
+}
+
 export interface ConnectorDefinition<TConfig = unknown, TState = unknown> {
   run(context: ConnectorRunContext<TConfig, TState>): MaybePromise<void>;
   configUi?(context: ConnectorConfigUiContext<TConfig, TState>): MaybePromise<ConnectorConfigUiResult>;
   requirements?: Record<string, ConnectorRequirementHandler>;
+  resolveSourceIdentity?(
+    context: ConnectorSourceIdentityContext<TConfig>,
+  ): MaybePromise<ConnectorSourceIdentityResult>;
 }
 
 export interface ConnectorIntegration<TConfig = unknown, TState = unknown> {
   id: string;
   connectorId: string;
-  integrationKey: string | undefined;
+  sourceKey: string | null;
+  identityStatus: ConnectorIdentityStatus;
+  lastResolvedKey: string | null;
+  displayName: string | null;
+  suggestedLabel: string | null;
   // Source lifecycle is intentionally separate from observed runtime state.
   // pausedAt + resumeAt describe the only mutable lifecycle policy:
   //   both absent              -> active
@@ -297,6 +320,13 @@ export interface ConnectorIntegration<TConfig = unknown, TState = unknown> {
 // Observed execution state only. Setup readiness lives in setupStatus and
 // Active/Paused lifecycle policy lives in pausedAt/resumeAt.
 export type ConnectorIntegrationStatus = "idle" | "running" | "error";
+export type ConnectorIdentityStatus =
+  | "unresolved"
+  | "resolved"
+  | "conflict"
+  | "changed"
+  | "error";
+export type ConnectorOwnership = "here" | "other-device" | "device-unknown";
 export type ConnectorRunStatus = "running" | "success" | "error" | "aborted";
 export type ConnectorRunTrigger = "manual" | "schedule" | "watch";
 
@@ -304,7 +334,7 @@ export interface ConnectorRunRecord {
   id: string;
   integrationId: string;
   connectorId: string;
-  integrationKey: string | undefined;
+  sourceKey: string | null;
   trigger: ConnectorRunTrigger;
   status: ConnectorRunStatus;
   startedAt: number;
@@ -348,7 +378,7 @@ export interface InstalledConnectorView {
   name: string;
   description: string;
   mode: ConnectorRuntimeMode;
-  integrationsMode: "singleton" | "multiple";
+  identityKind: ConnectorSourceIdentityKind;
   supported: boolean;
   packageTrust: ConnectorPackageTrustStatus;
   packageHash: string | undefined;

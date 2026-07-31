@@ -98,7 +98,12 @@ describe("DB", () => {
 
     expect(names).toContain("id");
     expect(names).toContain("connector_id");
-    expect(names).toContain("integration_key");
+    expect(names).toContain("source_key");
+    expect(names).toContain("identity_status");
+    expect(names).toContain("last_resolved_key");
+    expect(names).toContain("display_name");
+    expect(names).toContain("suggested_label");
+    expect(names).not.toContain("integration_key");
     expect(names).toContain("status");
     expect(names).toContain("setup_status");
     expect(names).toContain("trust_status");

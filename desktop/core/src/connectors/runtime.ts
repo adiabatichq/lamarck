@@ -18,12 +18,35 @@ export class ConnectorRuntime<TConfig = unknown, TState = unknown> {
   }
 }
 
-export function validateConnectorDefinition(definition: ConnectorDefinition): void {
+export function validateConnectorDefinition(
+  definition: ConnectorDefinition,
+  identityKind?: "single" | "device" | "connector",
+): void {
   if (!definition || typeof definition.run !== "function") {
     throw new Error("Connector module must export a run(context) function");
   }
   if (definition.configUi !== undefined && typeof definition.configUi !== "function") {
     throw new Error("Connector configUi export must be a function when provided");
+  }
+  if (
+    definition.resolveSourceIdentity !== undefined
+    && typeof definition.resolveSourceIdentity !== "function"
+  ) {
+    throw new Error("Connector resolveSourceIdentity export must be a function when provided");
+  }
+  if (identityKind === "connector" && !definition.resolveSourceIdentity) {
+    throw new Error(
+      "Connector source.identity=connector requires a resolveSourceIdentity(context) export",
+    );
+  }
+  if (
+    identityKind !== undefined
+    && identityKind !== "connector"
+    && definition.resolveSourceIdentity !== undefined
+  ) {
+    throw new Error(
+      `Connector source.identity=${identityKind} forbids a resolveSourceIdentity export`,
+    );
   }
   if (definition.requirements === undefined) return;
   if (

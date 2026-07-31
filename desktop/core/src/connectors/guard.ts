@@ -1,23 +1,23 @@
 import type { EventInput } from "../guard-types";
 import type { GuardSqlParams } from "../guard-service/protocol";
 import type { BoundConnectorGuard, ConnectorEventInput } from "./types";
-import { validateConnectorId, validateIntegrationKey } from "./manifest";
+import { validateConnectorId, validateSourceKey } from "./manifest";
 import { validateConnectorEvent } from "./runtime";
 
-export function sourceForConnector(connectorId: string, integrationKey?: string): string {
+export function sourceForConnector(connectorId: string, sourceKey?: string): string {
   validateConnectorId(connectorId);
-  if (integrationKey !== undefined) {
-    validateIntegrationKey(integrationKey);
+  if (sourceKey !== undefined) {
+    validateSourceKey(sourceKey);
   }
-  return `connector:${connectorId}${integrationKey ? `:${integrationKey}` : ""}`;
+  return `connector:${connectorId}${sourceKey ? `:${sourceKey}` : ""}`;
 }
 
 export function createBoundConnectorGuard(
   rootGuard: ConnectorHostGuard,
   connectorId: string,
-  integrationKey?: string,
+  sourceKey?: string,
 ): BoundConnectorGuard {
-  const source = sourceForConnector(connectorId, integrationKey);
+  const source = sourceForConnector(connectorId, sourceKey);
   const guard = rootGuard.withSource(source);
   return {
     async writeEvent(event: ConnectorEventInput): Promise<{ id: string }> {

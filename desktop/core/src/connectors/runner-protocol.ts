@@ -14,9 +14,22 @@ import type {
 } from "./types";
 
 export type HostToRunnerMessage =
-  | { type: "load"; entryPath: string; contentHash: string }
+  | {
+    type: "load";
+    entryPath: string;
+    contentHash: string;
+    connectorId?: string;
+    sourceIdentityKind?: "single" | "device" | "connector";
+  }
   | { type: "check"; ids: string[]; ctx: ConnectorRequirementContext }
   | { type: "request"; id: string; ctx: ConnectorRequirementContext }
+  | {
+    type: "resolveSourceIdentity";
+    config: unknown;
+    configSet: boolean;
+    authType: ConnectorRuntimeAuthType;
+    providerOrigin?: string;
+  }
   | {
     type: "run";
     config: unknown;
@@ -25,6 +38,7 @@ export type HostToRunnerMessage =
     configSet: boolean;
     host: ConnectorHostContext;
     authType: ConnectorRuntimeAuthType;
+    providerOrigin?: string;
   }
   | {
     type: "configUi";
@@ -42,6 +56,8 @@ export type RunnerToHostMessage =
   | { type: "load-error"; message: string }
   | { type: "checked"; records: Record<string, ConnectorRequirementStatus | null> }
   | { type: "requested"; status: ConnectorRequirementStatus | null }
+  | { type: "source-identity"; key: string; label?: string }
+  | { type: "source-identity-error"; message: string }
   | { type: "config-ui-ready"; url: string }
   | { type: "config-ui-error"; message: string }
   | { type: "done" }

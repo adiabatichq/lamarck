@@ -60,7 +60,7 @@ describe("data.db and system.db schema versions", () => {
     expect(sha256(DATA_SCHEMA_V1))
       .toBe("ec3182151699d26bcb3e00118fa5e93e6c2d4f5407de935e8f0351bf1cf6c395");
     expect(sha256(SYSTEM_SCHEMA_V1))
-      .toBe("2ad3c0191f2c680233934e5f39d72ba7d2cd74d81b497bd2995ccb4049e70198");
+      .toBe("a11ca16e67b7a76be8b759359306e0931c45f0ffbd77c03daae9f24cede3c8b9");
   });
 
   test("D2 promotion and demotion do not change the data database version", () => {

@@ -177,6 +177,61 @@ describe("Secret store and connector credential broker", () => {
     ).resolves.toEqual({ status: "failed", error: "Auth attempt not found" });
   });
 
+  test("poll expiry cancels an in-flight OAuth exchange before it can persist credentials", async () => {
+    let now = 1_000;
+    let markExchangeStarted!: () => void;
+    let releaseExchange!: (response: Response) => void;
+    const exchangeStarted = new Promise<void>((resolve) => {
+      markExchangeStarted = resolve;
+    });
+    const exchangeResponse = new Promise<Response>((resolve) => {
+      releaseExchange = resolve;
+    });
+    const secrets = new SqliteEncryptedSecretStore(opened.systemDb, createVaultKey());
+    const credentials = new CredentialStore(opened.systemDb);
+    const manager = new ConnectorAuthManager(secrets, {
+      credentialStore: credentials,
+      attemptTtlMs: 100,
+      now: () => now,
+      fetchImpl: async () => {
+        markExchangeStarted();
+        return exchangeResponse;
+      },
+    });
+    const auth = {
+      type: "oauth2-public" as const,
+      authorizationEndpoint: "https://provider.example/authorize",
+      tokenEndpoint: "https://provider.example/token",
+      clientId: "client-id",
+    };
+    const source = integration("expiry-race-ref");
+    const started = manager.startOAuth(source, auth, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    const completion = manager.completeOAuthCallback(new URLSearchParams({
+      state,
+      code: "code-1",
+    }));
+
+    await exchangeStarted;
+    now = started.expiresAt + 1;
+    await expect(manager.getOAuthAttempt(source.id, started.attemptId)).resolves.toMatchObject({
+      status: "expired",
+      integrationId: source.id,
+    });
+
+    releaseExchange(jsonResponse({ access_token: "must-not-survive", expires_in: 3_600 }));
+    const cancelled = await completion;
+    expect(cancelled).toMatchObject({
+      status: "failed",
+      error: "Authentication was cancelled for this Source",
+    });
+    expect(cancelled).not.toHaveProperty("integrationId");
+    expect(await secrets.has(source.authRef!)).toBe(false);
+    expect(credentials.get(source.authRef!)).toBeUndefined();
+  });
+
   test("oauth refresh single-flights concurrent getToken calls", async () => {
     let calls = 0;
     const manager = new ConnectorAuthManager(
@@ -530,7 +585,11 @@ function integration(authRef: string): ConnectorIntegration {
   return {
     id: "integration-1",
     connectorId: "connector-1",
-    integrationKey: undefined,
+    sourceKey: null,
+    identityStatus: "resolved",
+    lastResolvedKey: null,
+    displayName: null,
+    suggestedLabel: null,
     pausedAt: undefined,
     resumeAt: undefined,
     status: "idle",

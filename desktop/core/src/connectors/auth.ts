@@ -8,7 +8,6 @@ import {
 } from "../credentials";
 import {
   isOAuthAuthSpec,
-  runtimeAuthType,
   type ConnectorAuthHandle,
   type ConnectorAuthSpec,
   type ConnectorIntegration,
@@ -322,9 +321,6 @@ export class ConnectorAuthManager {
     const url = new URL(`/providers/${encodeURIComponent(auth.providerId)}/connect`, normalizeOrigin(input.appOrigin));
     url.searchParams.set("integrationId", integration.id);
     url.searchParams.set("start", "1");
-    if (integration.integrationKey) {
-      url.searchParams.set("integrationKey", integration.integrationKey);
-    }
     let authorizationUrl = url.toString();
     if (this.lamarckSession?.session && this.lamarckSession.startLogin) {
       const session = await this.lamarckSession.session().catch(() => ({ status: "signed_out" as const }));
@@ -355,6 +351,18 @@ export class ConnectorAuthManager {
       attempt.terminalAt = now;
       attempt.error = "OAuth attempt expired";
       this.attemptsByState.delete(attempt.state);
+      const result: OAuthAttemptView = {
+        status: attempt.status,
+        attemptId: attempt.id,
+        integrationId: attempt.integrationId,
+        authRef: attempt.authRef,
+        error: attempt.error,
+      };
+      // Poll-observed expiry is a cancellation boundary. Invalidate the
+      // generation before Supervisor releases the identity fence so a callback
+      // already awaiting token exchange cannot commit after expiry.
+      this.cancelAttemptsForIntegration(attempt.integrationId);
+      return result;
     }
     return {
       status: attempt.status,
@@ -399,6 +407,15 @@ export class ConnectorAuthManager {
       attempt.status = "expired";
       attempt.terminalAt = now;
       attempt.error = "Managed provider auth attempt expired";
+      const result: OAuthAttemptView = {
+        status: attempt.status,
+        attemptId: attempt.id,
+        integrationId: attempt.integrationId,
+        authRef: attempt.authRef,
+        error: attempt.error,
+      };
+      this.cancelAttemptsForIntegration(attempt.integrationId);
+      return result;
     }
     if (attempt.status === "pending") {
       try {
@@ -414,6 +431,16 @@ export class ConnectorAuthManager {
         attempt.terminalAt = this.now();
         attempt.credentialId = attempt.authRef;
       } catch (err) {
+        if (!this.isIntegrationAuthGenerationCurrent(
+          attempt.integrationId,
+          attempt.generation,
+        )) {
+          return {
+            status: "failed",
+            attemptId: attempt.id,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
         if (!(err instanceof ManagedProviderNotConnectedError) && !isLamarckSessionNotSignedInError(err)) {
           attempt.status = "failed";
           attempt.terminalAt = this.now();
@@ -471,13 +498,15 @@ export class ConnectorAuthManager {
       attempt.status = "expired";
       attempt.terminalAt = now;
       attempt.error = "OAuth attempt expired";
-      return {
+      const result: OAuthAttemptView = {
         status: "expired",
         attemptId: attempt.id,
         integrationId: attempt.integrationId,
         authRef: attempt.authRef,
         error: attempt.error,
       };
+      this.cancelAttemptsForIntegration(attempt.integrationId);
+      return result;
     }
     if (providerError) {
       attempt.status = "failed";
@@ -522,6 +551,16 @@ export class ConnectorAuthManager {
       attempt.status = "failed";
       attempt.terminalAt = this.now();
       attempt.error = err instanceof Error ? err.message : String(err);
+      if (!this.isIntegrationAuthGenerationCurrent(
+        attempt.integrationId,
+        attempt.generation,
+      )) {
+        return {
+          status: "failed",
+          attemptId: attempt.id,
+          error: attempt.error,
+        };
+      }
       return {
         status: "failed",
         attemptId: attempt.id,
@@ -542,30 +581,43 @@ export class ConnectorAuthManager {
       throw new Error(`Connector integration ${integration.id} requires auth_ref`);
     }
 
-    return {
-      type: runtimeAuthType(auth),
-      getToken: async () => {
-        const payload = await this.readPayload(authRef);
-        if (!payload) {
-          throw new Error(`Connector integration ${integration.id} is missing credentials`);
-        }
-        if (auth.type === "apiKey") {
-          if (payload.kind !== "apiKey") {
-            throw new Error(`Connector integration ${integration.id} credential kind mismatch`);
-          }
-          return payload.value;
-        }
-        if (auth.type === "managedProvider") {
-          if (payload.kind !== "managedProvider") {
-            throw new Error(`Connector integration ${integration.id} credential kind mismatch`);
-          }
-          return this.managedProviderAccessToken(authRef, auth, integration.id, payload);
-        }
-        if (!isOAuthAuthSpec(auth) || payload.kind !== "oauth2") {
+    const getToken = async (): Promise<string> => {
+      const payload = await this.readPayload(authRef);
+      if (!payload) {
+        throw new Error(`Connector integration ${integration.id} is missing credentials`);
+      }
+      if (auth.type === "apiKey") {
+        if (payload.kind !== "apiKey") {
           throw new Error(`Connector integration ${integration.id} credential kind mismatch`);
         }
-        return this.oauthAccessToken(authRef, auth, payload, integration.id);
-      },
+        return payload.value;
+      }
+      if (auth.type === "managedProvider") {
+        if (payload.kind !== "managedProvider") {
+          throw new Error(`Connector integration ${integration.id} credential kind mismatch`);
+        }
+        return this.managedProviderAccessToken(authRef, auth, integration.id, payload);
+      }
+      if (!isOAuthAuthSpec(auth) || payload.kind !== "oauth2") {
+        throw new Error(`Connector integration ${integration.id} credential kind mismatch`);
+      }
+      return this.oauthAccessToken(authRef, auth, payload, integration.id);
+    };
+
+    if (auth.type === "managedProvider") {
+      if (!this.managedProviderApiOrigin) {
+        throw managedProviderUnavailable(integration.connectorId);
+      }
+      return {
+        type: "managedProvider",
+        getToken,
+        providerOrigin: this.managedProviderApiOrigin,
+      };
+    }
+
+    return {
+      type: auth.type === "apiKey" ? "apiKey" : "oauth2",
+      getToken,
     };
   }
 
@@ -853,9 +905,20 @@ export class ConnectorAuthManager {
     if (this.removedIntegrationIds.has(integrationId)) {
       throw new Error("Source was removed during authentication");
     }
-    if (generation !== undefined && generation !== this.currentIntegrationAuthGeneration(integrationId)) {
+    if (!this.isIntegrationAuthGenerationCurrent(integrationId, generation)) {
       throw new Error("Authentication was cancelled for this Source");
     }
+  }
+
+  private isIntegrationAuthGenerationCurrent(
+    integrationId: string,
+    generation?: number,
+  ): boolean {
+    return !this.removedIntegrationIds.has(integrationId)
+      && (
+        generation === undefined
+        || generation === this.currentIntegrationAuthGeneration(integrationId)
+      );
   }
 
   private trackIntegrationCredential(

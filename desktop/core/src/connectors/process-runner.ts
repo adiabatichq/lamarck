@@ -19,6 +19,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type {
+  ConnectorAuthHandle,
   ConnectorConfigPatch,
   ConnectorConfigUiResult,
   ConnectorDefinition,
@@ -26,12 +27,14 @@ import type {
   ConnectorRequirementContext,
   ConnectorRequirementStatus,
   ConnectorRuntimeAuthType,
+  ConnectorSourceIdentityResult,
   ConnectorTextBlobResult,
 } from "./types";
 import type { HostToRunnerMessage, RunnerToHostMessage } from "./runner-protocol";
 
 export interface RunnerCapabilities {
   authType: ConnectorRuntimeAuthType;
+  providerOrigin?: string;
   writeEvent(event: unknown): Promise<unknown>;
   writeEvents(events: unknown): Promise<unknown>;
   writeTextBlob(input: unknown): Promise<unknown>;
@@ -40,6 +43,12 @@ export interface RunnerCapabilities {
   authGetToken(): Promise<string>;
   warningSet(value: unknown): Promise<void>;
   warningClear(key: unknown): Promise<void>;
+}
+
+export interface RunnerSourceIdentityCapabilities {
+  authType: ConnectorRuntimeAuthType;
+  authGetToken(): Promise<string>;
+  providerOrigin?: string;
 }
 
 export interface RunnerConfigUiCapabilities {
@@ -65,6 +74,13 @@ export interface RunnerConfigUiOptions {
   capabilities: RunnerConfigUiCapabilities;
 }
 
+export interface RunnerSourceIdentityOptions {
+  connectorId: string;
+  config: unknown;
+  signal: AbortSignal;
+  capabilities: RunnerSourceIdentityCapabilities;
+}
+
 export interface RunnerSession {
   requirementIds(): string[];
   check(
@@ -72,6 +88,7 @@ export interface RunnerSession {
     ctx: ConnectorRequirementContext,
   ): Promise<Record<string, ConnectorRequirementStatus | null>>;
   request(id: string, ctx: ConnectorRequirementContext): Promise<ConnectorRequirementStatus | null>;
+  resolveSourceIdentity(opts: RunnerSourceIdentityOptions): Promise<ConnectorSourceIdentityResult>;
   run(opts: RunnerRunOptions): Promise<void>;
   configUi(opts: RunnerConfigUiOptions): Promise<ConnectorConfigUiResult>;
   close(): Promise<void>;
@@ -119,6 +136,20 @@ export class InProcessRunnerSession implements RunnerSession {
     }
   }
 
+  async resolveSourceIdentity(
+    opts: RunnerSourceIdentityOptions,
+  ): Promise<ConnectorSourceIdentityResult> {
+    if (!this.definition.resolveSourceIdentity) {
+      throw new Error("Connector does not implement resolveSourceIdentity(context)");
+    }
+    return await this.definition.resolveSourceIdentity({
+      connectorId: opts.connectorId,
+      auth: connectorAuthHandle(opts.capabilities),
+      config: opts.config,
+      signal: opts.signal,
+    });
+  }
+
   async run(opts: RunnerRunOptions): Promise<void> {
     const caps = opts.capabilities;
     await this.definition.run({
@@ -135,9 +166,7 @@ export class InProcessRunnerSession implements RunnerSession {
         set: (warning) => caps.warningSet(warning),
         clear: (key) => caps.warningClear(key),
       },
-      auth: caps.authType === "none"
-        ? { type: "none" }
-        : { type: caps.authType as "apiKey" | "oauth2" | "managedProvider", getToken: () => caps.authGetToken() },
+      auth: connectorAuthHandle(caps),
       config: opts.config,
       host: opts.host,
       signal: opts.signal,
@@ -225,6 +254,10 @@ export interface ProcessRunnerSessionOptions {
   entryPath: string;
   contentHash: string;
   cwd: string;
+  /** Connector package identity, required before source identity can be resolved. */
+  connectorId?: string;
+  /** Expected source identity kind for manifest/definition cross-validation. */
+  sourceIdentityKind?: "single" | "device" | "connector";
   /** Test/embedding override; production uses the bundled Node runner. */
   runnerEntryPath?: string;
   /** Test/embedding override; production inherits the current Node 24 binary. */
@@ -246,7 +279,11 @@ export class ProcessRunnerSession implements RunnerSession {
   private proc: ChildProcess | undefined;
   private pending: PendingCommand | undefined;
   private inbox: RunnerToHostMessage[] = [];
-  private capabilities: (RunnerCapabilities | RunnerConfigUiCapabilities) | undefined;
+  private capabilities:
+    | RunnerCapabilities
+    | RunnerConfigUiCapabilities
+    | RunnerSourceIdentityCapabilities
+    | undefined;
   private reqIds: string[] = [];
   private exited = false;
   private killGraceMs: number;
@@ -296,7 +333,13 @@ export class ProcessRunnerSession implements RunnerSession {
     try {
       await this.expect(["hello"]);
       const loaded = await this.command(
-        { type: "load", entryPath: this.opts.entryPath, contentHash: this.opts.contentHash },
+        {
+          type: "load",
+          entryPath: this.opts.entryPath,
+          contentHash: this.opts.contentHash,
+          connectorId: this.opts.connectorId,
+          sourceIdentityKind: this.opts.sourceIdentityKind,
+        },
         ["loaded", "load-error"],
       );
       if (loaded.type === "load-error") {
@@ -331,7 +374,55 @@ export class ProcessRunnerSession implements RunnerSession {
     return reply.type === "requested" ? reply.status : null;
   }
 
+  async resolveSourceIdentity(
+    opts: RunnerSourceIdentityOptions,
+  ): Promise<ConnectorSourceIdentityResult> {
+    if (!this.opts.connectorId || this.opts.connectorId !== opts.connectorId) {
+      throw new Error(`Connector runner was not loaded for ${opts.connectorId}`);
+    }
+    connectorAuthHandle(opts.capabilities);
+    if (opts.signal.aborted) {
+      throw new Error("Connector source identity resolution was aborted");
+    }
+
+    this.capabilities = opts.capabilities;
+    const onAbort = () => this.forceKill();
+    opts.signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      const hasConfig = opts.config !== undefined;
+      const reply = await this.command(
+        {
+          type: "resolveSourceIdentity",
+          config: hasConfig ? opts.config : null,
+          configSet: hasConfig,
+          authType: opts.capabilities.authType,
+          providerOrigin: opts.capabilities.providerOrigin,
+        },
+        ["source-identity", "source-identity-error"],
+      );
+      if (reply.type === "source-identity-error") {
+        throw new Error(reply.message);
+      }
+      if (reply.type !== "source-identity") {
+        throw new Error("Connector source identity resolver did not return a result");
+      }
+      return {
+        key: reply.key,
+        ...(reply.label === undefined ? {} : { label: reply.label }),
+      };
+    } catch (err) {
+      if (opts.signal.aborted) {
+        throw new Error("Connector source identity resolution was aborted");
+      }
+      throw err;
+    } finally {
+      opts.signal.removeEventListener("abort", onAbort);
+      this.capabilities = undefined;
+    }
+  }
+
   async run(opts: RunnerRunOptions): Promise<void> {
+    connectorAuthHandle(opts.capabilities);
     this.capabilities = opts.capabilities;
     // run() owns abort handling for its duration: the session-level listener
     // would SIGKILL immediately and defeat the cooperative grace period, so it
@@ -361,6 +452,7 @@ export class ProcessRunnerSession implements RunnerSession {
           configSet: hasConfig,
           host: opts.host,
           authType: opts.capabilities.authType,
+          providerOrigin: opts.capabilities.providerOrigin,
         },
         ["done", "run-error"],
         { timeoutMs: 0 }, // runs are unbounded
@@ -625,6 +717,29 @@ function waitForChildSettlement(proc: ChildProcess, timeoutMs: number): Promise<
     proc.once("exit", finish);
     proc.once("close", finish);
   });
+}
+
+function connectorAuthHandle(
+  caps: RunnerSourceIdentityCapabilities,
+): ConnectorAuthHandle {
+  if (caps.authType === "managedProvider") {
+    if (typeof caps.providerOrigin !== "string" || !caps.providerOrigin) {
+      throw new Error("Connector managedProvider auth requires providerOrigin");
+    }
+    return {
+      type: "managedProvider",
+      getToken: () => caps.authGetToken(),
+      providerOrigin: caps.providerOrigin,
+    };
+  }
+  if (caps.providerOrigin !== undefined) {
+    throw new Error("Connector providerOrigin is only valid for managedProvider auth");
+  }
+  if (caps.authType === "none") return { type: "none" };
+  return {
+    type: caps.authType,
+    getToken: () => caps.authGetToken(),
+  };
 }
 
 function errorMessage(err: unknown): string {

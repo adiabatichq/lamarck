@@ -8,8 +8,6 @@ import type {
   ConnectorConfigOption,
   ConnectorConfigPanel,
   ConnectorConfigFieldType,
-  ConnectorIntegrationMode,
-  ConnectorIntegrationsSpec,
   ConnectorEventCatalog,
   ConnectorEventTypeDefinition,
   ConnectorManifest,
@@ -17,14 +15,20 @@ import type {
   ConnectorPlatformsSpec,
   ConnectorRuntimeMode,
   ConnectorRuntimeSpec,
+  ConnectorSourceIdentityKind,
+  ConnectorSourceSpec,
 } from "./types";
 import { validateConnectorSchedule } from "./schedule";
 
 const CONNECTOR_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
-const INTEGRATION_KEY_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const SOURCE_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$/;
 const EVENT_TYPE_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 const CONNECTOR_MODES = new Set<ConnectorRuntimeMode>(["watch", "poll", "manual"]);
-const INTEGRATION_MODES = new Set<ConnectorIntegrationMode>(["singleton", "multiple"]);
+const SOURCE_IDENTITY_KINDS = new Set<ConnectorSourceIdentityKind>([
+  "single",
+  "device",
+  "connector",
+]);
 const CONNECTOR_PLATFORMS = new Set<ConnectorPlatform>([
   "darwin",
   "linux",
@@ -46,14 +50,14 @@ const MANIFEST_FIELDS = new Set([
   "eventCatalog",
   "entry",
   "runtime",
-  "integrations",
+  "source",
   "platforms",
   "auth",
   "config",
   "configPanels",
 ]);
 const RUNTIME_FIELDS = new Set(["mode", "defaultSchedule"]);
-const INTEGRATIONS_FIELDS = new Set(["mode"]);
+const SOURCE_FIELDS = new Set(["identity"]);
 const PLATFORM_FIELDS = new Set(["requirements"]);
 const CONFIG_FIELD_FIELDS = new Set(["type", "label", "default", "options", "required"]);
 const CONFIG_OPTION_FIELDS = new Set(["value", "label"]);
@@ -80,9 +84,9 @@ export function validateConnectorId(id: string): void {
   }
 }
 
-export function validateIntegrationKey(key: string): void {
-  if (!INTEGRATION_KEY_PATTERN.test(key)) {
-    throw new Error(`Invalid connector integration key: ${key}`);
+export function validateSourceKey(key: string): void {
+  if (!SOURCE_KEY_PATTERN.test(key)) {
+    throw new Error(`Invalid connector source key: ${key}`);
   }
 }
 
@@ -113,7 +117,7 @@ export function validateConnectorManifest(value: unknown): ConnectorManifest {
   }
 
   const runtime = validateRuntimeSpec(connectorId, manifest.runtime);
-  const integrations = validateIntegrationsSpec(connectorId, manifest.integrations);
+  const source = validateSourceSpec(connectorId, manifest.source);
   const platforms = validatePlatformsSpec(connectorId, manifest.platforms);
   const auth = validateAuthSpec(connectorId, manifest.auth ?? { type: "none" });
   const config = validateConfigSchema(connectorId, manifest.config);
@@ -127,7 +131,7 @@ export function validateConnectorManifest(value: unknown): ConnectorManifest {
     eventCatalog,
     entry: manifest.entry,
     runtime,
-    integrations,
+    source,
     platforms,
     auth,
     ...(config === undefined ? {} : { config }),
@@ -311,19 +315,19 @@ function validateRuntimeSpec(connectorId: string, value: unknown): ConnectorRunt
   };
 }
 
-function validateIntegrationsSpec(connectorId: string, value: unknown): ConnectorIntegrationsSpec {
+function validateSourceSpec(connectorId: string, value: unknown): ConnectorSourceSpec {
   if (value === undefined) {
-    throw new Error(`Connector ${connectorId} requires an explicit integrations.mode (singleton or multiple)`);
+    throw new Error(`Connector ${connectorId} requires an explicit source.identity (single, device, or connector)`);
   }
-  const integrations = requirePlainObject(value, `Connector ${connectorId} integrations`);
-  assertAllowedFields(integrations, INTEGRATIONS_FIELDS, `Connector ${connectorId} integrations`);
-  if (integrations.mode === undefined) {
-    throw new Error(`Connector ${connectorId} requires an explicit integrations.mode (singleton or multiple)`);
+  const source = requirePlainObject(value, `Connector ${connectorId} source`);
+  assertAllowedFields(source, SOURCE_FIELDS, `Connector ${connectorId} source`);
+  if (source.identity === undefined) {
+    throw new Error(`Connector ${connectorId} requires an explicit source.identity (single, device, or connector)`);
   }
-  if (!INTEGRATION_MODES.has(integrations.mode as ConnectorIntegrationMode)) {
-    throw new Error(`Connector ${connectorId} has invalid integrations mode`);
+  if (!SOURCE_IDENTITY_KINDS.has(source.identity as ConnectorSourceIdentityKind)) {
+    throw new Error(`Connector ${connectorId} has invalid source identity`);
   }
-  return { mode: integrations.mode as ConnectorIntegrationMode };
+  return { identity: source.identity as ConnectorSourceIdentityKind };
 }
 
 function validateConfigPanels(

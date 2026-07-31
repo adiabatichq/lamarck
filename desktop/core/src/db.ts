@@ -18,7 +18,12 @@ export const SYSTEM_SCHEMA_V1 = `
 CREATE TABLE IF NOT EXISTS connector_integrations (
   id            TEXT PRIMARY KEY,
   connector_id  TEXT NOT NULL,
-  integration_key TEXT,
+  source_key    TEXT,
+  identity_status TEXT NOT NULL DEFAULT 'unresolved'
+                  CHECK (identity_status IN ('unresolved', 'resolved', 'conflict', 'changed', 'error')),
+  last_resolved_key TEXT,
+  display_name  TEXT,
+  suggested_label TEXT,
   status        TEXT NOT NULL DEFAULT 'idle',
   setup_status  TEXT NOT NULL DEFAULT 'ready',
   trust_status  TEXT NOT NULL DEFAULT 'missing',
@@ -43,14 +48,14 @@ CREATE INDEX IF NOT EXISTS idx_connector_integrations_connector
 CREATE INDEX IF NOT EXISTS idx_connector_integrations_status
   ON connector_integrations(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_integrations_identity
-  ON connector_integrations(connector_id, integration_key)
-  WHERE integration_key IS NOT NULL;
+  ON connector_integrations(connector_id, source_key)
+  WHERE source_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS connector_runs (
   id              TEXT PRIMARY KEY,
   integration_id  TEXT NOT NULL REFERENCES connector_integrations(id) ON DELETE CASCADE,
   connector_id    TEXT NOT NULL,
-  integration_key TEXT,
+  source_key      TEXT,
   trigger         TEXT NOT NULL,
   status          TEXT NOT NULL,
   started_at      INTEGER NOT NULL,

@@ -8,10 +8,17 @@
 
 import { pathToFileURL } from "url";
 import { validateConnectorDefinition } from "./runtime";
-import type { ConnectorConfigPatch, ConnectorDefinition, ConnectorRequirementStatus } from "./types";
+import type {
+  ConnectorAuthHandle,
+  ConnectorConfigPatch,
+  ConnectorDefinition,
+  ConnectorRequirementStatus,
+  ConnectorRuntimeAuthType,
+} from "./types";
 import type { HostToRunnerMessage, RunnerRpcMethod, RunnerToHostMessage } from "./runner-protocol";
 
 let definition: ConnectorDefinition | undefined;
+let connectorId: string | undefined;
 const abortController = new AbortController();
 
 let rpcSeq = 0;
@@ -41,8 +48,9 @@ async function handleMessage(msg: HostToRunnerMessage): Promise<void> {
         url.searchParams.set("hash", msg.contentHash);
         const mod = await import(url.href);
         const candidate = (mod.default ?? mod.connector) as ConnectorDefinition;
-        validateConnectorDefinition(candidate);
+        validateConnectorDefinition(candidate, msg.sourceIdentityKind);
         definition = candidate;
+        connectorId = msg.connectorId;
         send({
           type: "loaded",
           requirementIds: Object.keys(definition.requirements ?? {}),
@@ -86,6 +94,32 @@ async function handleMessage(msg: HostToRunnerMessage): Promise<void> {
       return;
     }
 
+    case "resolveSourceIdentity": {
+      if (!definition?.resolveSourceIdentity || !connectorId) {
+        send({
+          type: "source-identity-error",
+          message: "Connector runner has no loaded source identity resolver",
+        });
+        return;
+      }
+      try {
+        const result = await definition.resolveSourceIdentity({
+          connectorId,
+          auth: connectorAuthHandle(msg.authType, msg.providerOrigin),
+          config: msg.configSet ? msg.config : undefined,
+          signal: abortController.signal,
+        });
+        send({
+          type: "source-identity",
+          key: result.key,
+          ...(result.label === undefined ? {} : { label: result.label }),
+        });
+      } catch (err) {
+        send({ type: "source-identity-error", message: errorMessage(err) });
+      }
+      return;
+    }
+
     case "run": {
       if (!definition) {
         send({ type: "run-error", message: "Connector runner has no loaded definition" });
@@ -106,12 +140,7 @@ async function handleMessage(msg: HostToRunnerMessage): Promise<void> {
             set: (warning) => rpc<void>("warningSet", warning),
             clear: (key) => rpc<void>("warningClear", key),
           },
-          auth: msg.authType === "none"
-            ? { type: "none" }
-            : {
-              type: msg.authType as "apiKey" | "oauth2" | "managedProvider",
-              getToken: () => rpc<string>("authGetToken"),
-            },
+          auth: connectorAuthHandle(msg.authType, msg.providerOrigin),
           config: msg.configSet ? msg.config : undefined,
           host: msg.host,
           signal: abortController.signal,
@@ -172,6 +201,30 @@ async function handleMessage(msg: HostToRunnerMessage): Promise<void> {
       return;
     }
   }
+}
+
+function connectorAuthHandle(
+  authType: ConnectorRuntimeAuthType,
+  providerOrigin: string | undefined,
+): ConnectorAuthHandle {
+  if (authType === "managedProvider") {
+    if (typeof providerOrigin !== "string" || !providerOrigin) {
+      throw new Error("Connector managedProvider auth requires providerOrigin");
+    }
+    return {
+      type: "managedProvider",
+      getToken: () => rpc<string>("authGetToken"),
+      providerOrigin,
+    };
+  }
+  if (providerOrigin !== undefined) {
+    throw new Error("Connector providerOrigin is only valid for managedProvider auth");
+  }
+  if (authType === "none") return { type: "none" };
+  return {
+    type: authType,
+    getToken: () => rpc<string>("authGetToken"),
+  };
 }
 
 process.on("message", (msg) => {
