@@ -10,3 +10,4 @@ export * from "./scheduler";
 export * from "./schedule";
 export * from "./install";
 export * from "./registry";
+export * from "./source-identity";

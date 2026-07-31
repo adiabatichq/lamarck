@@ -28,6 +28,7 @@ import {
   resolveConnectorEntry,
   sourceForConnector,
   updateConnectorFromSource,
+  validateConnectorDefinition,
   validateConnectorEventCatalog,
   validateConnectorManifest,
   nextCronRunAt,
@@ -168,8 +169,8 @@ entry: ./index.mjs
 runtime:
   mode: poll
   defaultSchedule: "*/15 * * * *"
-integrations:
-  mode: multiple
+source:
+  identity: connector
 configPanels:
   privacy-controls:
     label: Privacy Controls
@@ -198,7 +199,7 @@ auth:
       eventCatalog: "./events.json",
       entry: "./index.mjs",
 	      runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
-	      integrations: { mode: "multiple" },
+	      source: { identity: "connector" },
 	      configPanels: {
 	        "privacy-controls": {
 	          label: "Privacy Controls",
@@ -234,8 +235,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
-integrations:
-  mode: singleton
+source:
+  identity: single
 auth:
   type: none
 `,
@@ -252,8 +253,6 @@ auth:
     const available = await listAvailableBuiltIns(templatesDir);
 
     expect(available.map(({ manifest }) => manifest.id).sort()).toEqual([
-      "app-commits",
-      "code-agent-transcripts",
       "local-git",
       "macos-ax",
       "oura",
@@ -274,13 +273,18 @@ auth:
       eventCatalog: "./events.json",
       entry: "./index.ts",
       runtime: { mode: "poll" },
-      integrations: { mode: "singleton" },
+      source: { identity: "single" },
     };
 
     expect(() => validateConnectorManifest({ ...base, id: "../demo" })).toThrow("Invalid connector id");
     expect(() =>
-      validateConnectorManifest({ ...base, integrations: undefined as any })
-    ).toThrow("requires an explicit integrations.mode");
+      validateConnectorManifest({ ...base, source: undefined as any })
+    ).toThrow("requires an explicit source.identity");
+    for (const identity of ["single", "device", "connector"] as const) {
+      expect(validateConnectorManifest({ ...base, source: { identity } }).source).toEqual({
+        identity,
+      });
+    }
     expect(() =>
       validateConnectorManifest({ ...base, runtime: { mode: "stream" as any } })
     ).toThrow("invalid runtime mode");
@@ -300,8 +304,8 @@ auth:
       validateConnectorManifest({ ...base, platforms: { haiku: {} } as any })
     ).toThrow("invalid platform");
 	    expect(() =>
-	      validateConnectorManifest({ ...base, integrations: { mode: "many" as any } })
-	    ).toThrow("invalid integrations mode");
+	      validateConnectorManifest({ ...base, source: { identity: "many" as any } })
+	    ).toThrow("invalid source identity");
 	    expect(() =>
 	      validateConnectorManifest({ ...base, configPanels: [] as any })
 	    ).toThrow("configPanels must be a map");
@@ -519,7 +523,7 @@ auth:
       eventCatalog: "./events.json",
       entry: "./index.mjs",
       runtime: { mode: "manual" },
-      integrations: { mode: "singleton" },
+      source: { identity: "single" },
       auth: { type: "none" },
     };
 
@@ -558,12 +562,16 @@ auth:
     );
     expect(() => validateConnectorManifest({
       ...base,
+      integrations: { mode: "singleton" },
+    })).toThrow("Connector manifest has unknown field: integrations");
+    expect(() => validateConnectorManifest({
+      ...base,
       runtime: { mode: "manual", unexpected: true },
     })).toThrow("runtime has unknown field: unexpected");
     expect(() => validateConnectorManifest({
       ...base,
-      integrations: { mode: "singleton", unexpected: true },
-    })).toThrow("integrations has unknown field: unexpected");
+      source: { identity: "single", unexpected: true },
+    })).toThrow("source has unknown field: unexpected");
     expect(() => validateConnectorManifest({
       ...base,
       platforms: { darwin: { requirements: [], unexpected: true } },
@@ -621,10 +629,27 @@ auth:
       eventCatalog: "./events.json",
       entry: "./index.mjs",
       runtime: { mode: "manual" },
-      integrations: { mode: "singleton" },
+      source: { identity: "single" },
       platforms: {},
       auth: { type: "none" },
     });
+  });
+
+  test("enforces source identity resolver exports at the manifest boundary", () => {
+    const run = vi.fn();
+    const resolveSourceIdentity = vi.fn(() => ({ key: "account-1" }));
+
+    expect(() => validateConnectorDefinition({ run }, "connector")).toThrow(
+      "source.identity=connector requires a resolveSourceIdentity",
+    );
+    expect(() => validateConnectorDefinition({ run, resolveSourceIdentity }, "single")).toThrow(
+      "source.identity=single forbids a resolveSourceIdentity",
+    );
+    expect(() => validateConnectorDefinition({ run, resolveSourceIdentity }, "device")).toThrow(
+      "source.identity=device forbids a resolveSourceIdentity",
+    );
+    expect(() => validateConnectorDefinition({ run, resolveSourceIdentity }, "connector"))
+      .not.toThrow();
   });
 
   test("strictly validates connector event catalogs", () => {
@@ -687,7 +712,7 @@ auth:
       eventCatalog: "./catalog/events.json",
       entry: "./index.mjs",
       runtime: { mode: "manual" },
-      integrations: { mode: "singleton" },
+      source: { identity: "single" },
       auth: { type: "none" },
     });
 
@@ -709,7 +734,7 @@ auth:
         eventCatalog,
         entry: "./index.mjs",
         runtime: { mode: "manual" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       });
 
@@ -745,7 +770,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       definition,
@@ -797,7 +822,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       { async run() {} },
@@ -860,7 +885,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       definition,
@@ -985,7 +1010,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
         config: {
           interval: { type: "number", label: "Interval", default: 5000 },
@@ -1045,7 +1070,7 @@ auth:
 	        eventCatalog: "./events.json",
 	        entry: "./index.ts",
 	        runtime: { mode: "manual" },
-	        integrations: { mode: "singleton" },
+	        source: { identity: "single" },
 	        auth: { type: "none" },
 	        config: {
 	          mode: { type: "string", label: "Mode", default: "rich-local" },
@@ -1104,7 +1129,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
         config: {
           region: {
@@ -1154,7 +1179,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
         config: {
           identity: { type: "string", label: "Identity", required: true },
@@ -1197,8 +1222,14 @@ auth:
     }
   });
 
-  test("supports multiple connector instances with separate sources and state", async () => {
-    const definition: ConnectorDefinition<{ externalId: string }, { seen: string }> = {
+  test("supports multiple connector instances with resolved source identities and separate state", async () => {
+    const definition: ConnectorDefinition<
+      { accountId: string; externalId: string },
+      { seen: string }
+    > = {
+      resolveSourceIdentity({ config }) {
+        return { key: config.accountId };
+      },
       async run({ guard, state, config }) {
         await guard.writeEvent({
           type: "calendar.event",
@@ -1219,16 +1250,24 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "multiple" },
+        source: { identity: "connector" },
         auth: { type: "none" },
       },
       definition,
     );
-    const personal = supervisor.ensureIntegration({ connectorId: "calendar", integrationKey: "personal", config: { externalId: "same" } });
-    const work = supervisor.ensureIntegration({ connectorId: "calendar", integrationKey: "work", config: { externalId: "same" } });
+    const personal = await supervisor.addIntegration({
+      connectorId: "calendar",
+      config: { accountId: "personal", externalId: "same" },
+    });
+    const work = await supervisor.addIntegration({
+      connectorId: "calendar",
+      config: { accountId: "work", externalId: "same" },
+    });
 
     expect(personal.id).not.toBe("calendar:personal");
     expect(work.id).not.toBe("calendar:work");
+    expect(personal).toMatchObject({ sourceKey: "personal", identityStatus: "resolved" });
+    expect(work).toMatchObject({ sourceKey: "work", identityStatus: "resolved" });
     await supervisor.run(personal.id);
     await supervisor.run(work.id);
 
@@ -1251,7 +1290,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       { async run() {} },
@@ -1265,42 +1304,94 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
-        integrations: { mode: "multiple" },
+        source: { identity: "connector" },
         auth: { type: "none" },
       },
-      { async run() {} },
+      {
+        async run() {},
+        resolveSourceIdentity({ config }) {
+          const accountId = (config as { accountId: string }).accountId;
+          return { key: accountId, label: `Suggested ${accountId}` };
+        },
+      },
     );
 
     expect(supervisor.listInstalledConnectors()).toEqual([
-      expect.objectContaining({ connectorId: "many-sources", integrationsMode: "multiple" }),
-      expect.objectContaining({ connectorId: "singleton-source", integrationsMode: "singleton" }),
+      expect.objectContaining({ connectorId: "many-sources", identityKind: "connector" }),
+      expect.objectContaining({ connectorId: "singleton-source", identityKind: "single" }),
     ]);
     expect(await supervisor.list()).toEqual([]);
 
-    const singleton = supervisor.addIntegration({ connectorId: "singleton-source" });
+    const [singleton, sameSingleton] = await Promise.all([
+      supervisor.addIntegration({ connectorId: "singleton-source" }),
+      supervisor.addIntegration({ connectorId: "singleton-source" }),
+    ]);
     expect(singleton.connectorId).toBe("singleton-source");
-    expect(() => supervisor.addIntegration({ connectorId: "singleton-source" }))
-      .toThrow("already has its singleton Source");
+    expect(sameSingleton.id).toBe(singleton.id);
+    expect((await supervisor.list()).filter(({ connectorId }) => connectorId === "singleton-source"))
+      .toHaveLength(1);
 
-    const draftOne = supervisor.addIntegration({ connectorId: "many-sources" });
-    const draftTwo = supervisor.addIntegration({ connectorId: "many-sources" });
-    expect(draftTwo.id).not.toBe(draftOne.id);
-    const work = supervisor.addIntegration({ connectorId: "many-sources", integrationKey: "work" });
-    expect(work.integrationKey).toBe("work");
-    expect(() => supervisor.addIntegration({ connectorId: "many-sources", integrationKey: "work" }))
-      .toThrow("already has Source work");
+    const personal = await supervisor.addIntegration({
+      connectorId: "many-sources",
+      config: { accountId: "personal" },
+    });
+    const work = await supervisor.addIntegration({
+      connectorId: "many-sources",
+      config: { accountId: "work" },
+    });
+    expect(work.id).not.toBe(personal.id);
+    expect(work).toMatchObject({
+      sourceKey: "work",
+      identityStatus: "resolved",
+      suggestedLabel: "Suggested work",
+    });
+
+    expect((await supervisor.list()).find(({ id }) => id === work.id)).toMatchObject({
+      name: "Suggested work",
+      connectorName: "Many Sources",
+    });
+    supervisor.renameIntegration(work.id, "My Work");
+    expect((await supervisor.list()).find(({ id }) => id === work.id)).toMatchObject({
+      name: "My Work",
+      displayName: "My Work",
+      sourceKey: "work",
+    });
+    supervisor.renameIntegration(work.id, null);
+    expect((await supervisor.list()).find(({ id }) => id === work.id)?.name)
+      .toBe("Suggested work");
+
+    const duplicate = await supervisor.addIntegration({
+      connectorId: "many-sources",
+      config: { accountId: "work" },
+    });
+    expect(duplicate).toMatchObject({
+      sourceKey: null,
+      lastResolvedKey: "work",
+      identityStatus: "conflict",
+    });
+    expect(duplicate.id).not.toBe(work.id);
+    expect((await supervisor.list()).find(({ id }) => id === duplicate.id)).toMatchObject({
+      conflictSourceId: work.id,
+      setupPending: expect.arrayContaining(["identity"]),
+    });
   });
 
-  test("edits a multi-integration setup row into a keyed integration", async () => {
-    const definition: ConnectorDefinition<{ externalId: string }, { seen: string }> = {
+  test("resolves connector-owned identity during setup and detects later identity changes", async () => {
+    const definition: ConnectorDefinition<
+      { "account-id": string; "external-id": string },
+      { seen: string }
+    > = {
+      resolveSourceIdentity({ config }) {
+        return { key: config["account-id"], label: `Account ${config["account-id"]}` };
+      },
       async run({ guard, state, config }) {
         await guard.writeEvent({
           type: "calendar.event",
-          externalId: config.externalId,
+          externalId: config["external-id"],
           startedAt: 2100,
-          payload: { id: config.externalId },
+          payload: { id: config["external-id"] },
         });
-        await state.set({ seen: config.externalId });
+        await state.set({ seen: config["external-id"] });
       },
     };
 
@@ -1313,30 +1404,38 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "multiple" },
+        source: { identity: "connector" },
         auth: { type: "none" },
+        config: {
+          "account-id": { type: "string", label: "Account ID" },
+          "external-id": { type: "string", label: "External ID" },
+        },
       },
       definition,
     );
 
     const setup = supervisor.ensureIntegration({ connectorId: "calendar" });
-    expect(setup.integrationKey).toBeUndefined();
+    expect(setup.sourceKey).toBeNull();
+    expect(setup.identityStatus).toBe("unresolved");
     expect(setup.setupStatus).toBe("setup");
-    expect((await supervisor.list())[0].source).toBeUndefined();
-    expect(() =>
-      supervisor.ensureIntegration({ connectorId: "calendar", setupStatus: "ready" })
-    ).toThrow("requires an integration_key");
-    expect(() =>
-      supervisor.updateIntegration(setup.id, { setupStatus: "ready" })
-    ).toThrow("requires an integration_key");
+    expect((await supervisor.list())[0].source).toBeNull();
+    expect((await supervisor.list())[0].setupPending).toEqual(
+      expect.arrayContaining(["identity", "config"]),
+    );
 
-    const ready = await supervisor.configureIntegration<{ externalId: string }, { seen: string }>(setup.id, {
-      integrationKey: "work",
-      setupStatus: "ready",
-      config: { externalId: "event-1" },
+    const ready = await supervisor.configureIntegration<
+      { "account-id": string; "external-id": string },
+      { seen: string }
+    >(setup.id, {
+      config: { "account-id": "work", "external-id": "event-1" },
     });
     expect(ready.id).toBe(setup.id);
-    expect(ready.integrationKey).toBe("work");
+    expect(ready).toMatchObject({
+      sourceKey: "work",
+      lastResolvedKey: "work",
+      identityStatus: "resolved",
+      suggestedLabel: "Account work",
+    });
     expect(ready.setupStatus).toBe("ready");
     expect((await supervisor.list())[0].source).toBe("connector:calendar:work");
 
@@ -1345,9 +1444,359 @@ auth:
     const event = dataDb.prepare("SELECT source, external_id FROM events").get() as any;
     expect(event).toEqual({ source: "connector:calendar:work", external_id: "event-1" });
     expect(supervisor.getIntegration(ready.id)?.syncState).toEqual({ seen: "event-1" });
-    expect(() =>
-      supervisor.updateIntegration(ready.id, { integrationKey: "personal" })
-    ).toThrow("rename requires an explicit migration");
+
+    const changed = await supervisor.configureIntegration(ready.id, {
+      config: { "account-id": "personal", "external-id": "event-2" },
+    });
+    expect(changed).toMatchObject({
+      sourceKey: "work",
+      lastResolvedKey: "personal",
+      identityStatus: "changed",
+    });
+    await expect(supervisor.run(ready.id)).rejects.toThrow("not set up");
+  });
+
+  test("delete and re-add reclaims the same Source key and absorbs a full rescan", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "reclaimed-source",
+        name: "Reclaimed Source",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: { type: "none" },
+      },
+      {
+        async resolveSourceIdentity() {
+          return { key: "stable-account" };
+        },
+        async run({ guard }) {
+          await guard.writeEvent({
+            type: "reclaimed-source.item",
+            externalId: "stable-item",
+            startedAt: 2_150,
+            payload: { complete: true },
+          });
+        },
+      },
+    );
+
+    const first = await supervisor.addIntegration({ connectorId: "reclaimed-source" });
+    await supervisor.run(first.id);
+    await supervisor.removeIntegration(first.id);
+
+    const second = await supervisor.addIntegration({ connectorId: "reclaimed-source" });
+    expect(second.id).not.toBe(first.id);
+    expect(second).toMatchObject({
+      sourceKey: "stable-account",
+      identityStatus: "resolved",
+    });
+    await supervisor.run(second.id);
+
+    expect(dataDb.prepare(
+      `SELECT source, external_id, COUNT(*) AS count
+       FROM events
+       WHERE type = 'reclaimed-source.item'`,
+    ).get()).toEqual({
+      source: "connector:reclaimed-source:stable-account",
+      external_id: "stable-item",
+      count: 1,
+    });
+  });
+
+  test("persists sanitized identity errors and resolves them only through explicit retry", async () => {
+    let failResolution = true;
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "retry-identity",
+        name: "Retry Identity",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: { type: "none" },
+      },
+      {
+        async run() {},
+        async resolveSourceIdentity() {
+          if (failResolution) {
+            throw new Error("Bearer super-secret access_token=also-secret");
+          }
+          return { key: "account-11", label: "Recovered account" };
+        },
+      },
+    );
+
+    const failed = await supervisor.addIntegration({ connectorId: "retry-identity" });
+    expect(failed).toMatchObject({
+      sourceKey: null,
+      identityStatus: "error",
+      setupStatus: "setup",
+    });
+    expect(failed.lastError).toContain("Bearer [redacted]");
+    expect(failed.lastError).not.toContain("super-secret");
+    expect(failed.lastError).not.toContain("also-secret");
+
+    failResolution = false;
+    const recovered = await supervisor.retrySourceIdentity(failed.id);
+    expect(recovered).toMatchObject({
+      sourceKey: "account-11",
+      lastResolvedKey: "account-11",
+      identityStatus: "resolved",
+      suggestedLabel: "Recovered account",
+      setupStatus: "ready",
+      lastError: undefined,
+    });
+    await expect(supervisor.retrySourceIdentity(failed.id)).rejects.toThrow("already resolved");
+  });
+
+  test("startup recovery retries durable identity errors through the ordinary setup path", async () => {
+    let resolverAvailable = false;
+    const manifest: ConnectorManifest = {
+      manifestVersion: 1,
+      id: "startup-identity-error",
+      name: "Startup Identity Error",
+      description: "Test connector manifest.",
+      eventCatalog: "./events.json",
+      entry: "./index.ts",
+      runtime: { mode: "manual" },
+      source: { identity: "connector" },
+      auth: { type: "none" },
+    };
+    const definition: ConnectorDefinition = {
+      async run() {},
+      async resolveSourceIdentity() {
+        if (!resolverAvailable) throw new Error("provider temporarily unavailable");
+        return { key: "recovered-account" };
+      },
+    };
+    supervisor.register(manifest, definition);
+    const failed = await supervisor.addIntegration({ connectorId: manifest.id });
+    expect(failed.identityStatus).toBe("error");
+
+    resolverAvailable = true;
+    const restarted = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+    });
+    restarted.register(manifest, definition);
+    await restarted.recoverSourceIdentities();
+    expect(restarted.getIntegration(failed.id)).toMatchObject({
+      sourceKey: "recovered-account",
+      identityStatus: "resolved",
+      setupStatus: "ready",
+    });
+  });
+
+  test("startup recovery reclaims a conflicted key after its owning Source is deleted", async () => {
+    const manifest: ConnectorManifest = {
+      manifestVersion: 1,
+      id: "startup-identity-conflict",
+      name: "Startup Identity Conflict",
+      description: "Test connector manifest.",
+      eventCatalog: "./events.json",
+      entry: "./index.ts",
+      runtime: { mode: "manual" },
+      source: { identity: "connector" },
+      auth: { type: "none" },
+    };
+    const definition: ConnectorDefinition<{ account: string }> = {
+      async run() {},
+      resolveSourceIdentity({ config }) {
+        return { key: config.account };
+      },
+    };
+    supervisor.register(manifest, definition);
+    const owner = await supervisor.addIntegration({
+      connectorId: manifest.id,
+      config: { account: "shared-account" },
+    });
+    const conflicted = await supervisor.addIntegration({
+      connectorId: manifest.id,
+      config: { account: "shared-account" },
+    });
+    expect(conflicted).toMatchObject({
+      sourceKey: null,
+      lastResolvedKey: "shared-account",
+      identityStatus: "conflict",
+    });
+    await supervisor.removeIntegration(owner.id);
+
+    const restarted = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+    });
+    restarted.register(manifest, definition);
+    await restarted.recoverSourceIdentities();
+    expect(restarted.getIntegration(conflicted.id)).toMatchObject({
+      sourceKey: "shared-account",
+      lastResolvedKey: "shared-account",
+      identityStatus: "resolved",
+      setupStatus: "ready",
+    });
+  });
+
+  test("fences connector-scoped identity mutations from runs and concurrent writes", async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const resolverEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const resolverRelease = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "identity-fence",
+        name: "Identity Fence",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: { type: "none" },
+      },
+      {
+        async run() {},
+        async resolveSourceIdentity({ config }) {
+          entered();
+          await resolverRelease;
+          return { key: (config as { accountId: string }).accountId };
+        },
+      },
+    );
+    const first = supervisor.ensureIntegration({
+      connectorId: "identity-fence",
+      config: { accountId: "first" },
+    });
+    const second = supervisor.ensureIntegration({
+      connectorId: "identity-fence",
+      config: { accountId: "second" },
+    });
+
+    const pending = supervisor.retrySourceIdentity(first.id);
+    await resolverEntered;
+
+    expect(() => supervisor.start(first.id)).toThrow("identity mutation in progress");
+    await expect(supervisor.retrySourceIdentity(second.id)).rejects.toThrow(
+      "identity mutation in progress",
+    );
+    await expect(supervisor.configureIntegration(second.id, {
+      config: { accountId: "changed-while-fenced" },
+    })).rejects.toThrow("identity mutation in progress");
+    expect(supervisor.getIntegration(second.id)?.config).toEqual({ accountId: "second" });
+
+    release();
+    await expect(pending).resolves.toMatchObject({
+      sourceKey: "first",
+      identityStatus: "resolved",
+    });
+  });
+
+  test("fails closed when a connector Source has an invalid resolved/null identity pair", async () => {
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "invalid-identity-pair",
+        name: "Invalid Identity Pair",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: { type: "none" },
+      },
+      {
+        async run() {},
+        async resolveSourceIdentity() {
+          return { key: "valid-key" };
+        },
+      },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "invalid-identity-pair" });
+    systemDb.prepare(
+      `UPDATE connector_integrations
+       SET identity_status = 'resolved', source_key = NULL, setup_status = 'ready'
+       WHERE id = ?`,
+    ).run(source.id);
+
+    expect((await supervisor.list())[0]).toMatchObject({
+      source: null,
+      setupStatus: "setup",
+      setupPending: expect.arrayContaining(["identity"]),
+    });
+    await expect(supervisor.run(source.id)).rejects.toThrow("Source identity is not resolved");
+  });
+
+  test("classifies device Source ownership and blocks non-owning devices", async () => {
+    const registration = {
+      manifestVersion: 1,
+      id: "device-owned-feed",
+      name: "Device Owned Feed",
+      description: "Test connector manifest.",
+      eventCatalog: "./events.json",
+      entry: "./index.ts",
+      runtime: { mode: "watch" as const },
+      source: { identity: "device" as const },
+      auth: { type: "none" as const },
+    } satisfies ConnectorManifest;
+    const definition = { async run() {} };
+    const makeSupervisor = (deviceIdentity: { status: "resolved"; value: string } | {
+      status: "unavailable";
+      reason: string;
+    }) => new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      deviceIdentity,
+      deviceDisplayName: "Test Mac",
+    });
+
+    const owning = makeSupervisor({ status: "resolved", value: "device-a" });
+    owning.register(registration, definition);
+    const source = await owning.addIntegration({ connectorId: registration.id });
+    expect(source).toMatchObject({
+      sourceKey: "device-a",
+      identityStatus: "resolved",
+      suggestedLabel: "Test Mac",
+    });
+    expect((await owning.list())[0]).toMatchObject({ ownership: "here" });
+    await expect(owning.addIntegration({ connectorId: registration.id }))
+      .rejects.toThrow("already has a Source for this device");
+
+    const other = makeSupervisor({ status: "resolved", value: "device-b" });
+    other.register(registration, definition);
+    expect((await other.list())[0]).toMatchObject({ ownership: "other-device" });
+    await expect(other.run(source.id)).rejects.toThrow("belongs to another device");
+    const otherScheduler = new ConnectorScheduler({ supervisor: other, tickMs: 60_000 });
+    await otherScheduler.start();
+    expect((await other.list())[0].running).toBe(false);
+    await otherScheduler.stop();
+
+    const unknown = makeSupervisor({ status: "unavailable", reason: "machine id unavailable" });
+    unknown.register(registration, definition);
+    expect((await unknown.list())[0]).toMatchObject({
+      ownership: "device-unknown",
+      ownershipReason: "machine id unavailable",
+    });
+    await expect(unknown.run(source.id)).rejects.toThrow("Device identity unavailable");
+    await expect(unknown.addIntegration({ connectorId: registration.id }))
+      .rejects.toThrow("Device identity unavailable");
+    const unknownScheduler = new ConnectorScheduler({ supervisor: unknown, tickMs: 60_000 });
+    await unknownScheduler.start();
+    expect((await unknown.list())[0].running).toBe(false);
+    await unknownScheduler.stop();
   });
 
   test("provides auth as a capability handle", async () => {
@@ -1374,7 +1823,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "apiKey", label: "Oura Token" },
       },
       definition,
@@ -1382,9 +1831,8 @@ auth:
     const integration = supervisor.ensureIntegration({ connectorId: "oura" });
     expect(integration.setupStatus).toBe("setup");
     await expect(supervisor.connectIntegration(integration.id)).rejects.toThrow("requires credentials");
-    expect(() =>
-      supervisor.updateIntegration(integration.id, { setupStatus: "ready" })
-    ).toThrow("requires credentials");
+    expect(supervisor.updateIntegration(integration.id, { setupStatus: "ready" }).setupStatus)
+      .toBe("setup");
     await supervisor.getAuthManager().setToken(integration.authRef!, "secret-token");
     const ready = await supervisor.connectIntegration(integration.id);
     expect(
@@ -1418,7 +1866,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -1456,7 +1904,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -1485,7 +1933,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -1529,7 +1977,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -1581,7 +2029,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "apiKey" },
       },
       {
@@ -1617,7 +2065,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "apiKey" },
       },
       {
@@ -1669,7 +2117,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -1723,7 +2171,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -1763,7 +2211,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "apiKey" },
       },
       { async run() {} },
@@ -1784,7 +2232,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "apiKey" },
       },
       {
@@ -1819,7 +2267,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "multiple" },
+        source: { identity: "single" },
         platforms: {
           darwin: {
             requirements: ["macos-accessibility"],
@@ -1850,7 +2298,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         platforms: {
           darwin: { requirements: ["macos-accessibility"] },
         },
@@ -1892,9 +2340,8 @@ auth:
     await expect(supervisor.run(integration.id)).rejects.toThrow("not set up");
 
     // setupStatus cannot bypass the requirement gate.
-    expect(() =>
-      supervisor.updateIntegration(integration.id, { setupStatus: "ready" })
-    ).toThrow("requires platform requirements");
+    expect(supervisor.updateIntegration(integration.id, { setupStatus: "ready" }).setupStatus)
+      .toBe("setup");
 
     // check() persists status and keeps the integration in setup.
     const missing = await supervisor.checkIntegrationRequirements(integration.id);
@@ -1938,7 +2385,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         platforms: {
           darwin: { requirements: ["macos-accessibility"] },
         },
@@ -2004,7 +2451,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         platforms: {
           darwin: { requirements: ["macos-accessibility"] },
         },
@@ -2038,8 +2485,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: poll
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin:
     requirements:
@@ -2090,7 +2537,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -2134,7 +2581,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -2173,10 +2620,16 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "multiple" },
+        source: { identity: "connector" },
         auth: { type: "none" },
+        config: {
+          "account-id": { type: "string", label: "Account ID" },
+        },
       },
       {
+        resolveSourceIdentity({ config }) {
+          return { key: (config as { "account-id": string })["account-id"] };
+        },
         async run({ signal, warnings }) {
           starts += 1;
           await warnings.set({
@@ -2197,15 +2650,17 @@ auth:
     const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
 
     await scheduler.start();
-    const draft = supervisor.addIntegration({ connectorId: "new-source-watch" });
+    const draft = await supervisor.addIntegration({ connectorId: "new-source-watch" });
     expect(draft.setupStatus).toBe("setup");
+    expect(draft.identityStatus).toBe("unresolved");
     expect(reconcileReasons).toEqual([]);
     expect(starts).toBe(0);
 
-    const ready = supervisor.addIntegration({
+    const ready = await supervisor.addIntegration({
       connectorId: "new-source-watch",
-      integrationKey: "device-a",
+      config: { "account-id": "device-a" },
     });
+    expect(ready).toMatchObject({ sourceKey: "device-a", identityStatus: "resolved" });
     expect(ready.setupStatus).toBe("ready");
     expect(reconcileReasons).toEqual([
       { instanceId: ready.id, reason: "source_created" },
@@ -2226,7 +2681,7 @@ auth:
     await scheduler.stop();
   });
 
-  test("integration-key readiness promotion immediately wakes an idle watch Source", async () => {
+  test("identity resolution during configuration immediately wakes an idle watch Source", async () => {
     let starts = 0;
     supervisor.register(
       {
@@ -2237,10 +2692,16 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "multiple" },
+        source: { identity: "connector" },
         auth: { type: "none" },
+        config: {
+          "account-id": { type: "string", label: "Account ID" },
+        },
       },
       {
+        resolveSourceIdentity({ config }) {
+          return { key: (config as { "account-id": string })["account-id"] };
+        },
         async run({ signal }) {
           starts += 1;
           await new Promise<void>((resolve) => {
@@ -2262,10 +2723,11 @@ auth:
     expect(starts).toBe(0);
 
     const ready = await supervisor.configureIntegration(integration.id, {
-      integrationKey: "device-a",
+      config: { "account-id": "device-a" },
     });
+    expect(ready).toMatchObject({ sourceKey: "device-a", identityStatus: "resolved" });
     expect(ready.setupStatus).toBe("ready");
-    expect(reconcileReasons).toEqual(["readiness_changed"]);
+    expect(reconcileReasons).toEqual(["config_changed"]);
     expect(await waitWithTestTimeout((async () => {
       while (starts < 1) await new Promise((resolve) => setTimeout(resolve, 1));
     })(), 2_000)).toBe(true);
@@ -2284,7 +2746,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
         config: {
           label: { type: "string", label: "Label" },
@@ -2355,7 +2817,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
         config: {
           label: { type: "string", label: "Label", default: "old" },
@@ -2423,6 +2885,174 @@ auth:
     expect((await supervisor.list())[0].recentRuns[0].status).toBe("aborted");
   });
 
+  test("persists a connector API key only after the active attempt settles", async () => {
+    let attemptSignal: AbortSignal | undefined;
+    let markAttemptStarted!: () => void;
+    let releaseAttempt!: () => void;
+    const attemptStarted = new Promise<void>((resolve) => {
+      markAttemptStarted = resolve;
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "identity-credential-fence",
+        name: "Identity Credential Fence",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: { type: "apiKey" },
+      },
+      {
+        async resolveSourceIdentity({ auth }) {
+          if (auth.type === "none") throw new Error("expected auth");
+          return { key: await auth.getToken() };
+        },
+        async run({ signal }) {
+          attemptSignal = signal;
+          markAttemptStarted();
+          await new Promise<void>((resolve) => {
+            releaseAttempt = resolve;
+          });
+        },
+      },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "identity-credential-fence" });
+    const connected = await supervisor.connectIntegrationWithToken(source.id, "old-token");
+    expect(connected).toMatchObject({ sourceKey: "old-token", identityStatus: "resolved" });
+    const handle = supervisor.start(source.id, { trigger: "manual" });
+    await attemptStarted;
+
+    let connectSettled = false;
+    const reconnecting = supervisor.connectIntegrationWithToken(source.id, "new-token")
+      .finally(() => {
+        connectSettled = true;
+      });
+    expect(await waitWithTestTimeout((async () => {
+      while (!attemptSignal?.aborted) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+
+    expect(connectSettled).toBe(false);
+    expect(JSON.parse((await secrets.get(source.authRef!))!)).toMatchObject({
+      kind: "apiKey",
+      value: "old-token",
+    });
+    await expect(supervisor.connectIntegrationWithToken(source.id, "third-token"))
+      .rejects.toThrow("identity mutation in progress");
+
+    releaseAttempt();
+    await expect(reconnecting).resolves.toMatchObject({
+      sourceKey: "old-token",
+      lastResolvedKey: "new-token",
+      identityStatus: "changed",
+    });
+    expect(JSON.parse((await secrets.get(source.authRef!))!)).toMatchObject({
+      kind: "apiKey",
+      value: "new-token",
+    });
+    expect(await waitWithTestTimeout(handle.promise, 2_000)).toBe(true);
+    expect(handle.signal.aborted).toBe(true);
+  });
+
+  test("same-key identity mutation replaces one run attempt while changed identity blocks it", async () => {
+    const resolutions: string[] = [];
+    const attempts: Array<{ account: string; revision: string }> = [];
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "identity-run-intent",
+        name: "Identity Run Intent",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: { type: "none" },
+        config: {
+          account: { type: "string", label: "Account" },
+          revision: { type: "string", label: "Revision" },
+        },
+      },
+      {
+        resolveSourceIdentity({ config }) {
+          const value = config as { account: string; revision: string };
+          resolutions.push(value.revision);
+          return { key: value.account, label: `Suggested ${value.revision}` };
+        },
+        async run({ config, guard, signal }) {
+          const value = config as { account: string; revision: string };
+          attempts.push(value);
+          await guard.writeEvent({
+            type: "identity.intent",
+            externalId: value.revision,
+            startedAt: attempts.length,
+            payload: value,
+          });
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const source = await supervisor.addIntegration({
+      connectorId: "identity-run-intent",
+      config: { account: "work", revision: "old" },
+    });
+    supervisor.renameIntegration(source.id, "Pinned source name");
+    const handle = supervisor.start(source.id, { trigger: "manual" });
+    expect(await waitWithTestTimeout((async () => {
+      while (attempts.length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+
+    const same = await supervisor.configureIntegration(source.id, {
+      config: { account: "work", revision: "same-key" },
+    });
+    expect(same).toMatchObject({
+      sourceKey: "work",
+      identityStatus: "resolved",
+      suggestedLabel: "Suggested same-key",
+      displayName: "Pinned source name",
+    });
+    expect(await waitWithTestTimeout((async () => {
+      while (attempts.length < 2) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+    expect(handle.signal.aborted).toBe(false);
+    expect(resolutions).toEqual(["old", "same-key"]);
+    expect(attempts.map(({ revision }) => revision)).toEqual(["old", "same-key"]);
+    expect((await supervisor.list())[0]).toMatchObject({
+      name: "Pinned source name",
+      running: true,
+      recentRuns: [expect.objectContaining({ status: "running" })],
+    });
+
+    const changed = await supervisor.configureIntegration(source.id, {
+      config: { account: "personal", revision: "changed-key" },
+    });
+    expect(changed).toMatchObject({
+      sourceKey: "work",
+      lastResolvedKey: "personal",
+      identityStatus: "changed",
+      suggestedLabel: "Suggested changed-key",
+      displayName: "Pinned source name",
+    });
+    expect(await waitWithTestTimeout(handle.promise, 2_000)).toBe(true);
+    expect(handle.signal.aborted).toBe(true);
+    expect(attempts.map(({ revision }) => revision)).toEqual(["old", "same-key"]);
+    expect((await supervisor.list())[0]).toMatchObject({
+      name: "Pinned source name",
+      running: false,
+      setupPending: expect.arrayContaining(["identity"]),
+    });
+    expect(dataDb.prepare(
+      "SELECT source, external_id FROM events WHERE type = 'identity.intent' ORDER BY started_at",
+    ).all()).toEqual([
+      { source: "connector:identity-run-intent:work", external_id: "old" },
+      { source: "connector:identity-run-intent:work", external_id: "same-key" },
+    ]);
+  });
+
   test("explicit credential connect wakes an idle watch and reconnect replaces its active attempt", async () => {
     const tokens: string[] = [];
     const signals: AbortSignal[] = [];
@@ -2435,7 +3065,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "apiKey" },
       },
       {
@@ -2490,7 +3120,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
         config: {
           label: { type: "string", label: "Label", default: "old" },
@@ -2549,7 +3179,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
         config: {
           identity: { type: "string", label: "Identity" },
@@ -2594,7 +3224,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
         config: {
           label: { type: "string", label: "Label", default: "old" },
@@ -2659,7 +3289,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
         config: {
           label: { type: "string", label: "Label", default: "old" },
@@ -2680,7 +3310,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -2829,7 +3459,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -2873,7 +3503,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -2916,7 +3546,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -2947,7 +3577,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -2994,7 +3624,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       { async run() { runs += 1; } },
@@ -3026,7 +3656,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       { async run() { runs += 1; } },
@@ -3051,7 +3681,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -3087,7 +3717,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll", defaultSchedule: "*/15 * * * *" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       {
@@ -3136,8 +3766,8 @@ entry: ./index.mjs
 runtime:
   mode: poll
   defaultSchedule: "*/15 * * * *"
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -6349,6 +6979,47 @@ auth:
     ]);
   });
 
+  test("telegram-bot resolves Source identity from getMe and rejects invalid bot ids", async () => {
+    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { resolveSourceIdentity } = await import(telegramUrl) as {
+      resolveSourceIdentity(context: unknown, deps?: unknown): Promise<{
+        key: string;
+        label?: string;
+      }>;
+    };
+    const signal = new AbortController().signal;
+    const context = {
+      auth: {
+        type: "apiKey",
+        async getToken() {
+          return "telegram-token";
+        },
+      },
+      config: {},
+      signal,
+    };
+    const requests: Array<{ url: string; init: RequestInit }> = [];
+
+    await expect(resolveSourceIdentity(context, {
+      fetchImpl: async (url: string, init: RequestInit) => {
+        requests.push({ url: String(url), init });
+        return Response.json({
+          ok: true,
+          result: { id: 42, username: "lamarck_test_bot" },
+        });
+      },
+    })).resolves.toEqual({ key: "42", label: "lamarck_test_bot" });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].url).toContain("/bottelegram-token/getMe");
+    expect(requests[0].init).toMatchObject({ method: "POST", signal });
+
+    for (const id of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, 1e100, "42"]) {
+      await expect(resolveSourceIdentity(context, {
+        fetchImpl: async () => Response.json({ ok: true, result: { id } }),
+      })).rejects.toThrow("invalid bot id");
+    }
+  });
+
   test("telegram-bot connect verifies bot identity and stores connection state", async () => {
     const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
     const { connectOnce } = await import(telegramUrl) as {
@@ -7057,6 +7728,56 @@ auth:
     });
   });
 
+  test("oura resolves Source identity through the managed provider origin", async () => {
+    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const { resolveSourceIdentity } = await import(ouraUrl) as {
+      resolveSourceIdentity(context: unknown, deps?: unknown): Promise<{
+        key: string;
+        label?: string;
+      }>;
+    };
+    const signal = new AbortController().signal;
+    const context = {
+      auth: {
+        type: "managedProvider",
+        providerOrigin: "https://api.example.test",
+        async getToken() {
+          return "oura-capability-token";
+        },
+      },
+      config: {},
+      signal,
+    };
+    const requests: Array<{ url: string; init: RequestInit }> = [];
+
+    await expect(resolveSourceIdentity(context, {
+      fetchImpl: async (url: string, init: RequestInit) => {
+        requests.push({ url: String(url), init });
+        return Response.json({ id: "oura-user-7", email: "alice@example.test" });
+      },
+    })).resolves.toEqual({ key: "oura-user-7", label: "alice@example.test" });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].url).toBe("https://api.example.test/providers/oura/v1/identity");
+    expect(requests[0].init).toMatchObject({
+      method: "GET",
+      signal,
+      headers: {
+        Accept: "application/json",
+        Authorization: "Bearer oura-capability-token",
+      },
+    });
+
+    await expect(resolveSourceIdentity({
+      ...context,
+      auth: { ...context.auth, providerOrigin: undefined },
+    }, {
+      fetchImpl: async () => Response.json({ id: "unused" }),
+    })).rejects.toThrow("managed provider origin is unavailable");
+    await expect(resolveSourceIdentity(context, {
+      fetchImpl: async () => Response.json({ email: "missing-id@example.test" }),
+    })).rejects.toThrow("missing a stable id");
+  });
+
   test("oura sync uses revision-aware external ids and per-stream cursors", async () => {
     const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(ouraUrl) as {
@@ -7070,6 +7791,7 @@ auth:
     const context = {
       auth: {
         type: "managedProvider",
+        providerOrigin: "https://dev-api.example.test",
         async getToken() {
           return "oura-token";
         },
@@ -7175,6 +7897,7 @@ auth:
     const context = {
       auth: {
         type: "managedProvider",
+        providerOrigin: "https://dev-api.example.test",
         async getToken() {
           return "oura-token";
         },
@@ -7269,6 +7992,7 @@ auth:
     const context = {
       auth: {
         type: "managedProvider",
+        providerOrigin: "https://dev-api.example.test",
         async getToken() {
           return "oura-token";
         },
@@ -7330,6 +8054,7 @@ auth:
     const context = {
       auth: {
         type: "managedProvider",
+        providerOrigin: "https://dev-api.example.test",
         async getToken() {
           return "oura-token";
         },
@@ -7450,6 +8175,7 @@ auth:
     const context = {
       auth: {
         type: "managedProvider",
+        providerOrigin: "https://dev-api.example.test",
         async getToken() {
           return "oura-token";
         },
@@ -7550,6 +8276,7 @@ auth:
     const context = {
       auth: {
         type: "managedProvider",
+        providerOrigin: "https://dev-api.example.test",
         async getToken() {
           return "oura-token";
         },
@@ -7672,6 +8399,7 @@ auth:
     const context = {
       auth: {
         type: "managedProvider",
+        providerOrigin: "https://dev-api.example.test",
         async getToken() {
           return "oura-token";
         },
@@ -7768,6 +8496,7 @@ auth:
     const context = {
       auth: {
         type: "managedProvider",
+        providerOrigin: "https://dev-api.example.test",
         async getToken() {
           return "oura-token";
         },
@@ -7845,8 +8574,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -7915,7 +8644,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.mjs",
         runtime: { mode: "watch" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         platforms: { darwin: {} },
         auth: { type: "none" },
       }),
@@ -7951,7 +8680,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "manual" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: { type: "none" },
       },
       { async run() {} },
@@ -7977,7 +8706,7 @@ auth:
   function writeBuiltIn(
     builtinsDir: string,
     id: string,
-    integrationsMode: "singleton" | "multiple" = "singleton",
+    identityKind: "single" | "connector" = "single",
   ): string {
     const dir = join(builtinsDir, id);
     mkdirSync(dir, { recursive: true });
@@ -7991,15 +8720,26 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
-integrations:
-  mode: ${integrationsMode}
+source:
+  identity: ${identityKind}
 platforms:
   darwin: {}
 auth:
   type: none
 `,
     );
-    writeFileSync(join(dir, "index.mjs"), "export default { async run() {} };\n");
+    writeFileSync(
+      join(dir, "index.mjs"),
+      identityKind === "connector"
+        ? `export default {
+  async run() {},
+  async resolveSourceIdentity({ config }) {
+    return { key: String(config?.accountId ?? "work") };
+  },
+};
+`
+        : "export default { async run() {} };\n",
+    );
     return dir;
   }
 
@@ -8012,7 +8752,7 @@ auth:
       eventCatalog: "./events.json",
       entry: "./index.mjs",
       runtime: { mode: "manual" },
-      integrations: { mode: "singleton" },
+      source: { identity: "single" },
       auth: { type: "none" },
     } as ConnectorManifest);
     expect(isPlatformSupported(manifest, "darwin")).toBe(true);
@@ -8077,7 +8817,7 @@ auth:
   test("updates a same-id Connector by hash while preserving every Source", async () => {
     const guard = new Guard({ db: dataDb, source: "system:test" });
     const builtins = join(workspace, "builtins");
-    const candidateDir = writeBuiltIn(builtins, "seed", "multiple");
+    const candidateDir = writeBuiltIn(builtins, "seed", "connector");
     await installConnectorFromSource({
       sourceDir: candidateDir,
       workspacePath: workspace,
@@ -8086,10 +8826,10 @@ auth:
     });
     const installedDir = join(workspace, "connectors", "seed");
     await supervisor.registerDirectory(installedDir);
-    const source = supervisor.addIntegration({
+    await supervisor.approveCurrentPackage("seed");
+    const source = await supervisor.addIntegration({
       connectorId: "seed",
-      integrationKey: "work",
-      config: { folder: "inbox" },
+      config: { accountId: "work", folder: "inbox" },
       scheduleCron: "0 * * * *",
     });
     systemDb.prepare(
@@ -8100,7 +8840,11 @@ auth:
 
     writeFileSync(
       join(candidateDir, "index.mjs"),
-      "export default { async run() { /* revision 2 */ } };\n",
+      `export default {
+  async run() { /* revision 2 */ },
+  async resolveSourceIdentity() { return { key: "work", label: "revision-2" }; },
+};
+`,
     );
     const newHash = await hashConnectorPackage(candidateDir);
     expect(newHash).not.toBe(oldHash);
@@ -8119,10 +8863,19 @@ auth:
     });
     expect(readFileSync(join(installedDir, "index.mjs"), "utf8")).toContain("revision 2");
 
+    const awaitingApproval = supervisor.getIntegration(source.id)!;
+    expect(awaitingApproval).toMatchObject({
+      sourceKey: "work",
+      identityStatus: "error",
+      setupStatus: "setup",
+    });
+    await supervisor.approveCurrentPackage("seed");
     const preserved = supervisor.getIntegration(source.id)!;
     expect(preserved.id).toBe(source.id);
-    expect(preserved.integrationKey).toBe("work");
-    expect(preserved.config).toEqual({ folder: "inbox" });
+    expect(preserved.sourceKey).toBe("work");
+    expect(preserved.identityStatus).toBe("resolved");
+    expect(preserved.suggestedLabel).toBe("revision-2");
+    expect(preserved.config).toEqual({ accountId: "work", folder: "inbox" });
     expect(preserved.syncState).toEqual({ cursor: 42 });
     expect(preserved.scheduleCron).toBe("0 * * * *");
     expect(preserved.pausedAt).toBe(paused.pausedAt);
@@ -8151,10 +8904,115 @@ auth:
     ).toMatchObject({ n: 1 });
   });
 
+  test("rejects a package update while credential-driven identity resolution owns the Connector", async () => {
+    const guard = new Guard({ db: dataDb, source: "system:test" });
+    const sourceDir = join(workspace, "builtins", "credential-update-fence");
+    const enteredPath = join(workspace, "identity-resolver-entered");
+    const releasePath = join(workspace, "identity-resolver-release");
+    mkdirSync(sourceDir, { recursive: true });
+    writeConnectorManifestFixture(
+      join(sourceDir, "connector.yaml"),
+      `manifestVersion: 1
+id: credential-update-fence
+name: Credential Update Fence
+description: Test connector manifest.
+eventCatalog: ./events.json
+entry: ./index.mjs
+runtime:
+  mode: manual
+source:
+  identity: connector
+platforms:
+  darwin: {}
+auth:
+  type: apiKey
+`,
+    );
+    const packageSource = (revision: number) => `
+import { existsSync, writeFileSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+export default {
+  async run() {},
+  async resolveSourceIdentity({ auth }) {
+    const token = await auth.getToken();
+    if (token === "new-token") {
+      writeFileSync(${JSON.stringify(enteredPath)}, "entered");
+      while (!existsSync(${JSON.stringify(releasePath)})) await delay(5);
+    }
+    return { key: "same-account", label: "revision-${revision}" };
+  },
+};
+`;
+    writeFileSync(join(sourceDir, "index.mjs"), packageSource(1));
+    await installConnectorFromSource({
+      sourceDir,
+      workspacePath: workspace,
+      connectorId: "credential-update-fence",
+      guard,
+    });
+    const installedDir = join(workspace, "connectors", "credential-update-fence");
+    await supervisor.registerDirectory(installedDir);
+    await supervisor.approveCurrentPackage("credential-update-fence");
+    const source = supervisor.ensureIntegration({ connectorId: "credential-update-fence" });
+    await expect(supervisor.connectIntegrationWithToken(source.id, "old-token"))
+      .resolves.toMatchObject({ sourceKey: "same-account", identityStatus: "resolved" });
+
+    writeFileSync(join(sourceDir, "index.mjs"), packageSource(2));
+    const connecting = supervisor.connectIntegrationWithToken(source.id, "new-token");
+    expect(await waitWithTestTimeout((async () => {
+      while (!existsSync(enteredPath)) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 3_000)).toBe(true);
+
+    await expect(updateConnectorFromSource({
+      sourceDir,
+      workspacePath: workspace,
+      connectorId: "credential-update-fence",
+      supervisor,
+      guard,
+    })).rejects.toThrow("identity mutation in progress");
+    expect(readFileSync(join(installedDir, "index.mjs"), "utf8")).toContain("revision-1");
+
+    writeFileSync(releasePath, "release");
+    await expect(connecting).resolves.toMatchObject({
+      sourceKey: "same-account",
+      identityStatus: "resolved",
+      suggestedLabel: "revision-1",
+    });
+
+    let markUpdateEntered!: () => void;
+    let releaseUpdate!: () => void;
+    const updateEntered = new Promise<void>((resolve) => {
+      markUpdateEntered = resolve;
+    });
+    const updateRelease = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
+    const coordinatingUpdate = supervisor.withConnectorUpdate(
+      "credential-update-fence",
+      await loadConnectorManifest(installedDir),
+      async () => {
+        markUpdateEntered();
+        await updateRelease;
+      },
+    );
+    await updateEntered;
+    await expect(supervisor.connectIntegrationWithToken(source.id, "third-token"))
+      .rejects.toThrow("identity mutation in progress");
+    await expect(supervisor.removeIntegration(source.id))
+      .rejects.toThrow("identity mutation in progress");
+    await expect(supervisor.addIntegration({ connectorId: "credential-update-fence" }))
+      .rejects.toThrow("Connector credential-update-fence is updating");
+    expect((await supervisor.list()).filter((item) => (
+      item.connectorId === "credential-update-fence"
+    )).map((item) => item.id)).toEqual([source.id]);
+    releaseUpdate();
+    await expect(coordinatingUpdate).resolves.toBeUndefined();
+  });
+
   test("rejects incompatible Connector updates and rolls back failed audit", async () => {
     const guard = new Guard({ db: dataDb, source: "system:test" });
     const builtins = join(workspace, "builtins");
-    const candidateDir = writeBuiltIn(builtins, "seed", "multiple");
+    const candidateDir = writeBuiltIn(builtins, "seed", "connector");
     await installConnectorFromSource({
       sourceDir: candidateDir,
       workspacePath: workspace,
@@ -8163,24 +9021,31 @@ auth:
     });
     const installedDir = join(workspace, "connectors", "seed");
     await supervisor.registerDirectory(installedDir);
-    const source = supervisor.addIntegration({ connectorId: "seed", integrationKey: "work" });
+    const source = await supervisor.addIntegration({
+      connectorId: "seed",
+      config: { accountId: "work" },
+    });
     const oldHash = await hashConnectorPackage(installedDir);
 
-    writeBuiltIn(builtins, "seed", "singleton");
+    writeBuiltIn(builtins, "seed", "single");
     await expect(updateConnectorFromSource({
       sourceDir: candidateDir,
       workspacePath: workspace,
       connectorId: "seed",
       supervisor,
       guard,
-    })).rejects.toThrow("cannot change integrations.mode while Sources exist");
+    })).rejects.toThrow("cannot change source.identity while Sources exist");
     expect(await hashConnectorPackage(installedDir)).toBe(oldHash);
     expect(supervisor.getIntegration(source.id)).toBeDefined();
 
-    writeBuiltIn(builtins, "seed", "multiple");
+    writeBuiltIn(builtins, "seed", "connector");
     writeFileSync(
       join(candidateDir, "index.mjs"),
-      "export default { async run() { /* rejected revision */ } };\n",
+      `export default {
+  async run() { /* rejected revision */ },
+  async resolveSourceIdentity() { return { key: "work" }; },
+};
+`,
     );
     const failingGuard = {
       withSource: (sourceName: string) => guard.withSource(sourceName),
@@ -8248,7 +9113,7 @@ auth:
   test("remove connector cascades Sources and reinstall starts with zero Sources", async () => {
     const guard = new Guard({ db: dataDb, source: "system:test" });
     const builtins = join(workspace, "builtins");
-    writeBuiltIn(builtins, "seed", "multiple");
+    writeBuiltIn(builtins, "seed", "connector");
     const installOnce = () =>
       installConnectorFromSource({
         sourceDir: join(builtins, "seed"),
@@ -8259,10 +9124,9 @@ auth:
 
     await installOnce();
     await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
-    const setup = supervisor.ensureIntegration({ connectorId: "seed" });
-    const work = supervisor.updateIntegration(setup.id, {
-      integrationKey: "work",
-      setupStatus: "ready",
+    const work = await supervisor.addIntegration({
+      connectorId: "seed",
+      config: { accountId: "work" },
     });
 
     expect(await removeConnectorFromWorkspace({
@@ -8276,7 +9140,10 @@ auth:
     await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
     expect((await supervisor.list()).filter((row) => row.connectorId === "seed")).toEqual([]);
 
-    const replacement = supervisor.ensureIntegration({ connectorId: "seed", integrationKey: "work" });
+    const replacement = await supervisor.addIntegration({
+      connectorId: "seed",
+      config: { accountId: "work" },
+    });
     expect(replacement.id).not.toBe(work.id);
   });
 
@@ -8293,8 +9160,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -8343,16 +9210,18 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "multiple" },
+        source: { identity: "connector" },
         auth: { type: "apiKey" },
       },
-      { async run() {} },
+      {
+        async run() {},
+        async resolveSourceIdentity() {
+          return { key: "work" };
+        },
+      },
     );
 
-    const integration = supervisor.ensureIntegration({
-      connectorId: "managed-feed",
-      integrationKey: "work",
-    });
+    const integration = supervisor.ensureIntegration({ connectorId: "managed-feed" });
     expect(integration.setupStatus).toBe("setup");
 
     // apiKey connect stores the token and promotes through the evaluator.
@@ -8409,10 +9278,15 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "watch" },
-        integrations: { mode: "multiple" },
+        source: { identity: "connector" },
         auth: { type: "apiKey" },
       },
       {
+        async resolveSourceIdentity({ auth }) {
+          if (auth.type === "none") throw new Error("expected auth");
+          const token = await auth.getToken();
+          return { key: token.startsWith("work-") ? "work" : "personal" };
+        },
         async run({ signal }) {
           await new Promise<void>((resolve) => {
             if (signal.aborted) resolve();
@@ -8421,10 +9295,12 @@ auth:
         },
       },
     );
-    const work = supervisor.ensureIntegration({ connectorId: "cascade-feed", integrationKey: "work" });
-    const personal = supervisor.ensureIntegration({ connectorId: "cascade-feed", integrationKey: "personal" });
+    const work = supervisor.ensureIntegration({ connectorId: "cascade-feed" });
+    const personal = supervisor.ensureIntegration({ connectorId: "cascade-feed" });
     const connectedWork = await supervisor.connectIntegrationWithToken(work.id, "work-token");
     const connectedPersonal = await supervisor.connectIntegrationWithToken(personal.id, "personal-token");
+    expect(connectedWork).toMatchObject({ sourceKey: "work", identityStatus: "resolved" });
+    expect(connectedPersonal).toMatchObject({ sourceKey: "personal", identityStatus: "resolved" });
     supervisor.start(work.id, { trigger: "watch" });
     expect((await supervisor.list()).find((source) => source.id === work.id)?.running).toBe(true);
 
@@ -8448,7 +9324,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: {
           type: "oauth2-public",
           authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
@@ -8462,6 +9338,397 @@ auth:
     await expect(
       supervisor.connectIntegrationWithToken(integration.id, "tok")
     ).rejects.toThrow("browser auth");
+  });
+
+  test("holds connector identity ownership through pending browser auth and releases it on terminal status", async () => {
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager: new ConnectorAuthManager(secrets, {
+        fetchImpl: async () => new Response(JSON.stringify({
+          access_token: "oauth-account-1",
+          token_type: "Bearer",
+          expires_in: 3600,
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      }),
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-identity-claim",
+        name: "OAuth Identity Claim",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://provider.example/authorize",
+          tokenEndpoint: "https://provider.example/token",
+          clientId: "identity-client",
+        },
+      },
+      {
+        async run() {},
+        async resolveSourceIdentity({ auth }) {
+          if (auth.type === "none") throw new Error("expected auth");
+          return { key: await auth.getToken(), label: "OAuth account" };
+        },
+      },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "oauth-identity-claim" });
+    const first = await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    await expect(supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    })).rejects.toThrow("identity mutation in progress");
+    await expect(supervisor.configureIntegration(source.id, { config: { note: "blocked" } }))
+      .rejects.toThrow("identity mutation in progress");
+
+    const firstState = new URL(first.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: firstState,
+      error: "access_denied",
+    }))).resolves.toMatchObject({ status: "failed", error: "access_denied" });
+
+    const second = await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const secondState = new URL(second.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: secondState,
+      code: "code-1",
+    }))).resolves.toMatchObject({ status: "connected", integrationId: source.id });
+    expect(supervisor.getIntegration(source.id)).toMatchObject({
+      sourceKey: "oauth-account-1",
+      identityStatus: "resolved",
+      suggestedLabel: "OAuth account",
+      setupStatus: "ready",
+    });
+  });
+
+  test("keeps browser identity finalization non-expiring while its resolver runs", async () => {
+    let markResolverEntered!: () => void;
+    let releaseResolver!: () => void;
+    const resolverEntered = new Promise<void>((resolve) => {
+      markResolverEntered = resolve;
+    });
+    const resolverRelease = new Promise<void>((resolve) => {
+      releaseResolver = resolve;
+    });
+    const authManager = new ConnectorAuthManager(secrets, {
+      attemptTtlMs: 100,
+      now: () => 1,
+      fetchImpl: async () => new Response(JSON.stringify({
+        access_token: "finalizing-account",
+        expires_in: 3_600,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    });
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager,
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-finalization-claim",
+        name: "OAuth Finalization Claim",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://provider.example/authorize",
+          tokenEndpoint: "https://provider.example/token",
+          clientId: "finalization-client",
+        },
+      },
+      {
+        async run() {},
+        async resolveSourceIdentity({ auth }) {
+          if (auth.type === "none") throw new Error("expected auth");
+          const key = await auth.getToken();
+          markResolverEntered();
+          await resolverRelease;
+          return { key };
+        },
+      },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "oauth-finalization-claim" });
+    const started = await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    const completion = supervisor.completeOAuthCallback(new URLSearchParams({
+      state,
+      code: "code-1",
+    }));
+
+    await resolverEntered;
+    try {
+      await expect(supervisor.startOAuthIntegration(source.id, {
+        redirectUri: "http://localhost:32123/oauth/callback",
+      })).rejects.toThrow("identity mutation in progress");
+      await expect(supervisor.disconnectIntegration(source.id))
+        .rejects.toThrow("identity mutation in progress");
+    } finally {
+      releaseResolver();
+    }
+
+    await expect(completion).resolves.toMatchObject({
+      status: "connected",
+      integrationId: source.id,
+    });
+    expect(supervisor.getIntegration(source.id)).toMatchObject({
+      sourceKey: "finalizing-account",
+      identityStatus: "resolved",
+      setupStatus: "ready",
+    });
+    expect(await authManager.hasToken(source.authRef!)).toBe(true);
+  });
+
+  test("a stale expired callback cannot release its replacement browser identity claim", async () => {
+    let now = Date.now();
+    let markExchangeStarted!: () => void;
+    let releaseExchange!: (response: Response) => void;
+    const exchangeStarted = new Promise<void>((resolve) => {
+      markExchangeStarted = resolve;
+    });
+    const exchangeResponse = new Promise<Response>((resolve) => {
+      releaseExchange = resolve;
+    });
+    const authManager = new ConnectorAuthManager(secrets, {
+      attemptTtlMs: 60_000,
+      now: () => now,
+      fetchImpl: async () => {
+        markExchangeStarted();
+        return exchangeResponse;
+      },
+    });
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager,
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-stale-finalizer",
+        name: "OAuth Stale Finalizer",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://provider.example/authorize",
+          tokenEndpoint: "https://provider.example/token",
+          clientId: "stale-finalizer-client",
+        },
+      },
+      {
+        async run() {},
+        async resolveSourceIdentity({ auth }) {
+          if (auth.type === "none") throw new Error("expected auth");
+          return { key: await auth.getToken() };
+        },
+      },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "oauth-stale-finalizer" });
+    const expired = await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const expiredState = new URL(expired.authorizationUrl).searchParams.get("state")!;
+    const staleCompletion = supervisor.completeOAuthCallback(new URLSearchParams({
+      state: expiredState,
+      code: "stale-code",
+    }));
+
+    await exchangeStarted;
+    now = expired.expiresAt + 1;
+    await expect(supervisor.getOAuthAttempt(source.id, expired.attemptId)).resolves.toMatchObject({
+      status: "expired",
+      integrationId: source.id,
+    });
+
+    now = Date.now();
+    const replacement = await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    releaseExchange(new Response(JSON.stringify({ access_token: "must-not-survive" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    const staleResult = await staleCompletion;
+    expect(staleResult).toMatchObject({
+      status: "failed",
+      error: "Authentication was cancelled for this Source",
+    });
+    expect(staleResult).not.toHaveProperty("integrationId");
+    await expect(supervisor.configureIntegration(source.id, { config: { account: "blocked" } }))
+      .rejects.toThrow("identity mutation in progress");
+
+    const replacementState = new URL(replacement.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: replacementState,
+      error: "cancelled",
+    }))).resolves.toMatchObject({ status: "failed", error: "cancelled" });
+    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+  });
+
+  test("sweeps an expired browser identity claim and cancels its stale callback", async () => {
+    const authManager = new ConnectorAuthManager(secrets, { now: () => 1 });
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager,
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-expired-claim",
+        name: "OAuth Expired Claim",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://provider.example/authorize",
+          tokenEndpoint: "https://provider.example/token",
+          clientId: "expired-client",
+        },
+      },
+      {
+        async run() {},
+        async resolveSourceIdentity() {
+          return { key: "never-used" };
+        },
+      },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "oauth-expired-claim" });
+    const expired = await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const replacement = await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const expiredState = new URL(expired.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: expiredState,
+      code: "stale-code",
+    }))).resolves.toEqual({
+      status: "failed",
+      error: "OAuth state is invalid or already used",
+    });
+    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+
+    const replacementState = new URL(replacement.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: replacementState,
+      error: "cancelled",
+    }))).resolves.toMatchObject({ status: "failed", error: "cancelled" });
+    await expect(supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    })).resolves.toHaveProperty("authorizationUrl");
+    await supervisor.removeIntegration(source.id);
+  });
+
+  test("holds a cancelled browser identity claim until Source credential deletion finishes", async () => {
+    let markDeletionStarted!: () => void;
+    let releaseDeletion!: () => void;
+    const deletionStarted = new Promise<void>((resolve) => {
+      markDeletionStarted = resolve;
+    });
+    const deletionRelease = new Promise<void>((resolve) => {
+      releaseDeletion = resolve;
+    });
+    const authManager = new ConnectorAuthManager(secrets);
+    const deleteCredentials = authManager.deleteIntegrationCredentials.bind(authManager);
+    const deleteSpy = vi.spyOn(authManager, "deleteIntegrationCredentials")
+      .mockImplementation(async (...args) => {
+        markDeletionStarted();
+        await deletionRelease;
+        await deleteCredentials(...args);
+      });
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager,
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-remove-claim",
+        name: "OAuth Remove Claim",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://provider.example/authorize",
+          tokenEndpoint: "https://provider.example/token",
+          clientId: "remove-claim-client",
+        },
+      },
+      {
+        async run() {},
+        async resolveSourceIdentity() {
+          return { key: "unused" };
+        },
+      },
+    );
+    const removingSource = supervisor.ensureIntegration({ connectorId: "oauth-remove-claim" });
+    const waitingSource = supervisor.ensureIntegration({ connectorId: "oauth-remove-claim" });
+    await supervisor.startOAuthIntegration(removingSource.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+
+    const removal = supervisor.removeIntegration(removingSource.id);
+    await deletionStarted;
+    try {
+      await expect(supervisor.retrySourceIdentity(waitingSource.id))
+        .rejects.toThrow("identity mutation in progress");
+    } finally {
+      releaseDeletion();
+    }
+    await expect(removal).resolves.toBeUndefined();
+    expect(supervisor.getIntegration(removingSource.id)).toBeUndefined();
+
+    const replacement = await supervisor.startOAuthIntegration(waitingSource.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const replacementState = new URL(replacement.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: replacementState,
+      error: "cancelled",
+    }))).resolves.toMatchObject({ status: "failed", error: "cancelled" });
+    deleteSpy.mockRestore();
   });
 
   test("oauth callback binds auth_ref to first-connect setup rows", async () => {
@@ -8510,7 +9777,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: {
           type: "oauth2-public",
           authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
@@ -8524,7 +9791,7 @@ auth:
     systemDb.prepare("UPDATE connector_integrations SET auth_ref = NULL WHERE id = ?").run(integration.id);
     expect(supervisor.getIntegration(integration.id)?.authRef).toBeUndefined();
 
-    const started = supervisor.startOAuthIntegration(integration.id, {
+    const started = await supervisor.startOAuthIntegration(integration.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
@@ -8564,7 +9831,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: {
           type: "oauth2-public",
           authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
@@ -8575,7 +9842,7 @@ auth:
       { async run() {} },
     );
     const source = supervisor.ensureIntegration({ connectorId: "oauth-remove" });
-    const started = supervisor.startOAuthIntegration(source.id, {
+    const started = await supervisor.startOAuthIntegration(source.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
@@ -8618,7 +9885,7 @@ auth:
         eventCatalog: "./events.json",
         entry: "./index.ts",
         runtime: { mode: "poll" },
-        integrations: { mode: "singleton" },
+        source: { identity: "single" },
         auth: {
           type: "oauth2-public",
           authorizationEndpoint: "https://accounts.example.test/authorize",
@@ -8629,7 +9896,7 @@ auth:
       { async run() {} },
     );
     const source = supervisor.ensureIntegration({ connectorId: "oauth-in-flight-remove" });
-    const started = supervisor.startOAuthIntegration(source.id, {
+    const started = await supervisor.startOAuthIntegration(source.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
@@ -8709,7 +9976,7 @@ auth:
           eventCatalog: "./events.json",
           entry: "./index.ts",
           runtime: { mode: "poll" },
-          integrations: { mode: "singleton" },
+          source: { identity: "single" },
           auth: {
             type: "oauth2-public",
             authorizationEndpoint: "https://provider.example/oauth/authorize",
@@ -8718,7 +9985,7 @@ auth:
           },
         },
         connect: async (integrationId) => {
-          const started = supervisor.startOAuthIntegration(integrationId, {
+          const started = await supervisor.startOAuthIntegration(integrationId, {
             redirectUri: "http://localhost:32123/oauth/callback",
           });
           const state = new URL(started.authorizationUrl).searchParams.get("state")!;
@@ -8735,7 +10002,7 @@ auth:
           eventCatalog: "./events.json",
           entry: "./index.ts",
           runtime: { mode: "poll" },
-          integrations: { mode: "singleton" },
+          source: { identity: "single" },
           auth: {
             type: "managedProvider",
             providerId: "oura",
@@ -8787,8 +10054,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -8847,8 +10114,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -8950,8 +10217,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -9032,8 +10299,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
-integrations:
-  mode: singleton
+source:
+  identity: single
 config:
   mode:
     type: string
@@ -9113,8 +10380,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
-integrations:
-  mode: singleton
+source:
+  identity: single
 config:
   label:
     type: string
@@ -9195,8 +10462,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: manual
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -9255,8 +10522,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: watch
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -9300,8 +10567,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: watch
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -9368,8 +10635,8 @@ entry: ./index.mjs
 runtime:
   mode: poll
   defaultSchedule: "*/15 * * * *"
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -9407,8 +10674,8 @@ entry: ./index.mjs
 runtime:
   mode: poll
   defaultSchedule: "*/15 * * * *"
-integrations:
-  mode: singleton
+source:
+  identity: single
 platforms:
   darwin: {}
 auth:
@@ -9490,5 +10757,10 @@ auth:
     expect(sourceForConnector("terminal")).toBe("connector:terminal");
     expect(sourceForConnector("calendar", "work")).toBe("connector:calendar:work");
     expect(() => sourceForConnector("../terminal")).toThrow("Invalid connector id");
+    expect(() => sourceForConnector("calendar", "")).toThrow("Invalid connector source key");
+    expect(() => sourceForConnector("calendar", "work account"))
+      .toThrow("Invalid connector source key");
+    expect(() => sourceForConnector("calendar", "work/account"))
+      .toThrow("Invalid connector source key");
   });
 });

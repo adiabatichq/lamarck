@@ -8,7 +8,8 @@ type ScheduledConnector = ConnectorIntegration & {
   running: boolean;
   supported: boolean;
   packageTrust: string;
-  source: string | undefined;
+  source: string | null;
+  ownership: "here" | "other-device" | "device-unknown";
   setupPending?: string[];
 };
 
@@ -342,6 +343,7 @@ function canSchedule(integration: ScheduledConnector, now: number): boolean {
     && integration.setupStatus === "ready"
     && (integration.setupPending?.length ?? 0) === 0
     && integration.supported
-    && integration.source !== undefined
+    && integration.ownership === "here"
+    && integration.source !== null
     && RUNNABLE_TRUST.has(integration.packageTrust);
 }

@@ -74,6 +74,7 @@ import {
 } from "./app-runtime-policy";
 import { createAppPackageJson, createAppPackageLock } from "./app-scaffold";
 import { APP_MANIFEST_DIGEST_PATTERN } from "../../capsule/src/app-manifest-authority";
+import { resolveDeviceIdentity } from "./device-identity";
 
 // Lamarck — HTTP server entry point
 // All routes go through here. Guard is the only write path.
@@ -102,6 +103,8 @@ const guard = RemoteGuard.fromEnvironment("system:server");
 await guard.health();
 const contentBlobStore = new ContentBlobStore(workspacePath);
 const settings = new SettingsStore(lamarckDir);
+const coreSettings = await settings.get();
+const deviceIdentity = await resolveDeviceIdentity(coreSettings.vaultId ?? "");
 const vaultKey = process.env.LAMARCK_VAULT_KEY ?? encodeVaultKey(randomBytes(32));
 const secretStore = new SqliteEncryptedSecretStore(systemDb, vaultKey);
 const credentialStore = new CredentialStore(systemDb);
@@ -126,6 +129,7 @@ const connectorSupervisor = new ConnectorSupervisor({
   authManager,
   oauthRedirectUri,
   managedProviderAppOrigin,
+  deviceIdentity,
 });
 // Built-ins are bundled catalog entries; installing one is an explicit user
 // action through the same install flow as any other connector package.
@@ -137,6 +141,7 @@ const connectorManifests = await registerWorkspaceConnectors(connectorSupervisor
     console.warn(`[lamarck] Skipping connector ${connectorDir}: ${message}`);
   },
 });
+await connectorSupervisor.recoverSourceIdentities();
 const connectorScheduler = new ConnectorScheduler({
   supervisor: connectorSupervisor,
   onError(err, integration) {
@@ -852,7 +857,7 @@ const server = await serve<{ cwd: string }>({
             name: entry.manifest.name,
             description: entry.manifest.description,
             mode: entry.manifest.runtime.mode,
-            integrationsMode: entry.manifest.integrations.mode,
+            identityKind: entry.manifest.source.identity,
             authType: entry.manifest.auth?.type ?? "none",
             supported: isPlatformSupported(entry.manifest, platform),
             installed: installed !== undefined,
@@ -934,12 +939,12 @@ const server = await serve<{ cwd: string }>({
       const createIntegrationMatch = path.match(/^\/api\/connectors\/([^/]+)\/integrations$/);
       if (createIntegrationMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const body = await readBody<{ integrationKey?: string; scheduleCron?: string | null; config?: unknown }>(req);
-        const integration = connectorSupervisor.addIntegration({
+        const body = await readBody<{ displayName?: unknown }>(req);
+        assertAllowedRequestFields(body, ["displayName"]);
+        assertDisplayNameField(body, { nullable: false });
+        const integration = await connectorSupervisor.addIntegration({
           connectorId: decodeURIComponent(createIntegrationMatch[1]),
-          integrationKey: body.integrationKey,
-          scheduleCron: body.scheduleCron,
-          config: body.config,
+          displayName: body.displayName as string | undefined,
         });
         return json({ integration });
       }
@@ -949,16 +954,24 @@ const server = await serve<{ cwd: string }>({
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const body = await readBody<{
           scheduleCron?: string | null;
-          integrationKey?: string;
+          displayName?: unknown;
           config?: unknown;
         }>(req);
+        assertAllowedRequestFields(body, ["displayName", "scheduleCron", "config"]);
+        assertDisplayNameField(body, { nullable: true });
         const instanceId = decodeURIComponent(integrationMatch[1]);
-        const integration = await connectorSupervisor.configureIntegration(instanceId, {
-          scheduleCron: body.scheduleCron,
-          integrationKey: body.integrationKey,
-          config: body.config,
-        });
-        return json({ integration });
+        let integration = connectorSupervisor.getIntegration(instanceId);
+        if (!integration) return json({ error: "not found" }, 404);
+        if ("scheduleCron" in body || "config" in body) {
+          integration = await connectorSupervisor.configureIntegration(instanceId, {
+            scheduleCron: body.scheduleCron,
+            config: body.config,
+          });
+        }
+        const renamed = body.displayName === undefined
+          ? integration
+          : connectorSupervisor.renameIntegration(instanceId, body.displayName as string | null);
+        return json({ integration: renamed });
       }
 	      if (integrationMatch && method === "DELETE") {
 	        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
@@ -1057,6 +1070,19 @@ const server = await serve<{ cwd: string }>({
           decodeURIComponent(authAttemptMatch[2]),
         );
         return json(result);
+      }
+
+      const retryIdentityMatch = path.match(
+        /^\/api\/connectors\/integrations\/([^/]+)\/identity\/retry$/,
+      );
+      if (retryIdentityMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readBody<Record<string, unknown>>(req);
+        assertAllowedRequestFields(body, []);
+        const integration = await connectorSupervisor.retrySourceIdentity(
+          decodeURIComponent(retryIdentityMatch[1]),
+        );
+        return json({ integration });
       }
 
       const restartIntegrationMatch = path.match(/^\/api\/connectors\/integrations\/([^/]+)\/restart$/);
@@ -1445,6 +1471,35 @@ connectorScheduler.start().catch((err) => {
 });
 
 console.log(`[lamarck] Server running on http://localhost:${server.port}`);
+
+function assertAllowedRequestFields(
+  value: unknown,
+  allowedFields: readonly string[],
+): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpStatusError(400, "request body must be a JSON object");
+  }
+  const allowed = new Set(allowedFields);
+  const unknown = Object.keys(value).find((field) => !allowed.has(field));
+  if (unknown) {
+    throw new HttpStatusError(400, `request body has unknown field: ${unknown}`);
+  }
+}
+
+function assertDisplayNameField(
+  value: Record<string, unknown>,
+  opts: { nullable: boolean },
+): void {
+  if (!("displayName" in value) || value.displayName === undefined) return;
+  if (typeof value.displayName === "string") return;
+  if (opts.nullable && value.displayName === null) return;
+  throw new HttpStatusError(
+    400,
+    opts.nullable
+      ? "displayName must be a string or null"
+      : "displayName must be a string",
+  );
+}
 
 // Graceful shutdown
 async function shutdown(): Promise<void> {
