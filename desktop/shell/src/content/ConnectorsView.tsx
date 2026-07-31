@@ -19,6 +19,7 @@ import {
   removeConnectorIntegration,
   requestConnectorRequirement,
   restartConnectorIntegration,
+  retryConnectorSourceIdentity,
   resumeConnectorIntegration,
   runConnectorIntegration,
   startConnectorConfigPanel,
@@ -39,6 +40,8 @@ import {
   sourceLifecycle,
   sourceNeedsAttention,
   sourceNeedsSetup,
+  sourceRunsHere,
+  sourceShownName,
   trustView,
   type SourceLifecycle,
 } from "../lib/connector-state";
@@ -361,9 +364,13 @@ function ConnectorCard({
       : trust === "broken"
         ? "broken"
         : "ready";
+  const canAddSource = connector.identityKind === "connector"
+    || (connector.identityKind === "device"
+      ? !integrations.some((source) => sourceRunsHere(source))
+      : integrations.length === 0);
 
   const [panel, setPanel] = useState<"approve" | "update" | "remove" | "add" | null>(null);
-  const [addKeyInput, setAddKeyInput] = useState("");
+  const [addNameInput, setAddNameInput] = useState("");
 
   useEffect(() => {
     if (panel === "update" && !updateAvailable) {
@@ -392,6 +399,7 @@ function ConnectorCard({
           <h2 className={styles.cardName}>{connector.name}</h2>
           <span className={styles.cardMeta}>
             {connector.mode}
+            <span className={styles.cron}>· {identityKindLabel(connector.identityKind)}</span>
             <span className={styles.cron}>
               · {integrations.length} source{integrations.length === 1 ? "" : "s"}
             </span>
@@ -412,17 +420,11 @@ function ConnectorCard({
             )}
             {trusted
               && interactive
-              && (connector.integrationsMode === "multiple" || integrations.length === 0)
+              && canAddSource
               && panel !== "add" && (
               <button
                 className={styles.ghostBtn}
-                onClick={() => {
-                  if (connector.integrationsMode === "singleton") {
-                    void onAct(connectorId, "add", () => createConnectorIntegration(connectorId));
-                  } else {
-                    setPanel("add");
-                  }
-                }}
+                onClick={() => setPanel("add")}
               >
                 + Add source
               </button>
@@ -508,29 +510,29 @@ function ConnectorCard({
           </div>
         )}
 
-        {panel === "add" && connector.integrationsMode === "multiple" && (
+        {panel === "add" && (
           <form
             className={styles.confirmPanel}
             onSubmit={(event) => {
               event.preventDefault();
               onAct(connectorId, "add", async () => {
-                await createConnectorIntegration(connectorId, addKeyInput.trim() || undefined);
-                setAddKeyInput("");
+                await createConnectorIntegration(connectorId, addNameInput.trim() || undefined);
+                setAddNameInput("");
                 setPanel(null);
               });
             }}
           >
             <div className={styles.confirmText}>
-              Add another <strong>{connector.name}</strong> Source with its own account, settings, and
-              sync progress. You can name it now or finish that during setup.
+              {addSourceDescription(connector)} You can give it a name now or leave that blank and
+              rename it later.
             </div>
             <div className={styles.inlineForm}>
               <input
                 className={styles.inlineInput}
                 aria-label="Source name"
-                placeholder="source name (optional), e.g. personal"
-                value={addKeyInput}
-                onChange={(event) => setAddKeyInput(event.target.value)}
+                placeholder="source name (optional), e.g. Personal"
+                value={addNameInput}
+                onChange={(event) => setAddNameInput(event.target.value)}
               />
               <button
                 className={styles.primaryBtn}
@@ -629,37 +631,45 @@ function IntegrationRow({
   const needs = setupNeeds(c);
   const needsSetup = sourceNeedsSetup(c);
   const [tokenInput, setTokenInput] = useState("");
-  const [keyInput, setKeyInput] = useState("");
+  const [displayNameInput, setDisplayNameInput] = useState(c.displayName ?? "");
   const [runsOpen, setRunsOpen] = useState(false);
-  const [lifecyclePanel, setLifecyclePanel] = useState<"pause" | "disconnect" | "remove" | null>(null);
+  const [lifecyclePanel, setLifecyclePanel] = useState<
+    "rename" | "pause" | "disconnect" | "remove" | null
+  >(null);
   const cardBusy = Boolean(busy[c.id]);
   const showSetup = trusted && interactive && needsSetup;
   const needsAttention = sourceNeedsAttention(c);
   const recentRuns = c.recentRuns ?? [];
   const configPanels = Object.entries(c.configPanels ?? {});
+  const runsHere = sourceRunsHere(c);
   const canRunNow = interactive
     && trusted
+    && runsHere
     && (state === "active" || state === "paused")
     && !needsSetup
     && (c.status !== "error" || state === "paused")
     && (c.mode === "manual" || c.mode === "poll");
   const canPause = interactive
     && trusted
+    && runsHere
     && state === "active"
     && sourceHasAutomaticActivity(c);
-  const canResume = interactive && trusted && state === "paused";
+  const canResume = interactive && trusted && runsHere && state === "paused";
   const canDisconnect = c.authType !== "none" && c.authReady;
-  const sourceLabel = c.integrationKey ?? c.source ?? c.name;
+  const sourceLabel = sourceShownName(c);
 
   return (
-    <div className={styles.integrationRow}>
+    <div className={styles.integrationRow} id={`source-${c.id}`}>
       <div className={styles.rowTop}>
         <span className={`${styles.rowBadge} ${styles[`tone_${state}`]}`}>
           <span className={styles.stateDot} />
           {SOURCE_LIFECYCLE_LABEL[state]}
         </span>
         <span className={styles.sourceLine}>
-          {c.source ?? `connector:${c.connectorId} — finish source setup`}
+          <strong className={styles.sourceName}>{sourceLabel}</strong>
+          <span className={styles.sourceProvenance}>
+            {c.source ?? `connector:${c.connectorId} — resolving source identity`}
+          </span>
         </span>
         {c.status === "running" && <span className={styles.activityBadge}>RUNNING</span>}
         {needsSetup && <span className={styles.conditionBadge}>NEEDS SETUP</span>}
@@ -676,7 +686,7 @@ function IntegrationRow({
             ? ` · next ${relativeTime(c.nextRunAt)}`
             : ""}
         </span>
-        {state === "active" && c.status === "error" && !needsSetup && (
+        {runsHere && state === "active" && c.status === "error" && !needsSetup && (
           <button
             className={styles.primaryBtn}
             disabled={cardBusy}
@@ -745,12 +755,66 @@ function IntegrationRow({
         <button
           className={styles.ghostBtn}
           disabled={cardBusy}
+          aria-expanded={lifecyclePanel === "rename"}
+          onClick={() => {
+            setDisplayNameInput(c.displayName ?? "");
+            setLifecyclePanel((panel) => panel === "rename" ? null : "rename");
+          }}
+        >
+          Rename…
+        </button>
+        <button
+          className={styles.ghostBtn}
+          disabled={cardBusy}
           aria-expanded={lifecyclePanel === "remove"}
           onClick={() => setLifecyclePanel((panel) => panel === "remove" ? null : "remove")}
         >
           Remove source…
         </button>
       </div>
+
+      {lifecyclePanel === "rename" && (
+        <form
+          className={styles.lifecyclePanel}
+          aria-label={`Rename ${sourceLabel}`}
+          onSubmit={(event) => {
+            event.preventDefault();
+            const displayName = displayNameInput.trim() || null;
+            onAct(c.id, "rename", async () => {
+              await updateConnectorIntegration(c.id, { displayName });
+              setLifecyclePanel(null);
+            });
+          }}
+        >
+          <span className={styles.lifecyclePrompt}>
+            Rename this Source without changing its identity, account, settings, or sync progress.
+            Leave the field blank to use its suggested or Connector name.
+          </span>
+          <div className={styles.lifecycleActions}>
+            <input
+              className={styles.inlineInput}
+              aria-label="Source display name"
+              placeholder={c.suggestedLabel ?? c.connectorName}
+              value={displayNameInput}
+              onChange={(event) => setDisplayNameInput(event.target.value)}
+            />
+            <button
+              className={styles.primaryBtn}
+              disabled={cardBusy || (displayNameInput.trim() || null) === c.displayName}
+            >
+              {busy[c.id] === "rename" ? "saving…" : "Save name"}
+            </button>
+            <button
+              type="button"
+              className={styles.ghostBtn}
+              disabled={cardBusy}
+              onClick={() => setLifecyclePanel(null)}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
 
       {lifecyclePanel === "pause" && (
         <div className={styles.lifecyclePanel} role="group" aria-label={`Pause ${sourceLabel}`}>
@@ -859,6 +923,14 @@ function IntegrationRow({
         </div>
       )}
 
+      <SourceIdentityState
+        source={c}
+        cardBusy={cardBusy}
+        retryEnabled={trusted && interactive}
+        busyLabel={busy[c.id]}
+        onAct={onAct}
+      />
+
       {needsSetup && needs.length > 0 && (
         <div className={styles.needsLine}>
           needs <span className={styles.needsItems}>{needs.join(" · ")}</span>
@@ -885,30 +957,6 @@ function IntegrationRow({
           {warning.message}
         </div>
       ))}
-
-      {showSetup && c.setupPending.includes("integration_key") && (
-        <form
-          className={styles.inlineForm}
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (!keyInput.trim()) return;
-            onAct(c.id, "name", async () => {
-              await updateConnectorIntegration(c.id, { integrationKey: keyInput.trim() });
-              setKeyInput("");
-            });
-          }}
-        >
-          <input
-            className={styles.inlineInput}
-            placeholder="source name, e.g. work or macbook"
-            value={keyInput}
-            onChange={(event) => setKeyInput(event.target.value)}
-          />
-          <button className={styles.ghostBtn} disabled={cardBusy || !keyInput.trim()}>
-            {busy[c.id] === "name" ? "saving…" : "Save"}
-          </button>
-        </form>
-      )}
 
       {showSetup && c.setupPending.includes("auth") && (
         c.authType === "apiKey" ? (
@@ -992,7 +1040,7 @@ function IntegrationRow({
         </div>
       )}
 
-      {c.lastError && (c.status === "error" || needsSetup) && (
+      {c.lastError && c.identityStatus !== "error" && (c.status === "error" || needsSetup) && (
         <div className={styles.lastError}>
           <span className={styles.errorGlyph}>▲</span>
           {c.lastError}
@@ -1054,6 +1102,140 @@ function IntegrationRow({
 	      )}
     </div>
   );
+}
+
+function SourceIdentityState({
+  source,
+  cardBusy,
+  retryEnabled,
+  busyLabel,
+  onAct,
+}: {
+  source: ConnectorIntegrationView;
+  cardBusy: boolean;
+  retryEnabled: boolean;
+  busyLabel?: string;
+  onAct: Act;
+}) {
+  const identityBlocked = source.identityStatus !== "resolved";
+  const ownershipBlocked = source.ownership !== "here";
+  const identityError = source.identityStatus === "conflict"
+    || source.identityStatus === "changed"
+    || source.identityStatus === "error";
+  const errorTone = identityError || source.ownership === "device-unknown";
+
+  return (
+    <>
+      <div className={styles.identitySummary} aria-label="Source identity and ownership">
+        <span className={`${styles.identityStatus} ${
+          identityError
+            ? styles.identityStatusError
+            : identityBlocked
+              ? styles.identityStatusPending
+              : ""
+        }`}>
+          identity {source.identityStatus}
+        </span>
+        <span>{identityKindLabel(source.identityKind)}</span>
+        <span aria-hidden="true">·</span>
+        <span>{ownershipLabel(source.ownership)}</span>
+      </div>
+      {(identityBlocked || ownershipBlocked) && (
+        <div className={`${styles.identityNotice} ${errorTone ? styles.identityNoticeError : ""}`}>
+          <span className={styles.errorGlyph}>{errorTone ? "▲" : "◇"}</span>
+          <span className={styles.identityNoticeText}>
+            {identityBlocked && identityStatusText(source)}
+            {identityBlocked && ownershipBlocked && " "}
+            {ownershipBlocked && ownershipText(source)}
+            {source.identityStatus === "conflict" && source.conflictSourceId && (
+              <>
+                {" "}
+                <a href={`#source-${source.conflictSourceId}`} className={styles.identityLink}>
+                  Open existing Source
+                </a>
+              </>
+            )}
+          </span>
+          {identityBlocked && source.identityKind === "connector" && (
+            <button
+              type="button"
+              className={styles.ghostBtn}
+              disabled={cardBusy || !retryEnabled}
+              title={retryEnabled ? "Resolve this Source identity again" : "Connector must be available first"}
+              onClick={() => onAct(
+                source.id,
+                "identity",
+                () => retryConnectorSourceIdentity(source.id),
+              )}
+            >
+              {busyLabel === "identity" ? "retrying…" : "Retry identity"}
+            </button>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+function identityKindLabel(kind: ConnectorIntegrationView["identityKind"]): string {
+  switch (kind) {
+    case "single":
+      return "single identity";
+    case "device":
+      return "device identity";
+    case "connector":
+      return "connector identity";
+  }
+}
+
+function ownershipLabel(ownership: ConnectorIntegrationView["ownership"]): string {
+  switch (ownership) {
+    case "here":
+      return "runs on this device";
+    case "other-device":
+      return "runs on another device";
+    case "device-unknown":
+      return "device identity unavailable";
+  }
+}
+
+function identityStatusText(source: ConnectorIntegrationView): string {
+  switch (source.identityStatus) {
+    case "unresolved":
+      return "Source identity has not been resolved yet.";
+    case "conflict":
+      return "This identity already belongs to another Source.";
+    case "changed":
+      return "The connected account no longer matches this Source. Reconnect the original account or add a new Source.";
+    case "error":
+      return source.lastError ?? "Source identity could not be resolved.";
+    case "resolved":
+      return "";
+  }
+}
+
+function ownershipText(source: ConnectorIntegrationView): string {
+  switch (source.ownership) {
+    case "here":
+      return "";
+    case "other-device":
+      return "This Source belongs to another device and does not run here.";
+    case "device-unknown":
+      return source.ownershipReason
+        ? `This device cannot be identified: ${source.ownershipReason}`
+        : "This device cannot be identified, so this Source cannot run here.";
+  }
+}
+
+function addSourceDescription(connector: InstalledConnectorView): string {
+  switch (connector.identityKind) {
+    case "single":
+      return `Add the ${connector.name} Source with its own settings and sync progress.`;
+    case "device":
+      return `Add a ${connector.name} Source for this device with its own settings and sync progress.`;
+    case "connector":
+      return `Add another ${connector.name} Source with its own account, settings, and sync progress.`;
+  }
 }
 
 // Schema-driven settings form: one input per declared config field, prefilled

@@ -11,12 +11,14 @@ vi.mock("../hooks/useConnectors", () => ({
 
 import { ConnectorCatalogView } from "./ConnectorCatalogView";
 import { ConnectorsView } from "./ConnectorsView";
+import type { ConnectorIntegrationView } from "../lib/api";
 
 const installedConnector = {
   connectorId: "github",
   name: "GitHub",
+  description: "GitHub activity.",
   mode: "poll" as const,
-  integrationsMode: "multiple" as const,
+  identityKind: "connector" as const,
   supported: true,
   packageTrust: "official" as const,
   packageHash: "sha256:installed-package",
@@ -25,8 +27,9 @@ const installedConnector = {
 const updateCandidate = {
   connectorId: "github",
   name: "GitHub",
+  description: "GitHub activity.",
   mode: "poll" as const,
-  integrationsMode: "multiple" as const,
+  identityKind: "connector" as const,
   authType: "managedProvider" as const,
   supported: true,
   installed: true,
@@ -38,13 +41,40 @@ const updateCandidate = {
 const installCandidate = {
   connectorId: "google-calendar",
   name: "Google Calendar",
+  description: "Calendar activity.",
   mode: "poll" as const,
-  integrationsMode: "multiple" as const,
+  identityKind: "connector" as const,
   authType: "oauth2-public" as const,
   supported: true,
   installed: false,
   catalogHash: "sha256:calendar-package",
   updateAvailable: false,
+};
+
+const identitySource: ConnectorIntegrationView = {
+  id: "source-new",
+  connectorId: "github",
+  connectorName: "GitHub",
+  sourceKey: null,
+  displayName: "Personal GitHub",
+  suggestedLabel: "octocat",
+  identityKind: "connector",
+  identityStatus: "conflict",
+  ownership: "here",
+  conflictSourceId: "source-existing",
+  name: "Personal GitHub",
+  description: "GitHub activity.",
+  mode: "poll",
+  status: "idle",
+  setupStatus: "setup",
+  packageTrust: "official",
+  authType: "managedProvider",
+  authReady: true,
+  setupPending: ["identity"],
+  source: null,
+  running: false,
+  supported: true,
+  requirements: [],
 };
 
 describe("Connector surface responsibilities", () => {
@@ -78,5 +108,52 @@ describe("Connector surface responsibilities", () => {
 
     expect(markup).toContain("UPDATE AVAILABLE");
     expect(markup).toContain("Update connector…");
+  });
+
+  test("shows Source identity, ownership, conflict, rename, and retry controls", () => {
+    mocks.useConnectors.mockReturnValue({
+      sources: [identitySource],
+      packages: [installedConnector],
+      available: [updateCandidate],
+      loading: false,
+      error: null,
+      refresh: vi.fn(),
+    });
+
+    const markup = renderToStaticMarkup(<ConnectorsView />);
+
+    expect(markup).toContain("Personal GitHub");
+    expect(markup).toContain("identity conflict");
+    expect(markup).toContain("connector identity");
+    expect(markup).toContain("runs on this device");
+    expect(markup).toContain("Open existing Source");
+    expect(markup).toContain("Retry identity");
+    expect(markup).toContain("Rename…");
+  });
+
+  test("presents another-device ownership without local run controls", () => {
+    mocks.useConnectors.mockReturnValue({
+      sources: [{
+        ...identitySource,
+        sourceKey: "github:octocat",
+        identityStatus: "resolved" as const,
+        ownership: "other-device" as const,
+        status: "error" as const,
+        setupStatus: "ready" as const,
+        setupPending: [],
+      }],
+      packages: [installedConnector],
+      available: [],
+      loading: false,
+      error: null,
+      refresh: vi.fn(),
+    });
+
+    const markup = renderToStaticMarkup(<ConnectorsView />);
+
+    expect(markup).toContain("runs on another device");
+    expect(markup).toContain("does not run here");
+    expect(markup).not.toContain("Run now");
+    expect(markup).not.toContain("Retry now");
   });
 });

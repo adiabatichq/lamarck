@@ -440,7 +440,7 @@ export interface ConnectorRunRecordView {
   id: string;
   integrationId: string;
   connectorId: string;
-  integrationKey?: string;
+  sourceKey: string | null;
   trigger: "manual" | "schedule" | "watch";
   status: "running" | "success" | "error" | "aborted";
   startedAt: number;
@@ -449,7 +449,16 @@ export interface ConnectorRunRecordView {
   error?: string;
 }
 
-export type ConnectorSetupPendingReason = "integration_key" | "auth" | "requirements" | "config";
+export type ConnectorSourceIdentityKind = "single" | "device" | "connector";
+export type ConnectorIdentityStatus =
+  | "unresolved"
+  | "resolved"
+  | "conflict"
+  | "changed"
+  | "error";
+export type ConnectorOwnership = "here" | "other-device" | "device-unknown";
+
+export type ConnectorSetupPendingReason = "identity" | "auth" | "requirements" | "config";
 
 export interface ConnectorConfigFieldView {
   type: "string" | "number" | "boolean";
@@ -469,7 +478,7 @@ export interface InstalledConnectorView {
   name: string;
   description: string;
   mode: "watch" | "poll" | "manual";
-  integrationsMode: "singleton" | "multiple";
+  identityKind: ConnectorSourceIdentityKind;
   supported: boolean;
   packageTrust: ConnectorTrust;
   packageHash?: string;
@@ -478,11 +487,20 @@ export interface InstalledConnectorView {
 export interface ConnectorIntegrationView {
   id: string;
   connectorId: string;
-  integrationKey?: string;
+  connectorName: string;
+  sourceKey: string | null;
+  displayName: string | null;
+  suggestedLabel: string | null;
+  identityKind: ConnectorSourceIdentityKind;
+  identityStatus: ConnectorIdentityStatus;
+  ownership: ConnectorOwnership;
+  ownershipReason?: string;
+  conflictSourceId?: string;
+  // Core resolves the same shown-name precedence used by the shell:
+  // displayName -> suggestedLabel -> connectorName.
   name: string;
   description?: string;
   mode: "watch" | "poll" | "manual" | "unknown";
-  integrationsMode: "singleton" | "multiple";
   // Observed runtime activity/health. Source lifecycle comes only from
   // pausedAt/resumeAt; setupPending is the independent readiness condition.
   status: "idle" | "running" | "error";
@@ -496,7 +514,7 @@ export interface ConnectorIntegrationView {
   authReady: boolean;
   oauthRedirectUri?: string;
   setupPending: ConnectorSetupPendingReason[];
-  source?: string;
+  source: string | null;
   running: boolean;
   supported: boolean;
   scheduleCron?: string;
@@ -532,7 +550,7 @@ export interface AvailableConnectorView {
   name: string;
   description: string;
   mode: "watch" | "poll" | "manual";
-  integrationsMode: "singleton" | "multiple";
+  identityKind: ConnectorSourceIdentityKind;
   authType: ConnectorAuthType;
   supported: boolean;
   installed: boolean;
@@ -613,7 +631,10 @@ export function runConnectorIntegration(integrationId: string): Promise<{ ok: tr
 export interface ConnectorIntegrationRow {
   id: string;
   connectorId: string;
-  integrationKey?: string;
+  sourceKey: string | null;
+  identityStatus: ConnectorIdentityStatus;
+  displayName: string | null;
+  suggestedLabel: string | null;
   status: "idle" | "running" | "error";
   setupStatus: "setup" | "ready";
   pausedAt?: number;
@@ -627,7 +648,11 @@ export interface ConnectorIntegrationRow {
 
 export function updateConnectorIntegration(
   integrationId: string,
-  input: { scheduleCron?: string | null; integrationKey?: string; config?: Record<string, unknown> },
+  input: {
+    displayName?: string | null;
+    scheduleCron?: string | null;
+    config?: Record<string, unknown>;
+  },
 ): Promise<{ integration: ConnectorIntegrationRow }> {
   return request(`/api/connectors/integrations/${encodeURIComponent(integrationId)}`, {
     method: "PATCH",
@@ -653,12 +678,21 @@ export function stopConnectorConfigPanelSession(sessionId: string): Promise<{ ok
 
 export function createConnectorIntegration(
   connectorId: string,
-  integrationKey?: string,
+  displayName?: string,
 ): Promise<{ integration: ConnectorIntegrationRow }> {
   return request(`/api/connectors/${encodeURIComponent(connectorId)}/integrations`, {
     method: "POST",
-    body: JSON.stringify(integrationKey ? { integrationKey } : {}),
+    body: JSON.stringify(displayName ? { displayName } : {}),
   });
+}
+
+export function retryConnectorSourceIdentity(
+  integrationId: string,
+): Promise<{ integration: ConnectorIntegrationRow }> {
+  return request(
+    `/api/connectors/integrations/${encodeURIComponent(integrationId)}/identity/retry`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
 }
 
 export function removeConnectorIntegration(integrationId: string): Promise<{ ok: true }> {

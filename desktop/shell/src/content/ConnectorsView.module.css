@@ -471,6 +471,9 @@
 .sourceLine {
   flex: 1;
   min-width: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 9px;
   font-size: 12px;
   color: var(--c-amber);
   background: var(--c-amber-dim);
@@ -480,6 +483,81 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.sourceName {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+
+.sourceProvenance {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--c-ink-faint);
+  font-size: 10.5px;
+}
+
+.identitySummary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  color: var(--c-ink-faint);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.identityStatus {
+  color: var(--c-green-quiet);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.identityStatusError {
+  color: var(--c-red);
+}
+
+.identityStatusPending {
+  color: var(--c-amber);
+}
+
+.identityNotice {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 3px;
+  color: var(--c-amber);
+  background: var(--c-amber-dim);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.identityNoticeError {
+  color: var(--c-red);
+  background: var(--c-red-dim);
+}
+
+.identityNoticeText {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.identityLink {
+  color: currentColor;
+  font-weight: 600;
+  text-underline-offset: 2px;
+}
+
+.identityLink:focus-visible {
+  outline: 2px solid var(--c-amber);
+  outline-offset: 2px;
 }
 
 /* ── Setup needs + inline forms ─────────────────────────────────────── */

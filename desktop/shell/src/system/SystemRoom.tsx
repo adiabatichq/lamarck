@@ -631,11 +631,22 @@ function sourceNeedsAttention(source: ConnectorIntegrationView): boolean {
   return source.status === "error"
     || source.setupStatus === "setup"
     || source.setupPending.length > 0
+    || source.ownership === "device-unknown"
+    || source.identityStatus === "conflict"
+    || source.identityStatus === "changed"
+    || source.identityStatus === "error"
     || Boolean(source.authAttention)
     || Boolean(source.warnings?.length);
 }
 
 function sourceAttentionText(source: ConnectorIntegrationView): string {
+  if (source.ownership === "device-unknown") {
+    return source.ownershipReason ?? "This device cannot be identified";
+  }
+  if (source.identityStatus === "conflict") return "Source identity already belongs to another Source";
+  if (source.identityStatus === "changed") return "Connected account no longer matches this Source";
+  if (source.identityStatus === "error") return source.lastError ?? "Source identity could not be resolved";
+  if (source.identityStatus === "unresolved") return "Source identity has not been resolved";
   if (source.status === "error") return source.lastError ?? "Runtime error";
   if (source.authAttention) return "Authentication needs attention";
   if (source.setupPending.length > 0) return `Setup pending: ${source.setupPending.join(", ")}`;

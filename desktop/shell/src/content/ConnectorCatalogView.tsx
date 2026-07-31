@@ -127,6 +127,7 @@ function CatalogCard({
           <h2 className={styles.cardName}>{entry.name}</h2>
           <span className={styles.cardMeta}>
             {entry.mode}
+            <span className={styles.cron}> · {entry.identityKind} identity</span>
             {entry.authType !== "none" && <span className={styles.cron}> · {entry.authType}</span>}
             <span className={styles.bundledSeal}>bundled</span>
           </span>

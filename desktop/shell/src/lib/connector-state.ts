@@ -29,10 +29,31 @@ export const SOURCE_LIFECYCLE_LABEL: Record<SourceLifecycle, string> = {
   paused: "PAUSED",
 };
 
+export function sourceShownName(
+  c: Pick<
+    ConnectorIntegrationView,
+    "displayName" | "suggestedLabel" | "connectorName"
+  >,
+): string {
+  return c.displayName ?? c.suggestedLabel ?? c.connectorName;
+}
+
+export function sourceRunsHere(c: Pick<ConnectorIntegrationView, "ownership">): boolean {
+  return c.ownership === "here";
+}
+
 // Health is a secondary condition. A paused source can still need attention,
 // and a failed run does not silently change its lifecycle.
 export function sourceNeedsAttention(c: ConnectorIntegrationView): boolean {
-  return Boolean(c.authAttention || c.status === "error" || c.warnings?.length);
+  return Boolean(
+    c.authAttention
+      || c.status === "error"
+      || c.warnings?.length
+      || c.ownership === "device-unknown"
+      || c.identityStatus === "conflict"
+      || c.identityStatus === "changed"
+      || c.identityStatus === "error",
+  );
 }
 
 // Trust collapses to what a user must understand: official, approved custom,
@@ -65,7 +86,7 @@ export function connectorNeedsAttention(
 }
 
 const SETUP_NEED_LABEL: Record<ConnectorSetupPendingReason, string> = {
-  integration_key: "source name",
+  identity: "source identity",
   auth: "account connection",
   requirements: "permission grants",
   config: "settings",
