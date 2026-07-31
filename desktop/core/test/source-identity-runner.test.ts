@@ -161,6 +161,139 @@ describe("Connector source identity runner contract", () => {
     })).rejects.toThrow("only valid for managedProvider");
   });
 
+  test("close drains host RPC accepted before an aborted child exits", async () => {
+    const cwd = temporaryDirectory();
+    const entryPath = join(cwd, "connector.mjs");
+    writeFileSync(entryPath, `
+export default {
+  async run({ guard }) {
+    await guard.writeEvent({
+      type: "delayed.write",
+      externalId: "old-source-write",
+      startedAt: 1,
+      payload: {},
+    });
+  },
+};
+`);
+    const session = new ProcessRunnerSession({
+      entryPath,
+      contentHash: "rpc-drain-test",
+      cwd,
+      connectorId: "rpc-drain",
+      sourceIdentityKind: "single",
+      runnerEntryPath: runnerEntry,
+      killGraceMs: 10,
+    });
+    const controller = new AbortController();
+    let markWriteStarted!: () => void;
+    let releaseWrite!: () => void;
+    const writeStarted = new Promise<void>((resolve) => {
+      markWriteStarted = resolve;
+    });
+    const writeRelease = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const capabilities = runCapabilities({ authType: "none" });
+    capabilities.writeEvent = async () => {
+      markWriteStarted();
+      await writeRelease;
+      return { id: "old-source-write" };
+    };
+
+    await session.open(controller.signal);
+    const running = session.run({
+      config: undefined,
+      host: { workspacePath: cwd },
+      signal: controller.signal,
+      capabilities,
+    });
+    await writeStarted;
+    controller.abort();
+    await running;
+
+    let closeSettled = false;
+    const closing = session.close().then(() => {
+      closeSettled = true;
+    });
+    try {
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+    } finally {
+      releaseWrite();
+    }
+    await closing;
+    expect(closeSettled).toBe(true);
+  });
+
+  test("close does not let an abandoned read-only RPC defeat a command timeout", async () => {
+    const cwd = temporaryDirectory();
+    const entryPath = join(cwd, "connector.mjs");
+    writeFileSync(entryPath, `
+export default {
+  async run() {},
+  async configUi({ state }) {
+    await state.get();
+    return { url: "http://127.0.0.1:49321/config" };
+  },
+};
+`);
+    const session = new ProcessRunnerSession({
+      entryPath,
+      contentHash: "rpc-read-timeout-test",
+      cwd,
+      connectorId: "rpc-read-timeout",
+      sourceIdentityKind: "single",
+      runnerEntryPath: runnerEntry,
+      commandTimeoutMs: 500,
+    });
+    let markStateReadStarted!: () => void;
+    let releaseStateRead!: () => void;
+    const stateReadStarted = new Promise<void>((resolve) => {
+      markStateReadStarted = resolve;
+    });
+    const stateReadRelease = new Promise<void>((resolve) => {
+      releaseStateRead = resolve;
+    });
+
+    await session.open();
+    const configuring = session.configUi({
+      panelId: "config",
+      config: undefined,
+      host: { workspacePath: cwd },
+      signal: new AbortController().signal,
+      capabilities: {
+        configGet: async () => undefined,
+        configReplace: async () => {},
+        configPatch: async () => undefined,
+        stateGet: async () => {
+          markStateReadStarted();
+          await stateReadRelease;
+          return undefined;
+        },
+        stateSet: async () => {},
+      },
+    });
+    await stateReadStarted;
+    await expect(configuring).rejects.toThrow("timed out");
+
+    const closing = session.close();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const settled = await Promise.race([
+        closing.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), 1_000);
+        }),
+      ]);
+      expect(settled).toBe(true);
+    } finally {
+      clearTimeout(timer);
+      releaseStateRead();
+      await closing;
+    }
+  });
+
   test("resolves in the child runner and rejects every non-auth RPC", async () => {
     const cwd = temporaryDirectory();
     const entryPath = join(cwd, "connector.mjs");

@@ -2955,6 +2955,61 @@ auth:
     expect(handle.signal.aborted).toBe(true);
   });
 
+  test("a same-key mutation before the first attempt preserves the run intent behind its barrier", async () => {
+    const attempts: string[] = [];
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "identity-pre-attempt-barrier",
+        name: "Identity Pre-Attempt Barrier",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: { type: "none" },
+        config: {
+          account: { type: "string", label: "Account" },
+          revision: { type: "string", label: "Revision" },
+        },
+      },
+      {
+        resolveSourceIdentity({ config }) {
+          return { key: (config as { account: string }).account };
+        },
+        async run({ config, signal }) {
+          attempts.push((config as { revision: string }).revision);
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const source = await supervisor.addIntegration({
+      connectorId: "identity-pre-attempt-barrier",
+      config: { account: "work", revision: "old" },
+    });
+
+    const handle = supervisor.start(source.id, { trigger: "manual" });
+    const configured = supervisor.configureIntegration(source.id, {
+      config: { account: "work", revision: "same-key" },
+    });
+
+    await expect(configured).resolves.toMatchObject({
+      sourceKey: "work",
+      identityStatus: "resolved",
+    });
+    expect(await waitWithTestTimeout((async () => {
+      while (attempts.length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+    })(), 2_000)).toBe(true);
+    expect(attempts).toEqual(["same-key"]);
+    expect(handle.signal.aborted).toBe(false);
+
+    handle.abort();
+    await expect(handle.promise).resolves.toBeUndefined();
+  });
+
   test("same-key identity mutation replaces one run attempt while changed identity blocks it", async () => {
     const resolutions: string[] = [];
     const attempts: Array<{ account: string; revision: string }> = [];
@@ -9729,6 +9784,206 @@ auth:
       error: "cancelled",
     }))).resolves.toMatchObject({ status: "failed", error: "cancelled" });
     deleteSpy.mockRestore();
+  });
+
+  test("disconnect releases a pending browser barrier without releasing its Connector claim", async () => {
+    let markRunStarted!: () => void;
+    const runStarted = new Promise<void>((resolve) => {
+      markRunStarted = resolve;
+    });
+    const authManager = new ConnectorAuthManager(secrets, {
+      fetchImpl: async () => new Response(JSON.stringify({
+        access_token: "connected-account",
+        expires_in: 3_600,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    });
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager,
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-disconnect-barrier",
+        name: "OAuth Disconnect Barrier",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "manual" },
+        source: { identity: "connector" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://provider.example/authorize",
+          tokenEndpoint: "https://provider.example/token",
+          clientId: "disconnect-barrier-client",
+        },
+      },
+      {
+        async resolveSourceIdentity({ auth }) {
+          if (auth.type === "none") throw new Error("expected auth");
+          return { key: await auth.getToken() };
+        },
+        async run({ signal }) {
+          markRunStarted();
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "oauth-disconnect-barrier" });
+    const waitingSource = supervisor.ensureIntegration({ connectorId: "oauth-disconnect-barrier" });
+    const initial = await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const initialState = new URL(initial.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: initialState,
+      code: "initial-code",
+    }))).resolves.toMatchObject({ status: "connected" });
+
+    const handle = supervisor.start(source.id, { trigger: "manual" });
+    await runStarted;
+    await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+
+    let markDeletionStarted!: () => void;
+    let releaseDeletion!: () => void;
+    const deletionStarted = new Promise<void>((resolve) => {
+      markDeletionStarted = resolve;
+    });
+    const deletionRelease = new Promise<void>((resolve) => {
+      releaseDeletion = resolve;
+    });
+    const deleteCredentials = authManager.deleteIntegrationCredentials.bind(authManager);
+    const deleteSpy = vi.spyOn(authManager, "deleteIntegrationCredentials")
+      .mockImplementation(async (...args) => {
+        markDeletionStarted();
+        await deletionRelease;
+        await deleteCredentials(...args);
+      });
+
+    const disconnecting = supervisor.disconnectIntegration(source.id);
+    try {
+      expect(await waitWithTestTimeout(deletionStarted, 2_000)).toBe(true);
+      expect(handle.signal.aborted).toBe(true);
+      await expect(supervisor.retrySourceIdentity(waitingSource.id))
+        .rejects.toThrow("identity mutation in progress");
+    } finally {
+      releaseDeletion();
+    }
+    expect(await waitWithTestTimeout(disconnecting, 2_000)).toBe(true);
+    await expect(disconnecting).resolves.toMatchObject({
+      identityStatus: "unresolved",
+      setupStatus: "setup",
+    });
+    expect(await waitWithTestTimeout(handle.promise, 2_000)).toBe(true);
+    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+    deleteSpy.mockRestore();
+
+    const replacement = await supervisor.startOAuthIntegration(waitingSource.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const replacementState = new URL(replacement.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: replacementState,
+      error: "cancelled",
+    }))).resolves.toMatchObject({ status: "failed", error: "cancelled" });
+  });
+
+  test("Pause stops a watch behind a pending browser barrier without releasing its Connector claim", async () => {
+    let markRunStarted!: () => void;
+    const runStarted = new Promise<void>((resolve) => {
+      markRunStarted = resolve;
+    });
+    const authManager = new ConnectorAuthManager(secrets, {
+      fetchImpl: async () => new Response(JSON.stringify({
+        access_token: "paused-account",
+        expires_in: 3_600,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    });
+    supervisor = new ConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      host: { workspacePath: workspace },
+      platform: "darwin",
+      authManager,
+    });
+    supervisor.register(
+      {
+        manifestVersion: 1,
+        id: "oauth-pause-barrier",
+        name: "OAuth Pause Barrier",
+        description: "Test connector manifest.",
+        eventCatalog: "./events.json",
+        entry: "./index.ts",
+        runtime: { mode: "watch" },
+        source: { identity: "connector" },
+        auth: {
+          type: "oauth2-public",
+          authorizationEndpoint: "https://provider.example/authorize",
+          tokenEndpoint: "https://provider.example/token",
+          clientId: "pause-barrier-client",
+        },
+      },
+      {
+        async resolveSourceIdentity({ auth }) {
+          if (auth.type === "none") throw new Error("expected auth");
+          return { key: await auth.getToken() };
+        },
+        async run({ signal }) {
+          markRunStarted();
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      },
+    );
+    const source = supervisor.ensureIntegration({ connectorId: "oauth-pause-barrier" });
+    const waitingSource = supervisor.ensureIntegration({ connectorId: "oauth-pause-barrier" });
+    const initial = await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const initialState = new URL(initial.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: initialState,
+      code: "initial-code",
+    }))).resolves.toMatchObject({ status: "connected" });
+
+    const handle = supervisor.start(source.id, { trigger: "watch" });
+    await runStarted;
+    const pending = await supervisor.startOAuthIntegration(source.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+
+    const pausing = supervisor.pauseIntegration(source.id);
+    expect(await waitWithTestTimeout(pausing, 2_000)).toBe(true);
+    await expect(pausing).resolves.toMatchObject({
+      pausedAt: expect.any(Number),
+      identityStatus: "unresolved",
+    });
+    expect(await waitWithTestTimeout(handle.promise, 2_000)).toBe(true);
+    expect(handle.signal.aborted).toBe(true);
+    await expect(supervisor.retrySourceIdentity(waitingSource.id))
+      .rejects.toThrow("identity mutation in progress");
+
+    const pendingState = new URL(pending.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: pendingState,
+      error: "cancelled",
+    }))).resolves.toMatchObject({ status: "failed", error: "cancelled" });
   });
 
   test("oauth callback binds auth_ref to first-connect setup rows", async () => {

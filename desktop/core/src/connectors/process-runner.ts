@@ -30,7 +30,7 @@ import type {
   ConnectorSourceIdentityResult,
   ConnectorTextBlobResult,
 } from "./types";
-import type { HostToRunnerMessage, RunnerToHostMessage } from "./runner-protocol";
+import type { HostToRunnerMessage, RunnerRpcMethod, RunnerToHostMessage } from "./runner-protocol";
 
 export interface RunnerCapabilities {
   authType: ConnectorRuntimeAuthType;
@@ -202,6 +202,14 @@ export class InProcessRunnerSession implements RunnerSession {
 const RUNNER_CHILD_PATH = resolveRunnerChildPath();
 const DEFAULT_KILL_GRACE_MS = 3_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 10_000;
+// Drained by close() so no host-side effect lands after the identity write
+// fence has treated the attempt as stopped. Listed as the exceptions rather
+// than the members: a new capability is drained by default, and forgetting to
+// classify it costs a short wait instead of silently reopening the fence.
+const NON_MUTATING_RPC_METHODS: ReadonlySet<RunnerRpcMethod> = new Set([
+  "stateGet",
+  "configGet",
+]);
 const CONNECTOR_OS_ENV_KEYS = [
   // Executable and user-directory discovery used by bundled Connectors.
   "PATH",
@@ -286,6 +294,8 @@ export class ProcessRunnerSession implements RunnerSession {
     | undefined;
   private reqIds: string[] = [];
   private exited = false;
+  private closing = false;
+  private inFlightHostMutations = new Set<Promise<void>>();
   private killGraceMs: number;
   private commandTimeoutMs: number;
   private abortSignal: AbortSignal | undefined;
@@ -524,15 +534,23 @@ export class ProcessRunnerSession implements RunnerSession {
 
   async close(): Promise<void> {
     this.abortSignal?.removeEventListener("abort", this.onSessionAbort);
+    this.closing = true;
     const proc = this.proc;
-    if (!proc) return;
-    if (this.exited) return;
-    if (!this.exited) {
-      // The child has no shutdown obligations (state writes complete over RPC
-      // before done), so closing is always a hard kill.
+    if (proc && !this.exited) {
+      // The child has no shutdown obligations, so closing is always a hard
+      // kill. Host mutations accepted before closing are drained below.
       this.forceKill();
     }
-    await waitForChildSettlement(proc, Math.max(this.killGraceMs, 1_000));
+    if (proc) {
+      await waitForChildSettlement(proc, Math.max(this.killGraceMs, 1_000));
+    }
+    // Individual capabilities may impose their own liveness bounds. This layer
+    // deliberately does not: returning before an accepted host mutation settles
+    // would reopen the identity write fence, letting a write or token refresh
+    // land under the old source key after a new credential was committed.
+    while (this.inFlightHostMutations.size > 0) {
+      await Promise.allSettled([...this.inFlightHostMutations]);
+    }
   }
 
   private forceKill(): void {
@@ -613,7 +631,15 @@ export class ProcessRunnerSession implements RunnerSession {
 
   private onMessage(message: RunnerToHostMessage): void {
     if (message.type === "rpc") {
-      void this.dispatchRpc(message.id, message.method, message.params);
+      if (this.closing) return;
+      const rpc = this.dispatchRpc(message.id, message.method, message.params);
+      if (!NON_MUTATING_RPC_METHODS.has(message.method)) {
+        this.inFlightHostMutations.add(rpc);
+        const cleanup = () => {
+          this.inFlightHostMutations.delete(rpc);
+        };
+        void rpc.then(cleanup, cleanup);
+      }
       return;
     }
     const pending = this.pending;
@@ -680,9 +706,22 @@ export class ProcessRunnerSession implements RunnerSession {
         default:
           throw new Error(`Unknown connector capability: ${method}`);
       }
-      this.send({ type: "rpc-result", id, ok: true, value });
+      this.sendRpcResult({ type: "rpc-result", id, ok: true, value });
     } catch (err) {
-      this.send({ type: "rpc-result", id, ok: false, error: errorMessage(err) });
+      this.sendRpcResult({ type: "rpc-result", id, ok: false, error: errorMessage(err) });
+    }
+  }
+
+  private sendRpcResult(
+    message: Extract<HostToRunnerMessage, { type: "rpc-result" }>,
+  ): void {
+    const proc = this.proc;
+    if (this.closing || this.exited || !proc?.connected) return;
+    try {
+      proc.send(message, () => {});
+    } catch {
+      // The child may exit between the state check and the IPC send. The host
+      // capability has already settled, which is the close/fence obligation.
     }
   }
 }

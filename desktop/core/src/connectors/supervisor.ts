@@ -858,6 +858,18 @@ export class ConnectorSupervisor {
       );
     }
 
+    let claimedBrowserAttempt = pendingIdentityClaim?.sourceId === instanceId
+      ? pendingIdentityClaim
+      : undefined;
+    if (claimedBrowserAttempt) {
+      // The preserved run intent is waiting on this claim's barrier. Cancel
+      // the browser attempt and release only that barrier before awaiting the
+      // intent, while retaining the Connector exclusion through deletion.
+      this.authManager.cancelAttemptsForIntegration(instanceId);
+      claimedBrowserAttempt.expiresAt = undefined;
+      this.activeRuns.get(instanceId)?.releaseIdentityMutation();
+    }
+
     // Disconnect is a readiness change, not Source removal: stop current use
     // of the account and delete credentials, while preserving Source identity,
     // config, checkpoint, schedule, and pause policy.
@@ -867,12 +879,39 @@ export class ConnectorSupervisor {
       await active.promise.catch(() => {});
     }
 
-    this.authManager.cancelAttemptsForIntegration(instanceId);
-    if (pendingIdentityClaim?.sourceId === instanceId) {
-      this.releaseIdentityMutation(existing.connectorId, pendingIdentityClaim);
+    // A browser connect can claim this Source while Disconnect is awaiting a
+    // previously active attempt. Adopt and cancel that late expiring claim;
+    // never interrupt finalization after it has become non-expiring.
+    const currentIdentityClaim = this.identityMutations.get(existing.connectorId);
+    if (
+      currentIdentityClaim
+      && currentIdentityClaim !== claimedBrowserAttempt
+      && currentIdentityClaim.expiresAt === undefined
+    ) {
+      throw new ConnectorLifecycleConflictError(
+        `Connector ${existing.connectorId} already has an identity mutation in progress`,
+      );
     }
-    await this.authManager.deleteIntegrationCredentials(instanceId, existing.authRef);
-    return (await this.refreshSetupStatus(instanceId)) as ConnectorIntegration<TConfig, TState>;
+    if (
+      currentIdentityClaim
+      && currentIdentityClaim !== claimedBrowserAttempt
+      && currentIdentityClaim.sourceId === instanceId
+    ) {
+      this.authManager.cancelAttemptsForIntegration(instanceId);
+      currentIdentityClaim.expiresAt = undefined;
+      claimedBrowserAttempt = currentIdentityClaim;
+    }
+    if (!claimedBrowserAttempt) {
+      this.authManager.cancelAttemptsForIntegration(instanceId);
+    }
+    try {
+      await this.authManager.deleteIntegrationCredentials(instanceId, existing.authRef);
+      return (await this.refreshSetupStatus(instanceId)) as ConnectorIntegration<TConfig, TState>;
+    } finally {
+      if (claimedBrowserAttempt) {
+        this.releaseIdentityMutation(existing.connectorId, claimedBrowserAttempt);
+      }
+    }
   }
 
   isRegistered(connectorId: string): boolean {
@@ -1273,6 +1312,10 @@ export class ConnectorSupervisor {
     this.store.pause(instanceId, durationMs === undefined ? undefined : Date.now() + durationMs);
     const active = this.activeRuns.get(instanceId);
     if (active && active.trigger !== "manual") {
+      // An identity mutation may have parked this preserved run intent behind
+      // its barrier. Pause terminates the intent, so wake that barrier before
+      // awaiting it without releasing the Connector's mutation claim.
+      active.releaseIdentityMutation();
       active.abort();
       await active.promise.catch(() => {});
     }
@@ -1799,6 +1842,11 @@ export class ConnectorSupervisor {
       while (!active.signal.aborted) {
         await active.waitForIdentityMutation();
         if (active.signal.aborted) break;
+        // A mutation can install a barrier after waitForIdentityMutation()
+        // snapshots "none" but before this continuation runs. Re-enter the
+        // wait instead of treating that mutation's temporary setup state as a
+        // reason to terminate the higher-level run intent.
+        if (active.identityBarrier) continue;
         const integration = this.store.get(active.instanceId);
         if (!integration) {
           active.abort();
