@@ -6,8 +6,8 @@ eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
   mode: watch
-integrations:
-  mode: multiple
+source:
+  identity: device
 platforms:
   darwin:
     requirements:

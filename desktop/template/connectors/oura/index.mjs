@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-const DEFAULT_LAMARCK_API_ORIGIN = "https://api.lamarck.ai";
+const IDENTITY_PATH = "/v1/identity";
 const DEFAULT_LOOKBACK_DAYS = 3;
 const DEFAULT_BACKFILL_YEARS = 1;
 const DATE_BACKFILL_CHUNK_DAYS = 90;
@@ -115,12 +115,41 @@ export default {
   async run(context) {
     await syncOnce(context);
   },
+
+  async resolveSourceIdentity(context) {
+    return resolveSourceIdentity(context);
+  },
 };
 
-export async function syncOnce(context, deps = {}) {
-  if (!context.auth || context.auth.type !== "managedProvider") {
-    throw new Error("Oura connector requires Lamarck managed provider credentials");
+export async function resolveSourceIdentity(context, deps = {}) {
+  assertManagedProviderAuth(context.auth);
+  const token = await context.auth.getToken();
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    throw new Error("Oura connector requires fetch");
   }
+
+  const baseUrl = managedProviderBaseUrl(context.auth, deps);
+  const res = await fetchImpl(providerUrl(baseUrl, IDENTITY_PATH).toString(), {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    signal: context.signal,
+  });
+  const body = await providerResponseBody(res);
+  if (typeof body.id !== "string" || body.id.length === 0) {
+    throw new Error("Oura identity response is missing a stable id");
+  }
+  return {
+    key: body.id,
+    ...(typeof body.email === "string" ? { label: body.email } : {}),
+  };
+}
+
+export async function syncOnce(context, deps = {}) {
+  assertManagedProviderAuth(context.auth);
 
   const config = normalizeConfig(context.config);
   const previous = normalizeState(await context.state.get());
@@ -137,7 +166,7 @@ export async function syncOnce(context, deps = {}) {
   if (typeof fetchImpl !== "function") {
     throw new Error("Oura connector requires fetch");
   }
-  const baseUrl = managedProviderBaseUrl(context, deps);
+  const baseUrl = managedProviderBaseUrl(context.auth, deps);
   const streams = selectStreams(config);
 
   for (const stream of streams) {
@@ -464,19 +493,7 @@ async function fetchPage({ stream, range, token, nextToken, signal, fetchImpl, b
     },
     signal,
   });
-  const text = await res.text();
-  const body = text ? JSON.parse(text) : {};
-
-  if (!res.ok) {
-    const retryAfter = typeof res.headers?.get === "function" ? res.headers.get("retry-after") : undefined;
-    const retryHint = retryAfter ? ` retry after ${retryAfter}s` : "";
-    const message = typeof body.detail === "string"
-      ? body.detail
-      : typeof body.message === "string"
-        ? body.message
-        : `Oura API returned ${res.status}`;
-    throw new Error(`${message}${retryHint}`);
-  }
+  const body = await providerResponseBody(res);
 
   return {
     data: Array.isArray(body.data) ? body.data : [],
@@ -488,14 +505,32 @@ async function fetchPage({ stream, range, token, nextToken, signal, fetchImpl, b
   };
 }
 
-function managedProviderBaseUrl(context, deps) {
+async function providerResponseBody(res) {
+  const text = await res.text();
+  const parsed = text ? JSON.parse(text) : {};
+  const body = isObject(parsed) ? parsed : {};
+
+  if (!res.ok) {
+    const retryAfter = typeof res.headers?.get === "function" ? res.headers.get("retry-after") : undefined;
+    const retryHint = retryAfter ? ` retry after ${retryAfter}s` : "";
+    const message = typeof body.detail === "string"
+      ? body.detail
+      : typeof body.message === "string"
+        ? body.message
+        : `Oura API returned ${res.status}`;
+    throw new Error(`${message}${retryHint}`);
+  }
+  return body;
+}
+
+function managedProviderBaseUrl(auth, deps) {
   if (typeof deps.baseUrl === "string" && deps.baseUrl.trim()) {
     return normalizeBaseUrl(deps.baseUrl);
   }
-  const apiOrigin = typeof context.host?.lamarckApiOrigin === "string" && context.host.lamarckApiOrigin.trim()
-    ? context.host.lamarckApiOrigin
-    : DEFAULT_LAMARCK_API_ORIGIN;
-  return new URL("/providers/oura/", normalizeBaseUrl(apiOrigin)).toString();
+  if (typeof auth.providerOrigin !== "string" || !auth.providerOrigin.trim()) {
+    throw new Error("Oura managed provider origin is unavailable");
+  }
+  return new URL("/providers/oura/", normalizeBaseUrl(auth.providerOrigin)).toString();
 }
 
 function providerUrl(baseUrl, path) {
@@ -509,6 +544,12 @@ function normalizeBaseUrl(value) {
   url.hash = "";
   if (!url.pathname.endsWith("/")) url.pathname += "/";
   return url.toString();
+}
+
+function assertManagedProviderAuth(auth) {
+  if (!auth || auth.type !== "managedProvider" || typeof auth.getToken !== "function") {
+    throw new Error("Oura connector requires Lamarck managed provider credentials");
+  }
 }
 
 async function writeBatch(guard, events) {

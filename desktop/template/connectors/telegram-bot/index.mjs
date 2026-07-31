@@ -35,7 +35,32 @@ export default {
   async configUi(context) {
     return startSetupPanel(context);
   },
+
+  async resolveSourceIdentity(context) {
+    return resolveSourceIdentity(context);
+  },
 };
+
+export async function resolveSourceIdentity(context, deps = {}) {
+  assertApiKeyAuth(context.auth);
+  const token = await context.auth.getToken();
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    throw new Error("Telegram connector requires fetch");
+  }
+
+  const me = await telegramApi(token, "getMe", {}, {
+    fetchImpl,
+    signal: context.signal,
+  });
+  if (!Number.isSafeInteger(me?.id) || me.id <= 0) {
+    throw new Error("Telegram getMe returned an invalid bot id");
+  }
+  return {
+    key: String(me.id),
+    ...(typeof me.username === "string" ? { label: me.username } : {}),
+  };
+}
 
 export async function connectOnce(context, deps = {}) {
   assertApiKeyAuth(context.auth);

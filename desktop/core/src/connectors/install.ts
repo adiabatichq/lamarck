@@ -123,6 +123,13 @@ export async function listInstalledConnectorDirs(workspacePath: string): Promise
 // can be installed without a download. Listing them never copies anything —
 // installation is always an explicit user action through the same install
 // flow as any other connector package.
+// These prototypes remain in-tree for their focused tests, but neither has an
+// approved Source identity and therefore neither is a shipping catalog entry.
+const EXCLUDED_BUILTIN_CONNECTOR_IDS = new Set([
+  "app-commits",
+  "code-agent-transcripts",
+]);
+
 export async function listAvailableBuiltIns(
   builtinsDir: string,
   onError?: (connectorDir: string, error: unknown) => void,
@@ -136,7 +143,13 @@ export async function listAvailableBuiltIns(
   }
 
   const available: InstalledConnector[] = [];
-  for (const entry of entries.filter((e) => e.isDirectory() && !e.name.startsWith(".")).sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const entry of entries
+    .filter((e) => (
+      e.isDirectory()
+      && !e.name.startsWith(".")
+      && !EXCLUDED_BUILTIN_CONNECTOR_IDS.has(e.name)
+    ))
+    .sort((a, b) => a.name.localeCompare(b.name))) {
     const dir = join(builtinsDir, entry.name);
     try {
       const manifest = await loadConnectorManifest(dir);
