@@ -12,8 +12,8 @@ export {
 } from "./data-schema";
 export const SYSTEM_DB_FILENAME = "system.db";
 
-// Released schema constants are immutable migration inputs. Add a new version
-// instead of editing V1 once a later schema ships.
+// Released schema constants are immutable migration inputs. This greenfield V1
+// includes both the control plane and D1 working-tree reconciliation state.
 export const SYSTEM_SCHEMA_V1 = `
 CREATE TABLE IF NOT EXISTS connector_integrations (
   id            TEXT PRIMARY KEY,
@@ -105,9 +105,7 @@ CREATE INDEX IF NOT EXISTS idx_auth_credentials_owner
   ON auth_credentials(owner_type, owner_id);
 CREATE INDEX IF NOT EXISTS idx_auth_credentials_status
   ON auth_credentials(status);
-`;
 
-const SYSTEM_SCHEMA_V2_DELTA = `
 CREATE TABLE IF NOT EXISTS d1_working_tree_mirrors (
   doc_id              TEXT PRIMARY KEY,
   content_hash        TEXT NOT NULL
@@ -146,14 +144,13 @@ CREATE TABLE IF NOT EXISTS d1_working_tree_protected_hashes (
 );
 `;
 
-export const SYSTEM_SCHEMA_V2 = `${SYSTEM_SCHEMA_V1}${SYSTEM_SCHEMA_V2_DELTA}`;
-
-export const SYSTEM_SCHEMA = SYSTEM_SCHEMA_V2;
+export const SYSTEM_SCHEMA = SYSTEM_SCHEMA_V1;
+export const SYSTEM_DATABASE_VERSION = 1;
 
 const SYSTEM_MIGRATIONS: readonly DatabaseMigration[] = [
   {
     version: 1,
-    name: "baseline control-plane schema",
+    name: "baseline control-plane and D1 reconciliation schema",
     up(db) {
       db.exec(SYSTEM_SCHEMA_V1);
     },
@@ -163,21 +160,7 @@ const SYSTEM_MIGRATIONS: readonly DatabaseMigration[] = [
       });
     },
   },
-  {
-    version: 2,
-    name: "persist D1 working-tree reconciliation state and protected hashes",
-    up(db) {
-      db.exec(SYSTEM_SCHEMA_V2_DELTA);
-    },
-    validate(db) {
-      assertSchemaCompatible(db, SYSTEM_SCHEMA_V2, SYSTEM_DB_FILENAME, {
-        allowUnknownObjects: false,
-      });
-    },
-  },
 ];
-
-export const SYSTEM_DATABASE_VERSION = SYSTEM_MIGRATIONS.at(-1)?.version ?? 0;
 
 export function migrateSystemDatabase(db: DatabaseSync): number {
   return runDatabaseMigrations(db, {

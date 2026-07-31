@@ -16,7 +16,6 @@ import {
   SYSTEM_DATABASE_VERSION,
   SYSTEM_DB_FILENAME,
   SYSTEM_SCHEMA_V1,
-  SYSTEM_SCHEMA_V2,
 } from "../src/db";
 import { readDatabaseVersion } from "../src/database-migrations";
 import { GuardEngine } from "../src/guard-service/engine";
@@ -57,12 +56,10 @@ describe("data.db and system.db schema versions", () => {
   });
 
   test("pins the released migration inputs", () => {
-    expect(SYSTEM_DATABASE_VERSION).toBe(2);
+    expect(SYSTEM_DATABASE_VERSION).toBe(1);
     expect(sha256(DATA_SCHEMA_V1))
       .toBe("ec3182151699d26bcb3e00118fa5e93e6c2d4f5407de935e8f0351bf1cf6c395");
     expect(sha256(SYSTEM_SCHEMA_V1))
-      .toBe("2cda5cd73591c4425d6aa382f3024f7b96d80f6a0bfd39b8424e80fb598f3f91");
-    expect(sha256(SYSTEM_SCHEMA_V2))
       .toBe("2ad3c0191f2c680233934e5f39d72ba7d2cd74d81b497bd2995ccb4049e70198");
   });
 
@@ -171,7 +168,7 @@ describe("data.db and system.db schema versions", () => {
     db.close();
   });
 
-  test("adopts an exact legacy system v0 without changing control-plane rows", () => {
+  test("adopts an exact unversioned system schema without changing control-plane rows", () => {
     const legacy = new DatabaseSync(systemPath());
     legacy.exec(SYSTEM_SCHEMA_V1);
     legacy.prepare(
@@ -195,38 +192,16 @@ describe("data.db and system.db schema versions", () => {
     systemDb.close();
   });
 
-  test("upgrades declared system v1 to v2 without changing control-plane rows", () => {
-    const legacy = new DatabaseSync(systemPath());
-    legacy.exec(`${SYSTEM_SCHEMA_V1}\nPRAGMA user_version = 1;`);
-    legacy.prepare(
-      `INSERT INTO auth_accounts (id, label, subject, created_at)
-       VALUES (?, ?, ?, ?)`,
-    ).run("account-v1", "Version one", "subject-v1", 321);
-    legacy.close();
-
-    const systemDb = openSystemDatabase(workspace);
-    expect(readDatabaseVersion(systemDb, SYSTEM_DB_FILENAME)).toBe(SYSTEM_DATABASE_VERSION);
-    expect(systemDb.prepare("SELECT id, label, subject, created_at FROM auth_accounts").all())
-      .toEqual([{
-        id: "account-v1",
-        label: "Version one",
-        subject: "subject-v1",
-        created_at: 321,
-      }]);
-    expect(schemaObject(systemDb, "d1_working_tree_mirrors")).toBeTruthy();
-    expect(schemaObject(systemDb, "d1_working_tree_conflicts")).toBeTruthy();
-    expect(schemaObject(systemDb, "d1_working_tree_protected_hashes")).toBeTruthy();
-    systemDb.close();
-  });
-
-  test("refuses a malformed declared system v1 before creating v2 state", () => {
-    const malformed = new DatabaseSync(systemPath());
-    malformed.exec(`
+  test("refuses an incomplete declared system v1 without repairing it", () => {
+    const incomplete = new DatabaseSync(systemPath());
+    incomplete.exec(`
       ${SYSTEM_SCHEMA_V1}
-      DROP INDEX idx_auth_credentials_status;
+      DROP TABLE d1_working_tree_mirrors;
+      DROP TABLE d1_working_tree_conflicts;
+      DROP TABLE d1_working_tree_protected_hashes;
       PRAGMA user_version = 1;
     `);
-    malformed.close();
+    incomplete.close();
 
     expect(() => openSystemDatabase(workspace))
       .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
