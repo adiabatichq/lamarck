@@ -21,6 +21,10 @@ import { existsSync } from "node:fs";
 import { chmod, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { validateGuestRelease } from "../desktop/capsule-guest/scripts/release-contract.mjs";
+import {
+  assertDeviceIdentityNativeResourceLayout,
+  deviceIdentityNativeAddonPath,
+} from "../desktop/core/src/device-identity/native/resource-path.mjs";
 import { runPackagedNodePtySmoke } from "./macos-release-runtime.mjs";
 
 const ALPHA_BUNDLE_ID = "ai.lamarck.desktop.alpha";
@@ -72,6 +76,10 @@ const FIXED_ELECTRON_FILES = [
 
 await requireDirectory(distRoot, "renderer build output (npm run build)");
 await requireDirectory(nativeRoot, "capsule native staging (npm run capsule-guest:stage)");
+await requireFile(
+  deviceIdentityNativeAddonPath(nativeRoot),
+  "device identity native addon (npm run build)",
+);
 const guestRelease = await validateGuestRelease(join(nativeRoot, "capsule-guest"));
 await requireDirectory(templateRoot, "workspace template");
 await requireDirectory(electronSourceApp, "Electron.app (node node_modules/electron/install.js)");
@@ -132,6 +140,10 @@ try {
     await cp(join(electronOutRoot, name), join(electronResources, name));
   }
   await cp(nativeRoot, join(electronResources, "native"), { recursive: true });
+  assertDeviceIdentityNativeResourceLayout(
+    electronResources,
+    join(electronResources, "native"),
+  );
   await cp(templateRoot, join(resources, "template"), { recursive: true });
 
   // Runtime dependency closure: node-pty and its single runtime dependency,

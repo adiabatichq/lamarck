@@ -21,6 +21,10 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { validateGuestRelease } from "../desktop/capsule-guest/scripts/release-contract.mjs";
 import {
+  assertDeviceIdentityNativeResourceLayout,
+  deviceIdentityNativeAddonPath,
+} from "../desktop/core/src/device-identity/native/resource-path.mjs";
+import {
   createMacOsReleaseSourceSnapshot,
   validateMacOsReleaseSourceSnapshot,
   validateMacOsShellBuildExport,
@@ -122,6 +126,14 @@ async function packageRelease(releaseConfig, signingIdentity) {
         LAMARCK_GUEST_RELEASE_ROOT: releaseConfig.guestReleaseRoot,
       },
     });
+    run(process.execPath, [
+      join(
+        sourceSnapshotRoot,
+        "desktop", "core", "src", "device-identity", "native", "build.mjs",
+      ),
+      "--native-root",
+      isolatedNativeRoot,
+    ]);
     await validateMacOsReleaseSourceSnapshot(sourceSnapshotRoot);
     await validateNativeResources(isolatedNativeRoot, releaseConfig.expectedGuestArchitecture);
 
@@ -462,6 +474,10 @@ async function assembleApplication(
     );
   }
   await copyRealTree(nativeRoot, join(electronResources, "native"));
+  assertDeviceIdentityNativeResourceLayout(
+    electronResources,
+    join(electronResources, "native"),
+  );
   await copyRealTree(join(sourceSnapshotRoot, "desktop", "template"), join(resources, "template"));
 }
 
@@ -486,6 +502,10 @@ async function validatePackagedApplication(appPath, releaseConfig) {
     "preload.cjs",
     "pty-helper.cjs",
   ], "packaged Electron resources");
+  assertDeviceIdentityNativeResourceLayout(
+    electronResources,
+    join(electronResources, "native"),
+  );
   const expectedPackage = {
     name: "@lamarck/shell",
     version: releaseConfig.version,
@@ -553,11 +573,31 @@ async function validatePackagedApplication(appPath, releaseConfig) {
 }
 
 async function validateNativeResources(nativeRoot, expectedArchitecture) {
-  await requireRealDirectory(nativeRoot, "Capsule native resource root");
+  await requireRealDirectory(nativeRoot, "native resource root");
   assertExactList(
     await sortedEntries(nativeRoot),
-    ["capsule-guest", "lamarck-capsule-vm-host"],
-    "Capsule native resource root",
+    ["capsule-guest", "device-identity", "lamarck-capsule-vm-host"],
+    "native resource root",
+  );
+  const deviceIdentityDirectory = join(nativeRoot, "device-identity");
+  await requireRealDirectory(deviceIdentityDirectory, "device identity native resource directory");
+  assertExactList(
+    await sortedEntries(deviceIdentityDirectory),
+    ["lamarck_device_identity.node"],
+    "device identity native resource directory",
+  );
+  const deviceIdentityAddon = deviceIdentityNativeAddonPath(nativeRoot);
+  const deviceIdentityDetails = await requireRealFile(
+    deviceIdentityAddon,
+    "device identity native addon",
+  );
+  if ((deviceIdentityDetails.mode & 0o777) !== 0o644) {
+    throw new Error("device identity native addon mode is not 0644");
+  }
+  assertExactMachOArchitecture(
+    capture("lipo", ["-archs", deviceIdentityAddon]),
+    expectedArchitecture,
+    "device identity native addon",
   );
   const helper = join(nativeRoot, "lamarck-capsule-vm-host");
   const helperDetails = await requireRealFile(helper, "Capsule VM helper");
@@ -709,6 +749,10 @@ async function signElectronApplication(appPath, capsuleHelper, identity, sign) {
   if (!signableCode.has(resolve(capsuleHelper))) {
     throw new Error("Capsule VM helper is not a Mach-O code object in the Electron signing set");
   }
+  const deviceIdentityAddon = packagedDeviceIdentityAddon(appPath);
+  if (!signableCode.has(resolve(deviceIdentityAddon))) {
+    throw new Error("device identity addon is missing from the Electron signing set");
+  }
   for (const path of packagedNodePtyCode(appPath)) {
     if (!signableCode.has(resolve(path))) {
       throw new Error("packaged node-pty code is missing from the Electron signing set");
@@ -785,6 +829,10 @@ async function verifyReleaseSignatures(
   const codeObjects = await listCodeObjects(appPath);
   if (!codeObjects.includes(resolve(capsuleHelper))) {
     throw new Error("Capsule VM helper is missing from the postflight code-object set");
+  }
+  const deviceIdentityAddon = packagedDeviceIdentityAddon(appPath);
+  if (!codeObjects.includes(resolve(deviceIdentityAddon))) {
+    throw new Error("device identity addon is missing from the postflight code-object set");
   }
   for (const path of packagedNodePtyCode(appPath)) {
     if (!codeObjects.includes(resolve(path))) {
@@ -944,6 +992,13 @@ function packagedHelper(appPath) {
     "Contents", "Resources", "app", "dist-electron", "native",
     "lamarck-capsule-vm-host",
   );
+}
+
+function packagedDeviceIdentityAddon(appPath) {
+  return deviceIdentityNativeAddonPath(join(
+    appPath,
+    "Contents", "Resources", "app", "dist-electron", "native",
+  ));
 }
 
 function packagedNodePtyCode(appPath) {

@@ -2,6 +2,11 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const MACOS_RELEASE_APP_NAME = "Lamarck.app";
 export const MACOS_RELEASE_BUNDLE_ID = "ai.lamarck.desktop";
+export const MACOS_DEVICE_IDENTITY_REVIEW_ACKNOWLEDGEMENTS = Object.freeze([
+  "LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW",
+  "LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW",
+  "LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW",
+]);
 export const MACOS_ELECTRON_ARTIFACT = Object.freeze({
   version: "42.6.1",
   architecture: "arm64",
@@ -50,6 +55,7 @@ export function loadMacOsReleaseConfig({
 
   const codesignIdentity = distributionIdentity(env.LAMARCK_CODESIGN_IDENTITY);
   const notaryProfileName = notaryProfile(env.LAMARCK_NOTARY_PROFILE);
+  requireAppleDeviceIdentityReviews(env);
   const version = releaseVersion(env.LAMARCK_RELEASE_VERSION ?? packageVersion);
   const bundleIdentifier = bundleIdentifierValue(
     env.LAMARCK_BUNDLE_ID ?? MACOS_RELEASE_BUNDLE_ID,
@@ -99,6 +105,17 @@ export function loadMacOsReleaseConfig({
       `Lamarck-${version}-macos-${expectedGuestArchitecture}.zip`,
     ),
   });
+}
+
+export function requireAppleDeviceIdentityReviews(env) {
+  if (!env || typeof env !== "object" || Array.isArray(env)) {
+    throw new Error("Apple device identity review acknowledgements are required");
+  }
+  for (const name of MACOS_DEVICE_IDENTITY_REVIEW_ACKNOWLEDGEMENTS) {
+    if (env[name] !== "1") {
+      throw new Error(`${name}=1 is required for production macOS device identity distribution`);
+    }
+  }
 }
 
 /** A stable, secret-free plan used by --dry-run and contract tests. */

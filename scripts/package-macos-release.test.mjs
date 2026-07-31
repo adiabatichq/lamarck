@@ -27,6 +27,7 @@ import {
   notaryProfile,
   resolveInstalledDeveloperIdIdentity,
   validateLockedElectronPackage,
+  MACOS_DEVICE_IDENTITY_REVIEW_ACKNOWLEDGEMENTS,
   MACOS_ELECTRON_ARTIFACT,
 } from "./package-macos-release-contract.mjs";
 import {
@@ -42,11 +43,23 @@ import {
 } from "./macos-release-publication.mjs";
 import { loadFrozenOsxSign } from "./macos-release-signer.mjs";
 import { runPackagedNodePtySmoke } from "./macos-release-runtime.mjs";
+import {
+  buildDeviceIdentityNative,
+  deviceIdentityNativeRequired,
+} from "../desktop/core/src/device-identity/native/build.mjs";
+import {
+  DEVICE_IDENTITY_NATIVE_RESOURCE_PATH,
+  assertDeviceIdentityNativeResourceLayout,
+  deviceIdentityNativeAddonPath,
+} from "../desktop/core/src/device-identity/native/resource-path.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const validEnvironment = {
   LAMARCK_CODESIGN_IDENTITY: "Developer ID Application: Lamarck Test (ABCDE12345)",
   LAMARCK_NOTARY_PROFILE: "lamarck-notary",
+  LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW: "1",
+  LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW: "1",
+  LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW: "1",
 };
 
 test("release credentials fail closed when signing identity is absent or ad-hoc", () => {
@@ -107,6 +120,35 @@ test("release config is macOS-only and requires both credential references", () 
   }), /alpha macOS release is arm64-only; no signed x64 Guest image exists/);
 });
 
+test("production macOS device identity requires separate exact review acknowledgements", () => {
+  assert.deepEqual(MACOS_DEVICE_IDENTITY_REVIEW_ACKNOWLEDGEMENTS, [
+    "LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW",
+    "LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW",
+    "LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW",
+  ]);
+  for (const name of MACOS_DEVICE_IDENTITY_REVIEW_ACKNOWLEDGEMENTS) {
+    const missing = { ...validEnvironment };
+    delete missing[name];
+    assert.throws(() => loadMacOsReleaseConfig({
+      root,
+      packageVersion: "0.1.0",
+      env: missing,
+      platform: "darwin",
+      architecture: "arm64",
+    }), new RegExp(`${name}=1 is required`));
+
+    for (const value of ["0", "true", " 1", "1 "]) {
+      assert.throws(() => loadMacOsReleaseConfig({
+        root,
+        packageVersion: "0.1.0",
+        env: { ...validEnvironment, [name]: value },
+        platform: "darwin",
+        architecture: "arm64",
+      }), new RegExp(`${name}=1 is required`));
+    }
+  }
+});
+
 test("dry-run plan includes every production trust gate and never package:patch", () => {
   const config = loadMacOsReleaseConfig({
     root,
@@ -160,6 +202,11 @@ test("release signing policy gives only Electron and Capsule their required enti
   assert.deepEqual(macOsReleaseEntitlementsForPath(capsuleHelper, options), [
     "com.apple.security.virtualization",
   ]);
+  assert.deepEqual(macOsReleaseEntitlementsForPath(resolve(
+    appPath,
+    "Contents", "Resources", "app", "dist-electron", "native",
+    "device-identity", "lamarck_device_identity.node",
+  ), options), []);
   assert.deepEqual(macOsReleaseEntitlementsForPath(resolve(
     appPath,
     "Contents", "Resources", "app", "dist-electron", "native", "capsule-guest", "rootfs.img",
@@ -278,6 +325,85 @@ test("local and hermetic release builds share the canonical Desktop recipe", asy
   assert.equal(shellPackage.scripts.build, "node ../../scripts/build-desktop.mjs");
   assert.match(releaseBuilder, /join\(source, "scripts\/build-desktop\.mjs"\)/);
   assert.ok(MACOS_RELEASE_SOURCE_FILES.includes("scripts/build-desktop.mjs"));
+});
+
+test("device identity native build and packaged lookup share one exact resource path", async (t) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "lamarck-device-identity-resource-"));
+  t.after(async () => await rm(temporaryRoot, { recursive: true, force: true }));
+  const bundleDirectory = join(temporaryRoot, "dist-electron");
+  const nativeRoot = join(bundleDirectory, "native");
+  const addon = deviceIdentityNativeAddonPath(nativeRoot);
+
+  assert.equal(
+    DEVICE_IDENTITY_NATIVE_RESOURCE_PATH,
+    "./native/device-identity/lamarck_device_identity.node",
+  );
+  assert.equal(
+    assertDeviceIdentityNativeResourceLayout(bundleDirectory, nativeRoot),
+    addon,
+  );
+  assert.throws(
+    () => assertDeviceIdentityNativeResourceLayout(
+      bundleDirectory,
+      join(temporaryRoot, "other-native-root"),
+    ),
+    /does not match the Core lookup path/,
+  );
+  assert.equal(deviceIdentityNativeRequired("darwin"), true);
+  assert.equal(deviceIdentityNativeRequired("win32"), true);
+  assert.equal(deviceIdentityNativeRequired("linux"), false);
+
+  await mkdir(dirname(addon), { recursive: true });
+  await writeFile(addon, "stale generated addon\n");
+  const sibling = join(nativeRoot, "existing-native-resource");
+  await writeFile(sibling, "preserved\n");
+  assert.equal(await buildDeviceIdentityNative({
+    bundleDirectory,
+    nativeRoot,
+    platform: "linux",
+  }), undefined);
+  await assert.rejects(lstat(addon), /ENOENT/);
+  assert.equal(await readFile(sibling, "utf8"), "preserved\n");
+
+  const [
+    darwinAdapter,
+    windowsAdapter,
+    corePackage,
+    coreBuilder,
+    electronBuilder,
+    alphaPackager,
+    releasePackager,
+  ] = await Promise.all([
+    readFile(join(
+      root,
+      "desktop/core/src/device-identity/platform/darwin.ts",
+    ), "utf8"),
+    readFile(join(
+      root,
+      "desktop/core/src/device-identity/platform/win32.ts",
+    ), "utf8"),
+    readFile(join(root, "desktop/core/package.json"), "utf8"),
+    readFile(join(root, "scripts/build-core.mjs"), "utf8"),
+    readFile(join(root, "scripts/build-electron-main.mjs"), "utf8"),
+    readFile(join(root, "scripts/package-macos-alpha.mjs"), "utf8"),
+    readFile(join(root, "scripts/package-macos-release.mjs"), "utf8"),
+  ]);
+  for (const adapter of [darwinAdapter, windowsAdapter]) {
+    assert.match(adapter, /DEVICE_IDENTITY_NATIVE_RESOURCE_PATH/);
+  }
+  assert.equal(
+    JSON.parse(corePackage).scripts["build:native"],
+    "node src/device-identity/native/build.mjs",
+  );
+  for (const builder of [coreBuilder, electronBuilder]) {
+    assert.match(builder, /buildDeviceIdentityNative/);
+  }
+  assert.match(alphaPackager, /deviceIdentityNativeAddonPath/);
+  for (const name of MACOS_DEVICE_IDENTITY_REVIEW_ACKNOWLEDGEMENTS) {
+    assert.equal(alphaPackager.includes(name), false);
+  }
+  assert.match(releasePackager, /\["capsule-guest", "device-identity", "lamarck-capsule-vm-host"\]/);
+  assert.ok(MACOS_RELEASE_SOURCE_DIRECTORIES.includes("desktop/core/src"));
 });
 
 test("macOS packages replace Electron branding with the committed Lamarck icon", async () => {

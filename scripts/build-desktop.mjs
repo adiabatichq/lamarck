@@ -10,6 +10,12 @@ import { spawnSync } from "node:child_process";
 import { rm, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  deviceIdentityNativeAddonPath,
+} from "../desktop/core/src/device-identity/native/resource-path.mjs";
+import {
+  deviceIdentityNativeRequired,
+} from "../desktop/core/src/device-identity/native/build.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const defaultRoot = resolve(dirname(scriptPath), "..");
@@ -59,6 +65,7 @@ function buildContext(options) {
     shellDir: join(root, "desktop", "shell"),
     systemSdkDir: join(root, "desktop", "system-sdk"),
     env: options.env ?? process.env,
+    platform: options.platform ?? process.platform,
   };
 }
 
@@ -96,7 +103,13 @@ function buildElectronHost(context) {
 }
 
 function hostOutputPaths(context) {
-  return GENERATED_HOST_PATHS.map((name) => join(context.shellDir, "dist-electron", name));
+  const outputRoot = join(context.shellDir, "dist-electron");
+  return [
+    ...GENERATED_HOST_PATHS.map((name) => join(outputRoot, name)),
+    ...(deviceIdentityNativeRequired(context.platform)
+      ? [deviceIdentityNativeAddonPath(join(outputRoot, "native"))]
+      : []),
+  ];
 }
 
 function runNode(context, entry, args, cwd, label) {

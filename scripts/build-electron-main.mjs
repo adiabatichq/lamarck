@@ -2,6 +2,9 @@ import { cp, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
+import {
+  buildDeviceIdentityNative,
+} from "../desktop/core/src/device-identity/native/build.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const shellDir = resolve(root, "desktop/shell");
@@ -55,3 +58,7 @@ await esbuild.build({
 });
 await cp(resolve(shellDir, "electron/preload.cjs"), resolve(outDir, "preload.cjs"));
 await cp(resolve(coreDir, "src/pty-helper.cjs"), resolve(outDir, "pty-helper.cjs"));
+await buildDeviceIdentityNative({
+  bundleDirectory: outDir,
+  nativeRoot: resolve(outDir, "native"),
+});

@@ -13,6 +13,7 @@
   "scripts": {
     "prebuild": "npm --workspace @lamarck/system run build",
     "build": "node ../../scripts/build-core.mjs",
+    "build:native": "node src/device-identity/native/build.mjs",
     "build:guard": "node ../../scripts/build-core.mjs",
     "dev": "npm run build && node src/runtime-launcher.mjs",
     "cli": "node dist/cli.mjs",

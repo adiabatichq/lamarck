@@ -2,6 +2,9 @@ import { cp, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
+import {
+  buildDeviceIdentityNative,
+} from "../desktop/core/src/device-identity/native/build.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const coreDir = resolve(root, "desktop/core");
@@ -43,4 +46,8 @@ await Promise.all([
     format: "esm",
   }),
   cp(resolve(coreDir, "src/pty-helper.cjs"), resolve(outDir, "pty-helper.cjs")),
+  buildDeviceIdentityNative({
+    bundleDirectory: outDir,
+    nativeRoot: resolve(outDir, "native"),
+  }),
 ]);
