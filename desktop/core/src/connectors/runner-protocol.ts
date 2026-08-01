@@ -6,7 +6,6 @@
 // host-side capability broker where Guard injects source provenance.
 
 import type {
-  ConnectorHostContext,
   ConnectorConfigPatch,
   ConnectorRequirementContext,
   ConnectorRequirementStatus,
@@ -36,7 +35,6 @@ export type HostToRunnerMessage =
     // JSON cannot carry undefined; configSet=false means "config was absent"
     // so the child can preserve undefined semantics identical to in-process.
     configSet: boolean;
-    host: ConnectorHostContext;
     authType: ConnectorRuntimeAuthType;
     providerOrigin?: string;
   }
@@ -45,7 +43,6 @@ export type HostToRunnerMessage =
     panelId: string;
     config: unknown;
     configSet: boolean;
-    host: ConnectorHostContext;
   }
   | { type: "abort" }
   | { type: "rpc-result"; id: number; ok: boolean; value?: unknown; error?: string };

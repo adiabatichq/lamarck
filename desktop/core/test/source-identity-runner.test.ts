@@ -133,7 +133,6 @@ describe("Connector source identity runner contract", () => {
 
     await session.run({
       config: undefined,
-      host: { workspacePath: "/workspace" },
       signal: new AbortController().signal,
       capabilities,
     });
@@ -146,13 +145,11 @@ describe("Connector source identity runner contract", () => {
 
     await expect(session.run({
       config: undefined,
-      host: { workspacePath: "/workspace" },
       signal: new AbortController().signal,
       capabilities: runCapabilities({ authType: "managedProvider" }),
     })).rejects.toThrow("requires providerOrigin");
     await expect(session.run({
       config: undefined,
-      host: { workspacePath: "/workspace" },
       signal: new AbortController().signal,
       capabilities: runCapabilities({
         authType: "apiKey",
@@ -204,7 +201,6 @@ export default {
     await session.open(controller.signal);
     const running = session.run({
       config: undefined,
-      host: { workspacePath: cwd },
       signal: controller.signal,
       capabilities,
     });
@@ -260,7 +256,6 @@ export default {
     const configuring = session.configUi({
       panelId: "config",
       config: undefined,
-      host: { workspacePath: cwd },
       signal: new AbortController().signal,
       capabilities: {
         configGet: async () => undefined,

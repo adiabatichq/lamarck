@@ -125,7 +125,7 @@ const authManager = new ConnectorAuthManager(
 const connectorSupervisor = new ConnectorSupervisor({
   systemDb,
   guard,
-  host: { workspacePath, lamarckApiOrigin },
+  workspacePath,
   authManager,
   oauthRedirectUri,
   managedProviderAppOrigin,

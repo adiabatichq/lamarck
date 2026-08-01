@@ -197,11 +197,6 @@ export interface ConnectorWarningsHandle {
   clear(key: string): Promise<void>;
 }
 
-export interface ConnectorHostContext {
-  workspacePath: string;
-  lamarckApiOrigin?: string;
-}
-
 export interface ConnectorRunContext<TConfig = unknown, TState = unknown> {
   guard: BoundConnectorGuard;
   auth: ConnectorAuthHandle;
@@ -211,7 +206,6 @@ export interface ConnectorRunContext<TConfig = unknown, TState = unknown> {
   // explicit credential connection aborts signal and resumes the same run
   // intent in a fresh attempt.
   config: TConfig;
-  host: ConnectorHostContext;
   signal: AbortSignal;
 }
 
@@ -231,7 +225,6 @@ export interface ConnectorConfigUiContext<TConfig = unknown, TState = unknown> {
   config: TConfig;
   configStore: ConnectorConfigHandle<TConfig>;
   state: ConnectorStateHandle<TState>;
-  host: ConnectorHostContext;
   signal: AbortSignal;
 }
 
@@ -254,7 +247,6 @@ export interface ConnectorRequirementContext {
   connectorId: string;
   integrationId: string;
   platform: ConnectorPlatform;
-  host: ConnectorHostContext;
 }
 
 export interface ConnectorRequirementHandler {

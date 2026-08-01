@@ -23,7 +23,6 @@ import type {
   ConnectorConfigPatch,
   ConnectorConfigUiResult,
   ConnectorDefinition,
-  ConnectorHostContext,
   ConnectorRequirementContext,
   ConnectorRequirementStatus,
   ConnectorRuntimeAuthType,
@@ -61,7 +60,6 @@ export interface RunnerConfigUiCapabilities {
 
 export interface RunnerRunOptions {
   config: unknown;
-  host: ConnectorHostContext;
   signal: AbortSignal;
   capabilities: RunnerCapabilities;
 }
@@ -69,7 +67,6 @@ export interface RunnerRunOptions {
 export interface RunnerConfigUiOptions {
   panelId: string;
   config: unknown;
-  host: ConnectorHostContext;
   signal: AbortSignal;
   capabilities: RunnerConfigUiCapabilities;
 }
@@ -168,7 +165,6 @@ export class InProcessRunnerSession implements RunnerSession {
       },
       auth: connectorAuthHandle(caps),
       config: opts.config,
-      host: opts.host,
       signal: opts.signal,
     });
   }
@@ -189,7 +185,6 @@ export class InProcessRunnerSession implements RunnerSession {
         get: () => opts.capabilities.stateGet(),
         set: (value) => opts.capabilities.stateSet(value),
       },
-      host: opts.host,
       signal: opts.signal,
     });
   }
@@ -460,7 +455,6 @@ export class ProcessRunnerSession implements RunnerSession {
           type: "run",
           config: hasConfig ? opts.config : null,
           configSet: hasConfig,
-          host: opts.host,
           authType: opts.capabilities.authType,
           providerOrigin: opts.capabilities.providerOrigin,
         },
@@ -507,7 +501,6 @@ export class ProcessRunnerSession implements RunnerSession {
           panelId: opts.panelId,
           config: hasConfig ? opts.config : null,
           configSet: hasConfig,
-          host: opts.host,
         },
         ["config-ui-ready", "config-ui-error"],
       );

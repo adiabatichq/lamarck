@@ -142,7 +142,6 @@ async function handleMessage(msg: HostToRunnerMessage): Promise<void> {
           },
           auth: connectorAuthHandle(msg.authType, msg.providerOrigin),
           config: msg.configSet ? msg.config : undefined,
-          host: msg.host,
           signal: abortController.signal,
         });
         send({ type: "done" });
@@ -174,7 +173,6 @@ async function handleMessage(msg: HostToRunnerMessage): Promise<void> {
             get: () => rpc("stateGet"),
             set: (state) => rpc<void>("stateSet", state),
           },
-          host: msg.host,
           signal: abortController.signal,
         });
         send({ type: "config-ui-ready", url: result.url });

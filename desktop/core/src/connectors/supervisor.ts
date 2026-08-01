@@ -54,7 +54,6 @@ import type {
   ConnectorConfigPatch,
   ConnectorConfigField,
   ConnectorDefinition,
-  ConnectorHostContext,
   ConnectorIntegration,
   ConnectorOwnership,
   InstalledConnectorView,
@@ -139,7 +138,7 @@ interface ActiveConfigUiSession {
 export interface ConnectorSupervisorOptions {
   systemDb: DatabaseSync;
   guard: ConnectorHostGuard;
-  host: ConnectorHostContext;
+  workspacePath: string;
   platform?: ConnectorPlatform;
   authManager?: ConnectorAuthManager;
   officialCatalog?: ConnectorOfficialCatalogEntry[];
@@ -185,7 +184,7 @@ export class ConnectorSupervisor {
   private runnerKillGraceMs: number | undefined;
   private runnerCommandTimeoutMs: number | undefined;
   private guard: ConnectorHostGuard;
-  private host: ConnectorHostContext;
+  private workspacePath: string;
   private registry: WorkspaceConnectorRegistry;
   private oauthRedirectUri: string | undefined;
   private managedProviderAppOrigin: string;
@@ -194,7 +193,7 @@ export class ConnectorSupervisor {
 
   constructor(opts: ConnectorSupervisorOptions) {
     this.guard = opts.guard;
-    this.host = opts.host;
+    this.workspacePath = opts.workspacePath;
     this.store = new ConnectorIntegrationStore(opts.systemDb);
     this.store.recoverInterruptedRuns();
     this.authManager = opts.authManager ?? new ConnectorAuthManager();
@@ -1364,7 +1363,6 @@ export class ConnectorSupervisor {
 	      const result = await session.configUi({
 	        panelId,
 	        config,
-	        host: this.host,
 	        signal: controller.signal,
 	        capabilities: this.buildConfigUiCapabilities(integration.id),
 	      });
@@ -1583,7 +1581,6 @@ export class ConnectorSupervisor {
       connectorId: integration.connectorId,
       integrationId: integration.id,
       platform: this.platform,
-      host: this.host,
     };
   }
 
@@ -1888,7 +1885,6 @@ export class ConnectorSupervisor {
           await this.assertRunRequirements(registration, integration, session);
           await session.run({
             config: mergeConfig(schemaDefaults(registration.manifest), integration.config),
-            host: this.host,
             signal: attemptController.signal,
             capabilities: this.buildRunCapabilities(registration, integration),
           });
@@ -2013,7 +2009,7 @@ export class ConnectorSupervisor {
     const stateHandle = createConnectorStateHandle(this.store, integration.id);
     const authSpec = registration.manifest.auth ?? { type: "none" };
     const authHandle = this.authManager.createHandle(authSpec, integration);
-    const blobStore = new ContentBlobStore(this.host.workspacePath);
+    const blobStore = new ContentBlobStore(this.workspacePath);
     return {
       authType: runtimeAuthType(authSpec),
       ...(authHandle.type === "managedProvider"

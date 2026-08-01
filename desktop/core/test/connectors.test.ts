@@ -144,7 +144,7 @@ describe("Connector system", () => {
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace, lamarckApiOrigin: "https://dev-api.example.test" },
+      workspacePath: workspace,
       platform: "darwin",
       authManager: new ConnectorAuthManager(secrets),
     });
@@ -746,11 +746,11 @@ auth:
 
   test("runs a connector with bound guard, config, and persistent state", async () => {
     const definition: ConnectorDefinition<{ label: string; extra?: boolean }, { cursor: string }> = {
-      async run({ guard, state, config, host }) {
+      async run(context) {
+        expect(context).not.toHaveProperty("host");
+        const { guard, state, config } = context;
         expect(await state.get()).toBeUndefined();
         expect(config).toEqual({ label: "integration", extra: true });
-        expect(host.workspacePath).toBe(workspace);
-        expect(host.lamarckApiOrigin).toBe("https://dev-api.example.test");
         await guard.writeEvent({
           type: "app.commit",
           externalId: "abc123",
@@ -838,7 +838,7 @@ auth:
     const restarted = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
     });
     expect(restarted.getIntegration(source.id)?.status).toBe("idle");
@@ -1035,7 +1035,9 @@ auth:
 	      async run({ state }) {
 	        await state.set({ pendingUsers: { "123": { username: "alice" } } });
 	      },
-	      async configUi({ panelId, config, configStore, state }) {
+	      async configUi(context) {
+	        expect(context).not.toHaveProperty("host");
+	        const { panelId, config, configStore, state } = context;
 	        expect(panelId).toBe("privacy-controls");
 	        expect(config).toEqual({
 	          mode: "rich-local",
@@ -1583,7 +1585,7 @@ auth:
     const restarted = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
     });
     restarted.register(manifest, definition);
@@ -1632,7 +1634,7 @@ auth:
     const restarted = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
     });
     restarted.register(manifest, definition);
@@ -1757,7 +1759,7 @@ auth:
     }) => new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       deviceIdentity,
       deviceDisplayName: "Test Mac",
@@ -2255,7 +2257,7 @@ auth:
     const linuxSupervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "linux",
     });
     linuxSupervisor.register(
@@ -2316,12 +2318,14 @@ auth:
         requirements: {
           "macos-accessibility": {
             label: "Accessibility",
-            async check() {
+            async check(context) {
+              expect(context).not.toHaveProperty("host");
               return granted
                 ? { status: "satisfied" }
                 : { status: "missing", message: "Accessibility access is not granted." };
             },
-            async request() {
+            async request(context) {
+              expect(context).not.toHaveProperty("host");
               granted = true;
               return { status: "pending", message: "Granting..." };
             },
@@ -2502,7 +2506,8 @@ auth:
   requirements: {
     "macos-accessibility": {
       label: "Accessibility",
-      async check() {
+      async check(context) {
+        if ("host" in context) throw new Error("host leaked into connector requirement context");
         return { status: "satisfied" };
       },
     },
@@ -7871,9 +7876,6 @@ auth:
         backfillYears: 0,
         streams: ["daily_sleep"],
       },
-      host: {
-        lamarckApiOrigin: "https://dev-api.example.test",
-      },
       signal: new AbortController().signal,
     };
 
@@ -8640,14 +8642,16 @@ auth:
     writeFileSync(
       join(sourceDir, "index.mjs"),
       `export default {
-  async run({ guard, state, host }) {
+  async run(context) {
+    if ("host" in context) throw new Error("host leaked into connector run context");
+    const { guard, state } = context;
     await guard.writeEvent({
       type: "calendar.install-test",
       externalId: "installed",
       startedAt: 4500,
       payload: { installed: true },
     });
-    await state.set({ installed: true, lamarckApiOrigin: host.lamarckApiOrigin });
+    await state.set({ installed: true });
   },
 };
 `,
@@ -8675,10 +8679,7 @@ auth:
       type: "calendar.install-test",
       external_id: "installed",
     });
-    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({
-      installed: true,
-      lamarckApiOrigin: "https://dev-api.example.test",
-    });
+    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ installed: true });
     expect(supervisor.getIntegration(integration.id)?.trustStatus).toBe("custom");
 
     expect(await removeInstalledConnector(workspace, "calendar")).toBe(true);
@@ -8722,7 +8723,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager,
     });
@@ -8746,7 +8747,7 @@ auth:
     const restarted = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager,
     });
@@ -9399,7 +9400,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager: new ConnectorAuthManager(secrets, {
         fetchImpl: async () => new Response(JSON.stringify({
@@ -9492,7 +9493,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager,
     });
@@ -9578,7 +9579,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager,
     });
@@ -9654,7 +9655,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager,
     });
@@ -9730,7 +9731,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager,
     });
@@ -9803,7 +9804,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager,
     });
@@ -9916,7 +9917,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager,
     });
@@ -9990,7 +9991,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager: new ConnectorAuthManager(secrets, {
         managedProviderApiOrigin: "https://api.lamarck.ai",
@@ -10073,7 +10074,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager,
     });
@@ -10127,7 +10128,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager,
     });
@@ -10179,7 +10180,7 @@ auth:
     supervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       authManager: new ConnectorAuthManager(secrets, {
         managedProviderApiOrigin: "https://api.lamarck.ai",
@@ -10574,7 +10575,9 @@ auth:
 	      join(dir, "index.mjs"),
 	      `export default {
   async run() {},
-  async configUi({ panelId, config, configStore, state }) {
+  async configUi(context) {
+    if ("host" in context) throw new Error("host leaked into connector config UI context");
+    const { panelId, config, configStore, state } = context;
     if (panelId !== "privacy-controls") throw new Error("wrong panel");
     if (config.mode !== "rich-local") throw new Error("missing default");
     const previous = await state.get();
@@ -10619,7 +10622,7 @@ auth:
     const reconfigSupervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       runnerKillGraceMs: 150,
     });
@@ -10761,7 +10764,7 @@ auth:
     const fastKillSupervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       runnerKillGraceMs: 150,
     });
@@ -10873,7 +10876,7 @@ auth:
     const hangSupervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
-      host: { workspacePath: workspace },
+      workspacePath: workspace,
       platform: "darwin",
       runnerCommandTimeoutMs: 300,
     });
