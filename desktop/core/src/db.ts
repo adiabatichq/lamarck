@@ -15,7 +15,7 @@ export const SYSTEM_DB_FILENAME = "system.db";
 // Released schema constants are immutable migration inputs. This greenfield V1
 // includes both the control plane and D1 working-tree reconciliation state.
 export const SYSTEM_SCHEMA_V1 = `
-CREATE TABLE IF NOT EXISTS connector_integrations (
+CREATE TABLE IF NOT EXISTS connector_sources (
   id            TEXT PRIMARY KEY,
   connector_id  TEXT NOT NULL,
   source_key    TEXT,
@@ -43,17 +43,17 @@ CREATE TABLE IF NOT EXISTS connector_integrations (
   updated_at    INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_connector_integrations_connector
-  ON connector_integrations(connector_id);
-CREATE INDEX IF NOT EXISTS idx_connector_integrations_status
-  ON connector_integrations(status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_integrations_identity
-  ON connector_integrations(connector_id, source_key)
+CREATE INDEX IF NOT EXISTS idx_connector_sources_connector
+  ON connector_sources(connector_id);
+CREATE INDEX IF NOT EXISTS idx_connector_sources_status
+  ON connector_sources(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_sources_identity
+  ON connector_sources(connector_id, source_key)
   WHERE source_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS connector_runs (
   id              TEXT PRIMARY KEY,
-  integration_id  TEXT NOT NULL REFERENCES connector_integrations(id) ON DELETE CASCADE,
+  source_id       TEXT NOT NULL REFERENCES connector_sources(id) ON DELETE CASCADE,
   connector_id    TEXT NOT NULL,
   source_key      TEXT,
   trigger         TEXT NOT NULL,
@@ -64,8 +64,8 @@ CREATE TABLE IF NOT EXISTS connector_runs (
   error           TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_connector_runs_integration
-  ON connector_runs(integration_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_connector_runs_source
+  ON connector_runs(source_id, started_at DESC);
 
 CREATE TABLE IF NOT EXISTS connector_custom_approvals (
   connector_id   TEXT NOT NULL,

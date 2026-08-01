@@ -1,34 +1,34 @@
-// ConnectorsView — the Source Console: connector integration management.
+// ConnectorsView — the Source Console: Source management.
 //
-// Hierarchy mirrors the model: a connector package owns its integrations
-// (source identities). One card per connector; integrations are rows inside
+// Hierarchy mirrors the model: a connector package owns its sources
+// (source identities). One card per connector; sources are rows inside
 // it. Trust and platform availability are connector-level; setup, auth,
-// permissions, and lifecycle actions are per integration.
+// permissions, and lifecycle actions are per Source.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useConnectors } from "../hooks/useConnectors";
 import {
   approveConnector,
   checkConnectorRequirements,
-  connectConnectorIntegration,
-  createConnectorIntegration,
-  disconnectConnectorIntegration,
+  connectConnectorSource,
+  createConnectorSource,
+  disconnectConnectorSource,
   getConnectorAuthAttempt,
-  pauseConnectorIntegration,
+  pauseConnectorSource,
   removeConnector,
-  removeConnectorIntegration,
+  removeConnectorSource,
   requestConnectorRequirement,
-  restartConnectorIntegration,
+  restartConnectorSource,
   retryConnectorSourceIdentity,
-  resumeConnectorIntegration,
-  runConnectorIntegration,
+  resumeConnectorSource,
+  runConnectorSource,
   startConnectorConfigPanel,
   startConnectorAuth,
   stopConnectorConfigPanelSession,
   updateConnector,
-  updateConnectorIntegration,
+  updateConnectorSource,
   type AvailableConnectorView,
-  type ConnectorIntegrationView,
+  type ConnectorSourceView,
   type InstalledConnectorView,
   type ConnectorRequirementView,
 } from "../lib/api";
@@ -49,8 +49,8 @@ import styles from "./ConnectorsView.module.css";
 
 type Act = (key: string, label: string, fn: () => Promise<unknown>) => Promise<void>;
 type AuthPendingAttempt = { attemptId: string };
-type TrackAuthAttempt = (integrationId: string, attemptId: string) => void;
-type DismissAuthAttempt = (integrationId: string) => void;
+type TrackAuthAttempt = (sourceId: string, attemptId: string) => void;
+type DismissAuthAttempt = (sourceId: string) => void;
 type ConfigPanelModalState = {
   sessionId: string;
   url: string;
@@ -90,16 +90,16 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
     [refresh],
   );
 
-  const trackAuthAttempt = useCallback<TrackAuthAttempt>((integrationId, attemptId) => {
-    setAuthPending((prev) => ({ ...prev, [integrationId]: { attemptId } }));
+  const trackAuthAttempt = useCallback<TrackAuthAttempt>((sourceId, attemptId) => {
+    setAuthPending((prev) => ({ ...prev, [sourceId]: { attemptId } }));
   }, []);
 
-  const dismissAuthAttempt = useCallback<DismissAuthAttempt>((integrationId) => {
-    setAuthPending((prev) => clearAuthPendingAttempt(prev, integrationId));
+  const dismissAuthAttempt = useCallback<DismissAuthAttempt>((sourceId) => {
+    setAuthPending((prev) => clearAuthPendingAttempt(prev, sourceId));
   }, []);
 
   const openConfigPanel = useCallback(
-    async (connector: ConnectorIntegrationView, panelId: string, label: string) => {
+    async (connector: ConnectorSourceView, panelId: string, label: string) => {
       await act(connector.id, "config-panel", async () => {
         if (configPanel) {
           await stopConnectorConfigPanelSession(configPanel.sessionId).catch(() => {});
@@ -148,13 +148,13 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
       polling = true;
       try {
         await Promise.all(
-          entries.map(async ([integrationId, pending]) => {
+          entries.map(async ([sourceId, pending]) => {
             try {
-              const result = await getConnectorAuthAttempt(integrationId, pending.attemptId);
+              const result = await getConnectorAuthAttempt(sourceId, pending.attemptId);
               if (stopped || result.status === "pending") return;
 
               setAuthPending((prev) =>
-                clearAuthPendingAttempt(prev, integrationId, pending.attemptId),
+                clearAuthPendingAttempt(prev, sourceId, pending.attemptId),
               );
 
               if (result.status === "connected") {
@@ -167,7 +167,7 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
             } catch (err) {
               if (stopped) return;
               setAuthPending((prev) =>
-                clearAuthPendingAttempt(prev, integrationId, pending.attemptId),
+                clearAuthPendingAttempt(prev, sourceId, pending.attemptId),
               );
               setActionError(err instanceof Error ? err.message : String(err));
             }
@@ -190,7 +190,7 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
   }, [authPending, refresh]);
 
   const groups = useMemo(() => {
-    const byConnector = new Map<string, ConnectorIntegrationView[]>();
+    const byConnector = new Map<string, ConnectorSourceView[]>();
     const catalogByConnector = new Map(
       available.map((entry) => [entry.connectorId, entry]),
     );
@@ -201,7 +201,7 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
     }
     return packages.map((connector) => ({
       connector,
-      integrations: byConnector.get(connector.connectorId) ?? [],
+      sources: byConnector.get(connector.connectorId) ?? [],
       catalogEntry: catalogByConnector.get(connector.connectorId),
     }));
   }, [sources, packages, available]);
@@ -272,7 +272,7 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
             <ConnectorCard
               key={group.connector.connectorId}
               connector={group.connector}
-              integrations={group.integrations}
+              sources={group.sources}
               catalogEntry={group.catalogEntry}
               index={index}
               busy={busy}
@@ -326,20 +326,20 @@ function TallyItem({
 
 interface ConnectorCardProps {
   connector: InstalledConnectorView;
-  integrations: ConnectorIntegrationView[];
+  sources: ConnectorSourceView[];
   catalogEntry?: AvailableConnectorView;
   index: number;
   busy: Record<string, string>;
   authPending: Record<string, AuthPendingAttempt>;
   onAct: Act;
-  onOpenConfigPanel: (connector: ConnectorIntegrationView, panelId: string, label: string) => Promise<void>;
+  onOpenConfigPanel: (connector: ConnectorSourceView, panelId: string, label: string) => Promise<void>;
   onTrackAuthAttempt: TrackAuthAttempt;
   onDismissAuthAttempt: DismissAuthAttempt;
 }
 
 function ConnectorCard({
   connector,
-  integrations,
+  sources,
   catalogEntry,
   index,
   busy,
@@ -354,9 +354,9 @@ function ConnectorCard({
   const trust = trustView(connector);
   const trusted = trust === "official" || trust === "custom";
   const interactive = connector.supported && trust !== "broken";
-  const ownedSourceScope = integrations.length === 1
+  const ownedSourceScope = sources.length === 1
     ? "its Source"
-    : `all ${integrations.length} of its Sources`;
+    : `all ${sources.length} of its Sources`;
   const connectorCondition = !connector.supported
     ? "unsupported"
     : trust === "needs-approval"
@@ -366,8 +366,8 @@ function ConnectorCard({
         : "ready";
   const canAddSource = connector.identityKind === "connector"
     || (connector.identityKind === "device"
-      ? !integrations.some((source) => sourceRunsHere(source))
-      : integrations.length === 0);
+      ? !sources.some((sourceRecord) => sourceRunsHere(sourceRecord))
+      : sources.length === 0);
 
   const [panel, setPanel] = useState<"approve" | "update" | "remove" | "add" | null>(null);
   const [addNameInput, setAddNameInput] = useState("");
@@ -401,7 +401,7 @@ function ConnectorCard({
             {connector.mode}
             <span className={styles.cron}>· {identityKindLabel(connector.identityKind)}</span>
             <span className={styles.cron}>
-              · {integrations.length} source{integrations.length === 1 ? "" : "s"}
+              · {sources.length} source{sources.length === 1 ? "" : "s"}
             </span>
             {trust === "official" && <span className={styles.officialSeal}>official</span>}
             {trust === "custom" && <span className={styles.customSeal}>custom</span>}
@@ -447,14 +447,14 @@ function ConnectorCard({
               Update <strong>{connector.name}</strong> from{" "}
               <code>{shortHash(catalogEntry.installedHash ?? connector.packageHash)}</code>
               {" → "}<code>{shortHash(catalogEntry.catalogHash)}</code>?
-              {integrations.length === 1 ? (
+              {sources.length === 1 ? (
                 <>
                   {" "}Its Source keeps its account, settings, schedule, pause policy, and sync
                   progress.
                 </>
-              ) : integrations.length > 1 ? (
+              ) : sources.length > 1 ? (
                 <>
-                  {" "}All {integrations.length} Sources keep their accounts, settings, schedules,
+                  {" "}All {sources.length} Sources keep their accounts, settings, schedules,
                   pause policies, and sync progress.
                 </>
               ) : (
@@ -516,7 +516,7 @@ function ConnectorCard({
             onSubmit={(event) => {
               event.preventDefault();
               onAct(connectorId, "add", async () => {
-                await createConnectorIntegration(connectorId, addNameInput.trim() || undefined);
+                await createConnectorSource(connectorId, addNameInput.trim() || undefined);
                 setAddNameInput("");
                 setPanel(null);
               });
@@ -551,7 +551,7 @@ function ConnectorCard({
           <div className={styles.confirmPanel}>
             <div className={styles.confirmText}>
               Remove the <strong>{connector.name}</strong> Connector?
-              {integrations.length > 0 ? (
+              {sources.length > 0 ? (
                 <> This also removes {ownedSourceScope}, including account credentials, settings,
                 schedules, and sync progress.</>
               ) : (
@@ -579,13 +579,13 @@ function ConnectorCard({
           </div>
         )}
 
-        <div className={styles.integrationList}>
-          {integrations.length === 0 ? (
+        <div className={styles.sourceList}>
+          {sources.length === 0 ? (
             <div className={styles.emptySources}>
               No Sources added. The Connector is installed and idle.
             </div>
-          ) : integrations.map((c) => (
-            <IntegrationRow
+          ) : sources.map((c) => (
+            <SourceRow
               key={c.id}
               connector={c}
               trusted={trusted}
@@ -604,19 +604,19 @@ function ConnectorCard({
   );
 }
 
-interface IntegrationRowProps {
-  connector: ConnectorIntegrationView;
+interface SourceRowProps {
+  connector: ConnectorSourceView;
   trusted: boolean;
   interactive: boolean;
   busy: Record<string, string>;
   pendingAuthAttempt?: AuthPendingAttempt;
   onAct: Act;
-  onOpenConfigPanel: (connector: ConnectorIntegrationView, panelId: string, label: string) => Promise<void>;
+  onOpenConfigPanel: (connector: ConnectorSourceView, panelId: string, label: string) => Promise<void>;
   onTrackAuthAttempt: TrackAuthAttempt;
   onDismissAuthAttempt: DismissAuthAttempt;
 }
 
-function IntegrationRow({
+function SourceRow({
   connector: c,
   trusted,
   interactive,
@@ -626,7 +626,7 @@ function IntegrationRow({
   onOpenConfigPanel,
   onTrackAuthAttempt,
   onDismissAuthAttempt,
-}: IntegrationRowProps) {
+}: SourceRowProps) {
   const state = sourceLifecycle(c);
   const needs = setupNeeds(c);
   const needsSetup = sourceNeedsSetup(c);
@@ -659,7 +659,7 @@ function IntegrationRow({
   const sourceLabel = sourceShownName(c);
 
   return (
-    <div className={styles.integrationRow} id={`source-${c.id}`}>
+    <div className={styles.sourceRow} id={`source-${c.id}`}>
       <div className={styles.rowTop}>
         <span className={`${styles.rowBadge} ${styles[`tone_${state}`]}`}>
           <span className={styles.stateDot} />
@@ -690,7 +690,7 @@ function IntegrationRow({
           <button
             className={styles.primaryBtn}
             disabled={cardBusy}
-            onClick={() => onAct(c.id, "restart", () => restartConnectorIntegration(c.id))}
+            onClick={() => onAct(c.id, "restart", () => restartConnectorSource(c.id))}
           >
             {busy[c.id] === "restart"
               ? "working…"
@@ -712,7 +712,7 @@ function IntegrationRow({
                 : "Run this connector now"
             }
             disabled={cardBusy || c.status === "running"}
-            onClick={() => onAct(c.id, "run", () => runConnectorIntegration(c.id))}
+            onClick={() => onAct(c.id, "run", () => runConnectorSource(c.id))}
           >
             {busy[c.id] === "run" || c.status === "running"
               ? "running…"
@@ -737,7 +737,7 @@ function IntegrationRow({
           <button
             className={styles.primaryBtn}
             disabled={cardBusy}
-            onClick={() => onAct(c.id, "resume", () => resumeConnectorIntegration(c.id))}
+            onClick={() => onAct(c.id, "resume", () => resumeConnectorSource(c.id))}
           >
             {busy[c.id] === "resume" ? "resuming…" : "Resume now"}
           </button>
@@ -781,7 +781,7 @@ function IntegrationRow({
             event.preventDefault();
             const displayName = displayNameInput.trim() || null;
             onAct(c.id, "rename", async () => {
-              await updateConnectorIntegration(c.id, { displayName });
+              await updateConnectorSource(c.id, { displayName });
               setLifecyclePanel(null);
             });
           }}
@@ -830,7 +830,7 @@ function IntegrationRow({
                 disabled={cardBusy}
                 onClick={() =>
                   onAct(c.id, "pause", async () => {
-                    await pauseConnectorIntegration(c.id, preset.durationMs);
+                    await pauseConnectorSource(c.id, preset.durationMs);
                     setLifecyclePanel(null);
                   })
                 }
@@ -844,7 +844,7 @@ function IntegrationRow({
               disabled={cardBusy}
               onClick={() =>
                 onAct(c.id, "pause", async () => {
-                  await pauseConnectorIntegration(c.id);
+                  await pauseConnectorSource(c.id);
                   setLifecyclePanel(null);
                 })
               }
@@ -874,7 +874,7 @@ function IntegrationRow({
               type="button"
               className={styles.hazardBtn}
               disabled={cardBusy}
-              onClick={() => onAct(c.id, "remove-source", () => removeConnectorIntegration(c.id))}
+              onClick={() => onAct(c.id, "remove-source", () => removeConnectorSource(c.id))}
             >
               {busy[c.id] === "remove-source" ? "removing…" : "Remove source"}
             </button>
@@ -904,7 +904,7 @@ function IntegrationRow({
               disabled={cardBusy}
               onClick={() =>
                 onAct(c.id, "disconnect", async () => {
-                  await disconnectConnectorIntegration(c.id);
+                  await disconnectConnectorSource(c.id);
                   setLifecyclePanel(null);
                 })
               }
@@ -924,7 +924,7 @@ function IntegrationRow({
       )}
 
       <SourceIdentityState
-        source={c}
+        sourceRecord={c}
         cardBusy={cardBusy}
         retryEnabled={trusted && interactive}
         busyLabel={busy[c.id]}
@@ -966,7 +966,7 @@ function IntegrationRow({
               event.preventDefault();
               if (!tokenInput.trim()) return;
               onAct(c.id, "connect", async () => {
-                await connectConnectorIntegration(c.id, tokenInput.trim());
+                await connectConnectorSource(c.id, tokenInput.trim());
                 setTokenInput("");
               });
             }}
@@ -1028,7 +1028,7 @@ function IntegrationRow({
       {c.requirements.length > 0 && showSetup && (
         <div className={styles.requirements}>
           {c.requirements.map((req) => (
-            <RequirementChip key={req.id} integrationId={c.id} req={req} busy={busy} onAct={onAct} />
+            <RequirementChip key={req.id} sourceId={c.id} req={req} busy={busy} onAct={onAct} />
           ))}
           <button
             className={styles.ghostBtn}
@@ -1105,24 +1105,24 @@ function IntegrationRow({
 }
 
 function SourceIdentityState({
-  source,
+  sourceRecord,
   cardBusy,
   retryEnabled,
   busyLabel,
   onAct,
 }: {
-  source: ConnectorIntegrationView;
+  sourceRecord: ConnectorSourceView;
   cardBusy: boolean;
   retryEnabled: boolean;
   busyLabel?: string;
   onAct: Act;
 }) {
-  const identityBlocked = source.identityStatus !== "resolved";
-  const ownershipBlocked = source.ownership !== "here";
-  const identityError = source.identityStatus === "conflict"
-    || source.identityStatus === "changed"
-    || source.identityStatus === "error";
-  const errorTone = identityError || source.ownership === "device-unknown";
+  const identityBlocked = sourceRecord.identityStatus !== "resolved";
+  const ownershipBlocked = sourceRecord.ownership !== "here";
+  const identityError = sourceRecord.identityStatus === "conflict"
+    || sourceRecord.identityStatus === "changed"
+    || sourceRecord.identityStatus === "error";
+  const errorTone = identityError || sourceRecord.ownership === "device-unknown";
 
   return (
     <>
@@ -1134,38 +1134,38 @@ function SourceIdentityState({
               ? styles.identityStatusPending
               : ""
         }`}>
-          identity {source.identityStatus}
+          identity {sourceRecord.identityStatus}
         </span>
-        <span>{identityKindLabel(source.identityKind)}</span>
+        <span>{identityKindLabel(sourceRecord.identityKind)}</span>
         <span aria-hidden="true">·</span>
-        <span>{ownershipLabel(source.ownership)}</span>
+        <span>{ownershipLabel(sourceRecord.ownership)}</span>
       </div>
       {(identityBlocked || ownershipBlocked) && (
         <div className={`${styles.identityNotice} ${errorTone ? styles.identityNoticeError : ""}`}>
           <span className={styles.errorGlyph}>{errorTone ? "▲" : "◇"}</span>
           <span className={styles.identityNoticeText}>
-            {identityBlocked && identityStatusText(source)}
+            {identityBlocked && identityStatusText(sourceRecord)}
             {identityBlocked && ownershipBlocked && " "}
-            {ownershipBlocked && ownershipText(source)}
-            {source.identityStatus === "conflict" && source.conflictSourceId && (
+            {ownershipBlocked && ownershipText(sourceRecord)}
+            {sourceRecord.identityStatus === "conflict" && sourceRecord.conflictSourceId && (
               <>
                 {" "}
-                <a href={`#source-${source.conflictSourceId}`} className={styles.identityLink}>
+                <a href={`#source-${sourceRecord.conflictSourceId}`} className={styles.identityLink}>
                   Open existing Source
                 </a>
               </>
             )}
           </span>
-          {identityBlocked && source.identityKind === "connector" && (
+          {identityBlocked && sourceRecord.identityKind === "connector" && (
             <button
               type="button"
               className={styles.ghostBtn}
               disabled={cardBusy || !retryEnabled}
               title={retryEnabled ? "Resolve this Source identity again" : "Connector must be available first"}
               onClick={() => onAct(
-                source.id,
+                sourceRecord.id,
                 "identity",
-                () => retryConnectorSourceIdentity(source.id),
+                () => retryConnectorSourceIdentity(sourceRecord.id),
               )}
             >
               {busyLabel === "identity" ? "retrying…" : "Retry identity"}
@@ -1177,7 +1177,7 @@ function SourceIdentityState({
   );
 }
 
-function identityKindLabel(kind: ConnectorIntegrationView["identityKind"]): string {
+function identityKindLabel(kind: ConnectorSourceView["identityKind"]): string {
   switch (kind) {
     case "single":
       return "single identity";
@@ -1188,7 +1188,7 @@ function identityKindLabel(kind: ConnectorIntegrationView["identityKind"]): stri
   }
 }
 
-function ownershipLabel(ownership: ConnectorIntegrationView["ownership"]): string {
+function ownershipLabel(ownership: ConnectorSourceView["ownership"]): string {
   switch (ownership) {
     case "here":
       return "runs on this device";
@@ -1199,8 +1199,8 @@ function ownershipLabel(ownership: ConnectorIntegrationView["ownership"]): strin
   }
 }
 
-function identityStatusText(source: ConnectorIntegrationView): string {
-  switch (source.identityStatus) {
+function identityStatusText(sourceRecord: ConnectorSourceView): string {
+  switch (sourceRecord.identityStatus) {
     case "unresolved":
       return "Source identity has not been resolved yet.";
     case "conflict":
@@ -1208,21 +1208,21 @@ function identityStatusText(source: ConnectorIntegrationView): string {
     case "changed":
       return "The connected account no longer matches this Source. Reconnect the original account or add a new Source.";
     case "error":
-      return source.lastError ?? "Source identity could not be resolved.";
+      return sourceRecord.lastError ?? "Source identity could not be resolved.";
     case "resolved":
       return "";
   }
 }
 
-function ownershipText(source: ConnectorIntegrationView): string {
-  switch (source.ownership) {
+function ownershipText(sourceRecord: ConnectorSourceView): string {
+  switch (sourceRecord.ownership) {
     case "here":
       return "";
     case "other-device":
       return "This Source belongs to another device and does not run here.";
     case "device-unknown":
-      return source.ownershipReason
-        ? `This device cannot be identified: ${source.ownershipReason}`
+      return sourceRecord.ownershipReason
+        ? `This device cannot be identified: ${sourceRecord.ownershipReason}`
         : "This device cannot be identified, so this Source cannot run here.";
   }
 }
@@ -1239,11 +1239,11 @@ function addSourceDescription(connector: InstalledConnectorView): string {
 }
 
 // Schema-driven settings form: one input per declared config field, prefilled
-// from the integration's stored override or the author default. Save writes the
+// from the Source's stored override or the author default. Save writes the
 // overrides; Reset clears them so the schema defaults apply again.
 function buildConfigValues(
-  schema: NonNullable<ConnectorIntegrationView["configSchema"]>,
-  config: ConnectorIntegrationView["config"],
+  schema: NonNullable<ConnectorSourceView["configSchema"]>,
+  config: ConnectorSourceView["config"],
 ): Record<string, string | number | boolean> {
   const next: Record<string, string | number | boolean> = {};
   for (const [key, field] of Object.entries(schema)) {
@@ -1255,7 +1255,7 @@ function buildConfigValues(
 }
 
 function withPrimitiveConfigValues(
-  config: ConnectorIntegrationView["config"],
+  config: ConnectorSourceView["config"],
   values: Record<string, string | number | boolean>,
 ): Record<string, unknown> {
   return {
@@ -1265,8 +1265,8 @@ function withPrimitiveConfigValues(
 }
 
 function withoutPrimitiveConfigValues(
-  config: ConnectorIntegrationView["config"],
-  schema: NonNullable<ConnectorIntegrationView["configSchema"]>,
+  config: ConnectorSourceView["config"],
+  schema: NonNullable<ConnectorSourceView["configSchema"]>,
 ): Record<string, unknown> {
   const next = { ...(isRecord(config) ? config : {}) };
   for (const key of Object.keys(schema)) {
@@ -1276,7 +1276,7 @@ function withoutPrimitiveConfigValues(
 }
 
 function ConfigForm({ connector: c, busy, onAct }: {
-  connector: ConnectorIntegrationView;
+  connector: ConnectorSourceView;
   busy: Record<string, string>;
   onAct: Act;
 }) {
@@ -1302,7 +1302,7 @@ function ConfigForm({ connector: c, busy, onAct }: {
       onSubmit={(event) => {
 	        event.preventDefault();
 	        onAct(c.id, "config", () =>
-	          updateConnectorIntegration(c.id, { config: withPrimitiveConfigValues(c.config, values) })
+	          updateConnectorSource(c.id, { config: withPrimitiveConfigValues(c.config, values) })
 	        );
 	      }}
     >
@@ -1363,7 +1363,7 @@ function ConfigForm({ connector: c, busy, onAct }: {
 	          title="Clear overrides and restore defaults"
 	          onClick={() =>
 	            onAct(c.id, "config", () =>
-	              updateConnectorIntegration(c.id, { config: withoutPrimitiveConfigValues(c.config, schema) })
+	              updateConnectorSource(c.id, { config: withoutPrimitiveConfigValues(c.config, schema) })
 	            )
 	          }
 	        >
@@ -1386,7 +1386,7 @@ async function openAuthorizationUrl(url: string): Promise<void> {
   window.open(url, "_blank", "noopener");
 }
 
-function isBrowserAuthType(type: ConnectorIntegrationView["authType"]): boolean {
+function isBrowserAuthType(type: ConnectorSourceView["authType"]): boolean {
   return type === "oauth2-public" || type === "managedProvider";
 }
 
@@ -1402,13 +1402,13 @@ function formatDuration(durationMs: number | undefined): string {
 
 function clearAuthPendingAttempt(
   attempts: Record<string, AuthPendingAttempt>,
-  integrationId: string,
+  sourceId: string,
   attemptId?: string,
 ): Record<string, AuthPendingAttempt> {
-  if (!attempts[integrationId]) return attempts;
-  if (attemptId && attempts[integrationId]?.attemptId !== attemptId) return attempts;
+  if (!attempts[sourceId]) return attempts;
+  if (attemptId && attempts[sourceId]?.attemptId !== attemptId) return attempts;
   const next = { ...attempts };
-  delete next[integrationId];
+  delete next[sourceId];
   return next;
 }
 
@@ -1418,14 +1418,14 @@ function shortHash(hash: string | undefined): string {
 }
 
 interface RequirementChipProps {
-  integrationId: string;
+  sourceId: string;
   req: ConnectorRequirementView;
   busy: Record<string, string>;
   onAct: Act;
 }
 
-function RequirementChip({ integrationId, req, busy, onAct }: RequirementChipProps) {
-  const busyKey = `${integrationId}:${req.id}`;
+function RequirementChip({ sourceId, req, busy, onAct }: RequirementChipProps) {
+  const busyKey = `${sourceId}:${req.id}`;
   const actionable = req.status !== "satisfied";
   return (
     <span
@@ -1442,8 +1442,8 @@ function RequirementChip({ integrationId, req, busy, onAct }: RequirementChipPro
           onClick={() =>
             onAct(busyKey, "grant", () =>
               req.status === "unknown"
-                ? checkConnectorRequirements(integrationId)
-                : requestConnectorRequirement(integrationId, req.id),
+                ? checkConnectorRequirements(sourceId)
+                : requestConnectorRequirement(sourceId, req.id),
             )
           }
         >

@@ -10,11 +10,12 @@ import {
   isOAuthAuthSpec,
   type ConnectorAuthHandle,
   type ConnectorAuthSpec,
-  type ConnectorIntegration,
+  type ConnectorSource,
   type ConnectorManagedProviderAuthSpec,
   type ConnectorOAuthAuthSpec,
   type ConnectorOAuthDirectAuthSpec,
 } from "./types";
+import { defaultAuthRef } from "./state";
 
 export type OAuthAttemptStatus = "pending" | "connected" | "failed" | "expired";
 
@@ -28,7 +29,7 @@ export interface OAuthStartResult {
 export interface OAuthAttemptView {
   status: OAuthAttemptStatus;
   attemptId?: string;
-  integrationId?: string;
+  sourceId?: string;
   authRef?: string;
   credentialId?: string;
   error?: string;
@@ -46,12 +47,12 @@ type SecretPayload =
   | {
       kind: "managedProvider";
       providerId: string;
-      integrationId: string;
+      sourceId: string;
     };
 
 interface OAuthAttempt {
   id: string;
-  integrationId: string;
+  sourceId: string;
   authRef: string;
   auth: ConnectorOAuthDirectAuthSpec;
   ownerType: string;
@@ -71,7 +72,7 @@ interface OAuthAttempt {
 
 interface ManagedProviderAttempt {
   id: string;
-  integrationId: string;
+  sourceId: string;
   authRef: string;
   providerId: string;
   expiresAt: number;
@@ -93,6 +94,10 @@ interface TokenResponse {
   error_description?: string;
 }
 
+// Shape of the Lamarck backend's capability-token response. These are wire
+// field names owned by the backend, not internal vocabulary: `integrationId`
+// stays because the two sides deploy independently and renaming one alone
+// makes every token fail validation below.
 interface ManagedProviderCapabilityToken {
   tokenType: "Bearer";
   accessToken: string;
@@ -133,9 +138,9 @@ export class ConnectorAuthManager {
   private attemptsById = new Map<string, OAuthAttempt>();
   private attemptsByState = new Map<string, OAuthAttempt>();
   private managedAttemptsById = new Map<string, ManagedProviderAttempt>();
-  private removedIntegrationIds = new Set<string>();
-  private authGenerationByIntegration = new Map<string, number>();
-  private credentialRefsByIntegration = new Map<string, Set<string>>();
+  private removedSourceIds = new Set<string>();
+  private authGenerationBySource = new Map<string, number>();
+  private credentialRefsBySource = new Map<string, Set<string>>();
   private refreshFlights = new Map<string, Promise<string>>();
 
   constructor(
@@ -163,18 +168,18 @@ export class ConnectorAuthManager {
     },
   ): Promise<void> {
     if (opts?.ownerType === "connector" && opts.ownerId) {
-      this.assertIntegrationAuthActive(opts.ownerId, opts.generation);
+      this.assertSourceAuthActive(opts.ownerId, opts.generation);
     }
     await this.writePayload(authRef, { kind: "apiKey", value: token });
     if (opts?.ownerType === "connector" && opts.ownerId) {
       try {
-        this.assertIntegrationAuthActive(opts.ownerId, opts.generation);
+        this.assertSourceAuthActive(opts.ownerId, opts.generation);
       } catch (err) {
         await this.deleteToken(authRef);
         throw err;
       }
     }
-    this.trackIntegrationCredential(opts?.ownerType, opts?.ownerId, authRef);
+    this.trackSourceCredential(opts?.ownerType, opts?.ownerId, authRef);
     this.credentialStore?.upsert({
       id: authRef,
       kind: "apiKey",
@@ -195,39 +200,39 @@ export class ConnectorAuthManager {
     await this.secrets.delete(authRef);
   }
 
-  async deleteIntegrationCredentials(integrationId: string, currentAuthRef?: string): Promise<void> {
+  async deleteSourceCredentials(sourceId: string, currentAuthRef?: string): Promise<void> {
     const refs = new Set(
       this.credentialStore
-        ?.listByOwner("connector", integrationId)
+        ?.listByOwner("connector", sourceId)
         .map((credential) => credential.id) ?? [],
     );
-    for (const ref of this.credentialRefsByIntegration.get(integrationId) ?? []) refs.add(ref);
+    for (const ref of this.credentialRefsBySource.get(sourceId) ?? []) refs.add(ref);
     if (currentAuthRef) refs.add(currentAuthRef);
     for (const ref of refs) {
       await this.deleteToken(ref);
     }
-    this.credentialRefsByIntegration.delete(integrationId);
+    this.credentialRefsBySource.delete(sourceId);
   }
 
-  currentIntegrationAuthGeneration(integrationId: string): number {
-    return this.authGenerationByIntegration.get(integrationId) ?? 0;
+  currentSourceAuthGeneration(sourceId: string): number {
+    return this.authGenerationBySource.get(sourceId) ?? 0;
   }
 
-  cancelAttemptsForIntegration(integrationId: string, opts?: { removed?: boolean }): void {
-    this.authGenerationByIntegration.set(
-      integrationId,
-      this.currentIntegrationAuthGeneration(integrationId) + 1,
+  cancelAttemptsForSource(sourceId: string, opts?: { removed?: boolean }): void {
+    this.authGenerationBySource.set(
+      sourceId,
+      this.currentSourceAuthGeneration(sourceId) + 1,
     );
-    if (opts?.removed) this.removedIntegrationIds.add(integrationId);
+    if (opts?.removed) this.removedSourceIds.add(sourceId);
     for (const [attemptId, attempt] of this.attemptsById) {
-      if (attempt.integrationId !== integrationId) continue;
+      if (attempt.sourceId !== sourceId) continue;
       attempt.status = "failed";
       attempt.error = "Source was removed during authentication";
       this.attemptsById.delete(attemptId);
       this.attemptsByState.delete(attempt.state);
     }
     for (const [attemptId, attempt] of this.managedAttemptsById) {
-      if (attempt.integrationId === integrationId) {
+      if (attempt.sourceId === sourceId) {
         attempt.status = "failed";
         attempt.error = "Source was removed during authentication";
         this.managedAttemptsById.delete(attemptId);
@@ -249,7 +254,7 @@ export class ConnectorAuthManager {
   }
 
   startOAuth(
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
     auth: ConnectorOAuthAuthSpec,
     input: { redirectUri: string },
   ): OAuthStartResult {
@@ -259,20 +264,20 @@ export class ConnectorAuthManager {
     const state = base64url(randomBytes(32));
     const attemptId = base64url(randomBytes(16));
     const expiresAt = now + this.attemptTtlMs;
-    const authRef = integration.authRef ?? `connector-integration:${integration.id}:auth`;
+    const authRef = sourceRecord.authRef ?? defaultAuthRef(sourceRecord.id);
     const attempt: OAuthAttempt = {
       id: attemptId,
-      integrationId: integration.id,
+      sourceId: sourceRecord.id,
       authRef,
       auth,
       ownerType: "connector",
-      ownerId: integration.id,
+      ownerId: sourceRecord.id,
       clientId: auth.clientId,
       codeVerifier,
       state,
       redirectUri: input.redirectUri,
       expiresAt,
-      generation: this.currentIntegrationAuthGeneration(integration.id),
+      generation: this.currentSourceAuthGeneration(sourceRecord.id),
       status: "pending",
     };
     this.attemptsById.set(attemptId, attempt);
@@ -298,7 +303,7 @@ export class ConnectorAuthManager {
   }
 
   async startManagedProvider(
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
     auth: ConnectorManagedProviderAuthSpec,
     input: { appOrigin: string },
   ): Promise<OAuthStartResult> {
@@ -306,20 +311,23 @@ export class ConnectorAuthManager {
     this.pruneAuthAttempts(now);
     const attemptId = base64url(randomBytes(16));
     const expiresAt = now + this.attemptTtlMs;
-    const authRef = integration.authRef ?? `connector-integration:${integration.id}:auth`;
+    const authRef = sourceRecord.authRef ?? defaultAuthRef(sourceRecord.id);
     const attempt: ManagedProviderAttempt = {
       id: attemptId,
-      integrationId: integration.id,
+      sourceId: sourceRecord.id,
       authRef,
       providerId: auth.providerId,
       expiresAt,
-      generation: this.currentIntegrationAuthGeneration(integration.id),
+      generation: this.currentSourceAuthGeneration(sourceRecord.id),
       status: "pending",
     };
     this.managedAttemptsById.set(attemptId, attempt);
 
     const url = new URL(`/providers/${encodeURIComponent(auth.providerId)}/connect`, normalizeOrigin(input.appOrigin));
-    url.searchParams.set("integrationId", integration.id);
+    // Wire field, not an internal name: the Lamarck web app reads
+    // `integrationId` from this URL. Renaming it here alone breaks the hosted
+    // OAuth flow, since the two sides ship and deploy independently.
+    url.searchParams.set("integrationId", sourceRecord.id);
     url.searchParams.set("start", "1");
     let authorizationUrl = url.toString();
     if (this.lamarckSession?.session && this.lamarckSession.startLogin) {
@@ -336,14 +344,14 @@ export class ConnectorAuthManager {
     };
   }
 
-  async getOAuthAttempt(integrationId: string, attemptId: string): Promise<OAuthAttemptView> {
+  async getOAuthAttempt(sourceId: string, attemptId: string): Promise<OAuthAttemptView> {
     const now = this.now();
     this.pruneAuthAttempts(now);
     const attempt = this.attemptsById.get(attemptId);
     if (!attempt) {
-      return this.getManagedProviderAttempt(integrationId, attemptId, now);
+      return this.getManagedProviderAttempt(sourceId, attemptId, now);
     }
-    if (attempt.integrationId !== integrationId) {
+    if (attempt.sourceId !== sourceId) {
       return { status: "failed", error: "Auth attempt not found" };
     }
     if (attempt.status === "pending" && now > attempt.expiresAt) {
@@ -354,20 +362,20 @@ export class ConnectorAuthManager {
       const result: OAuthAttemptView = {
         status: attempt.status,
         attemptId: attempt.id,
-        integrationId: attempt.integrationId,
+        sourceId: attempt.sourceId,
         authRef: attempt.authRef,
         error: attempt.error,
       };
       // Poll-observed expiry is a cancellation boundary. Invalidate the
       // generation before Supervisor releases the identity fence so a callback
       // already awaiting token exchange cannot commit after expiry.
-      this.cancelAttemptsForIntegration(attempt.integrationId);
+      this.cancelAttemptsForSource(attempt.sourceId);
       return result;
     }
     return {
       status: attempt.status,
       attemptId: attempt.id,
-      integrationId: attempt.integrationId,
+      sourceId: attempt.sourceId,
       authRef: attempt.authRef,
       credentialId: attempt.credentialId,
       error: attempt.error,
@@ -395,12 +403,12 @@ export class ConnectorAuthManager {
   }
 
   private async getManagedProviderAttempt(
-    integrationId: string,
+    sourceId: string,
     attemptId: string,
     now: number,
   ): Promise<OAuthAttemptView> {
     const attempt = this.managedAttemptsById.get(attemptId);
-    if (!attempt || attempt.integrationId !== integrationId) {
+    if (!attempt || attempt.sourceId !== sourceId) {
       return { status: "failed", error: "Auth attempt not found" };
     }
     if (attempt.status === "pending" && now > attempt.expiresAt) {
@@ -410,29 +418,29 @@ export class ConnectorAuthManager {
       const result: OAuthAttemptView = {
         status: attempt.status,
         attemptId: attempt.id,
-        integrationId: attempt.integrationId,
+        sourceId: attempt.sourceId,
         authRef: attempt.authRef,
         error: attempt.error,
       };
-      this.cancelAttemptsForIntegration(attempt.integrationId);
+      this.cancelAttemptsForSource(attempt.sourceId);
       return result;
     }
     if (attempt.status === "pending") {
       try {
-        await this.fetchManagedProviderCapability(attempt.providerId, attempt.integrationId);
-        this.assertIntegrationAuthActive(attempt.integrationId, attempt.generation);
+        await this.fetchManagedProviderCapability(attempt.providerId, attempt.sourceId);
+        this.assertSourceAuthActive(attempt.sourceId, attempt.generation);
         await this.persistManagedProviderBinding(attempt.authRef, {
           providerId: attempt.providerId,
-          integrationId: attempt.integrationId,
-          ownerId: attempt.integrationId,
+          sourceId: attempt.sourceId,
+          ownerId: attempt.sourceId,
           generation: attempt.generation,
         });
         attempt.status = "connected";
         attempt.terminalAt = this.now();
         attempt.credentialId = attempt.authRef;
       } catch (err) {
-        if (!this.isIntegrationAuthGenerationCurrent(
-          attempt.integrationId,
+        if (!this.isSourceAuthGenerationCurrent(
+          attempt.sourceId,
           attempt.generation,
         )) {
           return {
@@ -451,7 +459,7 @@ export class ConnectorAuthManager {
     return {
       status: attempt.status,
       attemptId: attempt.id,
-      integrationId: attempt.integrationId,
+      sourceId: attempt.sourceId,
       authRef: attempt.authRef,
       credentialId: attempt.credentialId,
       error: attempt.error,
@@ -501,11 +509,11 @@ export class ConnectorAuthManager {
       const result: OAuthAttemptView = {
         status: "expired",
         attemptId: attempt.id,
-        integrationId: attempt.integrationId,
+        sourceId: attempt.sourceId,
         authRef: attempt.authRef,
         error: attempt.error,
       };
-      this.cancelAttemptsForIntegration(attempt.integrationId);
+      this.cancelAttemptsForSource(attempt.sourceId);
       return result;
     }
     if (providerError) {
@@ -515,7 +523,7 @@ export class ConnectorAuthManager {
       return {
         status: "failed",
         attemptId: attempt.id,
-        integrationId: attempt.integrationId,
+        sourceId: attempt.sourceId,
         authRef: attempt.authRef,
         error: attempt.error,
       };
@@ -527,7 +535,7 @@ export class ConnectorAuthManager {
       return {
         status: "failed",
         attemptId: attempt.id,
-        integrationId: attempt.integrationId,
+        sourceId: attempt.sourceId,
         authRef: attempt.authRef,
         error: attempt.error,
       };
@@ -535,7 +543,7 @@ export class ConnectorAuthManager {
 
     try {
       const token = await this.exchangeCode(attempt, code);
-      this.assertIntegrationAuthActive(attempt.integrationId, attempt.generation);
+      this.assertSourceAuthActive(attempt.sourceId, attempt.generation);
       await this.persistOAuthToken(attempt, token);
       attempt.status = "connected";
       attempt.terminalAt = this.now();
@@ -543,7 +551,7 @@ export class ConnectorAuthManager {
       return {
         status: "connected",
         attemptId: attempt.id,
-        integrationId: attempt.integrationId,
+        sourceId: attempt.sourceId,
         authRef: attempt.authRef,
         credentialId: attempt.authRef,
       };
@@ -551,8 +559,8 @@ export class ConnectorAuthManager {
       attempt.status = "failed";
       attempt.terminalAt = this.now();
       attempt.error = err instanceof Error ? err.message : String(err);
-      if (!this.isIntegrationAuthGenerationCurrent(
-        attempt.integrationId,
+      if (!this.isSourceAuthGenerationCurrent(
+        attempt.sourceId,
         attempt.generation,
       )) {
         return {
@@ -564,49 +572,49 @@ export class ConnectorAuthManager {
       return {
         status: "failed",
         attemptId: attempt.id,
-        integrationId: attempt.integrationId,
+        sourceId: attempt.sourceId,
         authRef: attempt.authRef,
         error: attempt.error,
       };
     }
   }
 
-  createHandle(auth: ConnectorAuthSpec, integration: ConnectorIntegration): ConnectorAuthHandle {
+  createHandle(auth: ConnectorAuthSpec, sourceRecord: ConnectorSource): ConnectorAuthHandle {
     if (auth.type === "none") {
       return { type: "none" };
     }
 
-    const authRef = integration.authRef;
+    const authRef = sourceRecord.authRef;
     if (!authRef) {
-      throw new Error(`Connector integration ${integration.id} requires auth_ref`);
+      throw new Error(`Connector Source ${sourceRecord.id} requires auth_ref`);
     }
 
     const getToken = async (): Promise<string> => {
       const payload = await this.readPayload(authRef);
       if (!payload) {
-        throw new Error(`Connector integration ${integration.id} is missing credentials`);
+        throw new Error(`Connector Source ${sourceRecord.id} is missing credentials`);
       }
       if (auth.type === "apiKey") {
         if (payload.kind !== "apiKey") {
-          throw new Error(`Connector integration ${integration.id} credential kind mismatch`);
+          throw new Error(`Connector Source ${sourceRecord.id} credential kind mismatch`);
         }
         return payload.value;
       }
       if (auth.type === "managedProvider") {
         if (payload.kind !== "managedProvider") {
-          throw new Error(`Connector integration ${integration.id} credential kind mismatch`);
+          throw new Error(`Connector Source ${sourceRecord.id} credential kind mismatch`);
         }
-        return this.managedProviderAccessToken(authRef, auth, integration.id, payload);
+        return this.managedProviderAccessToken(authRef, auth, sourceRecord.id, payload);
       }
       if (!isOAuthAuthSpec(auth) || payload.kind !== "oauth2") {
-        throw new Error(`Connector integration ${integration.id} credential kind mismatch`);
+        throw new Error(`Connector Source ${sourceRecord.id} credential kind mismatch`);
       }
-      return this.oauthAccessToken(authRef, auth, payload, integration.id);
+      return this.oauthAccessToken(authRef, auth, payload, sourceRecord.id);
     };
 
     if (auth.type === "managedProvider") {
       if (!this.managedProviderApiOrigin) {
-        throw managedProviderUnavailable(integration.connectorId);
+        throw managedProviderUnavailable(sourceRecord.connectorId);
       }
       return {
         type: "managedProvider",
@@ -625,15 +633,15 @@ export class ConnectorAuthManager {
     authRef: string,
     auth: ConnectorOAuthAuthSpec,
     payload: Extract<SecretPayload, { kind: "oauth2" }>,
-    integrationId: string,
+    sourceId: string,
   ): Promise<string> {
     if (!payload.expiresAt || payload.expiresAt - this.now() > this.refreshSkewMs) {
       return payload.accessToken;
     }
     const existing = this.refreshFlights.get(authRef);
     if (existing) return existing;
-    const generation = this.currentIntegrationAuthGeneration(integrationId);
-    const flight = this.refreshOAuthToken(authRef, auth, payload, integrationId, generation)
+    const generation = this.currentSourceAuthGeneration(sourceId);
+    const flight = this.refreshOAuthToken(authRef, auth, payload, sourceId, generation)
       .finally(() => this.refreshFlights.delete(authRef));
     this.refreshFlights.set(authRef, flight);
     return flight;
@@ -642,19 +650,19 @@ export class ConnectorAuthManager {
   private async managedProviderAccessToken(
     authRef: string,
     auth: ConnectorManagedProviderAuthSpec,
-    integrationId: string,
+    sourceId: string,
     payload: Extract<SecretPayload, { kind: "managedProvider" }>,
   ): Promise<string> {
     if (payload.providerId !== auth.providerId) {
       throw new Error(`Managed provider credential is for ${payload.providerId}, not ${auth.providerId}`);
     }
-    if (payload.integrationId !== integrationId) {
-      throw new Error(`Managed provider credential is for integration ${payload.integrationId}, not ${integrationId}`);
+    if (payload.sourceId !== sourceId) {
+      throw new Error(`Managed provider credential is for Source ${payload.sourceId}, not ${sourceId}`);
     }
     const existing = this.refreshFlights.get(authRef);
     if (existing) return existing;
-    const generation = this.currentIntegrationAuthGeneration(integrationId);
-    const flight = this.issueManagedProviderToken(authRef, auth, integrationId, generation)
+    const generation = this.currentSourceAuthGeneration(sourceId);
+    const flight = this.issueManagedProviderToken(authRef, auth, sourceId, generation)
       .finally(() => this.refreshFlights.delete(authRef));
     this.refreshFlights.set(authRef, flight);
     return flight;
@@ -663,12 +671,12 @@ export class ConnectorAuthManager {
   private async issueManagedProviderToken(
     authRef: string,
     auth: ConnectorManagedProviderAuthSpec,
-    integrationId: string,
+    sourceId: string,
     generation: number,
   ): Promise<string> {
     try {
-      const token = await this.fetchManagedProviderCapability(auth.providerId, integrationId);
-      this.assertIntegrationAuthActive(integrationId, generation);
+      const token = await this.fetchManagedProviderCapability(auth.providerId, sourceId);
+      this.assertSourceAuthActive(sourceId, generation);
       return token.accessToken;
     } catch (err) {
       this.credentialStore?.setStatus(authRef, "refresh_failed", {
@@ -680,7 +688,7 @@ export class ConnectorAuthManager {
 
   private async fetchManagedProviderCapability(
     providerId: string,
-    integrationId: string,
+    sourceId: string,
   ): Promise<ManagedProviderCapabilityToken> {
     if (!this.managedProviderApiOrigin || !this.lamarckSession) {
       throw managedProviderUnavailable();
@@ -697,7 +705,8 @@ export class ConnectorAuthManager {
         Authorization: `Bearer ${sessionToken}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ integrationId }),
+      // Wire field, not an internal name — the backend reads `integrationId`.
+      body: JSON.stringify({ integrationId: sourceId }),
     });
     const text = await res.text();
     const data = text ? JSON.parse(text) as Partial<ManagedProviderCapabilityToken> & { error?: string; message?: string } : {};
@@ -717,7 +726,7 @@ export class ConnectorAuthManager {
       !data.accessToken ||
       !data.expiresAt ||
       data.providerId !== providerId ||
-      data.integrationId !== integrationId
+      data.integrationId !== sourceId
     ) {
       throw new Error("Managed provider capability endpoint returned an invalid token response");
     }
@@ -728,7 +737,7 @@ export class ConnectorAuthManager {
     authRef: string,
     input: {
       providerId: string;
-      integrationId: string;
+      sourceId: string;
       ownerId: string;
       generation: number;
     },
@@ -736,16 +745,16 @@ export class ConnectorAuthManager {
     const payload: Extract<SecretPayload, { kind: "managedProvider" }> = {
       kind: "managedProvider",
       providerId: input.providerId,
-      integrationId: input.integrationId,
+      sourceId: input.sourceId,
     };
     await this.writePayload(authRef, payload);
     try {
-      this.assertIntegrationAuthActive(input.integrationId, input.generation);
+      this.assertSourceAuthActive(input.sourceId, input.generation);
     } catch (err) {
       await this.deleteToken(authRef);
       throw err;
     }
-    this.trackIntegrationCredential("connector", input.integrationId, authRef);
+    this.trackSourceCredential("connector", input.sourceId, authRef);
     this.credentialStore?.upsert({
       id: authRef,
       kind: "managedProvider",
@@ -755,7 +764,7 @@ export class ConnectorAuthManager {
       secretItemId: authRef,
       metadata: {
         provider_id: input.providerId,
-        integration_id: input.integrationId,
+        source_id: input.sourceId,
       },
     });
   }
@@ -764,7 +773,7 @@ export class ConnectorAuthManager {
     authRef: string,
     auth: ConnectorOAuthDirectAuthSpec,
     payload: Extract<SecretPayload, { kind: "oauth2" }>,
-    integrationId: string,
+    sourceId: string,
     generation: number,
   ): Promise<string> {
     if (!payload.refreshToken) {
@@ -773,7 +782,7 @@ export class ConnectorAuthManager {
     }
     try {
       const token = await this.exchangeRefresh(auth, payload);
-      this.assertIntegrationAuthActive(integrationId, generation);
+      this.assertSourceAuthActive(sourceId, generation);
       const nextPayload: Extract<SecretPayload, { kind: "oauth2" }> = {
         ...payload,
         accessToken: requireAccessToken(token),
@@ -783,7 +792,7 @@ export class ConnectorAuthManager {
       };
       await this.writePayload(authRef, nextPayload);
       try {
-        this.assertIntegrationAuthActive(integrationId, generation);
+        this.assertSourceAuthActive(sourceId, generation);
       } catch (err) {
         await this.deleteToken(authRef);
         throw err;
@@ -862,12 +871,12 @@ export class ConnectorAuthManager {
     };
     await this.writePayload(attempt.authRef, payload);
     try {
-      this.assertIntegrationAuthActive(attempt.integrationId, attempt.generation);
+      this.assertSourceAuthActive(attempt.sourceId, attempt.generation);
     } catch (err) {
       await this.deleteToken(attempt.authRef);
       throw err;
     }
-    this.trackIntegrationCredential(attempt.ownerType, attempt.ownerId, attempt.authRef);
+    this.trackSourceCredential(attempt.ownerType, attempt.ownerId, attempt.authRef);
     this.credentialStore?.upsert({
       id: attempt.authRef,
       kind: "oauth2",
@@ -901,35 +910,35 @@ export class ConnectorAuthManager {
     await this.secrets.set(ref, JSON.stringify(payload));
   }
 
-  private assertIntegrationAuthActive(integrationId: string, generation?: number): void {
-    if (this.removedIntegrationIds.has(integrationId)) {
+  private assertSourceAuthActive(sourceId: string, generation?: number): void {
+    if (this.removedSourceIds.has(sourceId)) {
       throw new Error("Source was removed during authentication");
     }
-    if (!this.isIntegrationAuthGenerationCurrent(integrationId, generation)) {
+    if (!this.isSourceAuthGenerationCurrent(sourceId, generation)) {
       throw new Error("Authentication was cancelled for this Source");
     }
   }
 
-  private isIntegrationAuthGenerationCurrent(
-    integrationId: string,
+  private isSourceAuthGenerationCurrent(
+    sourceId: string,
     generation?: number,
   ): boolean {
-    return !this.removedIntegrationIds.has(integrationId)
+    return !this.removedSourceIds.has(sourceId)
       && (
         generation === undefined
-        || generation === this.currentIntegrationAuthGeneration(integrationId)
+        || generation === this.currentSourceAuthGeneration(sourceId)
       );
   }
 
-  private trackIntegrationCredential(
+  private trackSourceCredential(
     ownerType: string | undefined,
     ownerId: string | undefined,
     authRef: string,
   ): void {
     if (ownerType !== "connector" || !ownerId) return;
-    const refs = this.credentialRefsByIntegration.get(ownerId) ?? new Set<string>();
+    const refs = this.credentialRefsBySource.get(ownerId) ?? new Set<string>();
     refs.add(authRef);
-    this.credentialRefsByIntegration.set(ownerId, refs);
+    this.credentialRefsBySource.set(ownerId, refs);
   }
 }
 

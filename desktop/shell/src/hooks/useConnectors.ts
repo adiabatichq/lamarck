@@ -5,12 +5,12 @@ import {
   listAvailableConnectors,
   listConnectors,
   type AvailableConnectorView,
-  type ConnectorIntegrationView,
+  type ConnectorSourceView,
   type InstalledConnectorView,
 } from "../lib/api";
 
 export function useConnectors(pollMs = 2000) {
-  const [sources, setSources] = useState<ConnectorIntegrationView[]>([]);
+  const [sources, setSources] = useState<ConnectorSourceView[]>([]);
   const [packages, setPackages] = useState<InstalledConnectorView[]>([]);
   const [available, setAvailable] = useState<AvailableConnectorView[]>([]);
   const [loading, setLoading] = useState(true);

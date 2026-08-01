@@ -1,8 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 import type {
-  ConnectorIntegration,
+  ConnectorSource,
   ConnectorIdentityStatus,
-  ConnectorIntegrationStatus,
+  ConnectorSourceStatus,
   ConnectorRequirementRecord,
   ConnectorRunRecord,
   ConnectorRunStatus,
@@ -15,7 +15,7 @@ import type {
 import { validateConnectorId, validateSourceKey } from "./manifest";
 import { ulid } from "../utils/ulid";
 
-interface IntegrationRow {
+interface SourceRow {
   id: string;
   connector_id: string;
   source_key: string | null;
@@ -23,7 +23,7 @@ interface IntegrationRow {
   last_resolved_key: string | null;
   display_name: string | null;
   suggested_label: string | null;
-  status: ConnectorIntegrationStatus;
+  status: ConnectorSourceStatus;
   setup_status: ConnectorSetupStatus;
   trust_status: ConnectorTrustStatus;
   schedule_cron: string | null;
@@ -44,7 +44,7 @@ interface IntegrationRow {
 
 interface RunRow {
   id: string;
-  integration_id: string;
+  source_id: string;
   connector_id: string;
   source_key: string | null;
   trigger: ConnectorRunTrigger;
@@ -55,7 +55,7 @@ interface RunRow {
   error: string | null;
 }
 
-export interface EnsureIntegrationInput<TConfig = unknown> {
+export interface EnsureSourceInput<TConfig = unknown> {
   id?: string;
   connectorId: string;
   displayName?: string | null;
@@ -68,25 +68,25 @@ export interface EnsureIntegrationInput<TConfig = unknown> {
   authRef?: string;
 }
 
-export type UpdateIntegrationInput<TConfig = unknown> = Omit<
-  EnsureIntegrationInput<TConfig>,
+export type UpdateSourceInput<TConfig = unknown> = Omit<
+  EnsureSourceInput<TConfig>,
   "id" | "connectorId" | "displayName"
 >;
 
 export type ConnectorIdentityPublishOutcome = "resolved" | "conflict" | "changed";
 
-export class ConnectorIntegrationStore {
+export class ConnectorSourceStore {
   constructor(private systemDb: DatabaseSync) {}
 
   ensure<TConfig = unknown, TState = unknown>(
-    input: EnsureIntegrationInput<TConfig>,
-  ): ConnectorIntegration<TConfig, TState> {
+    input: EnsureSourceInput<TConfig>,
+  ): ConnectorSource<TConfig, TState> {
     validateConnectorId(input.connectorId);
     const existing = input.id ? this.get<TConfig, TState>(input.id) : undefined;
     const now = Date.now();
     if (existing) {
       if (existing.connectorId !== input.connectorId) {
-        throw new Error(`Connector integration ${existing.id} belongs to ${existing.connectorId}`);
+        throw new Error(`Connector Source ${existing.id} belongs to ${existing.connectorId}`);
       }
       const nextConfig = input.config === undefined ? existing.config : input.config;
       const nextSetup = input.setupStatus ?? existing.setupStatus;
@@ -96,7 +96,7 @@ export class ConnectorIntegrationStore {
       const recoveredFromSetup = existing.status === "error"
         && existing.setupStatus === "setup"
         && nextSetup === "ready";
-      const nextStatus: ConnectorIntegrationStatus = recoveredFromSetup ? "idle" : existing.status;
+      const nextStatus: ConnectorSourceStatus = recoveredFromSetup ? "idle" : existing.status;
       // Recovery into idle clears the stale failure message; a preserved run
       // error keeps its message.
       const nextLastError = nextStatus === "idle" && existing.status !== "idle"
@@ -112,7 +112,7 @@ export class ConnectorIntegrationStore {
       const nextTrustStatus = input.trustStatus ?? existing.trustStatus;
       const nextAuthRef = input.authRef ?? existing.authRef ?? defaultAuthRef(existing.id);
       this.systemDb.prepare(
-        `UPDATE connector_integrations
+        `UPDATE connector_sources
          SET status = ?,
              setup_status = ?,
              trust_status = ?,
@@ -140,11 +140,11 @@ export class ConnectorIntegrationStore {
       return this.get<TConfig, TState>(existing.id)!;
     }
 
-    const id = input.id ?? newIntegrationId();
+    const id = input.id ?? newSourceId();
     const setupStatus = input.setupStatus ?? "setup";
-    const status: ConnectorIntegrationStatus = "idle";
+    const status: ConnectorSourceStatus = "idle";
     this.systemDb.prepare(
-      `INSERT INTO connector_integrations
+      `INSERT INTO connector_sources
        (id, connector_id, source_key, identity_status, last_resolved_key,
         display_name, suggested_label, status, setup_status, trust_status,
         schedule_cron, next_run_at, paused_at, resume_at, package_hash, config,
@@ -172,8 +172,8 @@ export class ConnectorIntegrationStore {
   }
 
   createSingle<TConfig = unknown, TState = unknown>(
-    input: Omit<EnsureIntegrationInput<TConfig>, "id">,
-  ): ConnectorIntegration<TConfig, TState> {
+    input: Omit<EnsureSourceInput<TConfig>, "id">,
+  ): ConnectorSource<TConfig, TState> {
     validateConnectorId(input.connectorId);
     this.systemDb.exec("BEGIN IMMEDIATE");
     try {
@@ -184,11 +184,11 @@ export class ConnectorIntegrationStore {
       }
       const created = this.ensure<TConfig, TState>({
         ...input,
-        id: newIntegrationId(),
+        id: newSourceId(),
         setupStatus: "setup",
       });
       this.systemDb.prepare(
-        `UPDATE connector_integrations
+        `UPDATE connector_sources
          SET source_key = NULL,
              identity_status = 'resolved',
              last_resolved_key = NULL,
@@ -206,20 +206,20 @@ export class ConnectorIntegrationStore {
   }
 
   createDevice<TConfig = unknown, TState = unknown>(
-    input: Omit<EnsureIntegrationInput<TConfig>, "id">,
+    input: Omit<EnsureSourceInput<TConfig>, "id">,
     sourceKey: string,
     suggestedLabel?: string,
-  ): ConnectorIntegration<TConfig, TState> {
+  ): ConnectorSource<TConfig, TState> {
     validateSourceKey(sourceKey);
     this.systemDb.exec("BEGIN IMMEDIATE");
     try {
       const created = this.ensure<TConfig, TState>({
         ...input,
-        id: newIntegrationId(),
+        id: newSourceId(),
         setupStatus: "setup",
       });
       this.systemDb.prepare(
-        `UPDATE connector_integrations
+        `UPDATE connector_sources
          SET source_key = ?,
              identity_status = 'resolved',
              last_resolved_key = ?,
@@ -237,22 +237,22 @@ export class ConnectorIntegrationStore {
   }
 
   createConnector<TConfig = unknown, TState = unknown>(
-    input: Omit<EnsureIntegrationInput<TConfig>, "id">,
-  ): ConnectorIntegration<TConfig, TState> {
+    input: Omit<EnsureSourceInput<TConfig>, "id">,
+  ): ConnectorSource<TConfig, TState> {
     return this.ensure<TConfig, TState>({
       ...input,
-      id: newIntegrationId(),
+      id: newSourceId(),
       setupStatus: "setup",
     });
   }
 
   update<TConfig = unknown, TState = unknown>(
     id: string,
-    input: UpdateIntegrationInput<TConfig>,
-  ): ConnectorIntegration<TConfig, TState> {
+    input: UpdateSourceInput<TConfig>,
+  ): ConnectorSource<TConfig, TState> {
     const existing = this.get(id);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${id}`);
+      throw new Error(`Connector Source not found: ${id}`);
     }
     return this.ensure<TConfig, TState>({
       ...input,
@@ -263,72 +263,72 @@ export class ConnectorIntegrationStore {
 
   get<TConfig = unknown, TState = unknown>(
     id: string,
-  ): ConnectorIntegration<TConfig, TState> | undefined {
-    const row = this.systemDb.prepare("SELECT * FROM connector_integrations WHERE id = ?").get(id) as unknown as IntegrationRow | undefined;
-    return row ? rowToIntegration<TConfig, TState>(row) : undefined;
+  ): ConnectorSource<TConfig, TState> | undefined {
+    const row = this.systemDb.prepare("SELECT * FROM connector_sources WHERE id = ?").get(id) as unknown as SourceRow | undefined;
+    return row ? rowToSource<TConfig, TState>(row) : undefined;
   }
 
   getBySourceKey<TConfig = unknown, TState = unknown>(
     connectorId: string,
     sourceKey: string,
-  ): ConnectorIntegration<TConfig, TState> | undefined {
+  ): ConnectorSource<TConfig, TState> | undefined {
     validateConnectorId(connectorId);
     validateSourceKey(sourceKey);
     const row = this.systemDb.prepare(
-      `SELECT * FROM connector_integrations
+      `SELECT * FROM connector_sources
        WHERE connector_id = ? AND source_key = ?
        ORDER BY created_at
        LIMIT 1`,
-    ).get(connectorId, sourceKey) as unknown as IntegrationRow | undefined;
-    return row ? rowToIntegration<TConfig, TState>(row) : undefined;
+    ).get(connectorId, sourceKey) as unknown as SourceRow | undefined;
+    return row ? rowToSource<TConfig, TState>(row) : undefined;
   }
 
   firstForConnector<TConfig = unknown, TState = unknown>(
     connectorId: string,
-  ): ConnectorIntegration<TConfig, TState> | undefined {
+  ): ConnectorSource<TConfig, TState> | undefined {
     validateConnectorId(connectorId);
     const row = this.systemDb.prepare(
-      `SELECT * FROM connector_integrations
+      `SELECT * FROM connector_sources
        WHERE connector_id = ?
        ORDER BY created_at
        LIMIT 1`
-    ).get(connectorId) as unknown as IntegrationRow | undefined;
-    return row ? rowToIntegration<TConfig, TState>(row) : undefined;
+    ).get(connectorId) as unknown as SourceRow | undefined;
+    return row ? rowToSource<TConfig, TState>(row) : undefined;
   }
 
   delete(id: string): boolean {
-    const result = this.systemDb.prepare("DELETE FROM connector_integrations WHERE id = ?").run(id);
+    const result = this.systemDb.prepare("DELETE FROM connector_sources WHERE id = ?").run(id);
     return result.changes > 0;
   }
 
-  list(): ConnectorIntegration[] {
-    return (this.systemDb.prepare("SELECT * FROM connector_integrations ORDER BY connector_id, source_key, created_at").all() as unknown as IntegrationRow[])
-      .map((row) => rowToIntegration(row));
+  list(): ConnectorSource[] {
+    return (this.systemDb.prepare("SELECT * FROM connector_sources ORDER BY connector_id, source_key, created_at").all() as unknown as SourceRow[])
+      .map((row) => rowToSource(row));
   }
 
-  listForConnector(connectorId: string): ConnectorIntegration[] {
+  listForConnector(connectorId: string): ConnectorSource[] {
     validateConnectorId(connectorId);
     return (this.systemDb.prepare(
-      `SELECT * FROM connector_integrations
+      `SELECT * FROM connector_sources
        WHERE connector_id = ?
        ORDER BY source_key, created_at`,
-    ).all(connectorId) as unknown as IntegrationRow[]).map((row) => rowToIntegration(row));
+    ).all(connectorId) as unknown as SourceRow[]).map((row) => rowToSource(row));
   }
 
-  setDisplayName(id: string, displayName: string | null): ConnectorIntegration {
-    if (!this.get(id)) throw new Error(`Connector integration not found: ${id}`);
+  setDisplayName(id: string, displayName: string | null): ConnectorSource {
+    if (!this.get(id)) throw new Error(`Connector Source not found: ${id}`);
     this.systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET display_name = ?, updated_at = ?
        WHERE id = ?`,
     ).run(displayName, Date.now(), id);
     return this.get(id)!;
   }
 
-  beginIdentityResolution(id: string): ConnectorIntegration {
-    if (!this.get(id)) throw new Error(`Connector integration not found: ${id}`);
+  beginIdentityResolution(id: string): ConnectorSource {
+    if (!this.get(id)) throw new Error(`Connector Source not found: ${id}`);
     this.systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET identity_status = 'unresolved', setup_status = 'setup', updated_at = ?
        WHERE id = ?`,
     ).run(Date.now(), id);
@@ -339,30 +339,30 @@ export class ConnectorIntegrationStore {
     id: string,
     sourceKey: string,
     suggestedLabel: string | null,
-  ): { integration: ConnectorIntegration; outcome: ConnectorIdentityPublishOutcome } {
+  ): { sourceRecord: ConnectorSource; outcome: ConnectorIdentityPublishOutcome } {
     validateSourceKey(sourceKey);
     const existing = this.get(id);
-    if (!existing) throw new Error(`Connector integration not found: ${id}`);
+    if (!existing) throw new Error(`Connector Source not found: ${id}`);
 
     if (existing.sourceKey !== null && existing.sourceKey !== sourceKey) {
       this.writeIdentityOutcome(existing, "changed", existing.sourceKey, sourceKey, suggestedLabel, null);
-      return { integration: this.get(id)!, outcome: "changed" };
+      return { sourceRecord: this.get(id)!, outcome: "changed" };
     }
 
     try {
       assertSourceKeyImmutable(existing.sourceKey, sourceKey);
       this.writeIdentityOutcome(existing, "resolved", sourceKey, sourceKey, suggestedLabel, null);
-      return { integration: this.get(id)!, outcome: "resolved" };
+      return { sourceRecord: this.get(id)!, outcome: "resolved" };
     } catch (error) {
       if (!isSourceKeyConstraintError(error) || existing.sourceKey !== null) throw error;
       this.writeIdentityOutcome(existing, "conflict", null, sourceKey, suggestedLabel, null);
-      return { integration: this.get(id)!, outcome: "conflict" };
+      return { sourceRecord: this.get(id)!, outcome: "conflict" };
     }
   }
 
-  publishIdentityError(id: string, message: string): ConnectorIntegration {
+  publishIdentityError(id: string, message: string): ConnectorSource {
     const existing = this.get(id);
-    if (!existing) throw new Error(`Connector integration not found: ${id}`);
+    if (!existing) throw new Error(`Connector Source not found: ${id}`);
     this.writeIdentityOutcome(
       existing,
       "error",
@@ -375,7 +375,7 @@ export class ConnectorIntegrationStore {
   }
 
   private writeIdentityOutcome(
-    existing: ConnectorIntegration,
+    existing: ConnectorSource,
     identityStatus: ConnectorIdentityStatus,
     sourceKey: string | null,
     lastResolvedKey: string | null,
@@ -383,7 +383,7 @@ export class ConnectorIntegrationStore {
     lastError: string | null,
   ): void {
     this.systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET source_key = ?,
            identity_status = ?,
            last_resolved_key = ?,
@@ -402,26 +402,26 @@ export class ConnectorIntegrationStore {
     );
   }
 
-  pause(id: string, resumeAt?: number): ConnectorIntegration {
+  pause(id: string, resumeAt?: number): ConnectorSource {
     const existing = this.get(id);
-    if (!existing) throw new Error(`Connector integration not found: ${id}`);
+    if (!existing) throw new Error(`Connector Source not found: ${id}`);
     const now = Date.now();
     if (resumeAt !== undefined && (!Number.isFinite(resumeAt) || resumeAt <= now)) {
       throw new Error("Connector pause resumeAt must be in the future");
     }
     this.systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET paused_at = ?, resume_at = ?, updated_at = ?
        WHERE id = ?`
     ).run(now, resumeAt ?? null, now, id);
     return this.get(id)!;
   }
 
-  resume(id: string): ConnectorIntegration {
+  resume(id: string): ConnectorSource {
     const existing = this.get(id);
-    if (!existing) throw new Error(`Connector integration not found: ${id}`);
+    if (!existing) throw new Error(`Connector Source not found: ${id}`);
     this.systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET paused_at = NULL, resume_at = NULL, updated_at = ?
        WHERE id = ?`
     ).run(Date.now(), id);
@@ -430,7 +430,7 @@ export class ConnectorIntegrationStore {
 
   resumeExpired(now: number): number {
     return Number(this.systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET paused_at = NULL, resume_at = NULL, updated_at = ?
        WHERE paused_at IS NOT NULL AND resume_at IS NOT NULL AND resume_at <= ?`
     ).run(now, now).changes);
@@ -446,14 +446,14 @@ export class ConnectorIntegrationStore {
        WHERE status = 'running'`
     ).run(now, now);
     this.systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET status = 'idle', updated_at = ?
        WHERE status = 'running'`
     ).run(now);
   }
 
   createRun(input: {
-    integration: ConnectorIntegration;
+    sourceRecord: ConnectorSource;
     trigger: ConnectorRunTrigger;
     startedAt?: number;
   }): ConnectorRunRecord {
@@ -461,17 +461,17 @@ export class ConnectorIntegrationStore {
     const id = newRunId();
     this.systemDb.prepare(
       `INSERT INTO connector_runs
-       (id, integration_id, connector_id, source_key, trigger, status, started_at)
+       (id, source_id, connector_id, source_key, trigger, status, started_at)
        VALUES (?, ?, ?, ?, ?, 'running', ?)`
     ).run(
       id,
-      input.integration.id,
-      input.integration.connectorId,
-      input.integration.sourceKey,
+      input.sourceRecord.id,
+      input.sourceRecord.connectorId,
+      input.sourceRecord.sourceKey,
       input.trigger,
       startedAt,
     );
-    this.pruneRuns(input.integration.id);
+    this.pruneRuns(input.sourceRecord.id);
     return this.getRun(id)!;
   }
 
@@ -493,13 +493,13 @@ export class ConnectorIntegrationStore {
     return this.getRun(id);
   }
 
-  listRuns(integrationId: string, limit = 8): ConnectorRunRecord[] {
+  listRuns(sourceId: string, limit = 8): ConnectorRunRecord[] {
     return (this.systemDb.prepare(
       `SELECT * FROM connector_runs
-       WHERE integration_id = ?
+       WHERE source_id = ?
        ORDER BY started_at DESC, id DESC
        LIMIT ?`
-    ).all(integrationId, limit) as unknown as RunRow[]).map(rowToRun);
+    ).all(sourceId, limit) as unknown as RunRow[]).map(rowToRun);
   }
 
   setState<TState>(id: string, state: TState): void {
@@ -514,7 +514,7 @@ export class ConnectorIntegrationStore {
     const warning = normalizeWarningInput(input);
     const existing = this.get(id);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${id}`);
+      throw new Error(`Connector Source not found: ${id}`);
     }
 
     const now = Date.now();
@@ -537,7 +537,7 @@ export class ConnectorIntegrationStore {
   clearWarning(id: string, key: string): void {
     const existing = this.get(id);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${id}`);
+      throw new Error(`Connector Source not found: ${id}`);
     }
     const warnings = existing.warnings ?? [];
     const next = warnings.filter((record) => record.key !== key);
@@ -546,19 +546,19 @@ export class ConnectorIntegrationStore {
   }
 
   // Explicit recovery from a run error: back to idle, stale failure message and
-  // pending schedule cleared so the scheduler picks the integration up fresh.
+  // pending schedule cleared so the scheduler picks the Source up fresh.
   resetErrorToIdle(id: string): void {
     this.systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET status = 'idle', last_error = NULL, next_run_at = NULL, updated_at = ?
        WHERE id = ?`
     ).run(Date.now(), id);
   }
 
-  setStatus(id: string, status: ConnectorIntegrationStatus, error?: string): void {
+  setStatus(id: string, status: ConnectorSourceStatus, error?: string): void {
     const now = Date.now();
     this.systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET status = ?, last_error = ?, updated_at = ?, last_run_at = CASE WHEN ? THEN ? ELSE last_run_at END
        WHERE id = ?`
     ).run(status, error ?? null, now, status === "idle" ? 1 : 0, now, id);
@@ -567,7 +567,7 @@ export class ConnectorIntegrationStore {
   setTrustForConnector(connectorId: string, trustStatus: ConnectorTrustStatus, packageHash?: string): void {
     validateConnectorId(connectorId);
     this.systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET trust_status = ?, package_hash = COALESCE(?, package_hash), updated_at = ?
        WHERE connector_id = ?`
     ).run(trustStatus, packageHash ?? null, Date.now(), connectorId);
@@ -575,13 +575,13 @@ export class ConnectorIntegrationStore {
 
   private updateJsonColumn(id: string, column: "config" | "sync_state" | "requirements_status", value: unknown): void {
     this.systemDb.prepare(
-      `UPDATE connector_integrations SET ${column} = ?, updated_at = ? WHERE id = ?`
+      `UPDATE connector_sources SET ${column} = ?, updated_at = ? WHERE id = ?`
     ).run(stringifyJson(value), Date.now(), id);
   }
 
   private setWarnings(id: string, warnings: ConnectorWarningRecord[]): void {
     this.systemDb.prepare(
-      `UPDATE connector_integrations SET warnings = ?, updated_at = ? WHERE id = ?`
+      `UPDATE connector_sources SET warnings = ?, updated_at = ? WHERE id = ?`
     ).run(stringifyJson(warnings.length ? warnings : undefined), Date.now(), id);
   }
 
@@ -590,22 +590,22 @@ export class ConnectorIntegrationStore {
     return row ? rowToRun(row) : undefined;
   }
 
-  private pruneRuns(integrationId: string, keep = 50): void {
+  private pruneRuns(sourceId: string, keep = 50): void {
     this.systemDb.prepare(
       `DELETE FROM connector_runs
-       WHERE integration_id = ?
+       WHERE source_id = ?
          AND id NOT IN (
            SELECT id FROM connector_runs
-           WHERE integration_id = ?
+           WHERE source_id = ?
            ORDER BY started_at DESC, id DESC
            LIMIT ?
          )`
-    ).run(integrationId, integrationId, keep);
+    ).run(sourceId, sourceId, keep);
   }
 }
 
 export function createConnectorStateHandle<TState>(
-  store: ConnectorIntegrationStore,
+  store: ConnectorSourceStore,
   instanceId: string,
 ) {
   return {
@@ -618,7 +618,7 @@ export function createConnectorStateHandle<TState>(
   };
 }
 
-export function newIntegrationId(): string {
+export function newSourceId(): string {
   return ulid();
 }
 
@@ -626,8 +626,13 @@ function newRunId(): string {
   return ulid();
 }
 
-export function defaultAuthRef(integrationId: string): string {
-  return `connector-integration:${integrationId}:auth`;
+// The secret-store key for a Source's credentials. Derived only when a Source
+// has no stored `authRef`; a stored one always wins, so changing this format
+// affects new Sources and leaves existing credentials reachable. Every caller
+// must use this function rather than rebuilding the string, or a divergence
+// would silently look up the wrong key and report a missing credential.
+export function defaultAuthRef(sourceId: string): string {
+  return `connector-source:${sourceId}:auth`;
 }
 
 export function assertSourceKeyImmutable(
@@ -638,7 +643,7 @@ export function assertSourceKeyImmutable(
   throw new Error("Connector source key is immutable once claimed");
 }
 
-function rowToIntegration<TConfig, TState>(row: IntegrationRow): ConnectorIntegration<TConfig, TState> {
+function rowToSource<TConfig, TState>(row: SourceRow): ConnectorSource<TConfig, TState> {
   return {
     id: row.id,
     connectorId: row.connector_id,
@@ -669,22 +674,22 @@ function rowToIntegration<TConfig, TState>(row: IntegrationRow): ConnectorIntegr
   };
 }
 
-export function isIntegrationPaused(
-  integration: Pick<ConnectorIntegration, "pausedAt" | "resumeAt">,
+export function isSourcePaused(
+  sourceRecord: Pick<ConnectorSource, "pausedAt" | "resumeAt">,
   now = Date.now(),
 ): boolean {
-  return integration.pausedAt !== undefined
-    && (integration.resumeAt === undefined || integration.resumeAt > now);
+  return sourceRecord.pausedAt !== undefined
+    && (sourceRecord.resumeAt === undefined || sourceRecord.resumeAt > now);
 }
 
-function normalizeObservedStatus(status: string): ConnectorIntegrationStatus {
+function normalizeObservedStatus(status: string): ConnectorSourceStatus {
   return status === "running" || status === "error" ? status : "idle";
 }
 
 function rowToRun(row: RunRow): ConnectorRunRecord {
   return {
     id: row.id,
-    integrationId: row.integration_id,
+    sourceId: row.source_id,
     connectorId: row.connector_id,
     sourceKey: row.source_key,
     trigger: row.trigger,
@@ -740,6 +745,6 @@ function isSourceKeyConstraintError(error: unknown): boolean {
     ? error.message
     : "";
   return message.includes("UNIQUE constraint failed")
-    && message.includes("connector_integrations.connector_id")
-    && message.includes("connector_integrations.source_key");
+    && message.includes("connector_sources.connector_id")
+    && message.includes("connector_sources.source_key");
 }

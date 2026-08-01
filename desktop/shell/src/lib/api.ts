@@ -438,7 +438,7 @@ export interface ConnectorWarningRecord {
 
 export interface ConnectorRunRecordView {
   id: string;
-  integrationId: string;
+  sourceId: string;
   connectorId: string;
   sourceKey: string | null;
   trigger: "manual" | "schedule" | "watch";
@@ -484,7 +484,7 @@ export interface InstalledConnectorView {
   packageHash?: string;
 }
 
-export interface ConnectorIntegrationView {
+export interface ConnectorSourceView {
   id: string;
   connectorId: string;
   connectorName: string;
@@ -527,7 +527,7 @@ export interface ConnectorIntegrationView {
   recentRuns?: ConnectorRunRecordView[];
   // Config schema declared by the connector manifest (user-facing fields).
   configSchema?: Record<string, ConnectorConfigFieldView>;
-  // Current user override/payload values stored on the integration. Manifest
+  // Current user override/payload values stored on the Source. Manifest
   // config fields use top-level primitive keys; custom config panels may store
   // opaque nested payloads beside them.
   config?: Record<string, unknown>;
@@ -535,8 +535,8 @@ export interface ConnectorIntegrationView {
 }
 
 export function listConnectors(): Promise<{
-  sources: ConnectorIntegrationView[];
-  connectors: ConnectorIntegrationView[];
+  sources: ConnectorSourceView[];
+  connectors: ConnectorSourceView[];
   packages: InstalledConnectorView[];
 }> {
   return request("/api/connectors");
@@ -590,45 +590,45 @@ export function approveConnector(connectorId: string): Promise<{ ok: true }> {
 }
 
 export function checkConnectorRequirements(
-  integrationId: string,
+  sourceId: string,
 ): Promise<{ requirements: Record<string, ConnectorRequirementView> }> {
   return request(
-    `/api/connectors/integrations/${encodeURIComponent(integrationId)}/requirements/check`,
+    `/api/connectors/sources/${encodeURIComponent(sourceId)}/requirements/check`,
     { method: "POST", body: JSON.stringify({}) },
   );
 }
 
 export function requestConnectorRequirement(
-  integrationId: string,
+  sourceId: string,
   requirementId: string,
 ): Promise<{ requirement: ConnectorRequirementView }> {
   return request(
-    `/api/connectors/integrations/${encodeURIComponent(integrationId)}/requirements/${encodeURIComponent(requirementId)}/request`,
+    `/api/connectors/sources/${encodeURIComponent(sourceId)}/requirements/${encodeURIComponent(requirementId)}/request`,
     { method: "POST", body: JSON.stringify({}) },
   );
 }
 
-export function restartConnectorIntegration(
-  integrationId: string,
-): Promise<{ integration: ConnectorIntegrationRow }> {
+export function restartConnectorSource(
+  sourceId: string,
+): Promise<{ sourceRecord: ConnectorSourceRow }> {
   return request(
-    `/api/connectors/integrations/${encodeURIComponent(integrationId)}/restart`,
+    `/api/connectors/sources/${encodeURIComponent(sourceId)}/restart`,
     { method: "POST", body: JSON.stringify({}) },
   );
 }
 
 // Trigger an explicit run using the latest stored Source config.
-export function runConnectorIntegration(integrationId: string): Promise<{ ok: true }> {
+export function runConnectorSource(sourceId: string): Promise<{ ok: true }> {
   return request(
-    `/api/connectors/integrations/${encodeURIComponent(integrationId)}/run`,
+    `/api/connectors/sources/${encodeURIComponent(sourceId)}/run`,
     { method: "POST", body: JSON.stringify({}) },
   );
 }
 
-// Mutation endpoints return the raw integration row (no name/setupPending/
+// Mutation endpoints return the raw Source row (no name/setupPending/
 // requirements enrichment — those only come from listConnectors). Callers
 // should refresh the list after a mutation instead of consuming this shape.
-export interface ConnectorIntegrationRow {
+export interface ConnectorSourceRow {
   id: string;
   connectorId: string;
   sourceKey: string | null;
@@ -646,26 +646,26 @@ export interface ConnectorIntegrationRow {
   lastRunAt?: number;
 }
 
-export function updateConnectorIntegration(
-  integrationId: string,
+export function updateConnectorSource(
+  sourceId: string,
   input: {
     displayName?: string | null;
     scheduleCron?: string | null;
     config?: Record<string, unknown>;
   },
-): Promise<{ integration: ConnectorIntegrationRow }> {
-  return request(`/api/connectors/integrations/${encodeURIComponent(integrationId)}`, {
+): Promise<{ sourceRecord: ConnectorSourceRow }> {
+  return request(`/api/connectors/sources/${encodeURIComponent(sourceId)}`, {
     method: "PATCH",
     body: JSON.stringify(input),
   });
 }
 
 export function startConnectorConfigPanel(
-  integrationId: string,
+  sourceId: string,
   panelId: string,
 ): Promise<{ sessionId: string; url: string }> {
   return request(
-    `/api/connectors/integrations/${encodeURIComponent(integrationId)}/config-panels/${encodeURIComponent(panelId)}/start`,
+    `/api/connectors/sources/${encodeURIComponent(sourceId)}/config-panels/${encodeURIComponent(panelId)}/start`,
     { method: "POST", body: JSON.stringify({}) },
   );
 }
@@ -676,64 +676,64 @@ export function stopConnectorConfigPanelSession(sessionId: string): Promise<{ ok
   });
 }
 
-export function createConnectorIntegration(
+export function createConnectorSource(
   connectorId: string,
   displayName?: string,
-): Promise<{ integration: ConnectorIntegrationRow }> {
-  return request(`/api/connectors/${encodeURIComponent(connectorId)}/integrations`, {
+): Promise<{ sourceRecord: ConnectorSourceRow }> {
+  return request(`/api/connectors/${encodeURIComponent(connectorId)}/sources`, {
     method: "POST",
     body: JSON.stringify(displayName ? { displayName } : {}),
   });
 }
 
 export function retryConnectorSourceIdentity(
-  integrationId: string,
-): Promise<{ integration: ConnectorIntegrationRow }> {
+  sourceId: string,
+): Promise<{ sourceRecord: ConnectorSourceRow }> {
   return request(
-    `/api/connectors/integrations/${encodeURIComponent(integrationId)}/identity/retry`,
+    `/api/connectors/sources/${encodeURIComponent(sourceId)}/identity/retry`,
     { method: "POST", body: JSON.stringify({}) },
   );
 }
 
-export function removeConnectorIntegration(integrationId: string): Promise<{ ok: true }> {
-  return request(`/api/connectors/integrations/${encodeURIComponent(integrationId)}`, {
+export function removeConnectorSource(sourceId: string): Promise<{ ok: true }> {
+  return request(`/api/connectors/sources/${encodeURIComponent(sourceId)}`, {
     method: "DELETE",
   });
 }
 
-export function pauseConnectorIntegration(
-  integrationId: string,
+export function pauseConnectorSource(
+  sourceId: string,
   durationMs?: number,
-): Promise<{ integration: ConnectorIntegrationRow }> {
-  return request(`/api/connectors/integrations/${encodeURIComponent(integrationId)}/pause`, {
+): Promise<{ sourceRecord: ConnectorSourceRow }> {
+  return request(`/api/connectors/sources/${encodeURIComponent(sourceId)}/pause`, {
     method: "POST",
     body: JSON.stringify(durationMs === undefined ? {} : { durationMs }),
   });
 }
 
-export function resumeConnectorIntegration(
-  integrationId: string,
-): Promise<{ integration: ConnectorIntegrationRow }> {
-  return request(`/api/connectors/integrations/${encodeURIComponent(integrationId)}/resume`, {
+export function resumeConnectorSource(
+  sourceId: string,
+): Promise<{ sourceRecord: ConnectorSourceRow }> {
+  return request(`/api/connectors/sources/${encodeURIComponent(sourceId)}/resume`, {
     method: "POST",
     body: JSON.stringify({}),
   });
 }
 
-export function disconnectConnectorIntegration(
-  integrationId: string,
-): Promise<{ integration: ConnectorIntegrationView }> {
-  return request(`/api/connectors/integrations/${encodeURIComponent(integrationId)}/disconnect`, {
+export function disconnectConnectorSource(
+  sourceId: string,
+): Promise<{ sourceRecord: ConnectorSourceView }> {
+  return request(`/api/connectors/sources/${encodeURIComponent(sourceId)}/disconnect`, {
     method: "POST",
     body: JSON.stringify({}),
   });
 }
 
-export function connectConnectorIntegration(
-  integrationId: string,
+export function connectConnectorSource(
+  sourceId: string,
   token: string,
-): Promise<{ integration: ConnectorIntegrationRow }> {
-  return request(`/api/connectors/integrations/${encodeURIComponent(integrationId)}/connect`, {
+): Promise<{ sourceRecord: ConnectorSourceRow }> {
+  return request(`/api/connectors/sources/${encodeURIComponent(sourceId)}/connect`, {
     method: "POST",
     body: JSON.stringify({ token }),
   });
@@ -754,18 +754,18 @@ export interface OAuthAttemptResult {
   error?: string;
 }
 
-export function startConnectorAuth(integrationId: string): Promise<OAuthStartResult> {
-  return request(`/api/connectors/integrations/${encodeURIComponent(integrationId)}/auth/start`, {
+export function startConnectorAuth(sourceId: string): Promise<OAuthStartResult> {
+  return request(`/api/connectors/sources/${encodeURIComponent(sourceId)}/auth/start`, {
     method: "POST",
   });
 }
 
 export function getConnectorAuthAttempt(
-  integrationId: string,
+  sourceId: string,
   attemptId: string,
 ): Promise<OAuthAttemptResult> {
   return request(
-    `/api/connectors/integrations/${encodeURIComponent(integrationId)}/auth/attempts/${encodeURIComponent(attemptId)}`,
+    `/api/connectors/sources/${encodeURIComponent(sourceId)}/auth/attempts/${encodeURIComponent(attemptId)}`,
   );
 }
 

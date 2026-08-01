@@ -144,9 +144,9 @@ const connectorManifests = await registerWorkspaceConnectors(connectorSupervisor
 await connectorSupervisor.recoverSourceIdentities();
 const connectorScheduler = new ConnectorScheduler({
   supervisor: connectorSupervisor,
-  onError(err, integration) {
+  onError(err, sourceRecord) {
     const message = err instanceof Error ? err.message : String(err);
-    console.warn(`[lamarck] Connector ${integration.connectorId} scheduler error: ${message}`);
+    console.warn(`[lamarck] Connector ${sourceRecord.connectorId} scheduler error: ${message}`);
   },
 });
 let registry = await loadApps(appsDir);
@@ -819,9 +819,9 @@ const server = await serve<{ cwd: string }>({
       // -- Connectors --
       if (path === "/api/connectors" && method === "GET") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const sources = (await connectorSupervisor.list()).map((source) => ({
-          ...source,
-          oauthRedirectUri: isDirectOAuthAuthType(source.authType) ? oauthRedirectUri : undefined,
+        const sources = (await connectorSupervisor.list()).map((sourceRecord) => ({
+          ...sourceRecord,
+          oauthRedirectUri: isDirectOAuthAuthType(sourceRecord.authType) ? oauthRedirectUri : undefined,
         }));
         return json({
           sources,
@@ -915,10 +915,10 @@ const server = await serve<{ cwd: string }>({
         return json({ ok: true, manifest });
       }
 
-      const requirementsCheckMatch = path.match(/^\/api\/connectors\/integrations\/([^/]+)\/requirements\/check$/);
+      const requirementsCheckMatch = path.match(/^\/api\/connectors\/sources\/([^/]+)\/requirements\/check$/);
       if (requirementsCheckMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const requirements = await connectorSupervisor.checkIntegrationRequirements(
+        const requirements = await connectorSupervisor.checkSourceRequirements(
           decodeURIComponent(requirementsCheckMatch[1]),
         );
         return json({ requirements });
@@ -936,21 +936,21 @@ const server = await serve<{ cwd: string }>({
         return json({ ok: true, removed });
       }
 
-      const createIntegrationMatch = path.match(/^\/api\/connectors\/([^/]+)\/integrations$/);
-      if (createIntegrationMatch && method === "POST") {
+      const createSourceMatch = path.match(/^\/api\/connectors\/([^/]+)\/sources$/);
+      if (createSourceMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const body = await readBody<{ displayName?: unknown }>(req);
         assertAllowedRequestFields(body, ["displayName"]);
         assertDisplayNameField(body, { nullable: false });
-        const integration = await connectorSupervisor.addIntegration({
-          connectorId: decodeURIComponent(createIntegrationMatch[1]),
+        const sourceRecord = await connectorSupervisor.addSource({
+          connectorId: decodeURIComponent(createSourceMatch[1]),
           displayName: body.displayName as string | undefined,
         });
-        return json({ integration });
+        return json({ sourceRecord });
       }
 
-      const integrationMatch = path.match(/^\/api\/connectors\/integrations\/([^/]+)$/);
-      if (integrationMatch && method === "PATCH") {
+      const sourceRouteMatch = path.match(/^\/api\/connectors\/sources\/([^/]+)$/);
+      if (sourceRouteMatch && method === "PATCH") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const body = await readBody<{
           scheduleCron?: string | null;
@@ -959,62 +959,62 @@ const server = await serve<{ cwd: string }>({
         }>(req);
         assertAllowedRequestFields(body, ["displayName", "scheduleCron", "config"]);
         assertDisplayNameField(body, { nullable: true });
-        const instanceId = decodeURIComponent(integrationMatch[1]);
-        let integration = connectorSupervisor.getIntegration(instanceId);
-        if (!integration) return json({ error: "not found" }, 404);
+        const instanceId = decodeURIComponent(sourceRouteMatch[1]);
+        let sourceRecord = connectorSupervisor.getSource(instanceId);
+        if (!sourceRecord) return json({ error: "not found" }, 404);
         if ("scheduleCron" in body || "config" in body) {
-          integration = await connectorSupervisor.configureIntegration(instanceId, {
+          sourceRecord = await connectorSupervisor.configureSource(instanceId, {
             scheduleCron: body.scheduleCron,
             config: body.config,
           });
         }
         const renamed = body.displayName === undefined
-          ? integration
-          : connectorSupervisor.renameIntegration(instanceId, body.displayName as string | null);
-        return json({ integration: renamed });
+          ? sourceRecord
+          : connectorSupervisor.renameSource(instanceId, body.displayName as string | null);
+        return json({ sourceRecord: renamed });
       }
-	      if (integrationMatch && method === "DELETE") {
+	      if (sourceRouteMatch && method === "DELETE") {
 	        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-	        await connectorSupervisor.removeIntegration(decodeURIComponent(integrationMatch[1]));
+	        await connectorSupervisor.removeSource(decodeURIComponent(sourceRouteMatch[1]));
 	        return json({ ok: true });
 	      }
 
-      const pauseIntegrationMatch = path.match(/^\/api\/connectors\/integrations\/([^/]+)\/pause$/);
-      if (pauseIntegrationMatch && method === "POST") {
+      const pauseSourceMatch = path.match(/^\/api\/connectors\/sources\/([^/]+)\/pause$/);
+      if (pauseSourceMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const body = await readBody<{ durationMs?: number }>(req).catch(() => ({} as { durationMs?: number }));
-        const integration = await connectorSupervisor.pauseIntegration(
-          decodeURIComponent(pauseIntegrationMatch[1]),
+        const sourceRecord = await connectorSupervisor.pauseSource(
+          decodeURIComponent(pauseSourceMatch[1]),
           body.durationMs,
         );
-        return json({ integration });
+        return json({ sourceRecord });
       }
 
-      const resumeIntegrationMatch = path.match(/^\/api\/connectors\/integrations\/([^/]+)\/resume$/);
-      if (resumeIntegrationMatch && method === "POST") {
+      const resumeSourceMatch = path.match(/^\/api\/connectors\/sources\/([^/]+)\/resume$/);
+      if (resumeSourceMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const integration = connectorSupervisor.resumeIntegration(
-          decodeURIComponent(resumeIntegrationMatch[1]),
+        const sourceRecord = connectorSupervisor.resumeSource(
+          decodeURIComponent(resumeSourceMatch[1]),
         );
         connectorScheduler.tick().catch((err) => {
           console.warn(`[lamarck] Connector scheduler tick after resume failed: ${err}`);
         });
-        return json({ integration });
+        return json({ sourceRecord });
       }
 
-      const disconnectIntegrationMatch = path.match(
-        /^\/api\/connectors\/integrations\/([^/]+)\/disconnect$/,
+      const disconnectSourceMatch = path.match(
+        /^\/api\/connectors\/sources\/([^/]+)\/disconnect$/,
       );
-      if (disconnectIntegrationMatch && method === "POST") {
+      if (disconnectSourceMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const integration = await connectorSupervisor.disconnectIntegration(
-          decodeURIComponent(disconnectIntegrationMatch[1]),
+        const sourceRecord = await connectorSupervisor.disconnectSource(
+          decodeURIComponent(disconnectSourceMatch[1]),
         );
-        return json({ integration });
+        return json({ sourceRecord });
       }
 
 	      const configPanelStartMatch = path.match(
-	        /^\/api\/connectors\/integrations\/([^/]+)\/config-panels\/([^/]+)\/start$/,
+	        /^\/api\/connectors\/sources\/([^/]+)\/config-panels\/([^/]+)\/start$/,
 	      );
 	      if (configPanelStartMatch && method === "POST") {
 	        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
@@ -1034,22 +1034,22 @@ const server = await serve<{ cwd: string }>({
 	        return json({ ok: true, stopped });
 	      }
 
-	      const connectIntegrationMatch = path.match(/^\/api\/connectors\/integrations\/([^/]+)\/connect$/);
-      if (connectIntegrationMatch && method === "POST") {
+	      const connectSourceMatch = path.match(/^\/api\/connectors\/sources\/([^/]+)\/connect$/);
+      if (connectSourceMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const body = await readBody<{ token?: string }>(req);
-        const integration = await connectorSupervisor.connectIntegrationWithToken(
-          decodeURIComponent(connectIntegrationMatch[1]),
+        const sourceRecord = await connectorSupervisor.connectSourceWithToken(
+          decodeURIComponent(connectSourceMatch[1]),
           body.token ?? "",
         );
-        return json({ integration });
+        return json({ sourceRecord });
       }
 
-      const authStartMatch = path.match(/^\/api\/connectors\/integrations\/([^/]+)\/auth\/start$/)
-        ?? path.match(/^\/api\/connectors\/integrations\/([^/]+)\/oauth\/start$/);
+      const authStartMatch = path.match(/^\/api\/connectors\/sources\/([^/]+)\/auth\/start$/)
+        ?? path.match(/^\/api\/connectors\/sources\/([^/]+)\/oauth\/start$/);
       if (authStartMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const result = await connectorSupervisor.startAuthIntegration(
+        const result = await connectorSupervisor.startAuthSource(
           decodeURIComponent(authStartMatch[1]),
           {
             redirectUri: oauthRedirectUri,
@@ -1059,9 +1059,9 @@ const server = await serve<{ cwd: string }>({
       }
 
       const authAttemptMatch = path.match(
-        /^\/api\/connectors\/integrations\/([^/]+)\/auth\/attempts\/([^/]+)$/,
+        /^\/api\/connectors\/sources\/([^/]+)\/auth\/attempts\/([^/]+)$/,
       ) ?? path.match(
-        /^\/api\/connectors\/integrations\/([^/]+)\/oauth\/attempts\/([^/]+)$/,
+        /^\/api\/connectors\/sources\/([^/]+)\/oauth\/attempts\/([^/]+)$/,
       );
       if (authAttemptMatch && method === "GET") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
@@ -1073,38 +1073,38 @@ const server = await serve<{ cwd: string }>({
       }
 
       const retryIdentityMatch = path.match(
-        /^\/api\/connectors\/integrations\/([^/]+)\/identity\/retry$/,
+        /^\/api\/connectors\/sources\/([^/]+)\/identity\/retry$/,
       );
       if (retryIdentityMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const body = await readBody<Record<string, unknown>>(req);
         assertAllowedRequestFields(body, []);
-        const integration = await connectorSupervisor.retrySourceIdentity(
+        const sourceRecord = await connectorSupervisor.retrySourceIdentity(
           decodeURIComponent(retryIdentityMatch[1]),
         );
-        return json({ integration });
+        return json({ sourceRecord });
       }
 
-      const restartIntegrationMatch = path.match(/^\/api\/connectors\/integrations\/([^/]+)\/restart$/);
-      if (restartIntegrationMatch && method === "POST") {
+      const restartSourceMatch = path.match(/^\/api\/connectors\/sources\/([^/]+)\/restart$/);
+      if (restartSourceMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const integration = connectorSupervisor.restartIntegration(
-          decodeURIComponent(restartIntegrationMatch[1]),
+        const sourceRecord = connectorSupervisor.restartSource(
+          decodeURIComponent(restartSourceMatch[1]),
         );
         // Kick the scheduler so the restart takes effect immediately instead of
         // waiting for the next tick; don't block the response on it.
         connectorScheduler.tick().catch((err) => {
           console.warn(`[lamarck] Connector scheduler tick after restart failed: ${err}`);
         });
-        return json({ integration });
+        return json({ sourceRecord });
       }
 
       // Trigger an explicit run on demand: the only execution path for a manual
       // connector, and how any connector runs outside its normal schedule.
       // Non-blocking — the run proceeds in the background; status shows on the
-      // integration. Runtime config always comes from the latest stored Source.
-      const runIntegrationMatch = path.match(/^\/api\/connectors\/integrations\/([^/]+)\/run$/);
-      if (runIntegrationMatch && method === "POST") {
+      // Source. Runtime config always comes from the latest stored Source.
+      const runSourceMatch = path.match(/^\/api\/connectors\/sources\/([^/]+)\/run$/);
+      if (runSourceMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const body = await readBody<unknown>(req).catch(() => ({}));
         if (
@@ -1118,17 +1118,17 @@ const server = await serve<{ cwd: string }>({
             400,
           );
         }
-        const instanceId = decodeURIComponent(runIntegrationMatch[1]);
+        const instanceId = decodeURIComponent(runSourceMatch[1]);
         connectorSupervisor.start(instanceId, { trigger: "manual" });
         return json({ ok: true });
       }
 
       const requirementRequestMatch = path.match(
-        /^\/api\/connectors\/integrations\/([^/]+)\/requirements\/([^/]+)\/request$/,
+        /^\/api\/connectors\/sources\/([^/]+)\/requirements\/([^/]+)\/request$/,
       );
       if (requirementRequestMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const requirement = await connectorSupervisor.requestIntegrationRequirement(
+        const requirement = await connectorSupervisor.requestSourceRequirement(
           decodeURIComponent(requirementRequestMatch[1]),
           decodeURIComponent(requirementRequestMatch[2]),
         );

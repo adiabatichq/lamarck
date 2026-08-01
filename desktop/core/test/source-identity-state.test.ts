@@ -6,19 +6,19 @@ import {
   sanitizeSourceIdentityError,
   validateConnectorSourceIdentityResult,
 } from "../src/connectors/source-identity";
-import { ConnectorIntegrationStore } from "../src/connectors/state";
+import { ConnectorSourceStore } from "../src/connectors/state";
 import { openTestDatabases } from "./support/test-databases";
 
 describe("Connector source identity store", () => {
   let workspace: string;
-  let store: ConnectorIntegrationStore;
+  let store: ConnectorSourceStore;
   let close: () => void;
 
   beforeEach(() => {
     workspace = mkdtempSync(join(tmpdir(), "lamarck-source-identity-state-"));
     mkdirSync(join(workspace, ".lamarck"), { recursive: true });
     const databases = openTestDatabases(workspace);
-    store = new ConnectorIntegrationStore(databases.systemDb);
+    store = new ConnectorSourceStore(databases.systemDb);
     close = databases.close;
   });
 
@@ -48,7 +48,7 @@ describe("Connector source identity store", () => {
 
     const first = store.publishSourceIdentity(claimed.id, "account-7", "Work account");
     expect(first.outcome).toBe("resolved");
-    expect(first.integration).toMatchObject({
+    expect(first.sourceRecord).toMatchObject({
       sourceKey: "account-7",
       lastResolvedKey: "account-7",
       identityStatus: "resolved",
@@ -62,7 +62,7 @@ describe("Connector source identity store", () => {
       "Duplicate account",
     );
     expect(conflict.outcome).toBe("conflict");
-    expect(conflict.integration).toMatchObject({
+    expect(conflict.sourceRecord).toMatchObject({
       sourceKey: null,
       lastResolvedKey: "account-7",
       identityStatus: "conflict",
@@ -72,7 +72,7 @@ describe("Connector source identity store", () => {
 
     const changed = store.publishSourceIdentity(claimed.id, "account-8", "Personal account");
     expect(changed.outcome).toBe("changed");
-    expect(changed.integration).toMatchObject({
+    expect(changed.sourceRecord).toMatchObject({
       sourceKey: "account-7",
       lastResolvedKey: "account-8",
       identityStatus: "changed",
@@ -82,10 +82,10 @@ describe("Connector source identity store", () => {
   });
 
   test("records an identity error without discarding previously observed identity fields", () => {
-    const source = store.createConnector({ connectorId: "error-feed" });
-    store.publishSourceIdentity(source.id, "account-9", "Primary account");
+    const sourceRecord = store.createConnector({ connectorId: "error-feed" });
+    store.publishSourceIdentity(sourceRecord.id, "account-9", "Primary account");
 
-    const failed = store.publishIdentityError(source.id, "identity endpoint unavailable");
+    const failed = store.publishIdentityError(sourceRecord.id, "identity endpoint unavailable");
     expect(failed).toMatchObject({
       sourceKey: "account-9",
       lastResolvedKey: "account-9",
@@ -96,11 +96,11 @@ describe("Connector source identity store", () => {
   });
 
   test("rejects invalid source keys before any identity fields are written", () => {
-    const source = store.createConnector({ connectorId: "invalid-key-feed" });
+    const sourceRecord = store.createConnector({ connectorId: "invalid-key-feed" });
 
-    expect(() => store.publishSourceIdentity(source.id, "contains spaces", null))
+    expect(() => store.publishSourceIdentity(sourceRecord.id, "contains spaces", null))
       .toThrow("Invalid connector source key");
-    expect(store.get(source.id)).toMatchObject({
+    expect(store.get(sourceRecord.id)).toMatchObject({
       sourceKey: null,
       lastResolvedKey: null,
       identityStatus: "unresolved",

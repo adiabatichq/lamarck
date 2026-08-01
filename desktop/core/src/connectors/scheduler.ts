@@ -1,9 +1,9 @@
 import type { ConnectorSupervisor } from "./supervisor";
-import type { ConnectorIntegration, ConnectorRunHandle } from "./types";
+import type { ConnectorSource, ConnectorRunHandle } from "./types";
 import { nextCronRunAt } from "./schedule";
-import { isIntegrationPaused } from "./state";
+import { isSourcePaused } from "./state";
 
-type ScheduledConnector = ConnectorIntegration & {
+type ScheduledConnector = ConnectorSource & {
   mode: string;
   running: boolean;
   supported: boolean;
@@ -20,7 +20,7 @@ export interface ConnectorSchedulerOptions {
   watchReconcileRetryMs?: number;
   watchReconcileMaxRetryMs?: number;
   now?: () => number;
-  onError?: (error: unknown, integration: ScheduledConnector) => void;
+  onError?: (error: unknown, sourceRecord: ScheduledConnector) => void;
 }
 
 const DEFAULT_TICK_MS = 60_000;
@@ -37,14 +37,14 @@ export class ConnectorScheduler {
   private watchReconcileMaxRetryMs: number;
   private nextWatchReconcileRetryMs: number;
   private now: () => number;
-  private onError?: (error: unknown, integration: ScheduledConnector) => void;
+  private onError?: (error: unknown, sourceRecord: ScheduledConnector) => void;
   private timer: ReturnType<typeof setInterval> | undefined;
   private tickPromise: Promise<void> | undefined;
   private activeRuns = new Map<string, ConnectorRunHandle>();
   private watchReconcilePromise: Promise<void> | undefined;
   private watchReconcileRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private watchReconcileAllPending = false;
-  private pendingWatchIntegrationIds = new Set<string>();
+  private pendingWatchSourceIds = new Set<string>();
   private disposeRuntimeReconcileListener: (() => void) | undefined;
   private started = false;
   private stopped = false;
@@ -106,7 +106,7 @@ export class ConnectorScheduler {
     this.started = false;
     this.unsubscribeRuntimeReconcileRequests();
     this.watchReconcileAllPending = false;
-    this.pendingWatchIntegrationIds.clear();
+    this.pendingWatchSourceIds.clear();
     this.cancelWatchReconcileRetry();
     this.resetWatchReconcileBackoff();
     if (this.timer) {
@@ -137,23 +137,23 @@ export class ConnectorScheduler {
   }
 
   private async startWatchConnectors(
-    targetIntegrationIds?: ReadonlySet<string>,
+    targetSourceIds?: ReadonlySet<string>,
   ): Promise<void> {
-    for (const integration of (await this.supervisor.list()) as ScheduledConnector[]) {
+    for (const sourceRecord of (await this.supervisor.list()) as ScheduledConnector[]) {
       if (this.stopped) return;
-      if (targetIntegrationIds && !targetIntegrationIds.has(integration.id)) continue;
-      if (integration.mode !== "watch") continue;
-      if (!canSchedule(integration, this.now())) continue;
-      if (integration.running || this.activeRuns.has(integration.id) || integration.status !== "idle") continue;
+      if (targetSourceIds && !targetSourceIds.has(sourceRecord.id)) continue;
+      if (sourceRecord.mode !== "watch") continue;
+      if (!canSchedule(sourceRecord, this.now())) continue;
+      if (sourceRecord.running || this.activeRuns.has(sourceRecord.id) || sourceRecord.status !== "idle") continue;
 
       try {
-        const handle = this.supervisor.start(integration.id, { trigger: "watch" });
-        this.activeRuns.set(integration.id, handle);
+        const handle = this.supervisor.start(sourceRecord.id, { trigger: "watch" });
+        this.activeRuns.set(sourceRecord.id, handle);
         handle.promise
-          .catch((err) => this.reportError(err, integration))
-          .finally(() => this.activeRuns.delete(integration.id));
+          .catch((err) => this.reportError(err, sourceRecord))
+          .finally(() => this.activeRuns.delete(sourceRecord.id));
       } catch (err) {
-        this.reportError(err, integration);
+        this.reportError(err, sourceRecord);
       }
     }
   }
@@ -162,50 +162,50 @@ export class ConnectorScheduler {
     if (this.stopped) return;
     const now = this.now();
     const due = ((await this.supervisor.list()) as ScheduledConnector[])
-      .filter((integration) => this.isDuePollIntegration(integration, now));
+      .filter((sourceRecord) => this.isDuePollSource(sourceRecord, now));
 
-    await Promise.all(due.map((integration) => this.runPollIntegration(integration)));
+    await Promise.all(due.map((sourceRecord) => this.runPollSource(sourceRecord)));
   }
 
-  private isDuePollIntegration(integration: ScheduledConnector, now: number): boolean {
-    if (integration.mode !== "poll") return false;
-    if (!canSchedule(integration, now)) return false;
-    if (!integration.scheduleCron) return false;
-    if (integration.running || this.activeRuns.has(integration.id)) return false;
-    return integration.nextRunAt === undefined || integration.nextRunAt <= now;
+  private isDuePollSource(sourceRecord: ScheduledConnector, now: number): boolean {
+    if (sourceRecord.mode !== "poll") return false;
+    if (!canSchedule(sourceRecord, now)) return false;
+    if (!sourceRecord.scheduleCron) return false;
+    if (sourceRecord.running || this.activeRuns.has(sourceRecord.id)) return false;
+    return sourceRecord.nextRunAt === undefined || sourceRecord.nextRunAt <= now;
   }
 
-  private async runPollIntegration(integration: ScheduledConnector): Promise<void> {
+  private async runPollSource(sourceRecord: ScheduledConnector): Promise<void> {
     let nextRunAt: number;
     try {
-      nextRunAt = nextCronRunAt(integration.scheduleCron!, this.now());
+      nextRunAt = nextCronRunAt(sourceRecord.scheduleCron!, this.now());
     } catch (err) {
-      this.reportError(err, integration);
+      this.reportError(err, sourceRecord);
       return;
     }
 
     try {
-      const handle = this.supervisor.start(integration.id, { trigger: "schedule" });
-      this.activeRuns.set(integration.id, handle);
+      const handle = this.supervisor.start(sourceRecord.id, { trigger: "schedule" });
+      this.activeRuns.set(sourceRecord.id, handle);
       await handle.promise;
     } catch (err) {
-      this.reportError(err, integration);
+      this.reportError(err, sourceRecord);
     } finally {
-      this.activeRuns.delete(integration.id);
+      this.activeRuns.delete(sourceRecord.id);
       try {
-        this.supervisor.updateIntegration(integration.id, { nextRunAt });
+        this.supervisor.updateSource(sourceRecord.id, { nextRunAt });
       } catch (err) {
-        this.reportError(err, integration);
+        this.reportError(err, sourceRecord);
       }
     }
   }
 
-  private reportError(err: unknown, integration: ScheduledConnector): void {
+  private reportError(err: unknown, sourceRecord: ScheduledConnector): void {
     if (this.onError) {
-      this.onError(err, integration);
+      this.onError(err, sourceRecord);
       return;
     }
-    console.error(`[connectors] ${integration.connectorId} scheduler error:`, err);
+    console.error(`[connectors] ${sourceRecord.connectorId} scheduler error:`, err);
   }
 
   private reconcileWatchConnectors(instanceId?: string): Promise<void> {
@@ -214,9 +214,9 @@ export class ConnectorScheduler {
     this.cancelWatchReconcileRetry();
     if (instanceId === undefined) {
       this.watchReconcileAllPending = true;
-      this.pendingWatchIntegrationIds.clear();
+      this.pendingWatchSourceIds.clear();
     } else if (!this.watchReconcileAllPending) {
-      this.pendingWatchIntegrationIds.add(instanceId);
+      this.pendingWatchSourceIds.add(instanceId);
     }
     return this.ensureWatchReconcile();
   }
@@ -236,22 +236,22 @@ export class ConnectorScheduler {
   private async drainWatchReconciles(): Promise<void> {
     while (!this.stopped) {
       const reconcileAll = this.watchReconcileAllPending;
-      const targetIntegrationIds = new Set(this.pendingWatchIntegrationIds);
-      if (!reconcileAll && targetIntegrationIds.size === 0) return;
+      const targetSourceIds = new Set(this.pendingWatchSourceIds);
+      if (!reconcileAll && targetSourceIds.size === 0) return;
 
       this.watchReconcileAllPending = false;
-      this.pendingWatchIntegrationIds.clear();
+      this.pendingWatchSourceIds.clear();
       try {
-        await this.startWatchConnectors(reconcileAll ? undefined : targetIntegrationIds);
+        await this.startWatchConnectors(reconcileAll ? undefined : targetSourceIds);
         this.resetWatchReconcileBackoff();
       } catch (err) {
         if (!this.stopped) {
           if (reconcileAll) {
             this.watchReconcileAllPending = true;
-            this.pendingWatchIntegrationIds.clear();
+            this.pendingWatchSourceIds.clear();
           } else if (!this.watchReconcileAllPending) {
-            for (const instanceId of targetIntegrationIds) {
-              this.pendingWatchIntegrationIds.add(instanceId);
+            for (const instanceId of targetSourceIds) {
+              this.pendingWatchSourceIds.add(instanceId);
             }
           }
           this.scheduleWatchReconcileRetry();
@@ -267,7 +267,7 @@ export class ConnectorScheduler {
     if (
       this.stopped
       || this.watchReconcileRetryTimer
-      || (!this.watchReconcileAllPending && this.pendingWatchIntegrationIds.size === 0)
+      || (!this.watchReconcileAllPending && this.pendingWatchSourceIds.size === 0)
     ) {
       return;
     }
@@ -338,12 +338,12 @@ async function waitWithTimeout(promise: Promise<unknown>, timeoutMs: number): Pr
   }
 }
 
-function canSchedule(integration: ScheduledConnector, now: number): boolean {
-  return !isIntegrationPaused(integration, now)
-    && integration.setupStatus === "ready"
-    && (integration.setupPending?.length ?? 0) === 0
-    && integration.supported
-    && integration.ownership === "here"
-    && integration.source !== null
-    && RUNNABLE_TRUST.has(integration.packageTrust);
+function canSchedule(sourceRecord: ScheduledConnector, now: number): boolean {
+  return !isSourcePaused(sourceRecord, now)
+    && sourceRecord.setupStatus === "ready"
+    && (sourceRecord.setupPending?.length ?? 0) === 0
+    && sourceRecord.supported
+    && sourceRecord.ownership === "here"
+    && sourceRecord.source !== null
+    && RUNNABLE_TRUST.has(sourceRecord.packageTrust);
 }

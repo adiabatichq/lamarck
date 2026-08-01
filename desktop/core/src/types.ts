@@ -25,7 +25,7 @@ export type {
   ConnectorDefinition,
   ConnectorEventInput,
   ConnectorIdentityStatus,
-  ConnectorIntegration,
+  ConnectorSource,
   ConnectorManifest,
   ConnectorOwnership,
   ConnectorOfficialCatalogEntry,
@@ -46,5 +46,5 @@ export type {
   InstalledConnector,
   InstallConnectorOptions,
   RegisterWorkspaceConnectorsOptions,
-  UpdateIntegrationInput,
+  UpdateSourceInput,
 } from "./connectors";

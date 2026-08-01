@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   clearCoreBaseUrlCache,
-  createConnectorIntegration,
+  createConnectorSource,
   getCoreBaseUrl,
   retryConnectorSourceIdentity,
-  updateConnectorIntegration,
+  updateConnectorSource,
 } from "./api";
 
 describe("Core endpoint resolution", () => {
@@ -52,7 +52,7 @@ describe("Core endpoint resolution", () => {
   test("uses display names for Source mutations and has an explicit identity retry", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      text: async () => JSON.stringify({ integration: {} }),
+      text: async () => JSON.stringify({ sourceRecord: {} }),
     });
     vi.stubGlobal("window", {
       lamarckHost: {
@@ -62,14 +62,14 @@ describe("Core endpoint resolution", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    await createConnectorIntegration("github/work", "Personal");
-    await createConnectorIntegration("github/work");
-    await updateConnectorIntegration("source/1", { displayName: "Work" });
+    await createConnectorSource("github/work", "Personal");
+    await createConnectorSource("github/work");
+    await updateConnectorSource("source/1", { displayName: "Work" });
     await retryConnectorSourceIdentity("source/1");
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "http://localhost:32100/api/connectors/github%2Fwork/integrations",
+      "http://localhost:32100/api/connectors/github%2Fwork/sources",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ displayName: "Personal" }),
@@ -77,7 +77,7 @@ describe("Core endpoint resolution", () => {
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      "http://localhost:32100/api/connectors/github%2Fwork/integrations",
+      "http://localhost:32100/api/connectors/github%2Fwork/sources",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({}),
@@ -85,7 +85,7 @@ describe("Core endpoint resolution", () => {
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
-      "http://localhost:32100/api/connectors/integrations/source%2F1",
+      "http://localhost:32100/api/connectors/sources/source%2F1",
       expect.objectContaining({
         method: "PATCH",
         body: JSON.stringify({ displayName: "Work" }),
@@ -93,7 +93,7 @@ describe("Core endpoint resolution", () => {
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       4,
-      "http://localhost:32100/api/connectors/integrations/source%2F1/identity/retry",
+      "http://localhost:32100/api/connectors/sources/source%2F1/identity/retry",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({}),

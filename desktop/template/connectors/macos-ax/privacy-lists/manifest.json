@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "version": "2026-07-06",
-  "description": "Connector-owned domain lists used only for privacy policy classification. User overrides live in integration.config.",
+  "description": "Connector-owned domain lists used only for privacy policy classification. User overrides live in Source config.",
   "lists": {
     "adult_content": {
       "kind": "domain-list",

@@ -119,12 +119,12 @@ export interface ConnectorManifest {
   auth?: ConnectorAuthSpec;
   // Config schema: user-facing fields (type/label/default). Author defaults live
   // here (shown to the user, applied by the host); user-chosen values are
-  // overrides in integration config. Internal constants stay in code, undeclared.
+  // overrides in Source config. Internal constants stay in code, undeclared.
   config?: Record<string, ConnectorConfigField>;
   // Optional connector-owned config panels for settings too rich for the
   // primitive manifest config form. The shell opens a trusted connector child
   // process for each panel; the connector owns the UI and any complex payload
-  // schema stored in integration config.
+  // schema stored in Source config.
   configPanels?: Record<string, ConnectorConfigPanel>;
 }
 
@@ -245,7 +245,7 @@ export interface ConnectorRequirementRecord extends ConnectorRequirementStatus {
 
 export interface ConnectorRequirementContext {
   connectorId: string;
-  integrationId: string;
+  sourceId: string;
   platform: ConnectorPlatform;
 }
 
@@ -277,7 +277,7 @@ export interface ConnectorDefinition<TConfig = unknown, TState = unknown> {
   ): MaybePromise<ConnectorSourceIdentityResult>;
 }
 
-export interface ConnectorIntegration<TConfig = unknown, TState = unknown> {
+export interface ConnectorSource<TConfig = unknown, TState = unknown> {
   id: string;
   connectorId: string;
   sourceKey: string | null;
@@ -292,7 +292,7 @@ export interface ConnectorIntegration<TConfig = unknown, TState = unknown> {
   //   pausedAt + future resume -> timed pause
   pausedAt: number | undefined;
   resumeAt: number | undefined;
-  status: ConnectorIntegrationStatus;
+  status: ConnectorSourceStatus;
   setupStatus: ConnectorSetupStatus;
   trustStatus: ConnectorTrustStatus;
   scheduleCron: string | undefined;
@@ -311,7 +311,7 @@ export interface ConnectorIntegration<TConfig = unknown, TState = unknown> {
 
 // Observed execution state only. Setup readiness lives in setupStatus and
 // Active/Paused lifecycle policy lives in pausedAt/resumeAt.
-export type ConnectorIntegrationStatus = "idle" | "running" | "error";
+export type ConnectorSourceStatus = "idle" | "running" | "error";
 export type ConnectorIdentityStatus =
   | "unresolved"
   | "resolved"
@@ -324,7 +324,7 @@ export type ConnectorRunTrigger = "manual" | "schedule" | "watch";
 
 export interface ConnectorRunRecord {
   id: string;
-  integrationId: string;
+  sourceId: string;
   connectorId: string;
   sourceKey: string | null;
   trigger: ConnectorRunTrigger;

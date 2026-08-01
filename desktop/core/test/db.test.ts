@@ -36,15 +36,15 @@ describe("DB", () => {
     ).get();
     expect(docs).toBeTruthy();
 
-    const dataConnectorIntegrations = dataDb.prepare(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='connector_integrations'"
+    const dataConnectorSources = dataDb.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='connector_sources'"
     ).get();
-    expect(dataConnectorIntegrations).toBeFalsy();
+    expect(dataConnectorSources).toBeFalsy();
 
-    const connectorIntegrations = systemDb.prepare(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='connector_integrations'"
+    const connectorSources = systemDb.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='connector_sources'"
     ).get();
-    expect(connectorIntegrations).toBeTruthy();
+    expect(connectorSources).toBeTruthy();
 
     const connectorApprovals = systemDb.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name='connector_custom_approvals'"
@@ -91,9 +91,9 @@ describe("DB", () => {
     close();
   });
 
-  test("connector integrations table has runtime state columns", () => {
+  test("connector sources table has runtime state columns", () => {
     const { systemDb, close } = openDatabases(workspace);
-    const columns = systemDb.prepare("PRAGMA table_info(connector_integrations)").all() as { name: string }[];
+    const columns = systemDb.prepare("PRAGMA table_info(connector_sources)").all() as { name: string }[];
     const names = columns.map((c) => c.name);
 
     expect(names).toContain("id");

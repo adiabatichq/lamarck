@@ -13,7 +13,7 @@ import {
   listDocs,
   query,
   type AppInfo,
-  type ConnectorIntegrationView,
+  type ConnectorSourceView,
   type DataSchemaSnapshot,
   type Doc,
   type InstalledConnectorView,
@@ -31,7 +31,7 @@ interface RecentEvent {
 }
 
 interface SystemSnapshot {
-  sources: ConnectorIntegrationView[];
+  sources: ConnectorSourceView[];
   packages: InstalledConnectorView[];
   docs: Doc[];
   tables: DataSchemaSnapshot["tables"];
@@ -404,8 +404,8 @@ function SystemOverview({
           ) : (
             <div className={styles.attentionList}>
               {coreStatus === "offline" && <AttentionItem title="Core is offline" detail="Open Workspace to retry or inspect recovery." onClick={() => onNavigate("workspace")} />}
-              {sourceAttention.slice(0, 4).map((source) => (
-                <AttentionItem key={source.id} title={source.name} detail={sourceAttentionText(source)} onClick={() => onNavigate("sources")} />
+              {sourceAttention.slice(0, 4).map((sourceRecord) => (
+                <AttentionItem key={sourceRecord.id} title={sourceRecord.name} detail={sourceAttentionText(sourceRecord)} onClick={() => onNavigate("sources")} />
               ))}
             </div>
           )}
@@ -627,30 +627,30 @@ function SystemWorkspace({
   );
 }
 
-function sourceNeedsAttention(source: ConnectorIntegrationView): boolean {
-  return source.status === "error"
-    || source.setupStatus === "setup"
-    || source.setupPending.length > 0
-    || source.ownership === "device-unknown"
-    || source.identityStatus === "conflict"
-    || source.identityStatus === "changed"
-    || source.identityStatus === "error"
-    || Boolean(source.authAttention)
-    || Boolean(source.warnings?.length);
+function sourceNeedsAttention(sourceRecord: ConnectorSourceView): boolean {
+  return sourceRecord.status === "error"
+    || sourceRecord.setupStatus === "setup"
+    || sourceRecord.setupPending.length > 0
+    || sourceRecord.ownership === "device-unknown"
+    || sourceRecord.identityStatus === "conflict"
+    || sourceRecord.identityStatus === "changed"
+    || sourceRecord.identityStatus === "error"
+    || Boolean(sourceRecord.authAttention)
+    || Boolean(sourceRecord.warnings?.length);
 }
 
-function sourceAttentionText(source: ConnectorIntegrationView): string {
-  if (source.ownership === "device-unknown") {
-    return source.ownershipReason ?? "This device cannot be identified";
+function sourceAttentionText(sourceRecord: ConnectorSourceView): string {
+  if (sourceRecord.ownership === "device-unknown") {
+    return sourceRecord.ownershipReason ?? "This device cannot be identified";
   }
-  if (source.identityStatus === "conflict") return "Source identity already belongs to another Source";
-  if (source.identityStatus === "changed") return "Connected account no longer matches this Source";
-  if (source.identityStatus === "error") return source.lastError ?? "Source identity could not be resolved";
-  if (source.identityStatus === "unresolved") return "Source identity has not been resolved";
-  if (source.status === "error") return source.lastError ?? "Runtime error";
-  if (source.authAttention) return "Authentication needs attention";
-  if (source.setupPending.length > 0) return `Setup pending: ${source.setupPending.join(", ")}`;
-  if (source.warnings?.length) return source.warnings[0].message;
+  if (sourceRecord.identityStatus === "conflict") return "Source identity already belongs to another Source";
+  if (sourceRecord.identityStatus === "changed") return "Connected account no longer matches this Source";
+  if (sourceRecord.identityStatus === "error") return sourceRecord.lastError ?? "Source identity could not be resolved";
+  if (sourceRecord.identityStatus === "unresolved") return "Source identity has not been resolved";
+  if (sourceRecord.status === "error") return sourceRecord.lastError ?? "Runtime error";
+  if (sourceRecord.authAttention) return "Authentication needs attention";
+  if (sourceRecord.setupPending.length > 0) return `Setup pending: ${sourceRecord.setupPending.join(", ")}`;
+  if (sourceRecord.warnings?.length) return sourceRecord.warnings[0].message;
   return "Review Source state";
 }
 

@@ -153,7 +153,7 @@ export class WorkspaceConnectorRegistry {
   }
 }
 
-export function trustStatusForIntegration(trust: ConnectorPackageTrust): ConnectorTrustStatus {
+export function trustStatusForSource(trust: ConnectorPackageTrust): ConnectorTrustStatus {
   if (trust.status === "invalid") return "missing";
   return trust.status;
 }

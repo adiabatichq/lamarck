@@ -35,6 +35,7 @@ import {
   type ConnectorDefinition,
   type ConnectorManifest,
 } from "../src/connectors";
+import { defaultAuthRef } from "../src/connectors/state";
 import { MemorySecretStore } from "../src/credentials";
 
 const TEST_EVENT_CATALOG = {
@@ -562,8 +563,8 @@ auth:
     );
     expect(() => validateConnectorManifest({
       ...base,
-      integrations: { mode: "singleton" },
-    })).toThrow("Connector manifest has unknown field: integrations");
+      sources: { mode: "singleton" },
+    })).toThrow("Connector manifest has unknown field: sources");
     expect(() => validateConnectorManifest({
       ...base,
       runtime: { mode: "manual", unexpected: true },
@@ -775,27 +776,27 @@ auth:
       },
       definition,
     );
-    const integration = supervisor.ensureIntegration({
+    const sourceRecord = supervisor.ensureSource({
       connectorId: "app-commits",
       config: { label: "integration", extra: true },
     });
 
-    expect(integration.id).not.toBe("app-commits");
-    await supervisor.run(integration.id);
+    expect(sourceRecord.id).not.toBe("app-commits");
+    await supervisor.run(sourceRecord.id);
 
     const event = dataDb.prepare("SELECT * FROM events WHERE type = ?").get("app.commit") as any;
     expect(event.source).toBe("connector:app-commits");
     expect(event.external_id).toBe("abc123");
     expect(JSON.parse(event.payload)).toEqual({ sha: "abc123", label: "integration" });
 
-    const stored = supervisor.getIntegration<unknown, { cursor: string }>(integration.id);
+    const stored = supervisor.getSource<unknown, { cursor: string }>(sourceRecord.id);
     expect(stored?.status).toBe("idle");
     expect(stored?.syncState).toEqual({ cursor: "abc123" });
     expect(stored?.lastRunAt).toBeGreaterThan(0);
-    const listed = (await supervisor.list()).find((row) => row.id === integration.id)!;
+    const listed = (await supervisor.list()).find((row) => row.id === sourceRecord.id)!;
     expect(listed.recentRuns).toHaveLength(1);
     expect(listed.recentRuns[0]).toMatchObject({
-      integrationId: integration.id,
+      sourceId: sourceRecord.id,
       connectorId: "app-commits",
       trigger: "manual",
       status: "success",
@@ -804,10 +805,10 @@ auth:
     expect(listed.recentRuns[0].endedAt).toBeGreaterThanOrEqual(listed.recentRuns[0].startedAt);
     expect(listed.recentRuns[0].durationMs).toBeGreaterThanOrEqual(0);
 
-    expect(() => dataDb.prepare("SELECT * FROM connector_integrations").all()).toThrow("no such table");
+    expect(() => dataDb.prepare("SELECT * FROM connector_sources").all()).toThrow("no such table");
     const storedState = systemDb
-      .prepare("SELECT status, sync_state FROM connector_integrations WHERE id = ?")
-      .get(integration.id) as { status: string; sync_state: string };
+      .prepare("SELECT status, sync_state FROM connector_sources WHERE id = ?")
+      .get(sourceRecord.id) as { status: string; sync_state: string };
     expect(storedState.status).toBe("idle");
     expect(JSON.parse(storedState.sync_state)).toEqual({ cursor: "abc123" });
   });
@@ -827,13 +828,13 @@ auth:
       },
       { async run() {} },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "restart-recovery" });
-    systemDb.prepare("UPDATE connector_integrations SET status = 'running' WHERE id = ?").run(source.id);
+    const sourceRecord = supervisor.ensureSource({ connectorId: "restart-recovery" });
+    systemDb.prepare("UPDATE connector_sources SET status = 'running' WHERE id = ?").run(sourceRecord.id);
     systemDb.prepare(
       `INSERT INTO connector_runs
-       (id, integration_id, connector_id, trigger, status, started_at)
+       (id, source_id, connector_id, trigger, status, started_at)
        VALUES ('stale-run', ?, 'restart-recovery', 'schedule', 'running', 1)`,
-    ).run(source.id);
+    ).run(sourceRecord.id);
 
     const restarted = new ConnectorSupervisor({
       systemDb,
@@ -841,7 +842,7 @@ auth:
       workspacePath: workspace,
       platform: "darwin",
     });
-    expect(restarted.getIntegration(source.id)?.status).toBe("idle");
+    expect(restarted.getSource(sourceRecord.id)?.status).toBe("idle");
     expect((await restarted.list())[0]).not.toHaveProperty("description");
     expect(systemDb.prepare(
       "SELECT status, ended_at, error FROM connector_runs WHERE id = 'stale-run'",
@@ -890,9 +891,9 @@ auth:
       },
       definition,
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "blob-writer" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "blob-writer" });
 
-    await supervisor.run(integration.id);
+    await supervisor.run(sourceRecord.id);
 
     const digestHex = createHash("sha256").update(blobText).digest("hex");
     expect(writtenRef).toEqual({
@@ -1020,11 +1021,11 @@ auth:
       },
       definition,
     );
-    const integration = supervisor.ensureIntegration({
+    const sourceRecord = supervisor.ensureSource({
       connectorId: "cfg-merge",
       config: { label: "integration", extra: true },
     });
-    await supervisor.run(integration.id);
+    await supervisor.run(sourceRecord.id);
 
     // interval = schema default; label and extra = stored Source config.
     expect(received).toEqual({ interval: 5000, label: "integration", extra: true });
@@ -1083,15 +1084,15 @@ auth:
 	      },
 	      definition,
 	    );
-	    const integration = supervisor.ensureIntegration({
+	    const sourceRecord = supervisor.ensureSource({
 	      connectorId: "cfg-ui",
 	      config: { opaque: { keep: true } },
 	    });
 
-	    await supervisor.run(integration.id);
-	    const started = await supervisor.startConfigUi(integration.id, "privacy-controls");
+	    await supervisor.run(sourceRecord.id);
+	    const started = await supervisor.startConfigUi(sourceRecord.id, "privacy-controls");
 	    expect(started.url).toContain("token=abcdefghijklmnop");
-	    expect(supervisor.getIntegration(integration.id)?.config).toEqual({
+	    expect(supervisor.getSource(sourceRecord.id)?.config).toEqual({
 	      opaque: { keep: true },
 	      privacyPolicy: {
 	        version: 1,
@@ -1100,7 +1101,7 @@ auth:
 	        },
 	      },
 	    });
-	    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({
+	    expect(supervisor.getSource(sourceRecord.id)?.syncState).toEqual({
 	      pendingUsers: {},
 	      approvedUsers: { "123": { username: "alice" } },
 	    });
@@ -1109,7 +1110,7 @@ auth:
 	    expect(systemDb.prepare("SELECT COUNT(*) AS count FROM connector_runs").get()).toEqual({ count: 1 });
 	  });
 
-	  test("required config fields keep integrations in setup until configured", async () => {
+	  test("required config fields keep sources in setup until configured", async () => {
     let runs = 0;
     const definition: ConnectorDefinition = {
       async run({ guard, config }) {
@@ -1145,22 +1146,22 @@ auth:
       },
       definition,
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "configured-feed" });
-    expect(integration.setupStatus).toBe("setup");
+    const sourceRecord = supervisor.ensureSource({ connectorId: "configured-feed" });
+    expect(sourceRecord.setupStatus).toBe("setup");
     expect((await supervisor.list())[0].setupPending).toContain("config");
-    await expect(supervisor.run(integration.id)).rejects.toThrow("not set up");
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("not set up");
 
     const scheduler = new ConnectorScheduler({ supervisor });
     await scheduler.tick();
     expect(runs).toBe(0);
-    expect(supervisor.getIntegration(integration.id)?.nextRunAt).toBeUndefined();
+    expect(supervisor.getSource(sourceRecord.id)?.nextRunAt).toBeUndefined();
 
     expect(
-      (await supervisor.configureIntegration(integration.id, { config: { name: "" } })).setupStatus
+      (await supervisor.configureSource(sourceRecord.id, { config: { name: "" } })).setupStatus
     ).toBe("setup");
 
     expect(
-      (await supervisor.configureIntegration(integration.id, { config: { name: "ready" } })).setupStatus
+      (await supervisor.configureSource(sourceRecord.id, { config: { name: "ready" } })).setupStatus
     ).toBe("ready");
     await scheduler.tick();
 
@@ -1200,7 +1201,7 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({
+    const sourceRecord = supervisor.ensureSource({
       connectorId: "configured-panel-watch",
     });
     const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
@@ -1208,13 +1209,13 @@ auth:
     let configSessionId: string | undefined;
 
     try {
-      expect(integration.setupStatus).toBe("setup");
+      expect(sourceRecord.setupStatus).toBe("setup");
       expect(runs).toBe(0);
 
-      const started = await supervisor.startConfigUi(integration.id, "setup");
+      const started = await supervisor.startConfigUi(sourceRecord.id, "setup");
       configSessionId = started.sessionId;
 
-      expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("ready");
+      expect(supervisor.getSource(sourceRecord.id)?.setupStatus).toBe("ready");
       expect(await waitWithTestTimeout((async () => {
         while (runs < 1) await new Promise((resolve) => setTimeout(resolve, 1));
       })(), 2_000)).toBe(true);
@@ -1257,11 +1258,11 @@ auth:
       },
       definition,
     );
-    const personal = await supervisor.addIntegration({
+    const personal = await supervisor.addSource({
       connectorId: "calendar",
       config: { accountId: "personal", externalId: "same" },
     });
-    const work = await supervisor.addIntegration({
+    const work = await supervisor.addSource({
       connectorId: "calendar",
       config: { accountId: "work", externalId: "same" },
     });
@@ -1278,8 +1279,8 @@ auth:
       { source: "connector:calendar:personal", external_id: "same" },
       { source: "connector:calendar:work", external_id: "same" },
     ]);
-    expect(supervisor.getIntegration(personal.id)?.syncState).toEqual({ seen: "same" });
-    expect(supervisor.getIntegration(work.id)?.syncState).toEqual({ seen: "same" });
+    expect(supervisor.getSource(personal.id)?.syncState).toEqual({ seen: "same" });
+    expect(supervisor.getSource(work.id)?.syncState).toEqual({ seen: "same" });
   });
 
   test("Add Source is create-only and installed Connectors remain visible with zero Sources", async () => {
@@ -1325,19 +1326,19 @@ auth:
     expect(await supervisor.list()).toEqual([]);
 
     const [singleton, sameSingleton] = await Promise.all([
-      supervisor.addIntegration({ connectorId: "singleton-source" }),
-      supervisor.addIntegration({ connectorId: "singleton-source" }),
+      supervisor.addSource({ connectorId: "singleton-source" }),
+      supervisor.addSource({ connectorId: "singleton-source" }),
     ]);
     expect(singleton.connectorId).toBe("singleton-source");
     expect(sameSingleton.id).toBe(singleton.id);
     expect((await supervisor.list()).filter(({ connectorId }) => connectorId === "singleton-source"))
       .toHaveLength(1);
 
-    const personal = await supervisor.addIntegration({
+    const personal = await supervisor.addSource({
       connectorId: "many-sources",
       config: { accountId: "personal" },
     });
-    const work = await supervisor.addIntegration({
+    const work = await supervisor.addSource({
       connectorId: "many-sources",
       config: { accountId: "work" },
     });
@@ -1352,17 +1353,17 @@ auth:
       name: "Suggested work",
       connectorName: "Many Sources",
     });
-    supervisor.renameIntegration(work.id, "My Work");
+    supervisor.renameSource(work.id, "My Work");
     expect((await supervisor.list()).find(({ id }) => id === work.id)).toMatchObject({
       name: "My Work",
       displayName: "My Work",
       sourceKey: "work",
     });
-    supervisor.renameIntegration(work.id, null);
+    supervisor.renameSource(work.id, null);
     expect((await supervisor.list()).find(({ id }) => id === work.id)?.name)
       .toBe("Suggested work");
 
-    const duplicate = await supervisor.addIntegration({
+    const duplicate = await supervisor.addSource({
       connectorId: "many-sources",
       config: { accountId: "work" },
     });
@@ -1416,7 +1417,7 @@ auth:
       definition,
     );
 
-    const setup = supervisor.ensureIntegration({ connectorId: "calendar" });
+    const setup = supervisor.ensureSource({ connectorId: "calendar" });
     expect(setup.sourceKey).toBeNull();
     expect(setup.identityStatus).toBe("unresolved");
     expect(setup.setupStatus).toBe("setup");
@@ -1425,7 +1426,7 @@ auth:
       expect.arrayContaining(["identity", "config"]),
     );
 
-    const ready = await supervisor.configureIntegration<
+    const ready = await supervisor.configureSource<
       { "account-id": string; "external-id": string },
       { seen: string }
     >(setup.id, {
@@ -1445,9 +1446,9 @@ auth:
 
     const event = dataDb.prepare("SELECT source, external_id FROM events").get() as any;
     expect(event).toEqual({ source: "connector:calendar:work", external_id: "event-1" });
-    expect(supervisor.getIntegration(ready.id)?.syncState).toEqual({ seen: "event-1" });
+    expect(supervisor.getSource(ready.id)?.syncState).toEqual({ seen: "event-1" });
 
-    const changed = await supervisor.configureIntegration(ready.id, {
+    const changed = await supervisor.configureSource(ready.id, {
       config: { "account-id": "personal", "external-id": "event-2" },
     });
     expect(changed).toMatchObject({
@@ -1486,11 +1487,11 @@ auth:
       },
     );
 
-    const first = await supervisor.addIntegration({ connectorId: "reclaimed-source" });
+    const first = await supervisor.addSource({ connectorId: "reclaimed-source" });
     await supervisor.run(first.id);
-    await supervisor.removeIntegration(first.id);
+    await supervisor.removeSource(first.id);
 
-    const second = await supervisor.addIntegration({ connectorId: "reclaimed-source" });
+    const second = await supervisor.addSource({ connectorId: "reclaimed-source" });
     expect(second.id).not.toBe(first.id);
     expect(second).toMatchObject({
       sourceKey: "stable-account",
@@ -1534,7 +1535,7 @@ auth:
       },
     );
 
-    const failed = await supervisor.addIntegration({ connectorId: "retry-identity" });
+    const failed = await supervisor.addSource({ connectorId: "retry-identity" });
     expect(failed).toMatchObject({
       sourceKey: null,
       identityStatus: "error",
@@ -1578,7 +1579,7 @@ auth:
       },
     };
     supervisor.register(manifest, definition);
-    const failed = await supervisor.addIntegration({ connectorId: manifest.id });
+    const failed = await supervisor.addSource({ connectorId: manifest.id });
     expect(failed.identityStatus).toBe("error");
 
     resolverAvailable = true;
@@ -1590,7 +1591,7 @@ auth:
     });
     restarted.register(manifest, definition);
     await restarted.recoverSourceIdentities();
-    expect(restarted.getIntegration(failed.id)).toMatchObject({
+    expect(restarted.getSource(failed.id)).toMatchObject({
       sourceKey: "recovered-account",
       identityStatus: "resolved",
       setupStatus: "ready",
@@ -1616,11 +1617,11 @@ auth:
       },
     };
     supervisor.register(manifest, definition);
-    const owner = await supervisor.addIntegration({
+    const owner = await supervisor.addSource({
       connectorId: manifest.id,
       config: { account: "shared-account" },
     });
-    const conflicted = await supervisor.addIntegration({
+    const conflicted = await supervisor.addSource({
       connectorId: manifest.id,
       config: { account: "shared-account" },
     });
@@ -1629,7 +1630,7 @@ auth:
       lastResolvedKey: "shared-account",
       identityStatus: "conflict",
     });
-    await supervisor.removeIntegration(owner.id);
+    await supervisor.removeSource(owner.id);
 
     const restarted = new ConnectorSupervisor({
       systemDb,
@@ -1639,7 +1640,7 @@ auth:
     });
     restarted.register(manifest, definition);
     await restarted.recoverSourceIdentities();
-    expect(restarted.getIntegration(conflicted.id)).toMatchObject({
+    expect(restarted.getSource(conflicted.id)).toMatchObject({
       sourceKey: "shared-account",
       lastResolvedKey: "shared-account",
       identityStatus: "resolved",
@@ -1677,11 +1678,11 @@ auth:
         },
       },
     );
-    const first = supervisor.ensureIntegration({
+    const first = supervisor.ensureSource({
       connectorId: "identity-fence",
       config: { accountId: "first" },
     });
-    const second = supervisor.ensureIntegration({
+    const second = supervisor.ensureSource({
       connectorId: "identity-fence",
       config: { accountId: "second" },
     });
@@ -1693,10 +1694,10 @@ auth:
     await expect(supervisor.retrySourceIdentity(second.id)).rejects.toThrow(
       "identity mutation in progress",
     );
-    await expect(supervisor.configureIntegration(second.id, {
+    await expect(supervisor.configureSource(second.id, {
       config: { accountId: "changed-while-fenced" },
     })).rejects.toThrow("identity mutation in progress");
-    expect(supervisor.getIntegration(second.id)?.config).toEqual({ accountId: "second" });
+    expect(supervisor.getSource(second.id)?.config).toEqual({ accountId: "second" });
 
     release();
     await expect(pending).resolves.toMatchObject({
@@ -1725,19 +1726,19 @@ auth:
         },
       },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "invalid-identity-pair" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "invalid-identity-pair" });
     systemDb.prepare(
-      `UPDATE connector_integrations
+      `UPDATE connector_sources
        SET identity_status = 'resolved', source_key = NULL, setup_status = 'ready'
        WHERE id = ?`,
-    ).run(source.id);
+    ).run(sourceRecord.id);
 
     expect((await supervisor.list())[0]).toMatchObject({
       source: null,
       setupStatus: "setup",
       setupPending: expect.arrayContaining(["identity"]),
     });
-    await expect(supervisor.run(source.id)).rejects.toThrow("Source identity is not resolved");
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("Source identity is not resolved");
   });
 
   test("classifies device Source ownership and blocks non-owning devices", async () => {
@@ -1767,20 +1768,20 @@ auth:
 
     const owning = makeSupervisor({ status: "resolved", value: "device-a" });
     owning.register(registration, definition);
-    const source = await owning.addIntegration({ connectorId: registration.id });
-    expect(source).toMatchObject({
+    const sourceRecord = await owning.addSource({ connectorId: registration.id });
+    expect(sourceRecord).toMatchObject({
       sourceKey: "device-a",
       identityStatus: "resolved",
       suggestedLabel: "Test Mac",
     });
     expect((await owning.list())[0]).toMatchObject({ ownership: "here" });
-    await expect(owning.addIntegration({ connectorId: registration.id }))
+    await expect(owning.addSource({ connectorId: registration.id }))
       .rejects.toThrow("already has a Source for this device");
 
     const other = makeSupervisor({ status: "resolved", value: "device-b" });
     other.register(registration, definition);
     expect((await other.list())[0]).toMatchObject({ ownership: "other-device" });
-    await expect(other.run(source.id)).rejects.toThrow("belongs to another device");
+    await expect(other.run(sourceRecord.id)).rejects.toThrow("belongs to another device");
     const otherScheduler = new ConnectorScheduler({ supervisor: other, tickMs: 60_000 });
     await otherScheduler.start();
     expect((await other.list())[0].running).toBe(false);
@@ -1792,8 +1793,8 @@ auth:
       ownership: "device-unknown",
       ownershipReason: "machine id unavailable",
     });
-    await expect(unknown.run(source.id)).rejects.toThrow("Device identity unavailable");
-    await expect(unknown.addIntegration({ connectorId: registration.id }))
+    await expect(unknown.run(sourceRecord.id)).rejects.toThrow("Device identity unavailable");
+    await expect(unknown.addSource({ connectorId: registration.id }))
       .rejects.toThrow("Device identity unavailable");
     const unknownScheduler = new ConnectorScheduler({ supervisor: unknown, tickMs: 60_000 });
     await unknownScheduler.start();
@@ -1830,23 +1831,23 @@ auth:
       },
       definition,
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "oura" });
-    expect(integration.setupStatus).toBe("setup");
-    await expect(supervisor.connectIntegration(integration.id)).rejects.toThrow("requires credentials");
-    expect(supervisor.updateIntegration(integration.id, { setupStatus: "ready" }).setupStatus)
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oura" });
+    expect(sourceRecord.setupStatus).toBe("setup");
+    await expect(supervisor.connectSource(sourceRecord.id)).rejects.toThrow("requires credentials");
+    expect(supervisor.updateSource(sourceRecord.id, { setupStatus: "ready" }).setupStatus)
       .toBe("setup");
-    await supervisor.getAuthManager().setToken(integration.authRef!, "secret-token");
-    const ready = await supervisor.connectIntegration(integration.id);
+    await supervisor.getAuthManager().setToken(sourceRecord.authRef!, "secret-token");
+    const ready = await supervisor.connectSource(sourceRecord.id);
     expect(
-      (await supervisor.configureIntegration(ready.id, { config: { sample: true } })).setupStatus
+      (await supervisor.configureSource(ready.id, { config: { sample: true } })).setupStatus
     ).toBe("ready");
     expect(() =>
-      supervisor.updateIntegration(ready.id, { authRef: "missing-token-ref" })
-    ).toThrow("authRef changes must use connectIntegration");
+      supervisor.updateSource(ready.id, { authRef: "missing-token-ref" })
+    ).toThrow("authRef changes must use connectSource");
 
     await supervisor.getAuthManager().setToken("rotated-ref", "rotated-token");
-    // @ts-expect-error connectIntegration is credential-only; config writes use configureIntegration.
-    const rotated = await supervisor.connectIntegration(ready.id, { authRef: "rotated-ref", config: { smuggled: true } });
+    // @ts-expect-error connectSource is credential-only; config writes use configureSource.
+    const rotated = await supervisor.connectSource(ready.id, { authRef: "rotated-ref", config: { smuggled: true } });
     expect(rotated.setupStatus).toBe("ready");
     expect(rotated.authRef).toBe("rotated-ref");
     expect(rotated.config).toEqual({ sample: true });
@@ -1888,9 +1889,9 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "json-feed" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "json-feed" });
 
-    await supervisor.run(integration.id);
+    await supervisor.run(sourceRecord.id);
 
     const event = dataDb.prepare("SELECT payload FROM events WHERE type = ?").get("json.string") as any;
     expect(JSON.parse(event.payload)).toBe("hello");
@@ -1919,9 +1920,9 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "id-feed" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "id-feed" });
 
-    await supervisor.run(integration.id);
+    await supervisor.run(sourceRecord.id);
   });
 
   test("connector guard treats duplicate externalId writes as idempotent", async () => {
@@ -1957,8 +1958,8 @@ auth:
       },
     );
 
-    const integration = supervisor.ensureIntegration({ connectorId: "retry-feed" });
-    await supervisor.run(integration.id);
+    const sourceRecord = supervisor.ensureSource({ connectorId: "retry-feed" });
+    await supervisor.run(sourceRecord.id);
 
     expect(ids[0]).toBe(ids[1]);
     const rows = dataDb.prepare("SELECT source, external_id, payload FROM events").all() as any[];
@@ -1968,7 +1969,7 @@ auth:
     expect(JSON.parse(rows[0].payload)).toEqual({ attempt: 1 });
   });
 
-  test("connector warnings are keyed non-fatal integration metadata", async () => {
+  test("connector warnings are keyed non-fatal Source metadata", async () => {
     let shouldClear = false;
     supervisor.register(
       {
@@ -2001,10 +2002,10 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "warning-feed" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "warning-feed" });
 
-    await supervisor.run(integration.id);
-    const warned = supervisor.getIntegration(integration.id);
+    await supervisor.run(sourceRecord.id);
+    const warned = supervisor.getSource(sourceRecord.id);
     expect(warned?.status).toBe("idle");
     expect(warned?.lastError).toBeUndefined();
     expect(warned?.warnings).toHaveLength(1);
@@ -2016,8 +2017,8 @@ auth:
     expect(warned?.warnings?.[0].firstSeenAt).toBeLessThanOrEqual(warned?.warnings?.[0].lastSeenAt ?? 0);
 
     shouldClear = true;
-    await supervisor.run(integration.id);
-    expect(supervisor.getIntegration(integration.id)?.warnings).toBeUndefined();
+    await supervisor.run(sourceRecord.id);
+    expect(supervisor.getSource(sourceRecord.id)?.warnings).toBeUndefined();
   });
 
   test("blocks runs up front when credentials disappear after ready", async () => {
@@ -2043,21 +2044,21 @@ auth:
       },
     );
 
-    const integration = supervisor.ensureIntegration({ connectorId: "revoked-feed" });
-    await supervisor.getAuthManager().setToken(integration.authRef!, "token");
-    const ready = await supervisor.connectIntegration(integration.id);
+    const sourceRecord = supervisor.ensureSource({ connectorId: "revoked-feed" });
+    await supervisor.getAuthManager().setToken(sourceRecord.authRef!, "token");
+    const ready = await supervisor.connectSource(sourceRecord.id);
     expect(ready.setupStatus).toBe("ready");
 
     // Token revoked after ready: the run must fail before connector code
-    // executes, and the integration drops back to setup.
-    await supervisor.getAuthManager().deleteToken(integration.authRef!);
-    await expect(supervisor.run(integration.id)).rejects.toThrow("credentials are missing");
+    // executes, and the Source drops back to setup.
+    await supervisor.getAuthManager().deleteToken(sourceRecord.authRef!);
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("credentials are missing");
     expect(connectorSawAuth).toBe(false);
-    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("setup");
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
+    expect(supervisor.getSource(sourceRecord.id)?.setupStatus).toBe("setup");
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("error");
   });
 
-  test("watch scheduler restarts integrations after setup recovery", async () => {
+  test("watch scheduler restarts sources after setup recovery", async () => {
     supervisor.register(
       {
         manifestVersion: 1,
@@ -2083,20 +2084,20 @@ auth:
       },
     );
 
-    const integration = supervisor.ensureIntegration({ connectorId: "auth-watch" });
-    await supervisor.getAuthManager().setToken(integration.authRef!, "token");
-    await supervisor.connectIntegration(integration.id);
+    const sourceRecord = supervisor.ensureSource({ connectorId: "auth-watch" });
+    await supervisor.getAuthManager().setToken(sourceRecord.authRef!, "token");
+    await supervisor.connectSource(sourceRecord.id);
 
     // Credentials revoked: the run-gate failure leaves a setup-blocked error.
-    await supervisor.getAuthManager().deleteToken(integration.authRef!);
-    await expect(supervisor.run(integration.id)).rejects.toThrow("credentials are missing");
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
-    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("setup");
+    await supervisor.getAuthManager().deleteToken(sourceRecord.authRef!);
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("credentials are missing");
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("error");
+    expect(supervisor.getSource(sourceRecord.id)?.setupStatus).toBe("setup");
 
     // Reconnect promotes back to ready and resets the setup-blocked error to
-    // idle, so the watch scheduler picks the integration up again.
-    await supervisor.getAuthManager().setToken(integration.authRef!, "token-2");
-    const recovered = await supervisor.connectIntegration(integration.id);
+    // idle, so the watch scheduler picks the Source up again.
+    await supervisor.getAuthManager().setToken(sourceRecord.authRef!, "token-2");
+    const recovered = await supervisor.connectSource(sourceRecord.id);
     expect(recovered.setupStatus).toBe("ready");
     expect(recovered.status).toBe("idle");
     expect(recovered.lastError).toBeUndefined();
@@ -2135,7 +2136,7 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "crashy-watch" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "crashy-watch" });
     const scheduler = new ConnectorScheduler({ supervisor, onError() {} });
 
     // Crash leaves a needs-attention error that further ticks do not retry.
@@ -2144,22 +2145,22 @@ auth:
     while ((await supervisor.list())[0].running) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
-    expect(supervisor.getIntegration(integration.id)?.lastError).toContain("connector bug");
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("error");
+    expect(supervisor.getSource(sourceRecord.id)?.lastError).toContain("connector bug");
 
     crash = false;
     await scheduler.tick();
     expect((await supervisor.list())[0].running).toBe(false);
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("error");
 
     // Explicit restart resets to idle and the scheduler picks it up again.
-    const restarted = supervisor.restartIntegration(integration.id);
+    const restarted = supervisor.restartSource(sourceRecord.id);
     expect(restarted.status).toBe("idle");
     expect(restarted.lastError).toBeUndefined();
 
     await scheduler.tick();
     expect((await supervisor.list())[0].running).toBe(true);
-    expect(() => supervisor.restartIntegration(integration.id)).toThrow("already running");
+    expect(() => supervisor.restartSource(sourceRecord.id)).toThrow("already running");
     await scheduler.stop();
   });
 
@@ -2182,21 +2183,21 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({
+    const sourceRecord = supervisor.ensureSource({
       connectorId: "undefined-rejection",
     });
     let rejected = false;
 
     try {
-      await supervisor.run(integration.id);
+      await supervisor.run(sourceRecord.id);
     } catch (error) {
       rejected = true;
       expect(error).toBeUndefined();
     }
 
     expect(rejected).toBe(true);
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
-    expect(supervisor.getIntegration(integration.id)?.lastError).toBe("undefined");
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("error");
+    expect(supervisor.getSource(sourceRecord.id)?.lastError).toBe("undefined");
     expect((await supervisor.list())[0].recentRuns[0]).toMatchObject({
       status: "error",
       error: "undefined",
@@ -2218,13 +2219,13 @@ auth:
       },
       { async run() {} },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "guarded-feed" });
-    expect(integration.setupStatus).toBe("setup");
-    expect(() => supervisor.restartIntegration(integration.id)).toThrow("not set up");
-    expect(() => supervisor.restartIntegration("missing-id")).toThrow("not found");
+    const sourceRecord = supervisor.ensureSource({ connectorId: "guarded-feed" });
+    expect(sourceRecord.setupStatus).toBe("setup");
+    expect(() => supervisor.restartSource(sourceRecord.id)).toThrow("not set up");
+    expect(() => supervisor.restartSource("missing-id")).toThrow("not found");
   });
 
-  test("fails auth connectors without credentials and records integration error", async () => {
+  test("fails auth connectors without credentials and records Source error", async () => {
     supervisor.register(
       {
         manifestVersion: 1,
@@ -2244,16 +2245,16 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "oura" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oura" });
 
-    expect(integration.setupStatus).toBe("setup");
-    await expect(supervisor.run(integration.id)).rejects.toThrow("not set up");
-    const stored = supervisor.getIntegration(integration.id);
+    expect(sourceRecord.setupStatus).toBe("setup");
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("not set up");
+    const stored = supervisor.getSource(sourceRecord.id);
     expect(stored?.status).toBe("idle");
     expect(stored?.lastError).toBeUndefined();
   });
 
-  test("gates integrations by platform", async () => {
+  test("gates sources by platform", async () => {
     const linuxSupervisor = new ConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
@@ -2281,15 +2282,15 @@ auth:
     );
 
     expect(() =>
-      linuxSupervisor.ensureIntegration({ connectorId: "macos-ax" })
+      linuxSupervisor.ensureSource({ connectorId: "macos-ax" })
     ).toThrow("not supported on linux");
 
     // Installing a connector never creates an unsupported placeholder Source.
-    expect(linuxSupervisor.getIntegration("macos-ax")).toBeUndefined();
+    expect(linuxSupervisor.getSource("macos-ax")).toBeUndefined();
     expect(await linuxSupervisor.list()).toEqual([]);
   });
 
-  test("gates no-auth integrations behind platform requirement lifecycle", async () => {
+  test("gates no-auth sources behind platform requirement lifecycle", async () => {
     let granted = false;
     supervisor.register(
       {
@@ -2334,48 +2335,48 @@ auth:
       },
     );
 
-    // First integration must not be ready while requirements are unchecked.
-    const integration = supervisor.ensureIntegration({ connectorId: "ax-watch" });
+    // First Source must not be ready while requirements are unchecked.
+    const sourceRecord = supervisor.ensureSource({ connectorId: "ax-watch" });
     const reconcileReasons: string[] = [];
     supervisor.onRuntimeReconcileRequested((instanceId, reason) => {
-      if (instanceId === integration.id) reconcileReasons.push(reason);
+      if (instanceId === sourceRecord.id) reconcileReasons.push(reason);
     });
-    expect(integration.setupStatus).toBe("setup");
-    await expect(supervisor.run(integration.id)).rejects.toThrow("not set up");
+    expect(sourceRecord.setupStatus).toBe("setup");
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("not set up");
 
     // setupStatus cannot bypass the requirement gate.
-    expect(supervisor.updateIntegration(integration.id, { setupStatus: "ready" }).setupStatus)
+    expect(supervisor.updateSource(sourceRecord.id, { setupStatus: "ready" }).setupStatus)
       .toBe("setup");
 
-    // check() persists status and keeps the integration in setup.
-    const missing = await supervisor.checkIntegrationRequirements(integration.id);
+    // check() persists status and keeps the Source in setup.
+    const missing = await supervisor.checkSourceRequirements(sourceRecord.id);
     expect(missing["macos-accessibility"].status).toBe("missing");
     expect(missing["macos-accessibility"].message).toContain("not granted");
     const listed = (await supervisor.list())[0];
     expect(listed.requirements).toEqual([
       expect.objectContaining({ id: "macos-accessibility", status: "missing" }),
     ]);
-    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("setup");
+    expect(supervisor.getSource(sourceRecord.id)?.setupStatus).toBe("setup");
     expect(reconcileReasons).toEqual([]);
 
     // request() resolves the requirement and the evaluator promotes to ready.
-    const requested = await supervisor.requestIntegrationRequirement(
-      integration.id,
+    const requested = await supervisor.requestSourceRequirement(
+      sourceRecord.id,
       "macos-accessibility",
     );
     expect(requested.status).toBe("satisfied");
-    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("ready");
+    expect(supervisor.getSource(sourceRecord.id)?.setupStatus).toBe("ready");
     expect(reconcileReasons).toEqual(["readiness_changed"]);
 
-    await supervisor.run(integration.id);
+    await supervisor.run(sourceRecord.id);
     const event = dataDb.prepare("SELECT source, type FROM events").get() as any;
     expect(event).toEqual({ source: "connector:ax-watch", type: "ax.sample" });
 
     // Requirement regression blocks the next run and demotes back to setup.
     granted = false;
-    await expect(supervisor.run(integration.id)).rejects.toThrow("requirements not satisfied");
-    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("setup");
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("error");
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("requirements not satisfied");
+    expect(supervisor.getSource(sourceRecord.id)?.setupStatus).toBe("setup");
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("error");
   });
 
   test("allows connecting auth before requirements are granted", async () => {
@@ -2413,20 +2414,20 @@ auth:
       },
     );
 
-    const integration = supervisor.ensureIntegration({ connectorId: "auth-ax" });
-    expect(integration.setupStatus).toBe("setup");
+    const sourceRecord = supervisor.ensureSource({ connectorId: "auth-ax" });
+    expect(sourceRecord.setupStatus).toBe("setup");
 
-    // Auth connects first: credentials bind, but the integration stays in
+    // Auth connects first: credentials bind, but the Source stays in
     // setup because the platform requirement is still missing.
-    await supervisor.getAuthManager().setToken(integration.authRef!, "token");
-    const connected = await supervisor.connectIntegration(integration.id);
+    await supervisor.getAuthManager().setToken(sourceRecord.authRef!, "token");
+    const connected = await supervisor.connectSource(sourceRecord.id);
     expect(connected.setupStatus).toBe("setup");
-    expect(connected.authRef).toBe(integration.authRef);
+    expect(connected.authRef).toBe(sourceRecord.authRef);
 
     // request() reports pending and the immediate re-check still says missing:
     // the pending record must stay visible for the UI.
-    const pending = await supervisor.requestIntegrationRequirement(
-      integration.id,
+    const pending = await supervisor.requestSourceRequirement(
+      sourceRecord.id,
       "macos-accessibility",
     );
     expect(pending.status).toBe("pending");
@@ -2438,11 +2439,11 @@ auth:
     // Once the requirement is granted, a check promotes to ready without
     // reconnecting auth.
     granted = true;
-    const records = await supervisor.checkIntegrationRequirements(integration.id);
+    const records = await supervisor.checkSourceRequirements(sourceRecord.id);
     expect(records["macos-accessibility"].status).toBe("satisfied");
-    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("ready");
+    expect(supervisor.getSource(sourceRecord.id)?.setupStatus).toBe("ready");
 
-    await supervisor.run(integration.id);
+    await supervisor.run(sourceRecord.id);
   });
 
   test("records an error when a declared requirement has no handler", async () => {
@@ -2464,16 +2465,16 @@ auth:
       { async run() {} },
     );
 
-    const integration = supervisor.ensureIntegration({ connectorId: "no-handler" });
-    expect(integration.setupStatus).toBe("setup");
+    const sourceRecord = supervisor.ensureSource({ connectorId: "no-handler" });
+    expect(sourceRecord.setupStatus).toBe("setup");
 
-    const records = await supervisor.checkIntegrationRequirements(integration.id);
+    const records = await supervisor.checkSourceRequirements(sourceRecord.id);
     expect(records["macos-accessibility"].status).toBe("error");
     expect(records["macos-accessibility"].message).toContain("does not implement requirement handler");
     await expect(
-      supervisor.requestIntegrationRequirement(integration.id, "macos-accessibility")
+      supervisor.requestSourceRequirement(sourceRecord.id, "macos-accessibility")
     ).rejects.toThrow("does not implement requirement handler");
-    await expect(supervisor.run(integration.id)).rejects.toThrow("not set up");
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("not set up");
   });
 
   test("requirement checks pass the trust gate before importing connector code", async () => {
@@ -2517,19 +2518,19 @@ auth:
     );
 
     await registerWorkspaceConnectors(supervisor, workspace);
-    supervisor.ensureIntegration({ connectorId: "untrusted-ax" });
-    const integration = (await supervisor.list())[0];
-    expect(integration.packageTrust).toBe("untrusted");
-    expect(integration.requirements).toEqual([
+    supervisor.ensureSource({ connectorId: "untrusted-ax" });
+    const sourceRecord = (await supervisor.list())[0];
+    expect(sourceRecord.packageTrust).toBe("untrusted");
+    expect(sourceRecord.requirements).toEqual([
       expect.objectContaining({ id: "macos-accessibility", status: "unknown" }),
     ]);
 
-    await expect(supervisor.checkIntegrationRequirements(integration.id)).rejects.toThrow("not trusted");
+    await expect(supervisor.checkSourceRequirements(sourceRecord.id)).rejects.toThrow("not trusted");
 
     await supervisor.approveCurrentPackage("untrusted-ax");
-    const records = await supervisor.checkIntegrationRequirements(integration.id);
+    const records = await supervisor.checkSourceRequirements(sourceRecord.id);
     expect(records["macos-accessibility"].status).toBe("satisfied");
-    expect(supervisor.getIntegration(integration.id)?.setupStatus).toBe("ready");
+    expect(supervisor.getSource(sourceRecord.id)?.setupStatus).toBe("ready");
   });
 
   test("starts and aborts watch connector runs", async () => {
@@ -2564,16 +2565,16 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "terminal" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "terminal" });
 
-    const handle = supervisor.start(integration.id);
+    const handle = supervisor.start(sourceRecord.id);
     expect((await supervisor.list())[0].running).toBe(true);
     handle.abort();
     await handle.promise;
 
     expect((await supervisor.list())[0].running).toBe(false);
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
-    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ stopped: true });
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("idle");
+    expect(supervisor.getSource(sourceRecord.id)?.syncState).toEqual({ stopped: true });
   });
 
   test("scheduler starts watch connectors and stops them on shutdown", async () => {
@@ -2602,7 +2603,7 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "watch-feed" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "watch-feed" });
     const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
 
     await scheduler.start();
@@ -2610,8 +2611,8 @@ auth:
 
     await scheduler.stop();
     expect((await supervisor.list())[0].running).toBe(false);
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
-    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ stopped: true });
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("idle");
+    expect(supervisor.getSource(sourceRecord.id)?.syncState).toEqual({ stopped: true });
   });
 
   test("creating a ready Source immediately wakes its idle watch without a timer tick", async () => {
@@ -2655,13 +2656,13 @@ auth:
     const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
 
     await scheduler.start();
-    const draft = await supervisor.addIntegration({ connectorId: "new-source-watch" });
+    const draft = await supervisor.addSource({ connectorId: "new-source-watch" });
     expect(draft.setupStatus).toBe("setup");
     expect(draft.identityStatus).toBe("unresolved");
     expect(reconcileReasons).toEqual([]);
     expect(starts).toBe(0);
 
-    const ready = await supervisor.addIntegration({
+    const ready = await supervisor.addSource({
       connectorId: "new-source-watch",
       config: { "account-id": "device-a" },
     });
@@ -2671,12 +2672,12 @@ auth:
       { instanceId: ready.id, reason: "source_created" },
     ]);
     expect(await waitWithTestTimeout((async () => {
-      while (!supervisor.getIntegration(ready.id)?.warnings?.length) {
+      while (!supervisor.getSource(ready.id)?.warnings?.length) {
         await new Promise((resolve) => setTimeout(resolve, 1));
       }
     })(), 2_000)).toBe(true);
     expect(starts).toBe(1);
-    expect(supervisor.getIntegration(ready.id)?.warnings).toEqual([
+    expect(supervisor.getSource(ready.id)?.warnings).toEqual([
       expect.objectContaining({
         key: "setup-needed",
         message: "Finish connector setup.",
@@ -2716,18 +2717,18 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "identity-watch" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "identity-watch" });
     const reconcileReasons: string[] = [];
     supervisor.onRuntimeReconcileRequested((instanceId, reason) => {
-      if (instanceId === integration.id) reconcileReasons.push(reason);
+      if (instanceId === sourceRecord.id) reconcileReasons.push(reason);
     });
     const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
 
     await scheduler.start();
-    expect(integration.setupStatus).toBe("setup");
+    expect(sourceRecord.setupStatus).toBe("setup");
     expect(starts).toBe(0);
 
-    const ready = await supervisor.configureIntegration(integration.id, {
+    const ready = await supervisor.configureSource(sourceRecord.id, {
       config: { "account-id": "device-a" },
     });
     expect(ready).toMatchObject({ sourceKey: "device-a", identityStatus: "resolved" });
@@ -2767,7 +2768,7 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({
+    const sourceRecord = supervisor.ensureSource({
       connectorId: "restartable-scheduler-watch",
     });
     const originalSubscribe = supervisor.onRuntimeReconcileRequested.bind(supervisor);
@@ -2799,7 +2800,7 @@ auth:
     await scheduler.start();
     expect(subscriptions).toBe(2);
 
-    await supervisor.configureIntegration(integration.id, {
+    await supervisor.configureSource(sourceRecord.id, {
       config: { label: "ready" },
     });
     expect(await waitWithTestTimeout((async () => {
@@ -2839,7 +2840,7 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({
+    const sourceRecord = supervisor.ensureSource({
       connectorId: "reconfigurable-watch",
       config: {
         label: "old",
@@ -2852,7 +2853,7 @@ auth:
     while (configs.length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
 
     // JSON object key order is not an effective config change.
-    await supervisor.configureIntegration(integration.id, {
+    await supervisor.configureSource(sourceRecord.id, {
       config: {
         opaque: { second: 2, first: 1 },
         label: "old",
@@ -2861,13 +2862,13 @@ auth:
     expect(signals[0].aborted).toBe(false);
     expect(configs).toHaveLength(1);
 
-    const intermediateWrite = supervisor.configureIntegration(integration.id, {
+    const intermediateWrite = supervisor.configureSource(sourceRecord.id, {
       config: {
         label: "intermediate",
         opaque: { first: 1, second: 2 },
       },
     });
-    const latestWrite = supervisor.configureIntegration(integration.id, {
+    const latestWrite = supervisor.configureSource(sourceRecord.id, {
       config: {
         label: "new",
         opaque: { first: 1, second: 2 },
@@ -2886,7 +2887,7 @@ auth:
     expect(duringReplacement.recentRuns[0].status).toBe("running");
 
     await scheduler.stop();
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("idle");
     expect((await supervisor.list())[0].recentRuns[0].status).toBe("aborted");
   });
 
@@ -2923,14 +2924,14 @@ auth:
         },
       },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "identity-credential-fence" });
-    const connected = await supervisor.connectIntegrationWithToken(source.id, "old-token");
+    const sourceRecord = supervisor.ensureSource({ connectorId: "identity-credential-fence" });
+    const connected = await supervisor.connectSourceWithToken(sourceRecord.id, "old-token");
     expect(connected).toMatchObject({ sourceKey: "old-token", identityStatus: "resolved" });
-    const handle = supervisor.start(source.id, { trigger: "manual" });
+    const handle = supervisor.start(sourceRecord.id, { trigger: "manual" });
     await attemptStarted;
 
     let connectSettled = false;
-    const reconnecting = supervisor.connectIntegrationWithToken(source.id, "new-token")
+    const reconnecting = supervisor.connectSourceWithToken(sourceRecord.id, "new-token")
       .finally(() => {
         connectSettled = true;
       });
@@ -2939,11 +2940,11 @@ auth:
     })(), 2_000)).toBe(true);
 
     expect(connectSettled).toBe(false);
-    expect(JSON.parse((await secrets.get(source.authRef!))!)).toMatchObject({
+    expect(JSON.parse((await secrets.get(sourceRecord.authRef!))!)).toMatchObject({
       kind: "apiKey",
       value: "old-token",
     });
-    await expect(supervisor.connectIntegrationWithToken(source.id, "third-token"))
+    await expect(supervisor.connectSourceWithToken(sourceRecord.id, "third-token"))
       .rejects.toThrow("identity mutation in progress");
 
     releaseAttempt();
@@ -2952,7 +2953,7 @@ auth:
       lastResolvedKey: "new-token",
       identityStatus: "changed",
     });
-    expect(JSON.parse((await secrets.get(source.authRef!))!)).toMatchObject({
+    expect(JSON.parse((await secrets.get(sourceRecord.authRef!))!)).toMatchObject({
       kind: "apiKey",
       value: "new-token",
     });
@@ -2991,13 +2992,13 @@ auth:
         },
       },
     );
-    const source = await supervisor.addIntegration({
+    const sourceRecord = await supervisor.addSource({
       connectorId: "identity-pre-attempt-barrier",
       config: { account: "work", revision: "old" },
     });
 
-    const handle = supervisor.start(source.id, { trigger: "manual" });
-    const configured = supervisor.configureIntegration(source.id, {
+    const handle = supervisor.start(sourceRecord.id, { trigger: "manual" });
+    const configured = supervisor.configureSource(sourceRecord.id, {
       config: { account: "work", revision: "same-key" },
     });
 
@@ -3056,17 +3057,17 @@ auth:
         },
       },
     );
-    const source = await supervisor.addIntegration({
+    const sourceRecord = await supervisor.addSource({
       connectorId: "identity-run-intent",
       config: { account: "work", revision: "old" },
     });
-    supervisor.renameIntegration(source.id, "Pinned source name");
-    const handle = supervisor.start(source.id, { trigger: "manual" });
+    supervisor.renameSource(sourceRecord.id, "Pinned source name");
+    const handle = supervisor.start(sourceRecord.id, { trigger: "manual" });
     expect(await waitWithTestTimeout((async () => {
       while (attempts.length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
     })(), 2_000)).toBe(true);
 
-    const same = await supervisor.configureIntegration(source.id, {
+    const same = await supervisor.configureSource(sourceRecord.id, {
       config: { account: "work", revision: "same-key" },
     });
     expect(same).toMatchObject({
@@ -3087,7 +3088,7 @@ auth:
       recentRuns: [expect.objectContaining({ status: "running" })],
     });
 
-    const changed = await supervisor.configureIntegration(source.id, {
+    const changed = await supervisor.configureSource(sourceRecord.id, {
       config: { account: "personal", revision: "changed-key" },
     });
     expect(changed).toMatchObject({
@@ -3140,19 +3141,19 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "credential-watch" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "credential-watch" });
     const scheduler = new ConnectorScheduler({ supervisor, tickMs: 60_000 });
 
     await scheduler.start();
     expect(tokens).toEqual([]);
 
-    await supervisor.connectIntegrationWithToken(integration.id, "old-token");
+    await supervisor.connectSourceWithToken(sourceRecord.id, "old-token");
     expect(await waitWithTestTimeout((async () => {
       while (tokens.length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
     })(), 2_000)).toBe(true);
     expect(tokens).toEqual(["old-token"]);
 
-    await supervisor.connectIntegrationWithToken(integration.id, "new-token");
+    await supervisor.connectSourceWithToken(sourceRecord.id, "new-token");
     expect(signals[0].aborted).toBe(true);
     expect(await waitWithTestTimeout((async () => {
       while (tokens.length < 2) await new Promise((resolve) => setTimeout(resolve, 1));
@@ -3197,18 +3198,18 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({
+    const sourceRecord = supervisor.ensureSource({
       connectorId: "reconfigurable-manual",
       config: { label: "old" },
     });
-    const handle = supervisor.start(integration.id, { trigger: "manual" });
+    const handle = supervisor.start(sourceRecord.id, { trigger: "manual" });
     while (configs.length < 1) await new Promise((resolve) => setTimeout(resolve, 1));
     let settled = false;
     void handle.promise.finally(() => {
       settled = true;
     });
 
-    await supervisor.configureIntegration(integration.id, { config: { label: "new" } });
+    await supervisor.configureSource(sourceRecord.id, { config: { label: "new" } });
     expect(await waitWithTestTimeout((async () => {
       while (configs.length < 2) await new Promise((resolve) => setTimeout(resolve, 1));
     })(), 2_000)).toBe(true);
@@ -3255,14 +3256,14 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({
+    const sourceRecord = supervisor.ensureSource({
       connectorId: "invalidated-manual",
       config: { identity: "person@example.com" },
     });
-    const handle = supervisor.start(integration.id, { trigger: "manual" });
+    const handle = supervisor.start(sourceRecord.id, { trigger: "manual" });
     while (attempts < 1) await new Promise((resolve) => setTimeout(resolve, 1));
 
-    await supervisor.configureIntegration(integration.id, { config: { identity: "" } });
+    await supervisor.configureSource(sourceRecord.id, { config: { identity: "" } });
     await handle.promise;
 
     const stopped = (await supervisor.list())[0];
@@ -3302,7 +3303,7 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({
+    const sourceRecord = supervisor.ensureSource({
       connectorId: "idle-config-watch",
       config: { label: "old" },
     });
@@ -3314,17 +3315,17 @@ auth:
     }
     await Promise.resolve();
     expect(labels).toEqual(["old"]);
-    expect(supervisor.getIntegration(integration.id)?.warnings).toHaveLength(1);
+    expect(supervisor.getSource(sourceRecord.id)?.warnings).toHaveLength(1);
 
-    await supervisor.configureIntegration(integration.id, { config: { label: "new" } });
+    await supervisor.configureSource(sourceRecord.id, { config: { label: "new" } });
     expect(await waitWithTestTimeout((async () => {
       while (labels.length < 2) await new Promise((resolve) => setTimeout(resolve, 1));
     })(), 2_000)).toBe(true);
     expect(labels).toEqual(["old", "new"]);
-    expect(supervisor.getIntegration(integration.id)?.warnings).toBeUndefined();
+    expect(supervisor.getSource(sourceRecord.id)?.warnings).toBeUndefined();
 
     await scheduler.stop();
-    await supervisor.configureIntegration(integration.id, { config: { label: "after-stop" } });
+    await supervisor.configureSource(sourceRecord.id, { config: { label: "after-stop" } });
     await Promise.resolve();
     expect(labels).toEqual(["old", "new"]);
   });
@@ -3382,11 +3383,11 @@ auth:
       },
     );
 
-    const watch = supervisor.ensureIntegration({
+    const watch = supervisor.ensureSource({
       connectorId: "wake-during-poll-watch",
       config: { label: "old" },
     });
-    supervisor.ensureIntegration({ connectorId: "blocking-poll" });
+    supervisor.ensureSource({ connectorId: "blocking-poll" });
     const originalList = supervisor.list;
     supervisor.list = async function listWithOneFailure() {
       if (failNextList) {
@@ -3409,13 +3410,13 @@ auth:
           await new Promise((resolve) => setTimeout(resolve, 1));
         }
       })(), 2_000)).toBe(true);
-      while ((await supervisor.list()).find((source) => source.id === watch.id)?.running) {
+      while ((await supervisor.list()).find((sourceRecord) => sourceRecord.id === watch.id)?.running) {
         await new Promise((resolve) => setTimeout(resolve, 1));
       }
       await new Promise((resolve) => setTimeout(resolve, 0));
 
       failNextList = true;
-      await supervisor.configureIntegration(watch.id, {
+      await supervisor.configureSource(watch.id, {
         config: { label: "new" },
       });
       expect(await waitWithTestTimeout((async () => {
@@ -3533,20 +3534,20 @@ auth:
         },
       },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "pausable-watch" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "pausable-watch" });
     const scheduler = new ConnectorScheduler({ supervisor });
 
     await scheduler.tick();
     expect((await supervisor.list())[0].running).toBe(true);
     expect(starts).toBe(1);
 
-    const paused = await supervisor.pauseIntegration(source.id);
+    const paused = await supervisor.pauseSource(sourceRecord.id);
     expect(paused.pausedAt).toBeGreaterThan(0);
     expect((await supervisor.list())[0].running).toBe(false);
     await scheduler.tick();
     expect(starts).toBe(1);
 
-    supervisor.resumeIntegration(source.id);
+    supervisor.resumeSource(sourceRecord.id);
     await scheduler.tick();
     expect(starts).toBe(2);
     expect((await supervisor.list())[0].running).toBe(true);
@@ -3579,7 +3580,7 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "slow-poll" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "slow-poll" });
     const scheduler = new ConnectorScheduler({ supervisor });
 
     const tick = scheduler.tick();
@@ -3591,9 +3592,9 @@ auth:
     await tick;
 
     expect((await supervisor.list())[0].running).toBe(false);
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
-    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ aborted: true });
-    expect(supervisor.getIntegration(integration.id)?.nextRunAt).toBeGreaterThan(0);
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("idle");
+    expect(supervisor.getSource(sourceRecord.id)?.syncState).toEqual({ aborted: true });
+    expect(supervisor.getSource(sourceRecord.id)?.nextRunAt).toBeGreaterThan(0);
   });
 
   test("scheduler stop does not hang when a run ignores the abort signal", async () => {
@@ -3615,7 +3616,7 @@ auth:
         },
       },
     );
-    supervisor.ensureIntegration({ connectorId: "stubborn-watch" });
+    supervisor.ensureSource({ connectorId: "stubborn-watch" });
     const scheduler = new ConnectorScheduler({ supervisor, stopTimeoutMs: 50 });
 
     await scheduler.start();
@@ -3652,15 +3653,15 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "poll-feed" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "poll-feed" });
     expect(() =>
-      supervisor.updateIntegration(integration.id, { scheduleCron: "every 1m" })
+      supervisor.updateSource(sourceRecord.id, { scheduleCron: "every 1m" })
     ).toThrow("Unsupported connector schedule");
     const scheduler = new ConnectorScheduler({ supervisor, now: () => now });
 
     await scheduler.tick();
     expect(runs).toBe(1);
-    const afterFirstRun = supervisor.getIntegration(integration.id);
+    const afterFirstRun = supervisor.getSource(sourceRecord.id);
     expect(afterFirstRun?.nextRunAt).toBe(nextCronRunAt("*/15 * * * *", now));
 
     await scheduler.tick();
@@ -3669,7 +3670,7 @@ auth:
     now = afterFirstRun!.nextRunAt!;
     await scheduler.tick();
     expect(runs).toBe(2);
-    expect(supervisor.getIntegration(integration.id)?.nextRunAt).toBe(nextCronRunAt("*/15 * * * *", now));
+    expect(supervisor.getSource(sourceRecord.id)?.nextRunAt).toBe(nextCronRunAt("*/15 * * * *", now));
   });
 
   test("timed Pause suppresses poll runs until the scheduler expires it", async () => {
@@ -3689,20 +3690,20 @@ auth:
       },
       { async run() { runs += 1; } },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "timed-poll" });
-    const paused = await supervisor.pauseIntegration(source.id, 60_000);
+    const sourceRecord = supervisor.ensureSource({ connectorId: "timed-poll" });
+    const paused = await supervisor.pauseSource(sourceRecord.id, 60_000);
     const scheduler = new ConnectorScheduler({ supervisor, now: () => now });
 
     now = paused.resumeAt! - 1;
     await scheduler.tick();
     expect(runs).toBe(0);
-    expect(supervisor.getIntegration(source.id)?.pausedAt).toBeDefined();
+    expect(supervisor.getSource(sourceRecord.id)?.pausedAt).toBeDefined();
 
     now = paused.resumeAt!;
     await scheduler.tick();
     expect(runs).toBe(1);
-    expect(supervisor.getIntegration(source.id)?.pausedAt).toBeUndefined();
-    expect(supervisor.getIntegration(source.id)?.resumeAt).toBeUndefined();
+    expect(supervisor.getSource(sourceRecord.id)?.pausedAt).toBeUndefined();
+    expect(supervisor.getSource(sourceRecord.id)?.resumeAt).toBeUndefined();
   });
 
   test("Run now is an explicit one-off while a Source remains paused", async () => {
@@ -3721,12 +3722,12 @@ auth:
       },
       { async run() { runs += 1; } },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "paused-manual" });
-    await supervisor.pauseIntegration(source.id);
+    const sourceRecord = supervisor.ensureSource({ connectorId: "paused-manual" });
+    await supervisor.pauseSource(sourceRecord.id);
 
-    await supervisor.run(source.id, { trigger: "manual" });
+    await supervisor.run(sourceRecord.id, { trigger: "manual" });
     expect(runs).toBe(1);
-    expect(supervisor.getIntegration(source.id)?.pausedAt).toBeDefined();
+    expect(supervisor.getSource(sourceRecord.id)?.pausedAt).toBeDefined();
   });
 
   test("Pause changes automatic policy without aborting an active manual run", async () => {
@@ -3751,19 +3752,19 @@ auth:
         },
       },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "manual-in-flight" });
-    const handle = supervisor.start(source.id, { trigger: "manual" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "manual-in-flight" });
+    const handle = supervisor.start(sourceRecord.id, { trigger: "manual" });
     while (!finish) await new Promise((resolve) => setTimeout(resolve, 1));
 
-    await supervisor.pauseIntegration(source.id);
+    await supervisor.pauseSource(sourceRecord.id);
     expect(aborted).toBe(false);
     expect((await supervisor.list())[0].running).toBe(true);
-    expect(supervisor.getIntegration(source.id)?.pausedAt).toBeDefined();
+    expect(supervisor.getSource(sourceRecord.id)?.pausedAt).toBeDefined();
 
     finish();
     await handle.promise;
-    expect(supervisor.getIntegration(source.id)?.status).toBe("idle");
-    expect(supervisor.getIntegration(source.id)?.pausedAt).toBeDefined();
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("idle");
+    expect(supervisor.getSource(sourceRecord.id)?.pausedAt).toBeDefined();
   });
 
   test("scheduler validates poll schedules before running", async () => {
@@ -3792,9 +3793,9 @@ auth:
         },
       },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "invalid-schedule-feed" });
-    systemDb.prepare("UPDATE connector_integrations SET schedule_cron = ?, next_run_at = NULL WHERE id = ?")
-      .run("every 1m", integration.id);
+    const sourceRecord = supervisor.ensureSource({ connectorId: "invalid-schedule-feed" });
+    systemDb.prepare("UPDATE connector_sources SET schedule_cron = ?, next_run_at = NULL WHERE id = ?")
+      .run("every 1m", sourceRecord.id);
     const errors: unknown[] = [];
     const scheduler = new ConnectorScheduler({
       supervisor,
@@ -3850,7 +3851,7 @@ auth:
     );
 
     await registerWorkspaceConnectors(supervisor, workspace);
-    supervisor.ensureIntegration({ connectorId: "untrusted-feed" });
+    supervisor.ensureSource({ connectorId: "untrusted-feed" });
     expect((await supervisor.list())[0].packageTrust).toBe("untrusted");
 
     const scheduler = new ConnectorScheduler({ supervisor });
@@ -8665,12 +8666,12 @@ auth:
     const manifests = await registerWorkspaceConnectors(supervisor, workspace);
     expect(manifests.map((manifest) => manifest.id)).toEqual(["calendar"]);
     expect(await supervisor.list()).toEqual([]);
-    const integration = supervisor.ensureIntegration({ connectorId: "calendar" });
-    expect(integration.id).not.toBe("calendar");
+    const sourceRecord = supervisor.ensureSource({ connectorId: "calendar" });
+    expect(sourceRecord.id).not.toBe("calendar");
 
-    await expect(supervisor.run(integration.id)).rejects.toThrow("not trusted");
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("not trusted");
     await supervisor.approveCurrentPackage("calendar");
-    await supervisor.run(integration.id);
+    await supervisor.run(sourceRecord.id);
 
     const event = dataDb.prepare("SELECT source, type, external_id FROM events WHERE type = ?")
       .get("calendar.install-test") as any;
@@ -8679,8 +8680,8 @@ auth:
       type: "calendar.install-test",
       external_id: "installed",
     });
-    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ installed: true });
-    expect(supervisor.getIntegration(integration.id)?.trustStatus).toBe("custom");
+    expect(supervisor.getSource(sourceRecord.id)?.syncState).toEqual({ installed: true });
+    expect(supervisor.getSource(sourceRecord.id)?.trustStatus).toBe("custom");
 
     expect(await removeInstalledConnector(workspace, "calendar")).toBe(true);
     expect(existsSync(installed.dir)).toBe(false);
@@ -8741,8 +8742,8 @@ auth:
       },
       { async run() {} },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "removed-outside-core" });
-    await authManager.setToken(source.authRef!, "orphan-token");
+    const sourceRecord = supervisor.ensureSource({ connectorId: "removed-outside-core" });
+    await authManager.setToken(sourceRecord.authRef!, "orphan-token");
 
     const restarted = new ConnectorSupervisor({
       systemDb,
@@ -8752,8 +8753,8 @@ auth:
       authManager,
     });
     expect(await registerWorkspaceConnectors(restarted, workspace)).toEqual([]);
-    expect(restarted.getIntegration(source.id)).toBeUndefined();
-    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+    expect(restarted.getSource(sourceRecord.id)).toBeUndefined();
+    expect(await authManager.hasToken(sourceRecord.authRef!)).toBe(false);
     expect(
       dataDb.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'connector.removed'").get(),
     ).toMatchObject({ n: 1 });
@@ -8883,15 +8884,15 @@ auth:
     const installedDir = join(workspace, "connectors", "seed");
     await supervisor.registerDirectory(installedDir);
     await supervisor.approveCurrentPackage("seed");
-    const source = await supervisor.addIntegration({
+    const sourceRecord = await supervisor.addSource({
       connectorId: "seed",
       config: { accountId: "work", folder: "inbox" },
       scheduleCron: "0 * * * *",
     });
     systemDb.prepare(
-      "UPDATE connector_integrations SET sync_state = ? WHERE id = ?",
-    ).run(JSON.stringify({ cursor: 42 }), source.id);
-    const paused = await supervisor.pauseIntegration(source.id);
+      "UPDATE connector_sources SET sync_state = ? WHERE id = ?",
+    ).run(JSON.stringify({ cursor: 42 }), sourceRecord.id);
+    const paused = await supervisor.pauseSource(sourceRecord.id);
     const oldHash = await hashConnectorPackage(installedDir);
 
     writeFileSync(
@@ -8919,15 +8920,15 @@ auth:
     });
     expect(readFileSync(join(installedDir, "index.mjs"), "utf8")).toContain("revision 2");
 
-    const awaitingApproval = supervisor.getIntegration(source.id)!;
+    const awaitingApproval = supervisor.getSource(sourceRecord.id)!;
     expect(awaitingApproval).toMatchObject({
       sourceKey: "work",
       identityStatus: "error",
       setupStatus: "setup",
     });
     await supervisor.approveCurrentPackage("seed");
-    const preserved = supervisor.getIntegration(source.id)!;
-    expect(preserved.id).toBe(source.id);
+    const preserved = supervisor.getSource(sourceRecord.id)!;
+    expect(preserved.id).toBe(sourceRecord.id);
     expect(preserved.sourceKey).toBe("work");
     expect(preserved.identityStatus).toBe("resolved");
     expect(preserved.suggestedLabel).toBe("revision-2");
@@ -9009,12 +9010,12 @@ export default {
     const installedDir = join(workspace, "connectors", "credential-update-fence");
     await supervisor.registerDirectory(installedDir);
     await supervisor.approveCurrentPackage("credential-update-fence");
-    const source = supervisor.ensureIntegration({ connectorId: "credential-update-fence" });
-    await expect(supervisor.connectIntegrationWithToken(source.id, "old-token"))
+    const sourceRecord = supervisor.ensureSource({ connectorId: "credential-update-fence" });
+    await expect(supervisor.connectSourceWithToken(sourceRecord.id, "old-token"))
       .resolves.toMatchObject({ sourceKey: "same-account", identityStatus: "resolved" });
 
     writeFileSync(join(sourceDir, "index.mjs"), packageSource(2));
-    const connecting = supervisor.connectIntegrationWithToken(source.id, "new-token");
+    const connecting = supervisor.connectSourceWithToken(sourceRecord.id, "new-token");
     expect(await waitWithTestTimeout((async () => {
       while (!existsSync(enteredPath)) await new Promise((resolve) => setTimeout(resolve, 1));
     })(), 3_000)).toBe(true);
@@ -9052,15 +9053,15 @@ export default {
       },
     );
     await updateEntered;
-    await expect(supervisor.connectIntegrationWithToken(source.id, "third-token"))
+    await expect(supervisor.connectSourceWithToken(sourceRecord.id, "third-token"))
       .rejects.toThrow("identity mutation in progress");
-    await expect(supervisor.removeIntegration(source.id))
+    await expect(supervisor.removeSource(sourceRecord.id))
       .rejects.toThrow("identity mutation in progress");
-    await expect(supervisor.addIntegration({ connectorId: "credential-update-fence" }))
+    await expect(supervisor.addSource({ connectorId: "credential-update-fence" }))
       .rejects.toThrow("Connector credential-update-fence is updating");
     expect((await supervisor.list()).filter((item) => (
       item.connectorId === "credential-update-fence"
-    )).map((item) => item.id)).toEqual([source.id]);
+    )).map((item) => item.id)).toEqual([sourceRecord.id]);
     releaseUpdate();
     await expect(coordinatingUpdate).resolves.toBeUndefined();
   });
@@ -9077,7 +9078,7 @@ export default {
     });
     const installedDir = join(workspace, "connectors", "seed");
     await supervisor.registerDirectory(installedDir);
-    const source = await supervisor.addIntegration({
+    const sourceRecord = await supervisor.addSource({
       connectorId: "seed",
       config: { accountId: "work" },
     });
@@ -9092,7 +9093,7 @@ export default {
       guard,
     })).rejects.toThrow("cannot change source.identity while Sources exist");
     expect(await hashConnectorPackage(installedDir)).toBe(oldHash);
-    expect(supervisor.getIntegration(source.id)).toBeDefined();
+    expect(supervisor.getSource(sourceRecord.id)).toBeDefined();
 
     writeBuiltIn(builtins, "seed", "connector");
     writeFileSync(
@@ -9119,7 +9120,7 @@ export default {
       guard: failingGuard,
     })).rejects.toThrow("D0 unavailable");
     expect(await hashConnectorPackage(installedDir)).toBe(oldHash);
-    expect(supervisor.getIntegration(source.id)?.packageHash).toBe(oldHash);
+    expect(supervisor.getSource(sourceRecord.id)?.packageHash).toBe(oldHash);
     expect(
       dataDb.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'connector.updated'").get(),
     ).toMatchObject({ n: 0 });
@@ -9180,7 +9181,7 @@ export default {
 
     await installOnce();
     await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
-    const work = await supervisor.addIntegration({
+    const work = await supervisor.addSource({
       connectorId: "seed",
       config: { accountId: "work" },
     });
@@ -9190,13 +9191,13 @@ export default {
       connectorId: "seed",
       supervisor,
     })).toBe(true);
-    expect(supervisor.getIntegration(work.id)).toBeUndefined();
+    expect(supervisor.getSource(work.id)).toBeUndefined();
 
     await installOnce();
     await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
     expect((await supervisor.list()).filter((row) => row.connectorId === "seed")).toEqual([]);
 
-    const replacement = await supervisor.addIntegration({
+    const replacement = await supervisor.addSource({
       connectorId: "seed",
       config: { accountId: "work" },
     });
@@ -9241,10 +9242,10 @@ auth:
     );
 
     const manifest = await supervisor.registerDirectory(dir);
-    const integration = supervisor.ensureIntegration({ connectorId: manifest.id });
-    await expect(supervisor.run(integration.id)).rejects.toThrow("not trusted");
+    const sourceRecord = supervisor.ensureSource({ connectorId: manifest.id });
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("not trusted");
     await supervisor.approveCurrentPackage("demo");
-    await supervisor.run(integration.id);
+    await supervisor.run(sourceRecord.id);
 
     const event = dataDb.prepare("SELECT source, type, external_id FROM events WHERE type = ?")
       .get("demo.event") as any;
@@ -9253,7 +9254,7 @@ auth:
       type: "demo.event",
       external_id: "loaded",
     });
-    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ loaded: true });
+    expect(supervisor.getSource(sourceRecord.id)?.syncState).toEqual({ loaded: true });
   });
 
   test("manages Source lifecycle: connect, pause, resume, remove", async () => {
@@ -9277,45 +9278,45 @@ auth:
       },
     );
 
-    const integration = supervisor.ensureIntegration({ connectorId: "managed-feed" });
-    expect(integration.setupStatus).toBe("setup");
+    const sourceRecord = supervisor.ensureSource({ connectorId: "managed-feed" });
+    expect(sourceRecord.setupStatus).toBe("setup");
 
     // apiKey connect stores the token and promotes through the evaluator.
     await expect(
-      supervisor.connectIntegrationWithToken(integration.id, "  ")
+      supervisor.connectSourceWithToken(sourceRecord.id, "  ")
     ).rejects.toThrow("non-empty token");
-    const connected = await supervisor.connectIntegrationWithToken(integration.id, "tok-1");
+    const connected = await supervisor.connectSourceWithToken(sourceRecord.id, "tok-1");
     expect(connected.setupStatus).toBe("ready");
     expect(await supervisor.getAuthManager().hasToken(connected.authRef!)).toBe(true);
 
-    await supervisor.configureIntegration(integration.id, {
+    await supervisor.configureSource(sourceRecord.id, {
       config: { folder: "inbox" },
       scheduleCron: "0 * * * *",
     });
-    const paused = await supervisor.pauseIntegration(integration.id);
+    const paused = await supervisor.pauseSource(sourceRecord.id);
     expect(paused.pausedAt).toBeGreaterThan(0);
     expect(paused.resumeAt).toBeUndefined();
     expect(paused.status).toBe("idle");
 
     // Disconnect removes only account readiness. The Source and all other
     // Source-owned state survive, and a later reconnect is explicit.
-    const disconnected = await supervisor.disconnectIntegration(integration.id);
+    const disconnected = await supervisor.disconnectSource(sourceRecord.id);
     expect(disconnected.setupStatus).toBe("setup");
     expect(disconnected.pausedAt).toBe(paused.pausedAt);
     expect(disconnected.config).toEqual({ folder: "inbox" });
     expect(disconnected.scheduleCron).toBe("0 * * * *");
     expect(await supervisor.getAuthManager().hasToken(connected.authRef!)).toBe(false);
-    const reconnected = await supervisor.connectIntegrationWithToken(integration.id, "tok-2");
+    const reconnected = await supervisor.connectSourceWithToken(sourceRecord.id, "tok-2");
     expect(reconnected.setupStatus).toBe("ready");
     expect(reconnected.pausedAt).toBe(paused.pausedAt);
 
-    const resumed = supervisor.resumeIntegration(integration.id);
+    const resumed = supervisor.resumeSource(sourceRecord.id);
     expect(resumed.pausedAt).toBeUndefined();
     expect(resumed.resumeAt).toBeUndefined();
 
     // Remove purges credentials and deletes the row.
-    await supervisor.removeIntegration(integration.id);
-    expect(supervisor.getIntegration(integration.id)).toBeUndefined();
+    await supervisor.removeSource(sourceRecord.id);
+    expect(supervisor.getSource(sourceRecord.id)).toBeUndefined();
     expect(await supervisor.getAuthManager().hasToken(connected.authRef!)).toBe(false);
 
     // Removing the last Source leaves the Connector installed with zero
@@ -9351,18 +9352,18 @@ auth:
         },
       },
     );
-    const work = supervisor.ensureIntegration({ connectorId: "cascade-feed" });
-    const personal = supervisor.ensureIntegration({ connectorId: "cascade-feed" });
-    const connectedWork = await supervisor.connectIntegrationWithToken(work.id, "work-token");
-    const connectedPersonal = await supervisor.connectIntegrationWithToken(personal.id, "personal-token");
+    const work = supervisor.ensureSource({ connectorId: "cascade-feed" });
+    const personal = supervisor.ensureSource({ connectorId: "cascade-feed" });
+    const connectedWork = await supervisor.connectSourceWithToken(work.id, "work-token");
+    const connectedPersonal = await supervisor.connectSourceWithToken(personal.id, "personal-token");
     expect(connectedWork).toMatchObject({ sourceKey: "work", identityStatus: "resolved" });
     expect(connectedPersonal).toMatchObject({ sourceKey: "personal", identityStatus: "resolved" });
     supervisor.start(work.id, { trigger: "watch" });
-    expect((await supervisor.list()).find((source) => source.id === work.id)?.running).toBe(true);
+    expect((await supervisor.list()).find((sourceRecord) => sourceRecord.id === work.id)?.running).toBe(true);
 
     expect(await supervisor.unregister("cascade-feed")).toBe(true);
     expect(supervisor.isRegistered("cascade-feed")).toBe(false);
-    expect((await supervisor.list()).filter((source) => source.connectorId === "cascade-feed")).toEqual([]);
+    expect((await supervisor.list()).filter((sourceRecord) => sourceRecord.connectorId === "cascade-feed")).toEqual([]);
     expect(await supervisor.getAuthManager().hasToken(connectedWork.authRef!)).toBe(false);
     expect(await supervisor.getAuthManager().hasToken(connectedPersonal.authRef!)).toBe(false);
     expect(systemDb.prepare(
@@ -9390,9 +9391,9 @@ auth:
       },
       { async run() {} },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "oauth-feed" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oauth-feed" });
     await expect(
-      supervisor.connectIntegrationWithToken(integration.id, "tok")
+      supervisor.connectSourceWithToken(sourceRecord.id, "tok")
     ).rejects.toThrow("browser auth");
   });
 
@@ -9438,14 +9439,14 @@ auth:
         },
       },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "oauth-identity-claim" });
-    const first = await supervisor.startOAuthIntegration(source.id, {
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oauth-identity-claim" });
+    const first = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
-    await expect(supervisor.startOAuthIntegration(source.id, {
+    await expect(supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     })).rejects.toThrow("identity mutation in progress");
-    await expect(supervisor.configureIntegration(source.id, { config: { note: "blocked" } }))
+    await expect(supervisor.configureSource(sourceRecord.id, { config: { note: "blocked" } }))
       .rejects.toThrow("identity mutation in progress");
 
     const firstState = new URL(first.authorizationUrl).searchParams.get("state")!;
@@ -9454,15 +9455,15 @@ auth:
       error: "access_denied",
     }))).resolves.toMatchObject({ status: "failed", error: "access_denied" });
 
-    const second = await supervisor.startOAuthIntegration(source.id, {
+    const second = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const secondState = new URL(second.authorizationUrl).searchParams.get("state")!;
     await expect(supervisor.completeOAuthCallback(new URLSearchParams({
       state: secondState,
       code: "code-1",
-    }))).resolves.toMatchObject({ status: "connected", integrationId: source.id });
-    expect(supervisor.getIntegration(source.id)).toMatchObject({
+    }))).resolves.toMatchObject({ status: "connected", sourceId: sourceRecord.id });
+    expect(supervisor.getSource(sourceRecord.id)).toMatchObject({
       sourceKey: "oauth-account-1",
       identityStatus: "resolved",
       suggestedLabel: "OAuth account",
@@ -9525,8 +9526,8 @@ auth:
         },
       },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "oauth-finalization-claim" });
-    const started = await supervisor.startOAuthIntegration(source.id, {
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oauth-finalization-claim" });
+    const started = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
@@ -9537,10 +9538,10 @@ auth:
 
     await resolverEntered;
     try {
-      await expect(supervisor.startOAuthIntegration(source.id, {
+      await expect(supervisor.startOAuthSource(sourceRecord.id, {
         redirectUri: "http://localhost:32123/oauth/callback",
       })).rejects.toThrow("identity mutation in progress");
-      await expect(supervisor.disconnectIntegration(source.id))
+      await expect(supervisor.disconnectSource(sourceRecord.id))
         .rejects.toThrow("identity mutation in progress");
     } finally {
       releaseResolver();
@@ -9548,14 +9549,14 @@ auth:
 
     await expect(completion).resolves.toMatchObject({
       status: "connected",
-      integrationId: source.id,
+      sourceId: sourceRecord.id,
     });
-    expect(supervisor.getIntegration(source.id)).toMatchObject({
+    expect(supervisor.getSource(sourceRecord.id)).toMatchObject({
       sourceKey: "finalizing-account",
       identityStatus: "resolved",
       setupStatus: "ready",
     });
-    expect(await authManager.hasToken(source.authRef!)).toBe(true);
+    expect(await authManager.hasToken(sourceRecord.authRef!)).toBe(true);
   });
 
   test("a stale expired callback cannot release its replacement browser identity claim", async () => {
@@ -9608,8 +9609,8 @@ auth:
         },
       },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "oauth-stale-finalizer" });
-    const expired = await supervisor.startOAuthIntegration(source.id, {
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oauth-stale-finalizer" });
+    const expired = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const expiredState = new URL(expired.authorizationUrl).searchParams.get("state")!;
@@ -9620,13 +9621,13 @@ auth:
 
     await exchangeStarted;
     now = expired.expiresAt + 1;
-    await expect(supervisor.getOAuthAttempt(source.id, expired.attemptId)).resolves.toMatchObject({
+    await expect(supervisor.getOAuthAttempt(sourceRecord.id, expired.attemptId)).resolves.toMatchObject({
       status: "expired",
-      integrationId: source.id,
+      sourceId: sourceRecord.id,
     });
 
     now = Date.now();
-    const replacement = await supervisor.startOAuthIntegration(source.id, {
+    const replacement = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     releaseExchange(new Response(JSON.stringify({ access_token: "must-not-survive" }), {
@@ -9638,8 +9639,8 @@ auth:
       status: "failed",
       error: "Authentication was cancelled for this Source",
     });
-    expect(staleResult).not.toHaveProperty("integrationId");
-    await expect(supervisor.configureIntegration(source.id, { config: { account: "blocked" } }))
+    expect(staleResult).not.toHaveProperty("sourceId");
+    await expect(supervisor.configureSource(sourceRecord.id, { config: { account: "blocked" } }))
       .rejects.toThrow("identity mutation in progress");
 
     const replacementState = new URL(replacement.authorizationUrl).searchParams.get("state")!;
@@ -9647,7 +9648,7 @@ auth:
       state: replacementState,
       error: "cancelled",
     }))).resolves.toMatchObject({ status: "failed", error: "cancelled" });
-    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+    expect(await authManager.hasToken(sourceRecord.authRef!)).toBe(false);
   });
 
   test("sweeps an expired browser identity claim and cancels its stale callback", async () => {
@@ -9683,11 +9684,11 @@ auth:
         },
       },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "oauth-expired-claim" });
-    const expired = await supervisor.startOAuthIntegration(source.id, {
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oauth-expired-claim" });
+    const expired = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
-    const replacement = await supervisor.startOAuthIntegration(source.id, {
+    const replacement = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const expiredState = new URL(expired.authorizationUrl).searchParams.get("state")!;
@@ -9698,17 +9699,17 @@ auth:
       status: "failed",
       error: "OAuth state is invalid or already used",
     });
-    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+    expect(await authManager.hasToken(sourceRecord.authRef!)).toBe(false);
 
     const replacementState = new URL(replacement.authorizationUrl).searchParams.get("state")!;
     await expect(supervisor.completeOAuthCallback(new URLSearchParams({
       state: replacementState,
       error: "cancelled",
     }))).resolves.toMatchObject({ status: "failed", error: "cancelled" });
-    await expect(supervisor.startOAuthIntegration(source.id, {
+    await expect(supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     })).resolves.toHaveProperty("authorizationUrl");
-    await supervisor.removeIntegration(source.id);
+    await supervisor.removeSource(sourceRecord.id);
   });
 
   test("holds a cancelled browser identity claim until Source credential deletion finishes", async () => {
@@ -9721,8 +9722,8 @@ auth:
       releaseDeletion = resolve;
     });
     const authManager = new ConnectorAuthManager(secrets);
-    const deleteCredentials = authManager.deleteIntegrationCredentials.bind(authManager);
-    const deleteSpy = vi.spyOn(authManager, "deleteIntegrationCredentials")
+    const deleteCredentials = authManager.deleteSourceCredentials.bind(authManager);
+    const deleteSpy = vi.spyOn(authManager, "deleteSourceCredentials")
       .mockImplementation(async (...args) => {
         markDeletionStarted();
         await deletionRelease;
@@ -9759,13 +9760,13 @@ auth:
         },
       },
     );
-    const removingSource = supervisor.ensureIntegration({ connectorId: "oauth-remove-claim" });
-    const waitingSource = supervisor.ensureIntegration({ connectorId: "oauth-remove-claim" });
-    await supervisor.startOAuthIntegration(removingSource.id, {
+    const removingSource = supervisor.ensureSource({ connectorId: "oauth-remove-claim" });
+    const waitingSource = supervisor.ensureSource({ connectorId: "oauth-remove-claim" });
+    await supervisor.startOAuthSource(removingSource.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
 
-    const removal = supervisor.removeIntegration(removingSource.id);
+    const removal = supervisor.removeSource(removingSource.id);
     await deletionStarted;
     try {
       await expect(supervisor.retrySourceIdentity(waitingSource.id))
@@ -9774,9 +9775,9 @@ auth:
       releaseDeletion();
     }
     await expect(removal).resolves.toBeUndefined();
-    expect(supervisor.getIntegration(removingSource.id)).toBeUndefined();
+    expect(supervisor.getSource(removingSource.id)).toBeUndefined();
 
-    const replacement = await supervisor.startOAuthIntegration(waitingSource.id, {
+    const replacement = await supervisor.startOAuthSource(waitingSource.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const replacementState = new URL(replacement.authorizationUrl).searchParams.get("state")!;
@@ -9839,9 +9840,9 @@ auth:
         },
       },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "oauth-disconnect-barrier" });
-    const waitingSource = supervisor.ensureIntegration({ connectorId: "oauth-disconnect-barrier" });
-    const initial = await supervisor.startOAuthIntegration(source.id, {
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oauth-disconnect-barrier" });
+    const waitingSource = supervisor.ensureSource({ connectorId: "oauth-disconnect-barrier" });
+    const initial = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const initialState = new URL(initial.authorizationUrl).searchParams.get("state")!;
@@ -9850,9 +9851,9 @@ auth:
       code: "initial-code",
     }))).resolves.toMatchObject({ status: "connected" });
 
-    const handle = supervisor.start(source.id, { trigger: "manual" });
+    const handle = supervisor.start(sourceRecord.id, { trigger: "manual" });
     await runStarted;
-    await supervisor.startOAuthIntegration(source.id, {
+    await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
 
@@ -9864,15 +9865,15 @@ auth:
     const deletionRelease = new Promise<void>((resolve) => {
       releaseDeletion = resolve;
     });
-    const deleteCredentials = authManager.deleteIntegrationCredentials.bind(authManager);
-    const deleteSpy = vi.spyOn(authManager, "deleteIntegrationCredentials")
+    const deleteCredentials = authManager.deleteSourceCredentials.bind(authManager);
+    const deleteSpy = vi.spyOn(authManager, "deleteSourceCredentials")
       .mockImplementation(async (...args) => {
         markDeletionStarted();
         await deletionRelease;
         await deleteCredentials(...args);
       });
 
-    const disconnecting = supervisor.disconnectIntegration(source.id);
+    const disconnecting = supervisor.disconnectSource(sourceRecord.id);
     try {
       expect(await waitWithTestTimeout(deletionStarted, 2_000)).toBe(true);
       expect(handle.signal.aborted).toBe(true);
@@ -9887,10 +9888,10 @@ auth:
       setupStatus: "setup",
     });
     expect(await waitWithTestTimeout(handle.promise, 2_000)).toBe(true);
-    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+    expect(await authManager.hasToken(sourceRecord.authRef!)).toBe(false);
     deleteSpy.mockRestore();
 
-    const replacement = await supervisor.startOAuthIntegration(waitingSource.id, {
+    const replacement = await supervisor.startOAuthSource(waitingSource.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const replacementState = new URL(replacement.authorizationUrl).searchParams.get("state")!;
@@ -9952,9 +9953,9 @@ auth:
         },
       },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "oauth-pause-barrier" });
-    const waitingSource = supervisor.ensureIntegration({ connectorId: "oauth-pause-barrier" });
-    const initial = await supervisor.startOAuthIntegration(source.id, {
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oauth-pause-barrier" });
+    const waitingSource = supervisor.ensureSource({ connectorId: "oauth-pause-barrier" });
+    const initial = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const initialState = new URL(initial.authorizationUrl).searchParams.get("state")!;
@@ -9963,13 +9964,13 @@ auth:
       code: "initial-code",
     }))).resolves.toMatchObject({ status: "connected" });
 
-    const handle = supervisor.start(source.id, { trigger: "watch" });
+    const handle = supervisor.start(sourceRecord.id, { trigger: "watch" });
     await runStarted;
-    const pending = await supervisor.startOAuthIntegration(source.id, {
+    const pending = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
 
-    const pausing = supervisor.pauseIntegration(source.id);
+    const pausing = supervisor.pauseSource(sourceRecord.id);
     expect(await waitWithTestTimeout(pausing, 2_000)).toBe(true);
     await expect(pausing).resolves.toMatchObject({
       pausedAt: expect.any(Number),
@@ -10043,19 +10044,19 @@ auth:
       },
       { async run() {} },
     );
-    const integration = supervisor.ensureIntegration({ connectorId: "oauth-bind" });
-    systemDb.prepare("UPDATE connector_integrations SET auth_ref = NULL WHERE id = ?").run(integration.id);
-    expect(supervisor.getIntegration(integration.id)?.authRef).toBeUndefined();
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oauth-bind" });
+    systemDb.prepare("UPDATE connector_sources SET auth_ref = NULL WHERE id = ?").run(sourceRecord.id);
+    expect(supervisor.getSource(sourceRecord.id)?.authRef).toBeUndefined();
 
-    const started = await supervisor.startOAuthIntegration(integration.id, {
+    const started = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
     await expect(supervisor.completeOAuthCallback(new URLSearchParams({ state, code: "code-1" })))
-      .resolves.toMatchObject({ status: "connected", integrationId: integration.id });
+      .resolves.toMatchObject({ status: "connected", sourceId: sourceRecord.id });
 
-    const connected = supervisor.getIntegration(integration.id)!;
-    expect(connected.authRef).toBe(`connector-integration:${integration.id}:auth`);
+    const connected = supervisor.getSource(sourceRecord.id)!;
+    expect(connected.authRef).toBe(defaultAuthRef(sourceRecord.id));
     expect(connected.setupStatus).toBe("ready");
     expect(await supervisor.getAuthManager().hasToken(connected.authRef!)).toBe(true);
   });
@@ -10097,17 +10098,17 @@ auth:
       },
       { async run() {} },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "oauth-remove" });
-    const started = await supervisor.startOAuthIntegration(source.id, {
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oauth-remove" });
+    const started = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
 
-    await supervisor.removeIntegration(source.id);
+    await supervisor.removeSource(sourceRecord.id);
     await expect(supervisor.completeOAuthCallback(new URLSearchParams({ state, code: "late" })))
       .resolves.toEqual({ status: "failed", error: "OAuth state is invalid or already used" });
     expect(tokenExchanges).toBe(0);
-    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+    expect(await authManager.hasToken(sourceRecord.authRef!)).toBe(false);
   });
 
   test("removing a Source prevents an in-flight OAuth exchange from writing credentials", async () => {
@@ -10151,15 +10152,15 @@ auth:
       },
       { async run() {} },
     );
-    const source = supervisor.ensureIntegration({ connectorId: "oauth-in-flight-remove" });
-    const started = await supervisor.startOAuthIntegration(source.id, {
+    const sourceRecord = supervisor.ensureSource({ connectorId: "oauth-in-flight-remove" });
+    const started = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
     const completion = supervisor.completeOAuthCallback(new URLSearchParams({ state, code: "code" }));
 
     await exchangeStarted;
-    await supervisor.removeIntegration(source.id);
+    await supervisor.removeSource(sourceRecord.id);
     releaseExchange(new Response(JSON.stringify({ access_token: "must-not-survive" }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -10169,13 +10170,13 @@ auth:
       status: "failed",
       error: "Source was removed during authentication",
     });
-    expect(await authManager.hasToken(source.authRef!)).toBe(false);
+    expect(await authManager.hasToken(sourceRecord.authRef!)).toBe(false);
   });
 
   test("browser auth manifest flows expose the intended runtime handles", async () => {
     const seenAuthTypes: string[] = [];
     const seenTokens: string[] = [];
-    const reconciledIntegrationIds: string[] = [];
+    const reconciledSourceIds: string[] = [];
     let directOAuthTokenCalls = 0;
     supervisor = new ConnectorSupervisor({
       systemDb,
@@ -10216,12 +10217,12 @@ auth:
       }),
     });
     supervisor.onRuntimeReconcileRequested((instanceId, reason) => {
-      if (reason === "credential_connected") reconciledIntegrationIds.push(instanceId);
+      if (reason === "credential_connected") reconciledSourceIds.push(instanceId);
     });
 
     const manifests: Array<{
       manifest: ConnectorManifest;
-      connect: (integrationId: string) => Promise<void>;
+      connect: (sourceId: string) => Promise<void>;
     }> = [
       {
         manifest: {
@@ -10240,13 +10241,13 @@ auth:
             clientId: "public-client",
           },
         },
-        connect: async (integrationId) => {
-          const started = await supervisor.startOAuthIntegration(integrationId, {
+        connect: async (sourceId) => {
+          const started = await supervisor.startOAuthSource(sourceId, {
             redirectUri: "http://localhost:32123/oauth/callback",
           });
           const state = new URL(started.authorizationUrl).searchParams.get("state")!;
           await supervisor.completeOAuthCallback(new URLSearchParams({ state, code: "code-1" }));
-          await supervisor.getOAuthAttempt(integrationId, started.attemptId);
+          await supervisor.getOAuthAttempt(sourceId, started.attemptId);
         },
       },
       {
@@ -10264,18 +10265,18 @@ auth:
             providerId: "oura",
           },
         },
-        connect: async (integrationId) => {
-          const started = await supervisor.startAuthIntegration(integrationId, {
+        connect: async (sourceId) => {
+          const started = await supervisor.startAuthSource(sourceId, {
             redirectUri: "http://localhost:32123/oauth/callback",
           });
-          await expect(supervisor.getOAuthAttempt(integrationId, started.attemptId))
+          await expect(supervisor.getOAuthAttempt(sourceId, started.attemptId))
             .resolves.toMatchObject({ status: "connected" });
-          await supervisor.getOAuthAttempt(integrationId, started.attemptId);
+          await supervisor.getOAuthAttempt(sourceId, started.attemptId);
         },
       },
     ];
 
-    const integrationIds: string[] = [];
+    const sourceIds: string[] = [];
     for (const { manifest, connect } of manifests) {
       supervisor.register(manifest, {
         async run({ auth }) {
@@ -10285,16 +10286,16 @@ auth:
           }
         },
       });
-      const integration = supervisor.ensureIntegration({ connectorId: manifest.id });
-      integrationIds.push(integration.id);
-      await connect(integration.id);
-      await supervisor.run(integration.id);
+      const sourceRecord = supervisor.ensureSource({ connectorId: manifest.id });
+      sourceIds.push(sourceRecord.id);
+      await connect(sourceRecord.id);
+      await supervisor.run(sourceRecord.id);
     }
 
     expect(seenAuthTypes).toEqual(["oauth2", "managedProvider"]);
     expect(seenTokens).toEqual(["refreshed-access-token", "lamarck-capability-token"]);
     expect(directOAuthTokenCalls).toBe(2);
-    expect(reconciledIntegrationIds).toEqual(integrationIds);
+    expect(reconciledSourceIds).toEqual(sourceIds);
   });
 
   test("emits D0 audit events for connector approve and remove", async () => {
@@ -10321,7 +10322,7 @@ auth:
     writeFileSync(join(dir, "index.mjs"), "export default { async run() {} };\n");
 
     await supervisor.registerDirectory(dir);
-    supervisor.ensureIntegration({ connectorId: "audited" });
+    supervisor.ensureSource({ connectorId: "audited" });
     await supervisor.approveCurrentPackage("audited");
 
     const approved = dataDb
@@ -10410,7 +10411,7 @@ auth:
     );
 
     await supervisor.registerDirectory(dir);
-    const integration = supervisor.ensureIntegration({ connectorId: "pid-probe" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "pid-probe" });
     await supervisor.approveCurrentPackage("pid-probe");
     const childEnvironment = {
       LAMARCK_CONNECTOR_ENV_MARKER: "ordinary-runtime-value",
@@ -10429,7 +10430,7 @@ auth:
     );
     Object.assign(process.env, childEnvironment);
     try {
-      await supervisor.run(integration.id);
+      await supervisor.run(sourceRecord.id);
     } finally {
       for (const [key, previous] of Object.entries(previousEnvironment)) {
         if (previous === undefined) delete process.env[key];
@@ -10457,7 +10458,7 @@ auth:
       inventedLocale: null,
       electronRunAsNode: "1",
     });
-    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ pid: payload.pid });
+    expect(supervisor.getSource(sourceRecord.id)?.syncState).toEqual({ pid: payload.pid });
   });
 
   test("workspace package connectors can write text blobs over runner RPC", async () => {
@@ -10509,9 +10510,9 @@ export default {
     );
 
     await supervisor.registerDirectory(dir);
-    const integration = supervisor.ensureIntegration({ connectorId: "blob-rpc" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "blob-rpc" });
     await supervisor.approveCurrentPackage("blob-rpc");
-    await supervisor.run(integration.id);
+    await supervisor.run(sourceRecord.id);
 
     const blobText = "runner process redacted blob payload";
     const digestHex = createHash("sha256").update(blobText).digest("hex");
@@ -10598,20 +10599,20 @@ auth:
 	    );
 
 	    await supervisor.registerDirectory(dir);
-	    const integration = supervisor.ensureIntegration({ connectorId: "config-ui-rpc" });
-	    await supervisor.configureIntegration(integration.id, { config: { opaque: { keep: true } } });
+	    const sourceRecord = supervisor.ensureSource({ connectorId: "config-ui-rpc" });
+	    await supervisor.configureSource(sourceRecord.id, { config: { opaque: { keep: true } } });
 	    await supervisor.approveCurrentPackage("config-ui-rpc");
 
-	    const started = await supervisor.startConfigUi(integration.id, "privacy-controls");
+	    const started = await supervisor.startConfigUi(sourceRecord.id, "privacy-controls");
 	    expect(started.url).toContain("token=abcdefghijklmnop");
-	    expect(supervisor.getIntegration(integration.id)?.config).toEqual({
+	    expect(supervisor.getSource(sourceRecord.id)?.config).toEqual({
 	      opaque: { keep: true },
 	      privacyPolicy: {
 	        version: 1,
 	        apps: { "com.apple.finder": { action: "metadata_only" } },
 	      },
 	    });
-	    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({
+	    expect(supervisor.getSource(sourceRecord.id)?.syncState).toEqual({
 	      pendingUsers: {},
 	      approvedUsers: { "123": { username: "alice" } },
 	    });
@@ -10673,30 +10674,30 @@ auth:
     );
 
     await reconfigSupervisor.registerDirectory(dir);
-    const integration = reconfigSupervisor.ensureIntegration({
+    const sourceRecord = reconfigSupervisor.ensureSource({
       connectorId: "process-reconfigure",
       config: { label: "old" },
     });
     await reconfigSupervisor.approveCurrentPackage("process-reconfigure");
-    const handle = reconfigSupervisor.start(integration.id, { trigger: "manual" });
+    const handle = reconfigSupervisor.start(sourceRecord.id, { trigger: "manual" });
     expect(await waitWithTestTimeout((async () => {
       while (
-        ((reconfigSupervisor.getIntegration(integration.id)?.syncState as any)?.attempts?.length ?? 0) < 1
+        ((reconfigSupervisor.getSource(sourceRecord.id)?.syncState as any)?.attempts?.length ?? 0) < 1
       ) {
         await new Promise((resolve) => setTimeout(resolve, 1));
       }
     })(), 3_000)).toBe(true);
 
-    await reconfigSupervisor.configureIntegration(integration.id, { config: { label: "new" } });
+    await reconfigSupervisor.configureSource(sourceRecord.id, { config: { label: "new" } });
     expect(await waitWithTestTimeout((async () => {
       while (
-        ((reconfigSupervisor.getIntegration(integration.id)?.syncState as any)?.attempts?.length ?? 0) < 2
+        ((reconfigSupervisor.getSource(sourceRecord.id)?.syncState as any)?.attempts?.length ?? 0) < 2
       ) {
         await new Promise((resolve) => setTimeout(resolve, 1));
       }
     })(), 3_000)).toBe(true);
 
-    const attempts = (reconfigSupervisor.getIntegration(integration.id)?.syncState as any).attempts;
+    const attempts = (reconfigSupervisor.getSource(sourceRecord.id)?.syncState as any).attempts;
     expect(attempts.map((attempt: any) => attempt.label)).toEqual(["old", "new"]);
     expect(attempts[0].pid).not.toBe(attempts[1].pid);
     expect(handle.signal.aborted).toBe(false);
@@ -10745,11 +10746,11 @@ auth:
     );
 
     await supervisor.registerDirectory(dir);
-    const integration = supervisor.ensureIntegration({ connectorId: "warning-rpc" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "warning-rpc" });
     await supervisor.approveCurrentPackage("warning-rpc");
-    await supervisor.run(integration.id);
+    await supervisor.run(sourceRecord.id);
 
-    const stored = supervisor.getIntegration(integration.id);
+    const stored = supervisor.getSource(sourceRecord.id);
     expect(stored?.status).toBe("idle");
     expect(stored?.lastError).toBeUndefined();
     expect(stored?.warnings).toHaveLength(1);
@@ -10801,15 +10802,15 @@ export default {
     );
 
     await fastKillSupervisor.registerDirectory(dir);
-    const integration = fastKillSupervisor.ensureIntegration({ connectorId: "stubborn" });
+    const sourceRecord = fastKillSupervisor.ensureSource({ connectorId: "stubborn" });
     await fastKillSupervisor.approveCurrentPackage("stubborn");
 
-    const handle = fastKillSupervisor.start(integration.id);
+    const handle = fastKillSupervisor.start(sourceRecord.id);
     await new Promise((resolve) => setTimeout(resolve, 300));
     handle.abort();
     const settled = await waitWithTestTimeout(handle.promise, 3_000);
     expect(settled).toBe(true);
-    expect(fastKillSupervisor.getIntegration(integration.id)?.status).toBe("idle");
+    expect(fastKillSupervisor.getSource(sourceRecord.id)?.status).toBe("idle");
   });
 
   test("package runner abort is cooperative: the connector cleans up before any kill", async () => {
@@ -10849,10 +10850,10 @@ auth:
     );
 
     await supervisor.registerDirectory(dir);
-    const integration = supervisor.ensureIntegration({ connectorId: "tidy" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "tidy" });
     await supervisor.approveCurrentPackage("tidy");
 
-    const handle = supervisor.start(integration.id);
+    const handle = supervisor.start(sourceRecord.id);
     const started = await waitWithTestTimeout(
       (async () => {
         while (!dataDb.prepare("SELECT id FROM events WHERE type = ?").get("tidy.start")) {
@@ -10868,8 +10869,8 @@ auth:
     expect(settled).toBe(true);
     // The cleanup write only lands if abort stayed cooperative — an immediate
     // SIGKILL would have killed the child before state.set.
-    expect(supervisor.getIntegration(integration.id)?.syncState).toEqual({ cleanedUp: true });
-    expect(supervisor.getIntegration(integration.id)?.status).toBe("idle");
+    expect(supervisor.getSource(sourceRecord.id)?.syncState).toEqual({ cleanedUp: true });
+    expect(supervisor.getSource(sourceRecord.id)?.status).toBe("idle");
   });
 
   test("kills runner processes that hang during top-level import", async () => {
@@ -10909,13 +10910,13 @@ export default { async run() {} };
     );
 
     await hangSupervisor.registerDirectory(dir);
-    const integration = hangSupervisor.ensureIntegration({ connectorId: "import-hang" });
+    const sourceRecord = hangSupervisor.ensureSource({ connectorId: "import-hang" });
     await hangSupervisor.approveCurrentPackage("import-hang");
 
     // Bounded by runnerCommandTimeoutMs: the hanging import is killed and the
     // run fails instead of waiting forever.
-    await expect(hangSupervisor.run(integration.id)).rejects.toThrow("timed out");
-    expect(hangSupervisor.getIntegration(integration.id)?.status).toBe("error");
+    await expect(hangSupervisor.run(sourceRecord.id)).rejects.toThrow("timed out");
+    expect(hangSupervisor.getSource(sourceRecord.id)?.status).toBe("error");
   });
 
   test("isolates runner process crashes from the core", async () => {
@@ -10951,11 +10952,11 @@ auth:
     );
 
     await supervisor.registerDirectory(dir);
-    const integration = supervisor.ensureIntegration({ connectorId: "crasher" });
+    const sourceRecord = supervisor.ensureSource({ connectorId: "crasher" });
     await supervisor.approveCurrentPackage("crasher");
 
-    await expect(supervisor.run(integration.id)).rejects.toThrow("exited unexpectedly");
-    const stored = supervisor.getIntegration(integration.id);
+    await expect(supervisor.run(sourceRecord.id)).rejects.toThrow("exited unexpectedly");
+    const stored = supervisor.getSource(sourceRecord.id);
     expect(stored?.status).toBe("error");
     expect(stored?.lastError).toContain("exited unexpectedly");
   });

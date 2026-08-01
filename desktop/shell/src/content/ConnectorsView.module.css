@@ -394,9 +394,9 @@
   flex-shrink: 0;
 }
 
-/* ── Integration rows nested under the connector ────────────────────── */
+/* ── Source rows nested under the connector ────────────────────── */
 
-.integrationList {
+.sourceList {
   display: flex;
   flex-direction: column;
 }
@@ -410,7 +410,7 @@
   letter-spacing: 0.04em;
 }
 
-.integrationRow {
+.sourceRow {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -419,7 +419,7 @@
   border-left: 2px solid var(--c-line);
 }
 
-.integrationRow:first-child {
+.sourceRow:first-child {
   border-top: none;
   margin-top: 2px;
 }

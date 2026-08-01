@@ -3,24 +3,24 @@
 // independent observations/conditions.
 
 import type {
-  ConnectorIntegrationView,
+  ConnectorSourceView,
   ConnectorSetupPendingReason,
   InstalledConnectorView,
 } from "./api";
 
 export type SourceLifecycle = "active" | "paused";
 
-export function sourceIsPaused(c: ConnectorIntegrationView, now = Date.now()): boolean {
+export function sourceIsPaused(c: ConnectorSourceView, now = Date.now()): boolean {
   if (c.pausedAt === undefined) return false;
   return c.resumeAt === undefined || c.resumeAt > now;
 }
 
-export function sourceLifecycle(c: ConnectorIntegrationView, now = Date.now()): SourceLifecycle {
+export function sourceLifecycle(c: ConnectorSourceView, now = Date.now()): SourceLifecycle {
   if (sourceIsPaused(c, now)) return "paused";
   return "active";
 }
 
-export function sourceHasAutomaticActivity(c: ConnectorIntegrationView): boolean {
+export function sourceHasAutomaticActivity(c: ConnectorSourceView): boolean {
   return c.mode === "watch" || (c.mode === "poll" && Boolean(c.scheduleCron));
 }
 
@@ -31,20 +31,20 @@ export const SOURCE_LIFECYCLE_LABEL: Record<SourceLifecycle, string> = {
 
 export function sourceShownName(
   c: Pick<
-    ConnectorIntegrationView,
+    ConnectorSourceView,
     "displayName" | "suggestedLabel" | "connectorName"
   >,
 ): string {
   return c.displayName ?? c.suggestedLabel ?? c.connectorName;
 }
 
-export function sourceRunsHere(c: Pick<ConnectorIntegrationView, "ownership">): boolean {
+export function sourceRunsHere(c: Pick<ConnectorSourceView, "ownership">): boolean {
   return c.ownership === "here";
 }
 
 // Health is a secondary condition. A paused source can still need attention,
 // and a failed run does not silently change its lifecycle.
-export function sourceNeedsAttention(c: ConnectorIntegrationView): boolean {
+export function sourceNeedsAttention(c: ConnectorSourceView): boolean {
   return Boolean(
     c.authAttention
       || c.status === "error"
@@ -60,7 +60,7 @@ export function sourceNeedsAttention(c: ConnectorIntegrationView): boolean {
 // needs approval, or broken (package gone/invalid).
 export type TrustView = "official" | "custom" | "needs-approval" | "broken";
 
-export function trustView(c: Pick<ConnectorIntegrationView | InstalledConnectorView, "packageTrust">): TrustView {
+export function trustView(c: Pick<ConnectorSourceView | InstalledConnectorView, "packageTrust">): TrustView {
   switch (c.packageTrust) {
     case "official":
       return "official";
@@ -74,12 +74,12 @@ export function trustView(c: Pick<ConnectorIntegrationView | InstalledConnectorV
   }
 }
 
-export function sourceNeedsSetup(c: ConnectorIntegrationView): boolean {
+export function sourceNeedsSetup(c: ConnectorSourceView): boolean {
   return c.setupPending.length > 0;
 }
 
 export function connectorNeedsAttention(
-  c: Pick<ConnectorIntegrationView | InstalledConnectorView, "packageTrust" | "supported">,
+  c: Pick<ConnectorSourceView | InstalledConnectorView, "packageTrust" | "supported">,
 ): boolean {
   const trust = trustView(c);
   return !c.supported || trust === "needs-approval" || trust === "broken";
@@ -92,7 +92,7 @@ const SETUP_NEED_LABEL: Record<ConnectorSetupPendingReason, string> = {
   config: "settings",
 };
 
-export function setupNeeds(c: ConnectorIntegrationView): string[] {
+export function setupNeeds(c: ConnectorSourceView): string[] {
   return c.setupPending.map((reason) => SETUP_NEED_LABEL[reason]);
 }
 

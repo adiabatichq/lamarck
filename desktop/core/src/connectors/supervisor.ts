@@ -27,16 +27,16 @@ import {
   validateConnectorId,
   validateConnectorManifest,
 } from "./manifest";
-import { WorkspaceConnectorRegistry, trustStatusForIntegration } from "./registry";
+import { WorkspaceConnectorRegistry, trustStatusForSource } from "./registry";
 import { validateConnectorDefinition } from "./runtime";
 import {
-  ConnectorIntegrationStore,
+  ConnectorSourceStore,
   createConnectorStateHandle,
   defaultAuthRef,
-  isIntegrationPaused,
-  newIntegrationId,
-  type EnsureIntegrationInput,
-  type UpdateIntegrationInput,
+  isSourcePaused,
+  newSourceId,
+  type EnsureSourceInput,
+  type UpdateSourceInput,
 } from "./state";
 import {
   sanitizeSourceIdentityError,
@@ -54,7 +54,7 @@ import type {
   ConnectorConfigPatch,
   ConnectorConfigField,
   ConnectorDefinition,
-  ConnectorIntegration,
+  ConnectorSource,
   ConnectorOwnership,
   InstalledConnectorView,
   ConnectorManifest,
@@ -154,11 +154,11 @@ export interface ConnectorSupervisorOptions {
   deviceDisplayName?: string;
 }
 
-export interface ConnectIntegrationInput {
+export interface ConnectSourceInput {
   authRef?: string;
 }
 
-type NonConfigIntegrationUpdateInput = Omit<UpdateIntegrationInput<never>, "config">;
+type NonConfigSourceUpdateInput = Omit<UpdateSourceInput<never>, "config">;
 
 const DEFAULT_MANAGED_PROVIDER_APP_ORIGIN = "https://app.lamarck.ai";
 
@@ -178,7 +178,7 @@ export class ConnectorSupervisor {
     reason: ConnectorRuntimeReconcileReason,
   ) => void>();
   private activeConfigUiSessions = new Map<string, ActiveConfigUiSession>();
-  private store: ConnectorIntegrationStore;
+  private store: ConnectorSourceStore;
   private authManager: ConnectorAuthManager;
   private platform: ConnectorPlatform;
   private runnerKillGraceMs: number | undefined;
@@ -194,7 +194,7 @@ export class ConnectorSupervisor {
   constructor(opts: ConnectorSupervisorOptions) {
     this.guard = opts.guard;
     this.workspacePath = opts.workspacePath;
-    this.store = new ConnectorIntegrationStore(opts.systemDb);
+    this.store = new ConnectorSourceStore(opts.systemDb);
     this.store.recoverInterruptedRuns();
     this.authManager = opts.authManager ?? new ConnectorAuthManager();
     this.platform = opts.platform ?? currentConnectorPlatform();
@@ -244,7 +244,7 @@ export class ConnectorSupervisor {
     });
     this.store.setTrustForConnector(
       pkg.connectorId,
-      trustStatusForIntegration(pkg.trust),
+      trustStatusForSource(pkg.trust),
       pkg.contentHash,
     );
     return pkg.manifest;
@@ -294,21 +294,21 @@ export class ConnectorSupervisor {
       : undefined;
     this.updatingConnectorIds.add(connectorId);
     try {
-      for (const source of identitySources) {
-        this.store.beginIdentityResolution(source.id);
+      for (const sourceRecord of identitySources) {
+        this.store.beginIdentityResolution(sourceRecord.id);
       }
-      for (const source of sources) {
-        const active = this.activeRuns.get(source.id);
+      for (const sourceRecord of sources) {
+        const active = this.activeRuns.get(sourceRecord.id);
         if (active) {
           active.abort();
           await active.promise.catch(() => {});
         }
-        await this.stopConfigUiSessionsForIntegration(source.id);
+        await this.stopConfigUiSessionsForSource(sourceRecord.id);
       }
       try {
         const result = await update();
-        for (const source of identitySources) {
-          await this.resolveSourceIdentityInClaim(source.id);
+        for (const sourceRecord of identitySources) {
+          await this.resolveSourceIdentityInClaim(sourceRecord.id);
         }
         return result;
       } catch (error) {
@@ -316,9 +316,9 @@ export class ConnectorSupervisor {
         // error. Resolve against whichever trusted package is registered now;
         // if rollback itself failed, leaving unresolved is the fail-closed
         // recovery state.
-        for (const source of identitySources) {
-          if (!this.store.get(source.id)) continue;
-          await this.resolveSourceIdentityInClaim(source.id).catch(() => {});
+        for (const sourceRecord of identitySources) {
+          if (!this.store.get(sourceRecord.id)) continue;
+          await this.resolveSourceIdentityInClaim(sourceRecord.id).catch(() => {});
         }
         throw error;
       }
@@ -344,7 +344,7 @@ export class ConnectorSupervisor {
       });
       this.store.setTrustForConnector(
         connectorId,
-        trustStatusForIntegration(approved.trust),
+        trustStatusForSource(approved.trust),
         approved.contentHash,
       );
       // D0 audit: the trust decision — who approved which exact package content.
@@ -386,9 +386,9 @@ export class ConnectorSupervisor {
 
   private async removeSourcesForConnector(connectorId: string): Promise<number> {
     validateConnectorId(connectorId);
-    const sources = this.store.list().filter((integration) => integration.connectorId === connectorId);
-    for (const source of sources) {
-      await this.removeIntegration(source.id);
+    const sources = this.store.list().filter((sourceRecord) => sourceRecord.connectorId === connectorId);
+    for (const sourceRecord of sources) {
+      await this.removeSource(sourceRecord.id);
     }
     return sources.length;
   }
@@ -397,8 +397,8 @@ export class ConnectorSupervisor {
     const installed = new Set([...installedConnectorIds, ...this.registrations.keys()]);
     const orphaned = new Set(
       this.store.list()
-        .filter((source) => !installed.has(source.connectorId))
-        .map((source) => source.connectorId),
+        .filter((sourceRecord) => !installed.has(sourceRecord.connectorId))
+        .map((sourceRecord) => sourceRecord.connectorId),
     );
     for (const connectorId of orphaned) {
       await this.removeSourcesForConnector(connectorId);
@@ -415,16 +415,16 @@ export class ConnectorSupervisor {
   // Removes one Source: aborts its run, stops config UI, purges credentials,
   // config/checkpoint/schedule/run history with the row, and leaves no
   // placeholder behind. An installed connector may own zero Sources.
-  async removeIntegration(instanceId: string): Promise<void> {
-    const integration = this.store.get(instanceId);
-    if (!integration) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+  async removeSource(instanceId: string): Promise<void> {
+    const sourceRecord = this.store.get(instanceId);
+    if (!sourceRecord) {
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
 
-    let identityClaim = this.identityMutations.get(integration.connectorId);
+    let identityClaim = this.identityMutations.get(sourceRecord.connectorId);
     if (identityClaim && identityClaim.expiresAt === undefined) {
       throw new ConnectorLifecycleConflictError(
-        `Connector ${integration.connectorId} has an identity mutation in progress`,
+        `Connector ${sourceRecord.connectorId} has an identity mutation in progress`,
       );
     }
 
@@ -436,7 +436,7 @@ export class ConnectorSupervisor {
       // Explicit removal cancels the browser attempt synchronously, then owns
       // its claim until deletion completes. Release only the run barrier here
       // so aborting the preserved intent cannot deadlock behind that claim.
-      this.authManager.cancelAttemptsForIntegration(instanceId);
+      this.authManager.cancelAttemptsForSource(instanceId);
       claimedBrowserAttempt.expiresAt = undefined;
       active?.releaseIdentityMutation();
     }
@@ -444,18 +444,18 @@ export class ConnectorSupervisor {
 	      active.abort();
 	      await active.promise.catch(() => {});
     }
-    await this.stopConfigUiSessionsForIntegration(instanceId);
+    await this.stopConfigUiSessionsForSource(instanceId);
 
     // Re-check after awaited cleanup: a browser callback may have moved its
     // claim into non-expiring identity finalization while removal was waiting.
-    identityClaim = this.identityMutations.get(integration.connectorId);
+    identityClaim = this.identityMutations.get(sourceRecord.connectorId);
     if (
       identityClaim
       && identityClaim !== claimedBrowserAttempt
       && identityClaim.expiresAt === undefined
     ) {
       throw new ConnectorLifecycleConflictError(
-        `Connector ${integration.connectorId} has an identity mutation in progress`,
+        `Connector ${sourceRecord.connectorId} has an identity mutation in progress`,
       );
     }
     if (
@@ -463,30 +463,30 @@ export class ConnectorSupervisor {
       && identityClaim !== claimedBrowserAttempt
       && identityClaim.sourceId === instanceId
     ) {
-      this.authManager.cancelAttemptsForIntegration(instanceId);
+      this.authManager.cancelAttemptsForSource(instanceId);
       identityClaim.expiresAt = undefined;
       claimedBrowserAttempt = identityClaim;
     }
-    this.authManager.cancelAttemptsForIntegration(instanceId, { removed: true });
+    this.authManager.cancelAttemptsForSource(instanceId, { removed: true });
     try {
-      await this.authManager.deleteIntegrationCredentials(instanceId, integration.authRef);
+      await this.authManager.deleteSourceCredentials(instanceId, sourceRecord.authRef);
       this.store.delete(instanceId);
     } finally {
       if (claimedBrowserAttempt) {
-        this.releaseIdentityMutation(integration.connectorId, claimedBrowserAttempt);
+        this.releaseIdentityMutation(sourceRecord.connectorId, claimedBrowserAttempt);
       }
     }
   }
 
   // apiKey connect: store the pasted token and run the normal connect flow.
   // oauth2 uses the browser authorization flow, not this token endpoint.
-  async connectIntegrationWithToken<TConfig = unknown, TState = unknown>(
+  async connectSourceWithToken<TConfig = unknown, TState = unknown>(
     instanceId: string,
     token: string,
-  ): Promise<ConnectorIntegration<TConfig, TState>> {
+  ): Promise<ConnectorSource<TConfig, TState>> {
     const existing = this.store.get(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     const registration = this.requireRegistration(existing.connectorId);
     const auth = registration.manifest.auth ?? { type: "none" };
@@ -502,7 +502,7 @@ export class ConnectorSupervisor {
     const authRef = existing.authRef ?? defaultAuthRef(existing.id);
     if (registration.manifest.source.identity === "connector") {
       const connected = await this.withIdentityMutation(instanceId, async () => {
-        const generation = this.authManager.currentIntegrationAuthGeneration(existing.id);
+        const generation = this.authManager.currentSourceAuthGeneration(existing.id);
         await this.authManager.setToken(authRef, token.trim(), {
           ownerType: "connector",
           ownerId: existing.id,
@@ -511,25 +511,25 @@ export class ConnectorSupervisor {
         this.store.update(instanceId, { authRef });
       });
       this.requestRuntimeReconcile(instanceId, "credential_connected", false);
-      return connected as ConnectorIntegration<TConfig, TState>;
+      return connected as ConnectorSource<TConfig, TState>;
     }
 
-    const generation = this.authManager.currentIntegrationAuthGeneration(existing.id);
+    const generation = this.authManager.currentSourceAuthGeneration(existing.id);
     await this.authManager.setToken(authRef, token.trim(), {
       ownerType: "connector",
       ownerId: existing.id,
       generation,
     });
-    return this.connectIntegration<TConfig, TState>(instanceId, { authRef });
+    return this.connectSource<TConfig, TState>(instanceId, { authRef });
   }
 
-  async startOAuthIntegration(
+  async startOAuthSource(
     instanceId: string,
     input: { redirectUri: string },
   ): Promise<OAuthStartResult> {
     const existing = this.store.get(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     const registration = this.requireRegistration(existing.connectorId);
     const auth = registration.manifest.auth ?? { type: "none" };
@@ -542,13 +542,13 @@ export class ConnectorSupervisor {
     return this.startBrowserAuth(existing, () => this.authManager.startOAuth(existing, auth, input));
   }
 
-  async startAuthIntegration(
+  async startAuthSource(
     instanceId: string,
     input: { redirectUri: string },
   ): Promise<OAuthStartResult> {
     const existing = this.store.get(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     const registration = this.requireRegistration(existing.connectorId);
     const auth = registration.manifest.auth ?? { type: "none" };
@@ -584,9 +584,9 @@ export class ConnectorSupervisor {
     return result;
   }
 
-  ensureIntegration<TConfig = unknown, TState = unknown>(
-    input: EnsureIntegrationInput<TConfig>,
-  ): ConnectorIntegration<TConfig, TState> {
+  ensureSource<TConfig = unknown, TState = unknown>(
+    input: EnsureSourceInput<TConfig>,
+  ): ConnectorSource<TConfig, TState> {
     if (
       input.displayName !== undefined
       && input.displayName !== null
@@ -606,7 +606,7 @@ export class ConnectorSupervisor {
       validateConnectorSchedule(scheduleCron);
     }
     const packageHash = input.packageHash ?? registration.package?.contentHash;
-    const trustStatus = input.trustStatus ?? trustStatusForIntegration(registration.trust);
+    const trustStatus = input.trustStatus ?? trustStatusForSource(registration.trust);
     const storeInput = {
       ...input,
       setupStatus: "setup" as const,
@@ -619,7 +619,7 @@ export class ConnectorSupervisor {
       return this.store.ensure<TConfig, TState>(storeInput);
     }
 
-    let created: ConnectorIntegration<TConfig, TState>;
+    let created: ConnectorSource<TConfig, TState>;
     switch (registration.manifest.source.identity) {
       case "single":
         created = this.store.createSingle<TConfig, TState>(storeInput);
@@ -662,9 +662,9 @@ export class ConnectorSupervisor {
     return created;
   }
 
-  async addIntegration<TConfig = unknown, TState = unknown>(
-    input: Omit<EnsureIntegrationInput<TConfig>, "id">,
-  ): Promise<ConnectorIntegration<TConfig, TState>> {
+  async addSource<TConfig = unknown, TState = unknown>(
+    input: Omit<EnsureSourceInput<TConfig>, "id">,
+  ): Promise<ConnectorSource<TConfig, TState>> {
     const registration = this.requireRegistration(input.connectorId);
     if (this.updatingConnectorIds.has(input.connectorId)) {
       throw new ConnectorLifecycleConflictError(
@@ -674,7 +674,7 @@ export class ConnectorSupervisor {
     const before = registration.manifest.source.identity === "single"
       ? this.store.firstForConnector(input.connectorId)
       : undefined;
-    const created = this.ensureIntegration<TConfig, TState>(input);
+    const created = this.ensureSource<TConfig, TState>(input);
     let refreshed = await this.refreshSetupStatus(created.id, {
       allowIdentityResolution: false,
     });
@@ -687,31 +687,31 @@ export class ConnectorSupervisor {
     if (!before && refreshed.setupStatus === "ready") {
       this.requestRuntimeReconcile(refreshed.id, "source_created");
     }
-    return refreshed as ConnectorIntegration<TConfig, TState>;
+    return refreshed as ConnectorSource<TConfig, TState>;
   }
 
-  updateIntegration<TConfig = unknown, TState = unknown>(
+  updateSource<TConfig = unknown, TState = unknown>(
     instanceId: string,
-    input: NonConfigIntegrationUpdateInput,
-  ): ConnectorIntegration<TConfig, TState> {
+    input: NonConfigSourceUpdateInput,
+  ): ConnectorSource<TConfig, TState> {
     if ("config" in input) {
       throw new Error(
-        `Connector integration ${instanceId} config changes must use configureIntegration`,
+        `Connector Source ${instanceId} config changes must use configureSource`,
       );
     }
-    return this.persistIntegrationUpdate<TConfig, TState>(instanceId, input).updated;
+    return this.persistSourceUpdate<TConfig, TState>(instanceId, input).updated;
   }
 
-  async configureIntegration<TConfig = unknown, TState = unknown>(
+  async configureSource<TConfig = unknown, TState = unknown>(
     instanceId: string,
-    input: UpdateIntegrationInput<TConfig>,
-  ): Promise<ConnectorIntegration<TConfig, TState>> {
+    input: UpdateSourceInput<TConfig>,
+  ): Promise<ConnectorSource<TConfig, TState>> {
     const existing = this.store.get(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     const registration = this.requireRegistration(existing.connectorId);
-    this.validateIntegrationUpdateInput(existing, registration, input);
+    this.validateSourceUpdateInput(existing, registration, input);
     const previousEffectiveConfig = mergeConfig(
       schemaDefaults(registration.manifest),
       existing.config,
@@ -725,14 +725,14 @@ export class ConnectorSupervisor {
 
     if (registration.manifest.source.identity === "connector" && effectiveConfigChanged) {
       const refreshed = await this.withIdentityMutation(instanceId, async () => {
-        this.persistIntegrationUpdate<TConfig, TState>(instanceId, input);
+        this.persistSourceUpdate<TConfig, TState>(instanceId, input);
       });
       this.requestRuntimeReconcile(instanceId, "config_changed", false);
-      return refreshed as ConnectorIntegration<TConfig, TState>;
+      return refreshed as ConnectorSource<TConfig, TState>;
     }
 
-    const persisted = this.persistIntegrationUpdate<TConfig, TState>(instanceId, input);
-    let refreshed: ConnectorIntegration;
+    const persisted = this.persistSourceUpdate<TConfig, TState>(instanceId, input);
+    let refreshed: ConnectorSource;
     try {
       refreshed = await this.refreshSetupStatus(instanceId, {
         allowIdentityResolution: false,
@@ -750,22 +750,22 @@ export class ConnectorSupervisor {
     } else if (persisted.updated.setupStatus !== refreshed.setupStatus) {
       this.requestRuntimeReconcile(instanceId, "readiness_changed");
     }
-    return refreshed as ConnectorIntegration<TConfig, TState>;
+    return refreshed as ConnectorSource<TConfig, TState>;
   }
 
-  private persistIntegrationUpdate<TConfig = unknown, TState = unknown>(
+  private persistSourceUpdate<TConfig = unknown, TState = unknown>(
     instanceId: string,
-    input: UpdateIntegrationInput<TConfig>,
+    input: UpdateSourceInput<TConfig>,
   ): {
-    updated: ConnectorIntegration<TConfig, TState>;
+    updated: ConnectorSource<TConfig, TState>;
     effectiveConfigChanged: boolean;
   } {
     const existing = this.store.get(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     const registration = this.requireRegistration(existing.connectorId);
-    this.validateIntegrationUpdateInput(existing, registration, input);
+    this.validateSourceUpdateInput(existing, registration, input);
     const nextConfig = input.config === undefined ? existing.config : input.config;
     const previousEffectiveConfig = mergeConfig(
       schemaDefaults(registration.manifest),
@@ -790,29 +790,29 @@ export class ConnectorSupervisor {
     };
   }
 
-  private validateIntegrationUpdateInput(
-    existing: ConnectorIntegration,
+  private validateSourceUpdateInput(
+    existing: ConnectorSource,
     registration: Registration,
-    input: UpdateIntegrationInput<unknown>,
+    input: UpdateSourceInput<unknown>,
   ): void {
     if (!isPlatformSupported(registration.manifest, this.platform)) {
       throw new Error(`Connector ${existing.connectorId} is not supported on ${this.platform}`);
     }
     if (input.authRef !== undefined && input.authRef !== existing.authRef) {
       throw new Error(
-        `Connector integration ${existing.id} authRef changes must use connectIntegration`,
+        `Connector Source ${existing.id} authRef changes must use connectSource`,
       );
     }
     validateScheduleInput(input.scheduleCron);
   }
 
-  async connectIntegration<TConfig = unknown, TState = unknown>(
+  async connectSource<TConfig = unknown, TState = unknown>(
     instanceId: string,
-    input: ConnectIntegrationInput = {},
-  ): Promise<ConnectorIntegration<TConfig, TState>> {
+    input: ConnectSourceInput = {},
+  ): Promise<ConnectorSource<TConfig, TState>> {
     const existing = this.store.get(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     const registration = this.requireRegistration(existing.connectorId);
     const auth = registration.manifest.auth ?? { type: "none" };
@@ -824,27 +824,27 @@ export class ConnectorSupervisor {
     }
     const authRef = input.authRef ?? existing.authRef;
     if (!authRef || !(await this.authManager.hasToken(authRef))) {
-      throw new Error(`Connector integration ${instanceId} requires credentials before it can be ready`);
+      throw new Error(`Connector Source ${instanceId} requires credentials before it can be ready`);
     }
     if (registration.manifest.source.identity === "connector") {
       const connected = await this.withIdentityMutation(instanceId, async () => {
         this.store.update(instanceId, { authRef });
       });
       this.requestRuntimeReconcile(instanceId, "credential_connected", false);
-      return connected as ConnectorIntegration<TConfig, TState>;
+      return connected as ConnectorSource<TConfig, TState>;
     }
     this.store.update(instanceId, { authRef });
     const connected = await this.refreshSetupStatus(instanceId);
     this.requestRuntimeReconcile(instanceId, "credential_connected");
-    return connected as ConnectorIntegration<TConfig, TState>;
+    return connected as ConnectorSource<TConfig, TState>;
   }
 
-  async disconnectIntegration<TConfig = unknown, TState = unknown>(
+  async disconnectSource<TConfig = unknown, TState = unknown>(
     instanceId: string,
-  ): Promise<ConnectorIntegration<TConfig, TState>> {
+  ): Promise<ConnectorSource<TConfig, TState>> {
     const existing = this.store.get<TConfig, TState>(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     const registration = this.requireRegistration(existing.connectorId);
     if ((registration.manifest.auth ?? { type: "none" }).type === "none") {
@@ -864,7 +864,7 @@ export class ConnectorSupervisor {
       // The preserved run intent is waiting on this claim's barrier. Cancel
       // the browser attempt and release only that barrier before awaiting the
       // intent, while retaining the Connector exclusion through deletion.
-      this.authManager.cancelAttemptsForIntegration(instanceId);
+      this.authManager.cancelAttemptsForSource(instanceId);
       claimedBrowserAttempt.expiresAt = undefined;
       this.activeRuns.get(instanceId)?.releaseIdentityMutation();
     }
@@ -896,16 +896,16 @@ export class ConnectorSupervisor {
       && currentIdentityClaim !== claimedBrowserAttempt
       && currentIdentityClaim.sourceId === instanceId
     ) {
-      this.authManager.cancelAttemptsForIntegration(instanceId);
+      this.authManager.cancelAttemptsForSource(instanceId);
       currentIdentityClaim.expiresAt = undefined;
       claimedBrowserAttempt = currentIdentityClaim;
     }
     if (!claimedBrowserAttempt) {
-      this.authManager.cancelAttemptsForIntegration(instanceId);
+      this.authManager.cancelAttemptsForSource(instanceId);
     }
     try {
-      await this.authManager.deleteIntegrationCredentials(instanceId, existing.authRef);
-      return (await this.refreshSetupStatus(instanceId)) as ConnectorIntegration<TConfig, TState>;
+      await this.authManager.deleteSourceCredentials(instanceId, existing.authRef);
+      return (await this.refreshSetupStatus(instanceId)) as ConnectorSource<TConfig, TState>;
     } finally {
       if (claimedBrowserAttempt) {
         this.releaseIdentityMutation(existing.connectorId, claimedBrowserAttempt);
@@ -932,7 +932,7 @@ export class ConnectorSupervisor {
       .sort((a, b) => a.name.localeCompare(b.name) || a.connectorId.localeCompare(b.connectorId));
   }
 
-  async list(): Promise<Array<ConnectorIntegration & {
+  async list(): Promise<Array<ConnectorSource & {
     name: string;
     connectorName: string;
     description?: string;
@@ -955,18 +955,18 @@ export class ConnectorSupervisor {
 	    configSchema?: Record<string, ConnectorConfigField>;
 	    configPanels?: Record<string, ConnectorConfigPanel>;
 	  }>> {
-    return Promise.all(this.store.list().map(async (integration) => {
-      const registration = this.registrations.get(integration.connectorId);
+    return Promise.all(this.store.list().map(async (sourceRecord) => {
+      const registration = this.registrations.get(sourceRecord.connectorId);
       const identityKind = registration?.manifest.source.identity ?? "single";
       const identityReady = registration
-        ? identityPairResolved(integration, identityKind)
-        : integration.identityStatus === "resolved";
+        ? identityPairResolved(sourceRecord, identityKind)
+        : sourceRecord.identityStatus === "resolved";
       const activeRequirements = registration
         ? activePlatformRequirements(registration.manifest, this.platform)
         : [];
       const authSpec = registration?.manifest.auth ?? { type: "none" };
       const authType = authSpec.type;
-      const credential = integration.authRef ? this.authManager.credential(integration.authRef) : undefined;
+      const credential = sourceRecord.authRef ? this.authManager.credential(sourceRecord.authRef) : undefined;
       const storedRedirectUri = typeof credential?.metadata?.redirect_uri === "string"
         ? credential.metadata.redirect_uri
         : undefined;
@@ -979,35 +979,35 @@ export class ConnectorSupervisor {
             ? "redirect_uri_changed"
             : undefined;
       const authReady = authType === "none"
-        || Boolean(integration.authRef && (await this.authManager.hasToken(integration.authRef)));
+        || Boolean(sourceRecord.authRef && (await this.authManager.hasToken(sourceRecord.authRef)));
 
       const setupPending: ConnectorSetupPendingReason[] = [];
       if (registration) {
         if (!authReady) setupPending.push("auth");
-        if (!this.requirementsSatisfiedFor(registration.manifest, integration)) {
+        if (!this.requirementsSatisfiedFor(registration.manifest, sourceRecord)) {
           setupPending.push("requirements");
         }
-        if (!this.configSatisfiedFor(registration.manifest, integration.config)) {
+        if (!this.configSatisfiedFor(registration.manifest, sourceRecord.config)) {
           setupPending.push("config");
         }
         if (!identityReady) setupPending.push("identity");
       }
 
       const ownership = registration
-        ? this.ownershipFor(integration, registration.manifest)
+        ? this.ownershipFor(sourceRecord, registration.manifest)
         : "here";
-      const connectorName = registration?.manifest.name ?? integration.connectorId;
-      const conflictSourceId = integration.identityStatus === "conflict"
-        && integration.lastResolvedKey
-        ? this.store.getBySourceKey(integration.connectorId, integration.lastResolvedKey)?.id
+      const connectorName = registration?.manifest.name ?? sourceRecord.connectorId;
+      const conflictSourceId = sourceRecord.identityStatus === "conflict"
+        && sourceRecord.lastResolvedKey
+        ? this.store.getBySourceKey(sourceRecord.connectorId, sourceRecord.lastResolvedKey)?.id
         : undefined;
 
       return {
-        ...integration,
+        ...sourceRecord,
         setupStatus: registration
           ? setupPending.length > 0 ? "setup" : "ready"
-          : integration.setupStatus,
-        name: integration.displayName ?? integration.suggestedLabel ?? connectorName,
+          : sourceRecord.setupStatus,
+        name: sourceRecord.displayName ?? sourceRecord.suggestedLabel ?? connectorName,
         connectorName,
         ...(registration ? { description: registration.manifest.description } : {}),
         mode: registration?.manifest.runtime.mode ?? "unknown",
@@ -1018,9 +1018,9 @@ export class ConnectorSupervisor {
           : {}),
         ...(conflictSourceId ? { conflictSourceId } : {}),
         source: identityReady
-          ? sourceForConnector(integration.connectorId, integration.sourceKey ?? undefined)
+          ? sourceForConnector(sourceRecord.connectorId, sourceRecord.sourceKey ?? undefined)
           : null,
-        running: this.activeRuns.has(integration.id),
+        running: this.activeRuns.has(sourceRecord.id),
         supported: registration ? isPlatformSupported(registration.manifest, this.platform) : false,
         packageTrust: registration?.trust.status ?? "missing",
         authType,
@@ -1030,11 +1030,11 @@ export class ConnectorSupervisor {
         setupPending,
         requirements: activeRequirements.map((id) => ({
           id,
-          status: integration.requirementsStatus?.[id]?.status ?? "unknown",
-          message: integration.requirementsStatus?.[id]?.message,
-          lastCheckedAt: integration.requirementsStatus?.[id]?.lastCheckedAt,
+          status: sourceRecord.requirementsStatus?.[id]?.status ?? "unknown",
+          message: sourceRecord.requirementsStatus?.[id]?.message,
+          lastCheckedAt: sourceRecord.requirementsStatus?.[id]?.lastCheckedAt,
         })),
-	        recentRuns: this.store.listRuns(integration.id),
+	        recentRuns: this.store.listRuns(sourceRecord.id),
 	        configSchema: registration?.manifest.config,
 	        configPanels: registration?.manifest.configPanels,
 	      };
@@ -1089,7 +1089,7 @@ export class ConnectorSupervisor {
       if (existing.expiresAt !== undefined && Date.now() > existing.expiresAt) {
         // Expiry must invalidate the auth generation as well as the exclusion;
         // otherwise an already-running callback could commit after the sweep.
-        this.authManager.cancelAttemptsForIntegration(existing.sourceId);
+        this.authManager.cancelAttemptsForSource(existing.sourceId);
         this.identityMutations.delete(connectorId);
         this.activeRuns.get(existing.sourceId)?.releaseIdentityMutation();
       } else {
@@ -1121,10 +1121,10 @@ export class ConnectorSupervisor {
   private async withIdentityMutation<TConfig = unknown, TState = unknown>(
     instanceId: string,
     commit: () => Promise<void> | void = () => {},
-  ): Promise<ConnectorIntegration<TConfig, TState>> {
+  ): Promise<ConnectorSource<TConfig, TState>> {
     const existing = this.store.get(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     const registration = this.requireRegistration(existing.connectorId);
     if (registration.manifest.source.identity !== "connector") {
@@ -1143,50 +1143,50 @@ export class ConnectorSupervisor {
         );
         throw error;
       }
-      return await this.resolveSourceIdentityInClaim(instanceId) as ConnectorIntegration<TConfig, TState>;
+      return await this.resolveSourceIdentityInClaim(instanceId) as ConnectorSource<TConfig, TState>;
     } finally {
       this.releaseIdentityMutation(existing.connectorId, claim);
     }
   }
 
   private async startBrowserAuth(
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
     start: () => Promise<OAuthStartResult> | OAuthStartResult,
   ): Promise<OAuthStartResult> {
-    const registration = this.requireRegistration(integration.connectorId);
+    const registration = this.requireRegistration(sourceRecord.connectorId);
     if (registration.manifest.source.identity !== "connector") {
       return await start();
     }
 
-    const claim = this.claimIdentityMutation(integration.connectorId, integration.id);
+    const claim = this.claimIdentityMutation(sourceRecord.connectorId, sourceRecord.id);
     try {
-      this.store.beginIdentityResolution(integration.id);
-      await this.drainExecutionAttemptForIdentity(integration.id);
+      this.store.beginIdentityResolution(sourceRecord.id);
+      await this.drainExecutionAttemptForIdentity(sourceRecord.id);
       const result = await start();
       claim.expiresAt = result.expiresAt;
       return result;
     } catch (error) {
       this.store.publishIdentityError(
-        integration.id,
-        sanitizeSourceIdentityError(integration.connectorId, error),
+        sourceRecord.id,
+        sanitizeSourceIdentityError(sourceRecord.connectorId, error),
       );
-      this.releaseIdentityMutation(integration.connectorId, claim);
+      this.releaseIdentityMutation(sourceRecord.connectorId, claim);
       throw error;
     }
   }
 
   private async resolveSourceIdentityInClaim(
     instanceId: string,
-  ): Promise<ConnectorIntegration> {
-    let integration = this.store.get(instanceId);
-    if (!integration) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+  ): Promise<ConnectorSource> {
+    let sourceRecord = this.store.get(instanceId);
+    if (!sourceRecord) {
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
-    const registration = this.requireRegistration(integration.connectorId);
+    const registration = this.requireRegistration(sourceRecord.connectorId);
     if (registration.manifest.source.identity !== "connector") {
-      throw new Error(`Connector ${integration.connectorId} does not resolve Source identity`);
+      throw new Error(`Connector ${sourceRecord.connectorId} does not resolve Source identity`);
     }
-    if (!(await this.otherIdentityGatesReady(registration.manifest, integration))) {
+    if (!(await this.otherIdentityGatesReady(registration.manifest, sourceRecord))) {
       return await this.refreshSetupStatus(instanceId, { allowIdentityResolution: false });
     }
 
@@ -1194,26 +1194,26 @@ export class ConnectorSupervisor {
     let session: RunnerSession | undefined;
     try {
       session = await this.openTrustedSession(registration, controller.signal);
-      integration = this.store.get(instanceId)!;
+      sourceRecord = this.store.get(instanceId)!;
       const result = await session.resolveSourceIdentity({
-        connectorId: integration.connectorId,
-        config: mergeConfig(schemaDefaults(registration.manifest), integration.config),
+        connectorId: sourceRecord.connectorId,
+        config: mergeConfig(schemaDefaults(registration.manifest), sourceRecord.config),
         signal: controller.signal,
-        capabilities: this.buildSourceIdentityCapabilities(registration, integration),
+        capabilities: this.buildSourceIdentityCapabilities(registration, sourceRecord),
       });
       const validated = validateConnectorSourceIdentityResult(
-        integration.connectorId,
+        sourceRecord.connectorId,
         result,
       );
       this.store.publishSourceIdentity(
-        integration.id,
+        sourceRecord.id,
         validated.key,
         validated.label,
       );
     } catch (error) {
       this.store.publishIdentityError(
         instanceId,
-        sanitizeSourceIdentityError(integration.connectorId, error),
+        sanitizeSourceIdentityError(sourceRecord.connectorId, error),
       );
     } finally {
       controller.abort();
@@ -1224,30 +1224,30 @@ export class ConnectorSupervisor {
 
   private async otherIdentityGatesReady(
     manifest: ConnectorManifest,
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
   ): Promise<boolean> {
     const auth = manifest.auth ?? { type: "none" as const };
     const authReady = auth.type === "none"
-      || Boolean(integration.authRef && await this.authManager.hasToken(integration.authRef));
+      || Boolean(sourceRecord.authRef && await this.authManager.hasToken(sourceRecord.authRef));
     return authReady
-      && this.requirementsSatisfiedFor(manifest, integration)
-      && this.configSatisfiedFor(manifest, integration.config);
+      && this.requirementsSatisfiedFor(manifest, sourceRecord)
+      && this.configSatisfiedFor(manifest, sourceRecord.config);
   }
 
   private async finalizeConnectedAuthAttempt(result: OAuthAttemptView): Promise<void> {
-    if (!result.integrationId) return;
-    const integration = this.store.get(result.integrationId);
-    if (!integration) return;
-    const registration = this.requireRegistration(integration.connectorId);
+    if (!result.sourceId) return;
+    const sourceRecord = this.store.get(result.sourceId);
+    if (!sourceRecord) return;
+    const registration = this.requireRegistration(sourceRecord.connectorId);
     const identityClaim = registration.manifest.source.identity === "connector"
-      ? this.identityMutations.get(integration.connectorId)
+      ? this.identityMutations.get(sourceRecord.connectorId)
       : undefined;
 
     if (registration.manifest.source.identity === "connector") {
-      if (!identityClaim || identityClaim.sourceId !== integration.id) return;
+      if (!identityClaim || identityClaim.sourceId !== sourceRecord.id) return;
       if (result.status === "pending") return;
       if (result.status !== "connected" || !result.authRef) {
-        this.releaseIdentityMutation(integration.connectorId, identityClaim);
+        this.releaseIdentityMutation(sourceRecord.connectorId, identityClaim);
         return;
       }
     } else if (result.status !== "connected" || !result.authRef) {
@@ -1268,16 +1268,16 @@ export class ConnectorSupervisor {
     if (identityClaim) identityClaim.expiresAt = undefined;
 
     try {
-      if (integration.authRef !== result.authRef) {
-        this.store.update(integration.id, { authRef: result.authRef });
+      if (sourceRecord.authRef !== result.authRef) {
+        this.store.update(sourceRecord.id, { authRef: result.authRef });
       }
       if (identityClaim) {
-        await this.resolveSourceIdentityInClaim(integration.id);
+        await this.resolveSourceIdentityInClaim(sourceRecord.id);
       } else {
-        await this.refreshSetupStatus(integration.id);
+        await this.refreshSetupStatus(sourceRecord.id);
       }
       this.requestRuntimeReconcile(
-        integration.id,
+        sourceRecord.id,
         "credential_connected",
         identityClaim === undefined,
       );
@@ -1288,18 +1288,18 @@ export class ConnectorSupervisor {
       throw err;
     } finally {
       if (identityClaim) {
-        this.releaseIdentityMutation(integration.connectorId, identityClaim);
+        this.releaseIdentityMutation(sourceRecord.connectorId, identityClaim);
       }
     }
   }
 
-  async pauseIntegration<TConfig = unknown, TState = unknown>(
+  async pauseSource<TConfig = unknown, TState = unknown>(
     instanceId: string,
     durationMs?: number,
-  ): Promise<ConnectorIntegration<TConfig, TState>> {
+  ): Promise<ConnectorSource<TConfig, TState>> {
     const existing = this.store.get<TConfig, TState>(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     this.requireRegistration(existing.connectorId);
     if (durationMs !== undefined && (!Number.isFinite(durationMs) || durationMs <= 0)) {
@@ -1321,15 +1321,15 @@ export class ConnectorSupervisor {
     return this.store.get<TConfig, TState>(instanceId)!;
   }
 
-  resumeIntegration<TConfig = unknown, TState = unknown>(
+  resumeSource<TConfig = unknown, TState = unknown>(
     instanceId: string,
-  ): ConnectorIntegration<TConfig, TState> {
+  ): ConnectorSource<TConfig, TState> {
     const existing = this.store.get(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     this.requireRegistration(existing.connectorId);
-    return this.store.resume(instanceId) as ConnectorIntegration<TConfig, TState>;
+    return this.store.resume(instanceId) as ConnectorSource<TConfig, TState>;
   }
 
   resumeExpiredPauses(now = Date.now()): number {
@@ -1340,16 +1340,16 @@ export class ConnectorSupervisor {
 	    instanceId: string,
 	    panelId: string,
 	  ): Promise<{ sessionId: string; url: string }> {
-	    const integration = this.store.get(instanceId);
-	    if (!integration) {
-	      throw new Error(`Connector integration not found: ${instanceId}`);
+	    const sourceRecord = this.store.get(instanceId);
+	    if (!sourceRecord) {
+	      throw new Error(`Connector Source not found: ${instanceId}`);
 	    }
-	    const registration = this.requireRegistration(integration.connectorId);
+	    const registration = this.requireRegistration(sourceRecord.connectorId);
 	    if (!isPlatformSupported(registration.manifest, this.platform)) {
-	      throw new Error(`Connector ${integration.connectorId} is not supported on ${this.platform}`);
+	      throw new Error(`Connector ${sourceRecord.connectorId} is not supported on ${this.platform}`);
 	    }
 	    if (!registration.manifest.configPanels?.[panelId]) {
-	      throw new Error(`Connector ${integration.connectorId} does not declare config panel: ${panelId}`);
+	      throw new Error(`Connector ${sourceRecord.connectorId} does not declare config panel: ${panelId}`);
 	    }
 
 	    const controller = new AbortController();
@@ -1357,21 +1357,21 @@ export class ConnectorSupervisor {
 	    try {
 	      session = await this.openTrustedSession(registration, controller.signal);
 	      if (!registration.manifest.configPanels?.[panelId]) {
-	        throw new Error(`Connector ${integration.connectorId} does not declare config panel: ${panelId}`);
+	        throw new Error(`Connector ${sourceRecord.connectorId} does not declare config panel: ${panelId}`);
 	      }
-	      const config = mergeConfig(schemaDefaults(registration.manifest), integration.config);
+	      const config = mergeConfig(schemaDefaults(registration.manifest), sourceRecord.config);
 	      const result = await session.configUi({
 	        panelId,
 	        config,
 	        signal: controller.signal,
-	        capabilities: this.buildConfigUiCapabilities(integration.id),
+	        capabilities: this.buildConfigUiCapabilities(sourceRecord.id),
 	      });
 	      validateConfigUiUrl(result.url);
 	      const sessionId = newConfigUiSessionId();
 	      this.activeConfigUiSessions.set(sessionId, {
 	        id: sessionId,
-	        instanceId: integration.id,
-	        connectorId: integration.connectorId,
+	        instanceId: sourceRecord.id,
+	        connectorId: sourceRecord.connectorId,
 	        panelId,
 	        controller,
 	        session,
@@ -1395,33 +1395,33 @@ export class ConnectorSupervisor {
 	    return true;
 	  }
 
-  getIntegration<TConfig = unknown, TState = unknown>(
+  getSource<TConfig = unknown, TState = unknown>(
     instanceId: string,
-  ): ConnectorIntegration<TConfig, TState> | undefined {
+  ): ConnectorSource<TConfig, TState> | undefined {
     return this.store.get<TConfig, TState>(instanceId);
   }
 
-  renameIntegration<TConfig = unknown, TState = unknown>(
+  renameSource<TConfig = unknown, TState = unknown>(
     instanceId: string,
     displayName: string | null,
-  ): ConnectorIntegration<TConfig, TState> {
+  ): ConnectorSource<TConfig, TState> {
     const existing = this.store.get(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     this.requireRegistration(existing.connectorId);
     if (displayName !== null && typeof displayName !== "string") {
       throw new Error("Source displayName must be a string or null");
     }
-    return this.store.setDisplayName(instanceId, displayName) as ConnectorIntegration<TConfig, TState>;
+    return this.store.setDisplayName(instanceId, displayName) as ConnectorSource<TConfig, TState>;
   }
 
   async retrySourceIdentity<TConfig = unknown, TState = unknown>(
     instanceId: string,
-  ): Promise<ConnectorIntegration<TConfig, TState>> {
+  ): Promise<ConnectorSource<TConfig, TState>> {
     const existing = this.store.get(instanceId);
     if (!existing) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
     const registration = this.requireRegistration(existing.connectorId);
     if (registration.manifest.source.identity !== "connector") {
@@ -1440,17 +1440,17 @@ export class ConnectorSupervisor {
   // Startup recovery is deliberately the ordinary setup path: every durable
   // non-resolved Connector identity is retried only after the other gates pass.
   async recoverSourceIdentities(): Promise<void> {
-    for (const source of this.store.list()) {
-      const registration = this.registrations.get(source.connectorId);
+    for (const sourceRecord of this.store.list()) {
+      const registration = this.registrations.get(sourceRecord.connectorId);
       if (!registration) continue;
       if (
         registration.manifest.source.identity === "connector"
-        && source.identityStatus !== "resolved"
-        && await this.otherIdentityGatesReady(registration.manifest, source)
+        && sourceRecord.identityStatus !== "resolved"
+        && await this.otherIdentityGatesReady(registration.manifest, sourceRecord)
       ) {
-        await this.withIdentityMutation(source.id);
+        await this.withIdentityMutation(sourceRecord.id);
       } else {
-        await this.refreshSetupStatus(source.id, { allowIdentityResolution: false });
+        await this.refreshSetupStatus(sourceRecord.id, { allowIdentityResolution: false });
       }
     }
   }
@@ -1459,52 +1459,52 @@ export class ConnectorSupervisor {
     return this.authManager;
   }
 
-  // Re-runs the unified setup evaluator for one integration. Use after edits
+  // Re-runs the unified setup evaluator for one Source. Use after edits
   // that can complete setup without an auth/requirement action (for example
-  // setting the integration key on a no-auth connector).
-  async refreshIntegrationSetup<TConfig = unknown, TState = unknown>(
+  // setting the Source key on a no-auth connector).
+  async refreshSourceSetup<TConfig = unknown, TState = unknown>(
     instanceId: string,
-  ): Promise<ConnectorIntegration<TConfig, TState>> {
+  ): Promise<ConnectorSource<TConfig, TState>> {
     return (
       await this.refreshSetupStatus(instanceId, { reconcileTransition: true })
-    ) as ConnectorIntegration<TConfig, TState>;
+    ) as ConnectorSource<TConfig, TState>;
   }
 
-  // Explicit human recovery for a crashed run. Crashed ready integrations stay
+  // Explicit human recovery for a crashed run. Crashed ready sources stay
   // in error ("needs attention") by design — a connector bug should be seen,
   // not silently retried. Restart resets to idle so the scheduler picks the
-  // integration up again.
-  restartIntegration<TConfig = unknown, TState = unknown>(
+  // Source up again.
+  restartSource<TConfig = unknown, TState = unknown>(
     instanceId: string,
-  ): ConnectorIntegration<TConfig, TState> {
-    const integration = this.store.get<TConfig, TState>(instanceId);
-    if (!integration) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+  ): ConnectorSource<TConfig, TState> {
+    const sourceRecord = this.store.get<TConfig, TState>(instanceId);
+    if (!sourceRecord) {
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
-    this.requireRegistration(integration.connectorId);
-    if (this.activeRuns.has(instanceId) || integration.status === "running") {
-      throw new Error(`Connector integration is already running: ${instanceId}`);
+    this.requireRegistration(sourceRecord.connectorId);
+    if (this.activeRuns.has(instanceId) || sourceRecord.status === "running") {
+      throw new Error(`Connector Source is already running: ${instanceId}`);
     }
-    if (integration.setupStatus !== "ready") {
-      throw new Error(`Connector integration is not set up: ${instanceId}`);
+    if (sourceRecord.setupStatus !== "ready") {
+      throw new Error(`Connector Source is not set up: ${instanceId}`);
     }
-    if (integration.status !== "error") {
-      return integration;
+    if (sourceRecord.status !== "error") {
+      return sourceRecord;
     }
     this.store.resetErrorToIdle(instanceId);
     return this.store.get<TConfig, TState>(instanceId)!;
   }
 
-  async checkIntegrationRequirements(
+  async checkSourceRequirements(
     instanceId: string,
   ): Promise<Record<string, ConnectorRequirementRecord>> {
-    const integration = this.store.get(instanceId);
-    if (!integration) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+    const sourceRecord = this.store.get(instanceId);
+    if (!sourceRecord) {
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
-    const registration = this.requireRegistration(integration.connectorId);
+    const registration = this.requireRegistration(sourceRecord.connectorId);
     if (!isPlatformSupported(registration.manifest, this.platform)) {
-      throw new Error(`Connector ${integration.connectorId} is not supported on ${this.platform}`);
+      throw new Error(`Connector ${sourceRecord.connectorId} is not supported on ${this.platform}`);
     }
     const requirementIds = activePlatformRequirements(registration.manifest, this.platform);
     if (requirementIds.length === 0) return {};
@@ -1514,7 +1514,7 @@ export class ConnectorSupervisor {
     // execute in a separate runner process.
     const session = await this.openTrustedSession(registration);
     try {
-      const records = await this.evaluateRequirements(registration, integration, session, requirementIds);
+      const records = await this.evaluateRequirements(registration, sourceRecord, session, requirementIds);
       await this.refreshSetupStatus(instanceId, { reconcileTransition: true });
       return records;
     } finally {
@@ -1522,19 +1522,19 @@ export class ConnectorSupervisor {
     }
   }
 
-  async requestIntegrationRequirement(
+  async requestSourceRequirement(
     instanceId: string,
     requirementId: string,
   ): Promise<ConnectorRequirementRecord> {
-    const integration = this.store.get(instanceId);
-    if (!integration) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+    const sourceRecord = this.store.get(instanceId);
+    if (!sourceRecord) {
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
-    const registration = this.requireRegistration(integration.connectorId);
+    const registration = this.requireRegistration(sourceRecord.connectorId);
     const requirementIds = activePlatformRequirements(registration.manifest, this.platform);
     if (!requirementIds.includes(requirementId)) {
       throw new Error(
-        `Connector ${integration.connectorId} has no active requirement ${requirementId} on ${this.platform}`,
+        `Connector ${sourceRecord.connectorId} has no active requirement ${requirementId} on ${this.platform}`,
       );
     }
 
@@ -1542,11 +1542,11 @@ export class ConnectorSupervisor {
     try {
       if (!session.requirementIds().includes(requirementId)) {
         throw new Error(
-          `Connector ${integration.connectorId} does not implement requirement handler: ${requirementId}`,
+          `Connector ${sourceRecord.connectorId} does not implement requirement handler: ${requirementId}`,
         );
       }
 
-      const ctx = this.requirementContext(integration);
+      const ctx = this.requirementContext(sourceRecord);
       const rawRequest = await session.request(requirementId, ctx);
       const requestStatus = rawRequest === null ? undefined : normalizeRequirementStatus(rawRequest);
       if (requestStatus?.status === "error") {
@@ -1559,7 +1559,7 @@ export class ConnectorSupervisor {
         return record;
       }
 
-      const records = await this.evaluateRequirements(registration, integration, session, [requirementId]);
+      const records = await this.evaluateRequirements(registration, sourceRecord, session, [requirementId]);
       let record = records[requirementId];
       // check() is the authority for grants, but an in-flight request must stay
       // visible: when request() reports pending (e.g. "grant in System Settings")
@@ -1576,31 +1576,31 @@ export class ConnectorSupervisor {
     }
   }
 
-  private requirementContext(integration: ConnectorIntegration): ConnectorRequirementContext {
+  private requirementContext(sourceRecord: ConnectorSource): ConnectorRequirementContext {
     return {
-      connectorId: integration.connectorId,
-      integrationId: integration.id,
+      connectorId: sourceRecord.connectorId,
+      sourceId: sourceRecord.id,
       platform: this.platform,
     };
   }
 
   private requirementsSatisfiedFor(
     manifest: ConnectorManifest,
-    integration: ConnectorIntegration | undefined,
+    sourceRecord: ConnectorSource | undefined,
   ): boolean {
     const requirementIds = activePlatformRequirements(manifest, this.platform);
     if (requirementIds.length === 0) return true;
-    const status = integration?.requirementsStatus;
+    const status = sourceRecord?.requirementsStatus;
     return requirementIds.every((id) => status?.[id]?.status === "satisfied");
   }
 
   private async evaluateRequirements(
     registration: Registration,
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
     session: RunnerSession,
     requirementIds: string[],
   ): Promise<Record<string, ConnectorRequirementRecord>> {
-    const ctx = this.requirementContext(integration);
+    const ctx = this.requirementContext(sourceRecord);
     const results = await session.check(requirementIds, ctx);
     const updates: Record<string, ConnectorRequirementRecord> = {};
     for (const id of requirementIds) {
@@ -1613,7 +1613,7 @@ export class ConnectorSupervisor {
         : normalizeRequirementStatus(result);
       updates[id] = { ...status, lastCheckedAt: Date.now() };
     }
-    return this.persistRequirementRecords(integration.id, updates);
+    return this.persistRequirementRecords(sourceRecord.id, updates);
   }
 
   private persistRequirementRecords(
@@ -1627,17 +1627,17 @@ export class ConnectorSupervisor {
   }
 
   // Unified setup evaluator: ready requires source identity + auth + active
-  // platform requirements all satisfied. Demotes ready integrations whose
-  // requirements regressed; promotes setup integrations once everything passes.
+  // platform requirements all satisfied. Demotes ready sources whose
+  // requirements regressed; promotes setup sources once everything passes.
   private async refreshSetupStatus(
     instanceId: string,
     opts: { reconcileTransition?: boolean; allowIdentityResolution?: boolean } = {},
-  ): Promise<ConnectorIntegration> {
-    let integration = this.store.get(instanceId);
-    if (!integration) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+  ): Promise<ConnectorSource> {
+    let sourceRecord = this.store.get(instanceId);
+    if (!sourceRecord) {
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
-    const registration = this.requireRegistration(integration.connectorId);
+    const registration = this.requireRegistration(sourceRecord.connectorId);
     const manifest = registration.manifest;
     const requiresAuth = (manifest.auth ?? { type: "none" }).type !== "none";
 
@@ -1647,21 +1647,21 @@ export class ConnectorSupervisor {
       // concurrent config writes cannot promote or demote readiness from a
       // stale snapshot. If authRef itself changed, evaluate the latest ref.
       while (true) {
-        const evaluatedAuthRef = integration.authRef;
+        const evaluatedAuthRef = sourceRecord.authRef;
         authReady = Boolean(
           evaluatedAuthRef && (await this.authManager.hasToken(evaluatedAuthRef)),
         );
         const latest = this.store.get(instanceId);
         if (!latest) {
-          throw new Error(`Connector integration not found: ${instanceId}`);
+          throw new Error(`Connector Source not found: ${instanceId}`);
         }
-        integration = latest;
-        if (integration.authRef === evaluatedAuthRef) break;
+        sourceRecord = latest;
+        if (sourceRecord.authRef === evaluatedAuthRef) break;
       }
     }
 
-    const requirementsReady = this.requirementsSatisfiedFor(manifest, integration);
-    const configReady = this.configSatisfiedFor(manifest, integration.config);
+    const requirementsReady = this.requirementsSatisfiedFor(manifest, sourceRecord);
+    const configReady = this.configSatisfiedFor(manifest, sourceRecord.config);
     const otherGatesReady = requirementsReady && authReady && configReady;
 
     // Identity is the final setup gate. Automatic recovery uses the same
@@ -1669,10 +1669,10 @@ export class ConnectorSupervisor {
     // while a mutation already owns the exclusion.
     if (
       manifest.source.identity === "connector"
-      && integration.identityStatus !== "resolved"
+      && sourceRecord.identityStatus !== "resolved"
       && otherGatesReady
       && opts.allowIdentityResolution !== false
-      && !this.identityMutations.has(integration.connectorId)
+      && !this.identityMutations.has(sourceRecord.connectorId)
     ) {
       const resolved = await this.withIdentityMutation(instanceId);
       if (opts.reconcileTransition && resolved.setupStatus === "ready") {
@@ -1681,24 +1681,24 @@ export class ConnectorSupervisor {
       return resolved;
     }
 
-    const identityReady = identityPairResolved(integration, manifest.source.identity);
+    const identityReady = identityPairResolved(sourceRecord, manifest.source.identity);
     const eligible = identityReady && otherGatesReady;
 
-    if (integration.setupStatus === "ready" && !eligible) {
+    if (sourceRecord.setupStatus === "ready" && !eligible) {
       const refreshed = this.store.update(instanceId, { setupStatus: "setup" });
       if (opts.reconcileTransition) {
         this.requestRuntimeReconcile(instanceId, "readiness_changed");
       }
       return refreshed;
     }
-    if (integration.setupStatus === "setup" && eligible) {
+    if (sourceRecord.setupStatus === "setup" && eligible) {
       const refreshed = this.store.update(instanceId, { setupStatus: "ready" });
       if (opts.reconcileTransition) {
         this.requestRuntimeReconcile(instanceId, "readiness_changed");
       }
       return refreshed;
     }
-    return integration;
+    return sourceRecord;
   }
 
   // Auth gets the same run-time recheck as requirements: a token deleted or
@@ -1707,64 +1707,64 @@ export class ConnectorSupervisor {
   // connector code.
   private async assertRunAuth(
     registration: Registration,
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
   ): Promise<void> {
     const auth = registration.manifest.auth ?? { type: "none" };
     if (auth.type === "none") return;
-    if (integration.authRef && (await this.authManager.hasToken(integration.authRef))) return;
-    this.store.update(integration.id, { setupStatus: "setup" });
+    if (sourceRecord.authRef && (await this.authManager.hasToken(sourceRecord.authRef))) return;
+    this.store.update(sourceRecord.id, { setupStatus: "setup" });
     throw new Error(
-      `Connector ${integration.connectorId} credentials are missing; reconnect the integration`,
+      `Connector ${sourceRecord.connectorId} credentials are missing; reconnect the Source`,
     );
   }
 
   private async assertRunRequirements(
     registration: Registration,
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
     session: RunnerSession,
   ): Promise<void> {
     const requirementIds = activePlatformRequirements(registration.manifest, this.platform);
     if (requirementIds.length === 0) return;
 
-    const records = await this.evaluateRequirements(registration, integration, session, requirementIds);
+    const records = await this.evaluateRequirements(registration, sourceRecord, session, requirementIds);
     const unsatisfied = requirementIds.filter((id) => records[id]?.status !== "satisfied");
     if (unsatisfied.length > 0) {
-      this.store.update(integration.id, { setupStatus: "setup" });
+      this.store.update(sourceRecord.id, { setupStatus: "setup" });
       throw new Error(
-        `Connector ${integration.connectorId} requirements not satisfied: ${unsatisfied.join(", ")}`,
+        `Connector ${sourceRecord.connectorId} requirements not satisfied: ${unsatisfied.join(", ")}`,
       );
     }
   }
 
   private createRun(instanceId: string, opts?: { trigger?: ConnectorRunTrigger }): ActiveRunIntent {
     if (this.activeRuns.has(instanceId)) {
-      throw new Error(`Connector integration already running: ${instanceId}`);
+      throw new Error(`Connector Source already running: ${instanceId}`);
     }
 
-    const integration = this.store.get(instanceId);
-    if (!integration) {
-      throw new Error(`Connector integration not found: ${instanceId}`);
+    const sourceRecord = this.store.get(instanceId);
+    if (!sourceRecord) {
+      throw new Error(`Connector Source not found: ${instanceId}`);
     }
-    if (this.updatingConnectorIds.has(integration.connectorId)) {
+    if (this.updatingConnectorIds.has(sourceRecord.connectorId)) {
       throw new ConnectorLifecycleConflictError(
-        `Connector ${integration.connectorId} is updating`,
+        `Connector ${sourceRecord.connectorId} is updating`,
       );
     }
-    if (this.identityMutations.has(integration.connectorId)) {
+    if (this.identityMutations.has(sourceRecord.connectorId)) {
       throw new ConnectorLifecycleConflictError(
-        `Connector ${integration.connectorId} has an identity mutation in progress`,
+        `Connector ${sourceRecord.connectorId} has an identity mutation in progress`,
       );
     }
     const trigger = opts?.trigger ?? "manual";
-    if (trigger !== "manual" && isIntegrationPaused(integration)) {
+    if (trigger !== "manual" && isSourcePaused(sourceRecord)) {
       throw new Error(`Connector source is paused: ${instanceId}`);
     }
-    if (integration.setupStatus !== "ready") {
-      throw new Error(`Connector integration is not set up: ${instanceId}`);
+    if (sourceRecord.setupStatus !== "ready") {
+      throw new Error(`Connector Source is not set up: ${instanceId}`);
     }
 
-    const registration = this.requireRegistration(integration.connectorId);
-    const ownership = this.ownershipFor(integration, registration.manifest);
+    const registration = this.requireRegistration(sourceRecord.connectorId);
+    const ownership = this.ownershipFor(sourceRecord, registration.manifest);
     if (ownership !== "here") {
       throw new Error(
         ownership === "device-unknown"
@@ -1773,19 +1773,19 @@ export class ConnectorSupervisor {
       );
     }
     if (!isPlatformSupported(registration.manifest, this.platform)) {
-      throw new Error(`Connector ${integration.connectorId} is not supported on ${this.platform}`);
+      throw new Error(`Connector ${sourceRecord.connectorId} is not supported on ${this.platform}`);
     }
     if (!this.configSatisfiedFor(
       registration.manifest,
-      mergeConfig(schemaDefaults(registration.manifest), integration.config),
+      mergeConfig(schemaDefaults(registration.manifest), sourceRecord.config),
     )) {
       this.store.update(instanceId, { setupStatus: "setup" });
-      throw new Error(`Connector ${integration.connectorId} required configuration is missing`);
+      throw new Error(`Connector ${sourceRecord.connectorId} required configuration is missing`);
     }
 
     const controller = new AbortController();
     const runRecord = this.store.createRun({
-      integration,
+      sourceRecord,
       trigger,
     });
     this.store.setStatus(instanceId, "running");
@@ -1844,19 +1844,19 @@ export class ConnectorSupervisor {
         // wait instead of treating that mutation's temporary setup state as a
         // reason to terminate the higher-level run intent.
         if (active.identityBarrier) continue;
-        const integration = this.store.get(active.instanceId);
-        if (!integration) {
+        const sourceRecord = this.store.get(active.instanceId);
+        if (!sourceRecord) {
           active.abort();
           this.store.finishRun(runRecordId, "aborted");
           return;
         }
-        const registration = this.requireRegistration(integration.connectorId);
-        if (!this.canContinueRunIntent(active, integration, registration.manifest)) {
+        const registration = this.requireRegistration(sourceRecord.connectorId);
+        if (!this.canContinueRunIntent(active, sourceRecord, registration.manifest)) {
           active.abort();
           this.store.setStatus(
             active.instanceId,
             "idle",
-            integration.identityStatus === "error" ? integration.lastError : undefined,
+            sourceRecord.identityStatus === "error" ? sourceRecord.lastError : undefined,
           );
           this.store.finishRun(runRecordId, "aborted");
           return;
@@ -1877,16 +1877,16 @@ export class ConnectorSupervisor {
           | { ok: false; error: unknown };
         let session: RunnerSession | undefined;
         try {
-          await this.assertRunAuth(registration, integration);
+          await this.assertRunAuth(registration, sourceRecord);
           // The attempt signal is bound from the very first phase: a runtime
           // input generation change can replace a hanging import/check as well
           // as a connector that has already entered run(context).
           session = await this.openTrustedSession(registration, attemptController.signal);
-          await this.assertRunRequirements(registration, integration, session);
+          await this.assertRunRequirements(registration, sourceRecord, session);
           await session.run({
-            config: mergeConfig(schemaDefaults(registration.manifest), integration.config),
+            config: mergeConfig(schemaDefaults(registration.manifest), sourceRecord.config),
             signal: attemptController.signal,
-            capabilities: this.buildRunCapabilities(registration, integration),
+            capabilities: this.buildRunCapabilities(registration, sourceRecord),
           });
           attemptResult = { ok: true };
         } catch (err) {
@@ -1940,17 +1940,17 @@ export class ConnectorSupervisor {
 
   private canContinueRunIntent(
     active: ActiveRunIntent,
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
     manifest: ConnectorManifest,
   ): boolean {
-    if (this.updatingConnectorIds.has(integration.connectorId)) return false;
-    if (active.trigger !== "manual" && isIntegrationPaused(integration)) return false;
-    if (integration.setupStatus !== "ready") return false;
+    if (this.updatingConnectorIds.has(sourceRecord.connectorId)) return false;
+    if (active.trigger !== "manual" && isSourcePaused(sourceRecord)) return false;
+    if (sourceRecord.setupStatus !== "ready") return false;
     if (!isPlatformSupported(manifest, this.platform)) return false;
-    if (this.ownershipFor(integration, manifest) !== "here") return false;
+    if (this.ownershipFor(sourceRecord, manifest) !== "here") return false;
     return this.configSatisfiedFor(
       manifest,
-      mergeConfig(schemaDefaults(manifest), integration.config),
+      mergeConfig(schemaDefaults(manifest), sourceRecord.config),
     );
   }
 
@@ -1973,7 +1973,7 @@ export class ConnectorSupervisor {
     registration.trust = current.trust;
     this.store.setTrustForConnector(
       current.connectorId,
-      trustStatusForIntegration(current.trust),
+      trustStatusForSource(current.trust),
       current.contentHash,
     );
 
@@ -1996,19 +1996,19 @@ export class ConnectorSupervisor {
 
   private buildRunCapabilities(
     registration: Registration,
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
   ): RunnerCapabilities {
-    if (!identityPairResolved(integration, registration.manifest.source.identity)) {
-      throw new Error(`Connector Source identity is not resolved: ${integration.id}`);
+    if (!identityPairResolved(sourceRecord, registration.manifest.source.identity)) {
+      throw new Error(`Connector Source identity is not resolved: ${sourceRecord.id}`);
     }
     const boundGuard = createBoundConnectorGuard(
       this.guard,
-      integration.connectorId,
-      integration.sourceKey ?? undefined,
+      sourceRecord.connectorId,
+      sourceRecord.sourceKey ?? undefined,
     );
-    const stateHandle = createConnectorStateHandle(this.store, integration.id);
+    const stateHandle = createConnectorStateHandle(this.store, sourceRecord.id);
     const authSpec = registration.manifest.auth ?? { type: "none" };
-    const authHandle = this.authManager.createHandle(authSpec, integration);
+    const authHandle = this.authManager.createHandle(authSpec, sourceRecord);
     const blobStore = new ContentBlobStore(this.workspacePath);
     return {
       authType: runtimeAuthType(authSpec),
@@ -2024,21 +2024,21 @@ export class ConnectorSupervisor {
         ? Promise.reject(new Error("Connector does not use auth"))
         : authHandle.getToken(),
       warningSet: async (value) => {
-        this.store.setWarning(integration.id, value as ConnectorWarningInput);
+        this.store.setWarning(sourceRecord.id, value as ConnectorWarningInput);
       },
       warningClear: async (key) => {
         if (typeof key !== "string") throw new Error("Connector warning key must be a string");
-        this.store.clearWarning(integration.id, key);
+        this.store.clearWarning(sourceRecord.id, key);
 	      },
 	    };
 	  }
 
   private buildSourceIdentityCapabilities(
     registration: Registration,
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
   ): RunnerSourceIdentityCapabilities {
     const authSpec = registration.manifest.auth ?? { type: "none" as const };
-    const authHandle = this.authManager.createHandle(authSpec, integration);
+    const authHandle = this.authManager.createHandle(authSpec, sourceRecord);
     return {
       authType: runtimeAuthType(authSpec),
       authGetToken: () => authHandle.type === "none"
@@ -2056,7 +2056,7 @@ export class ConnectorSupervisor {
 	      configGet: async () => this.store.get(instanceId)?.config,
 	      configReplace: async (value) => {
 	        const next = normalizeJsonObject(value, "Connector config replacement");
-	        await this.configureIntegration(instanceId, { config: next });
+	        await this.configureSource(instanceId, { config: next });
 	      },
 	      configPatch: async (value) => {
 	        const patch = normalizeConfigPatch(value);
@@ -2066,7 +2066,7 @@ export class ConnectorSupervisor {
 	          delete next[key];
 	        }
 	        Object.assign(next, patch.set ?? {});
-	        await this.configureIntegration(instanceId, { config: next });
+	        await this.configureSource(instanceId, { config: next });
 	        return this.store.get(instanceId)?.config;
 	      },
 	      stateGet: () => stateHandle.get(),
@@ -2074,7 +2074,7 @@ export class ConnectorSupervisor {
 	    };
 	  }
 
-	  private async stopConfigUiSessionsForIntegration(instanceId: string): Promise<void> {
+	  private async stopConfigUiSessionsForSource(instanceId: string): Promise<void> {
 	    const sessionIds = [...this.activeConfigUiSessions.values()]
 	      .filter((session) => session.instanceId === instanceId)
 	      .map((session) => session.id);
@@ -2095,12 +2095,12 @@ export class ConnectorSupervisor {
   }
 
   private ownershipFor(
-    integration: ConnectorIntegration,
+    sourceRecord: ConnectorSource,
     manifest: ConnectorManifest,
   ): ConnectorOwnership {
     if (manifest.source.identity !== "device") return "here";
     if (this.deviceIdentity.status === "unavailable") return "device-unknown";
-    return integration.sourceKey === this.deviceIdentity.value ? "here" : "other-device";
+    return sourceRecord.sourceKey === this.deviceIdentity.value ? "here" : "other-device";
   }
 }
 
@@ -2227,13 +2227,13 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 function identityPairResolved(
-  integration: Pick<ConnectorIntegration, "identityStatus" | "sourceKey">,
+  sourceRecord: Pick<ConnectorSource, "identityStatus" | "sourceKey">,
   identityKind: ConnectorSourceIdentityKind,
 ): boolean {
-  if (integration.identityStatus !== "resolved") return false;
+  if (sourceRecord.identityStatus !== "resolved") return false;
   return identityKind === "single"
-    ? integration.sourceKey === null
-    : integration.sourceKey !== null;
+    ? sourceRecord.sourceKey === null
+    : sourceRecord.sourceKey !== null;
 }
 
 function normalizeDeviceLabel(value: string): string | undefined {
@@ -2247,8 +2247,8 @@ function isSourceIdentityConflictError(error: unknown): boolean {
     ? error.message
     : "";
   return message.includes("UNIQUE constraint failed")
-    && message.includes("connector_integrations.connector_id")
-    && message.includes("connector_integrations.source_key");
+    && message.includes("connector_sources.connector_id")
+    && message.includes("connector_sources.source_key");
 }
 
 function normalizeRequirementStatus(status: ConnectorRequirementStatus): ConnectorRequirementStatus {

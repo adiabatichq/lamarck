@@ -11,7 +11,7 @@ import {
   createVaultKey,
   encodeVaultKey,
 } from "../src/credentials";
-import type { ConnectorAuthHandle, ConnectorIntegration } from "../src/connectors";
+import type { ConnectorAuthHandle, ConnectorSource } from "../src/connectors";
 
 describe("Secret store and connector credential broker", () => {
   let workspace: string;
@@ -55,7 +55,7 @@ describe("Secret store and connector credential broker", () => {
 
     await manager.setToken("auth-ref", "secret-token", {
       ownerType: "connector",
-      ownerId: "integration-1",
+      ownerId: "source-1",
     });
 
     const credential = manager.credential("auth-ref");
@@ -63,10 +63,10 @@ describe("Secret store and connector credential broker", () => {
       id: "auth-ref",
       kind: "apiKey",
       ownerType: "connector",
-      ownerId: "integration-1",
+      ownerId: "source-1",
       status: "active",
     });
-    expect(await authToken(manager.createHandle({ type: "apiKey" }, integration("auth-ref")))).toBe("secret-token");
+    expect(await authToken(manager.createHandle({ type: "apiKey" }, sourceFixture("auth-ref")))).toBe("secret-token");
     expect(opened.dataDb.prepare("SELECT * FROM events WHERE type LIKE 'auth.%'").all()).toEqual([]);
   });
 
@@ -84,7 +84,7 @@ describe("Secret store and connector credential broker", () => {
       ownerId: "source-1",
     });
 
-    await manager.deleteIntegrationCredentials("source-1", "current-auth-ref");
+    await manager.deleteSourceCredentials("source-1", "current-auth-ref");
 
     expect(credentials.listByOwner("connector", "source-1")).toEqual([]);
     expect(await secrets.has("old-auth-ref")).toBe(false);
@@ -112,7 +112,7 @@ describe("Secret store and connector credential broker", () => {
       scope: ["read", "write"],
     };
 
-    const started = manager.startOAuth(integration("oauth-ref"), auth, {
+    const started = manager.startOAuth(sourceFixture("oauth-ref"), auth, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const authUrl = new URL(started.authorizationUrl);
@@ -125,11 +125,11 @@ describe("Secret store and connector credential broker", () => {
     }));
 
     expect(result).toMatchObject({ status: "connected", credentialId: "oauth-ref", authRef: "oauth-ref" });
-    expect(await manager.getOAuthAttempt("integration-1", started.attemptId)).toMatchObject({
+    expect(await manager.getOAuthAttempt("source-1", started.attemptId)).toMatchObject({
       status: "connected",
       credentialId: "oauth-ref",
     });
-    expect(await authToken(manager.createHandle(auth, integration("oauth-ref")))).toBe("access-1");
+    expect(await authToken(manager.createHandle(auth, sourceFixture("oauth-ref")))).toBe("access-1");
     expect(opened.dataDb.prepare("SELECT * FROM events WHERE type LIKE 'auth.%'").all()).toEqual([]);
   });
 
@@ -154,7 +154,7 @@ describe("Secret store and connector credential broker", () => {
       clientId: "client-id",
     };
 
-    const started = manager.startOAuth(integration("oauth-ref"), auth, {
+    const started = manager.startOAuth(sourceFixture("oauth-ref"), auth, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
@@ -168,12 +168,12 @@ describe("Secret store and connector credential broker", () => {
     expect(manager.claimConnectedAttemptFinalization(started.attemptId)).toBe(true);
 
     now += 201;
-    manager.startOAuth(integration("next-oauth-ref"), auth, {
+    manager.startOAuth(sourceFixture("next-oauth-ref"), auth, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     expect(manager.claimConnectedAttemptFinalization(started.attemptId)).toBe(false);
     await expect(
-      manager.getOAuthAttempt("integration-1", started.attemptId),
+      manager.getOAuthAttempt("source-1", started.attemptId),
     ).resolves.toEqual({ status: "failed", error: "Auth attempt not found" });
   });
 
@@ -204,8 +204,8 @@ describe("Secret store and connector credential broker", () => {
       tokenEndpoint: "https://provider.example/token",
       clientId: "client-id",
     };
-    const source = integration("expiry-race-ref");
-    const started = manager.startOAuth(source, auth, {
+    const sourceRecord = sourceFixture("expiry-race-ref");
+    const started = manager.startOAuth(sourceRecord, auth, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
@@ -216,9 +216,9 @@ describe("Secret store and connector credential broker", () => {
 
     await exchangeStarted;
     now = started.expiresAt + 1;
-    await expect(manager.getOAuthAttempt(source.id, started.attemptId)).resolves.toMatchObject({
+    await expect(manager.getOAuthAttempt(sourceRecord.id, started.attemptId)).resolves.toMatchObject({
       status: "expired",
-      integrationId: source.id,
+      sourceId: sourceRecord.id,
     });
 
     releaseExchange(jsonResponse({ access_token: "must-not-survive", expires_in: 3_600 }));
@@ -227,9 +227,9 @@ describe("Secret store and connector credential broker", () => {
       status: "failed",
       error: "Authentication was cancelled for this Source",
     });
-    expect(cancelled).not.toHaveProperty("integrationId");
-    expect(await secrets.has(source.authRef!)).toBe(false);
-    expect(credentials.get(source.authRef!)).toBeUndefined();
+    expect(cancelled).not.toHaveProperty("sourceId");
+    expect(await secrets.has(sourceRecord.authRef!)).toBe(false);
+    expect(credentials.get(sourceRecord.authRef!)).toBeUndefined();
   });
 
   test("oauth refresh single-flights concurrent getToken calls", async () => {
@@ -254,13 +254,13 @@ describe("Secret store and connector credential broker", () => {
       tokenEndpoint: "https://provider.example/token",
       clientId: "client-id",
     };
-    const started = manager.startOAuth(integration("oauth-ref"), auth, {
+    const started = manager.startOAuth(sourceFixture("oauth-ref"), auth, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
     await manager.completeOAuthCallback(new URLSearchParams({ state, code: "code-1" }));
 
-    const handle = manager.createHandle(auth, integration("oauth-ref"));
+    const handle = manager.createHandle(auth, sourceFixture("oauth-ref"));
     await expect(Promise.all([authToken(handle), authToken(handle)])).resolves.toEqual(["new", "new"]);
     expect(calls).toBe(2);
   });
@@ -292,17 +292,17 @@ describe("Secret store and connector credential broker", () => {
       tokenEndpoint: "https://provider.example/token",
       clientId: "client-id",
     };
-    const source = integration("oauth-ref");
-    const started = manager.startOAuth(source, auth, {
+    const sourceRecord = sourceFixture("oauth-ref");
+    const started = manager.startOAuth(sourceRecord, auth, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
     const state = new URL(started.authorizationUrl).searchParams.get("state")!;
     await manager.completeOAuthCallback(new URLSearchParams({ state, code: "code-1" }));
 
-    const token = authToken(manager.createHandle(auth, source));
+    const token = authToken(manager.createHandle(auth, sourceRecord));
     await refreshStarted;
-    manager.cancelAttemptsForIntegration(source.id, { removed: true });
-    await manager.deleteIntegrationCredentials(source.id, source.authRef);
+    manager.cancelAttemptsForSource(sourceRecord.id, { removed: true });
+    await manager.deleteSourceCredentials(sourceRecord.id, sourceRecord.authRef);
     releaseRefresh(jsonResponse({ access_token: "must-not-survive", expires_in: 3600 }));
 
     await expect(token).rejects.toThrow("Source was removed during authentication");
@@ -312,7 +312,7 @@ describe("Secret store and connector credential broker", () => {
 
   test("managed provider start builds the Lamarck connect URL", async () => {
     const manager = new ConnectorAuthManager();
-    const started = await manager.startManagedProvider(integration("managed-ref"), {
+    const started = await manager.startManagedProvider(sourceFixture("managed-ref"), {
       type: "managedProvider",
       providerId: "oura",
     }, {
@@ -347,11 +347,11 @@ describe("Secret store and connector credential broker", () => {
         accessToken: "lamarck-capability-token",
         expiresAt: new Date(Date.now() + 120_000).toISOString(),
         providerId: "oura",
-        integrationId: "integration-1",
+        integrationId: "source-1",
       }),
     });
 
-    const started = await manager.startManagedProvider(integration("managed-ref"), {
+    const started = await manager.startManagedProvider(sourceFixture("managed-ref"), {
       type: "managedProvider",
       providerId: "oura",
     }, {
@@ -359,7 +359,7 @@ describe("Secret store and connector credential broker", () => {
     });
     const loginUrl = new URL(started.authorizationUrl);
     expect(loginUrl.pathname).toBe("/auth/authorize");
-    await expect(manager.getOAuthAttempt("integration-1", started.attemptId)).resolves.toMatchObject({
+    await expect(manager.getOAuthAttempt("source-1", started.attemptId)).resolves.toMatchObject({
       status: "pending",
     });
 
@@ -369,9 +369,9 @@ describe("Secret store and connector credential broker", () => {
     }));
     const nextUrl = new URL(result.nextUrl!);
     expect(nextUrl.toString().startsWith("https://app.lamarck.ai/providers/oura/connect?")).toBe(true);
-    expect(nextUrl.searchParams.get("integrationId")).toBe("integration-1");
+    expect(nextUrl.searchParams.get("integrationId")).toBe("source-1");
     expect(nextUrl.searchParams.get("start")).toBe("1");
-    await expect(manager.getOAuthAttempt("integration-1", started.attemptId)).resolves.toMatchObject({
+    await expect(manager.getOAuthAttempt("source-1", started.attemptId)).resolves.toMatchObject({
       status: "connected",
       credentialId: "managed-ref",
     });
@@ -419,14 +419,14 @@ describe("Secret store and connector credential broker", () => {
       },
     );
 
-    const started = await manager.startManagedProvider(integration("managed-ref"), {
+    const started = await manager.startManagedProvider(sourceFixture("managed-ref"), {
       type: "managedProvider",
       providerId: "oura",
     }, {
       appOrigin: "https://app.lamarck.ai",
     });
 
-    await expect(manager.getOAuthAttempt("integration-1", started.attemptId)).resolves.toMatchObject({
+    await expect(manager.getOAuthAttempt("source-1", started.attemptId)).resolves.toMatchObject({
       status: "failed",
       error: "Lamarck desktop session expired. Sign in again.",
     });
@@ -581,9 +581,9 @@ describe("Secret store and connector credential broker", () => {
   });
 });
 
-function integration(authRef: string): ConnectorIntegration {
+function sourceFixture(authRef: string): ConnectorSource {
   return {
-    id: "integration-1",
+    id: "source-1",
     connectorId: "connector-1",
     sourceKey: null,
     identityStatus: "resolved",

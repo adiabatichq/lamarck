@@ -2,7 +2,7 @@
 
 These lists are connector-owned data packs for privacy classification. They do
 not define activity semantics and they should not be copied into
-`integration.config`. User choices and overrides live in `integration.config`;
+Source config. User choices and overrides live in Source config;
 these files are only the built-in baseline.
 
 The runtime loads the files once at connector startup and performs in-memory

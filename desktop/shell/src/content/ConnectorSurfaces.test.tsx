@@ -11,7 +11,7 @@ vi.mock("../hooks/useConnectors", () => ({
 
 import { ConnectorCatalogView } from "./ConnectorCatalogView";
 import { ConnectorsView } from "./ConnectorsView";
-import type { ConnectorIntegrationView } from "../lib/api";
+import type { ConnectorSourceView } from "../lib/api";
 
 const installedConnector = {
   connectorId: "github",
@@ -51,7 +51,7 @@ const installCandidate = {
   updateAvailable: false,
 };
 
-const identitySource: ConnectorIntegrationView = {
+const identitySource: ConnectorSourceView = {
   id: "source-new",
   connectorId: "github",
   connectorName: "GitHub",

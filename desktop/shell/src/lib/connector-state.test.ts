@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { ConnectorIntegrationView } from "./api";
+import type { ConnectorSourceView } from "./api";
 import {
   setupNeeds,
   sourceLifecycle,
@@ -12,7 +12,7 @@ import {
 
 const NOW = 1_000_000;
 
-function source(overrides: Partial<ConnectorIntegrationView> = {}): ConnectorIntegrationView {
+function sourceRecord(overrides: Partial<ConnectorSourceView> = {}): ConnectorSourceView {
   return {
     id: "source-1",
     connectorId: "example",
@@ -42,52 +42,52 @@ function source(overrides: Partial<ConnectorIntegrationView> = {}): ConnectorInt
 
 describe("source lifecycle", () => {
   test("has only active and paused states", () => {
-    expect(sourceLifecycle(source({ setupStatus: "setup" }), NOW)).toBe("active");
-    expect(sourceLifecycle(source(), NOW)).toBe("active");
-    expect(sourceLifecycle(source({ pausedAt: NOW - 1 }), NOW)).toBe("paused");
+    expect(sourceLifecycle(sourceRecord({ setupStatus: "setup" }), NOW)).toBe("active");
+    expect(sourceLifecycle(sourceRecord(), NOW)).toBe("active");
+    expect(sourceLifecycle(sourceRecord({ pausedAt: NOW - 1 }), NOW)).toBe("paused");
   });
 
   test("automatically reads an expired timed pause as active", () => {
-    expect(sourceLifecycle(source({ pausedAt: NOW - 100, resumeAt: NOW + 100 }), NOW)).toBe("paused");
-    expect(sourceLifecycle(source({ pausedAt: NOW - 200, resumeAt: NOW - 100 }), NOW)).toBe("active");
+    expect(sourceLifecycle(sourceRecord({ pausedAt: NOW - 100, resumeAt: NOW + 100 }), NOW)).toBe("paused");
+    expect(sourceLifecycle(sourceRecord({ pausedAt: NOW - 200, resumeAt: NOW - 100 }), NOW)).toBe("active");
   });
 
   test("keeps setup independent from pause policy", () => {
-    expect(sourceLifecycle(source({ setupStatus: "setup" }), NOW)).toBe("active");
-    expect(sourceLifecycle(source({ setupStatus: "setup", pausedAt: NOW - 1 }), NOW)).toBe("paused");
+    expect(sourceLifecycle(sourceRecord({ setupStatus: "setup" }), NOW)).toBe("active");
+    expect(sourceLifecycle(sourceRecord({ setupStatus: "setup", pausedAt: NOW - 1 }), NOW)).toBe("paused");
   });
 
   test("derives Needs setup from current run gates, not persisted setupStatus", () => {
-    const credentialMissing = source({ setupStatus: "ready", setupPending: ["auth"] });
+    const credentialMissing = sourceRecord({ setupStatus: "ready", setupPending: ["auth"] });
     expect(sourceLifecycle(credentialMissing, NOW)).toBe("active");
     expect(sourceNeedsSetup(credentialMissing)).toBe(true);
   });
 
   test("offers pause only to sources with automatic activity", () => {
-    expect(sourceHasAutomaticActivity(source({ mode: "watch" }))).toBe(true);
-    expect(sourceHasAutomaticActivity(source({ mode: "poll", scheduleCron: "0 * * * *" }))).toBe(true);
-    expect(sourceHasAutomaticActivity(source({ mode: "poll", scheduleCron: undefined }))).toBe(false);
-    expect(sourceHasAutomaticActivity(source({ mode: "manual" }))).toBe(false);
+    expect(sourceHasAutomaticActivity(sourceRecord({ mode: "watch" }))).toBe(true);
+    expect(sourceHasAutomaticActivity(sourceRecord({ mode: "poll", scheduleCron: "0 * * * *" }))).toBe(true);
+    expect(sourceHasAutomaticActivity(sourceRecord({ mode: "poll", scheduleCron: undefined }))).toBe(false);
+    expect(sourceHasAutomaticActivity(sourceRecord({ mode: "manual" }))).toBe(false);
   });
 
   test("keeps runtime health and package trust out of lifecycle", () => {
-    const failed = source({ status: "error", packageTrust: "untrusted" });
+    const failed = sourceRecord({ status: "error", packageTrust: "untrusted" });
     expect(sourceLifecycle(failed, NOW)).toBe("active");
     expect(sourceNeedsAttention(failed)).toBe(true);
   });
 
   test("uses display, suggested, then Connector name for the shown name", () => {
-    expect(sourceShownName(source({
+    expect(sourceShownName(sourceRecord({
       displayName: "Morning ring",
       suggestedLabel: "Scott's Oura",
       connectorName: "Oura",
     }))).toBe("Morning ring");
-    expect(sourceShownName(source({
+    expect(sourceShownName(sourceRecord({
       displayName: null,
       suggestedLabel: "Scott's Oura",
       connectorName: "Oura",
     }))).toBe("Scott's Oura");
-    expect(sourceShownName(source({
+    expect(sourceShownName(sourceRecord({
       displayName: null,
       suggestedLabel: null,
       connectorName: "Oura",
@@ -95,19 +95,19 @@ describe("source lifecycle", () => {
   });
 
   test("keeps ownership separate from lifecycle and flags local identity failures", () => {
-    const remote = source({ ownership: "other-device" });
+    const remote = sourceRecord({ ownership: "other-device" });
     expect(sourceLifecycle(remote, NOW)).toBe("active");
     expect(sourceRunsHere(remote)).toBe(false);
     expect(sourceNeedsAttention(remote)).toBe(false);
 
-    expect(sourceNeedsAttention(source({ identityStatus: "conflict" }))).toBe(true);
-    expect(sourceNeedsAttention(source({ identityStatus: "changed" }))).toBe(true);
-    expect(sourceNeedsAttention(source({ identityStatus: "error" }))).toBe(true);
-    expect(sourceNeedsAttention(source({ ownership: "device-unknown" }))).toBe(true);
+    expect(sourceNeedsAttention(sourceRecord({ identityStatus: "conflict" }))).toBe(true);
+    expect(sourceNeedsAttention(sourceRecord({ identityStatus: "changed" }))).toBe(true);
+    expect(sourceNeedsAttention(sourceRecord({ identityStatus: "error" }))).toBe(true);
+    expect(sourceNeedsAttention(sourceRecord({ ownership: "device-unknown" }))).toBe(true);
   });
 
   test("presents unresolved identity as a setup gate", () => {
-    const unresolved = source({
+    const unresolved = sourceRecord({
       identityStatus: "unresolved",
       setupPending: ["identity"],
     });
