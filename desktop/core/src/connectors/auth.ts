@@ -94,16 +94,12 @@ interface TokenResponse {
   error_description?: string;
 }
 
-// Shape of the Lamarck backend's capability-token response. These are wire
-// field names owned by the backend, not internal vocabulary: `integrationId`
-// stays because the two sides deploy independently and renaming one alone
-// makes every token fail validation below.
 interface ManagedProviderCapabilityToken {
   tokenType: "Bearer";
   accessToken: string;
   expiresAt: string;
   providerId: string;
-  integrationId: string;
+  sourceId: string;
 }
 
 type LamarckSessionCapability =
@@ -324,10 +320,7 @@ export class ConnectorAuthManager {
     this.managedAttemptsById.set(attemptId, attempt);
 
     const url = new URL(`/providers/${encodeURIComponent(auth.providerId)}/connect`, normalizeOrigin(input.appOrigin));
-    // Wire field, not an internal name: the Lamarck web app reads
-    // `integrationId` from this URL. Renaming it here alone breaks the hosted
-    // OAuth flow, since the two sides ship and deploy independently.
-    url.searchParams.set("integrationId", sourceRecord.id);
+    url.searchParams.set("sourceId", sourceRecord.id);
     url.searchParams.set("start", "1");
     let authorizationUrl = url.toString();
     if (this.lamarckSession?.session && this.lamarckSession.startLogin) {
@@ -705,8 +698,7 @@ export class ConnectorAuthManager {
         Authorization: `Bearer ${sessionToken}`,
         "Content-Type": "application/json",
       },
-      // Wire field, not an internal name — the backend reads `integrationId`.
-      body: JSON.stringify({ integrationId: sourceId }),
+      body: JSON.stringify({ sourceId }),
     });
     const text = await res.text();
     const data = text ? JSON.parse(text) as Partial<ManagedProviderCapabilityToken> & { error?: string; message?: string } : {};
@@ -726,7 +718,7 @@ export class ConnectorAuthManager {
       !data.accessToken ||
       !data.expiresAt ||
       data.providerId !== providerId ||
-      data.integrationId !== sourceId
+      data.sourceId !== sourceId
     ) {
       throw new Error("Managed provider capability endpoint returned an invalid token response");
     }

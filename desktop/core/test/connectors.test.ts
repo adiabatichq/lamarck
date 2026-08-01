@@ -10002,13 +10002,14 @@ auth:
         },
         fetchImpl: async (url, init) => {
           if (String(url).includes("/capability-token")) {
-            const body = JSON.parse(String(init?.body ?? "{}")) as { integrationId?: string };
+            const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            expect(body).toEqual({ sourceId: expect.any(String) });
             return new Response(JSON.stringify({
               tokenType: "Bearer",
               accessToken: "lamarck-capability-token",
               expiresAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
               providerId: "oura",
-              integrationId: body.integrationId,
+              sourceId: body.sourceId,
             }), {
               status: 200,
               headers: { "Content-Type": "application/json" },
@@ -10191,13 +10192,14 @@ auth:
         },
         fetchImpl: async (url, init) => {
           if (String(url).includes("/capability-token")) {
-            const body = JSON.parse(String(init?.body ?? "{}")) as { integrationId?: string };
+            const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+            expect(body).toEqual({ sourceId: expect.any(String) });
             return new Response(JSON.stringify({
               tokenType: "Bearer",
               accessToken: "lamarck-capability-token",
               expiresAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
               providerId: "oura",
-              integrationId: body.integrationId,
+              sourceId: body.sourceId,
             }), {
               status: 200,
               headers: { "Content-Type": "application/json" },

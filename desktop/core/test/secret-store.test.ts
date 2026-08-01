@@ -319,6 +319,7 @@ describe("Secret store and connector credential broker", () => {
       appOrigin: "https://app.lamarck.ai",
     });
     expect(started.authorizationUrl.startsWith("https://app.lamarck.ai/providers/oura/connect?")).toBe(true);
+    expect(new URL(started.authorizationUrl).searchParams.get("sourceId")).toBe("source-1");
     expect(new URL(started.authorizationUrl).searchParams.get("start")).toBe("1");
     expect(started.redirectUri).toBeUndefined();
   });
@@ -342,13 +343,17 @@ describe("Secret store and connector credential broker", () => {
     const manager = new ConnectorAuthManager(secretStore, {
       managedProviderApiOrigin: "https://api.lamarck.ai",
       lamarckSession: sessionManager,
-      fetchImpl: async () => jsonResponse({
-        tokenType: "Bearer",
-        accessToken: "lamarck-capability-token",
-        expiresAt: new Date(Date.now() + 120_000).toISOString(),
-        providerId: "oura",
-        integrationId: "source-1",
-      }),
+      fetchImpl: async (url, init) => {
+        expect(String(url)).toBe("https://api.lamarck.ai/providers/oura/capability-token");
+        expect(JSON.parse(String(init?.body ?? "{}"))).toEqual({ sourceId: "source-1" });
+        return jsonResponse({
+          tokenType: "Bearer",
+          accessToken: "lamarck-capability-token",
+          expiresAt: new Date(Date.now() + 120_000).toISOString(),
+          providerId: "oura",
+          sourceId: "source-1",
+        });
+      },
     });
 
     const started = await manager.startManagedProvider(sourceFixture("managed-ref"), {
@@ -369,11 +374,42 @@ describe("Secret store and connector credential broker", () => {
     }));
     const nextUrl = new URL(result.nextUrl!);
     expect(nextUrl.toString().startsWith("https://app.lamarck.ai/providers/oura/connect?")).toBe(true);
-    expect(nextUrl.searchParams.get("integrationId")).toBe("source-1");
+    expect(nextUrl.searchParams.get("sourceId")).toBe("source-1");
     expect(nextUrl.searchParams.get("start")).toBe("1");
     await expect(manager.getOAuthAttempt("source-1", started.attemptId)).resolves.toMatchObject({
       status: "connected",
       credentialId: "managed-ref",
+    });
+  });
+
+  test("managed provider rejects legacy integrationId-only capability responses", async () => {
+    const manager = new ConnectorAuthManager(
+      new SqliteEncryptedSecretStore(opened.systemDb, createVaultKey()),
+      {
+        managedProviderApiOrigin: "https://api.lamarck.ai",
+        lamarckSession: {
+          accessToken: async () => "desktop-session-token",
+          clearLocalSession: async () => {},
+        },
+        fetchImpl: async () => jsonResponse({
+          tokenType: "Bearer",
+          accessToken: "lamarck-capability-token",
+          expiresAt: new Date(Date.now() + 120_000).toISOString(),
+          providerId: "oura",
+          integrationId: "source-1",
+        }),
+      },
+    );
+    const started = await manager.startManagedProvider(sourceFixture("managed-ref"), {
+      type: "managedProvider",
+      providerId: "oura",
+    }, {
+      appOrigin: "https://app.lamarck.ai",
+    });
+
+    await expect(manager.getOAuthAttempt("source-1", started.attemptId)).resolves.toMatchObject({
+      status: "failed",
+      error: "Managed provider capability endpoint returned an invalid token response",
     });
   });
 
