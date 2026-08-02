@@ -63,6 +63,7 @@ interface LamarckSessionManagerOptions {
   redirectUri: string;
   credentialStore?: CredentialStore;
   fetchImpl?: typeof fetch;
+  requestTimeoutMs?: number;
   attemptTtlMs?: number;
   refreshSkewMs?: number;
 }
@@ -70,6 +71,7 @@ interface LamarckSessionManagerOptions {
 export class LamarckSessionManager {
   private credentialStore: CredentialStore | undefined;
   private fetchImpl: typeof fetch;
+  private requestTimeoutMs: number;
   private attemptTtlMs: number;
   private refreshSkewMs: number;
   private attemptsByState = new Map<string, LoginAttempt>();
@@ -80,6 +82,7 @@ export class LamarckSessionManager {
   ) {
     this.credentialStore = opts.credentialStore;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? 30_000;
     this.attemptTtlMs = opts.attemptTtlMs ?? 10 * 60_000;
     this.refreshSkewMs = opts.refreshSkewMs ?? 60_000;
   }
@@ -213,27 +216,34 @@ export class LamarckSessionManager {
         await this.clearLocalSession();
         throw new Error(SESSION_EXPIRED_MESSAGE);
       }
+      // A transport failure can be ambiguous after server-side token rotation.
+      // Preserve the local session; a later invalid-session response will use
+      // the existing reauthentication path.
       throw err;
     }
     await this.persistToken(token);
   }
 
   private async fetchToken(body: Record<string, string>): Promise<LamarckTokenResponse> {
-    const res = await this.fetchImpl(new URL("/desktop/auth/token", normalizeOrigin(this.opts.apiOrigin)).toString(), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
+    const response = await this.fetchTextWithDeadline(
+      new URL("/desktop/auth/token", normalizeOrigin(this.opts.apiOrigin)).toString(),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(body),
       },
-      body: JSON.stringify(body),
-    });
-    const text = await res.text();
-    const data = text ? JSON.parse(text) as Partial<LamarckTokenResponse> & { error?: string; message?: string } : {};
-    if (!res.ok) {
-      if (isLamarckSessionInvalid(res.status, data.error)) {
+    );
+    const data = response.body
+      ? JSON.parse(response.body) as Partial<LamarckTokenResponse> & { error?: string; message?: string }
+      : {};
+    if (!response.ok) {
+      if (isLamarckSessionInvalid(response.status, data.error)) {
         throw new LamarckSessionInvalidError(data.message ?? data.error ?? SESSION_EXPIRED_MESSAGE);
       }
-      throw new Error(data.message ?? data.error ?? `Desktop token endpoint returned ${res.status}`);
+      throw new Error(data.message ?? data.error ?? `Desktop token endpoint returned ${response.status}`);
     }
     if (
       data.tokenType !== "Bearer" ||
@@ -247,6 +257,38 @@ export class LamarckSessionManager {
       throw new Error("Desktop token endpoint returned an invalid token response");
     }
     return data as LamarckTokenResponse;
+  }
+
+  private async fetchTextWithDeadline(
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ): Promise<{ ok: boolean; status: number; body: string }> {
+    const controller = new AbortController();
+    const timeoutError = new Error(
+      `Lamarck session token request timed out after ${this.requestTimeoutMs}ms`,
+    );
+    timeoutError.name = "LamarckSessionRequestTimeoutError";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(timeoutError);
+    }, this.requestTimeoutMs);
+    try {
+      const response = await this.fetchImpl(input, {
+        ...init,
+        signal: controller.signal,
+      });
+      return {
+        ok: response.ok,
+        status: response.status,
+        body: await response.text(),
+      };
+    } catch (err) {
+      if (timedOut) throw timeoutError;
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async persistToken(token: LamarckTokenResponse): Promise<void> {

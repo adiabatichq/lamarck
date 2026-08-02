@@ -670,6 +670,53 @@ describe("Secret store and connector credential broker", () => {
     expect(calls).toBe(2);
   });
 
+  test("lamarck desktop session refresh request times out without replacing credentials", async () => {
+    let calls = 0;
+    let stalledSignal: AbortSignal | undefined;
+    const secretStore = new SqliteEncryptedSecretStore(opened.systemDb, createVaultKey());
+    const credentialStore = new CredentialStore(opened.systemDb);
+    const manager = new LamarckSessionManager(
+      secretStore,
+      {
+        credentialStore,
+        apiOrigin: "https://api.lamarck.ai",
+        appOrigin: "https://app.lamarck.ai",
+        redirectUri: "http://localhost:32100/auth/callback",
+        requestTimeoutMs: 5,
+        fetchImpl: async (_url, init) => {
+          calls++;
+          const body = JSON.parse(String(init?.body)) as Record<string, string>;
+          if (body.grantType === "authorization_code") {
+            return jsonResponse({
+              tokenType: "Bearer",
+              accessToken: "old-access",
+              refreshToken: "old-refresh",
+              accessTokenExpiresAt: new Date(Date.now() - 1_000).toISOString(),
+              refreshTokenExpiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+              userId: "usr_123",
+              sessionId: "dsk_123",
+            });
+          }
+          stalledSignal = init?.signal ?? undefined;
+          return responseWithBodyPendingUntilAborted(stalledSignal);
+        },
+      },
+    );
+
+    const started = manager.startLogin();
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    await manager.completeCallback(new URLSearchParams({ state, code: "desktop-code" }));
+
+    await expect(manager.accessToken()).rejects.toThrow(
+      "Lamarck session token request timed out after 5ms",
+    );
+    expect(stalledSignal?.aborted).toBe(true);
+    expect(calls).toBe(2);
+    expect(credentialStore.get("lamarck-session:current")).toMatchObject({
+      status: "active",
+    });
+  });
+
   test("lamarck desktop session clears local credentials when refresh is invalid", async () => {
     let calls = 0;
     const secretStore = new SqliteEncryptedSecretStore(opened.systemDb, createVaultKey());
