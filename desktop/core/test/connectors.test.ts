@@ -255,16 +255,20 @@ auth:
     const available = await listAvailableBuiltIns(templatesDir, (dir) => rejected.push(basename(dir)));
 
     expect(available.map(({ manifest }) => manifest.id).sort()).toEqual([
+      "code-agent-transcripts",
       "local-git",
       "macos-ax",
       "oura",
       "telegram-bot",
     ]);
     // The manifest gate is what keeps a parked package out of the catalog; no
-    // package is excluded by name. These two still declare the retired
-    // `integrations` block and cannot be revived until they declare a Source
-    // identity.
-    expect(rejected.sort()).toEqual(["app-commits", "code-agent-transcripts"]);
+    // package is excluded by name. app-commits still declares the retired
+    // `integrations` block and cannot be revived until its replacement owns
+    // an approved Source identity.
+    expect(rejected).toEqual(["app-commits"]);
+    expect(
+      available.find(({ manifest }) => manifest.id === "code-agent-transcripts")?.manifest.source.identity,
+    ).toBe("device");
     for (const entry of available) {
       const catalog = await loadConnectorEventCatalog(entry.dir, entry.manifest);
       expect(Object.keys(catalog.eventTypes).length).toBeGreaterThan(0);
