@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { dirname, join } from "path";
+import { basename, dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { ContentBlobStore } from "../src/blob-store";
@@ -251,7 +251,8 @@ auth:
 
   test("keeps bundled Connector templates valid under the V1 package contract", async () => {
     const templatesDir = fileURLToPath(new URL("../../template/connectors", import.meta.url));
-    const available = await listAvailableBuiltIns(templatesDir);
+    const rejected: string[] = [];
+    const available = await listAvailableBuiltIns(templatesDir, (dir) => rejected.push(basename(dir)));
 
     expect(available.map(({ manifest }) => manifest.id).sort()).toEqual([
       "local-git",
@@ -259,6 +260,11 @@ auth:
       "oura",
       "telegram-bot",
     ]);
+    // The manifest gate is what keeps a parked package out of the catalog; no
+    // package is excluded by name. These two still declare the retired
+    // `integrations` block and cannot be revived until they declare a Source
+    // identity.
+    expect(rejected.sort()).toEqual(["app-commits", "code-agent-transcripts"]);
     for (const entry of available) {
       const catalog = await loadConnectorEventCatalog(entry.dir, entry.manifest);
       expect(Object.keys(catalog.eventTypes).length).toBeGreaterThan(0);
