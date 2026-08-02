@@ -2,7 +2,7 @@
   "catalogVersion": 1,
   "eventTypes": {
     "local_git.commit": {
-      "description": "A commit observed in a user-selected local Git repository.",
+      "description": "A unique Git commit object observed by this device in a user-selected repository and matching a configured author or committer identity. Repeated observation of the same object across local repositories is replay-equivalent.",
       "payloadSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -39,7 +39,7 @@
           },
           "repo": {
             "type": "object",
-            "description": "Configured local repository identity and display metadata.",
+            "description": "One configured local repository context in which this device observed the commit; not an exhaustive inventory of every local repository containing it.",
             "additionalProperties": false,
             "required": ["path", "label"],
             "properties": {

@@ -1,7 +1,7 @@
 manifestVersion: 1
 id: local-git
 name: Local Git
-description: Captures commits from user-selected local Git repositories.
+description: Collects unique Git commits matching configured identities from user-selected local repositories as durable evidence for reconstructing coding work.
 eventCatalog: ./events.json
 entry: ./index.mjs
 runtime:
@@ -17,4 +17,4 @@ auth:
 configPanels:
   setup:
     label: Setup
-    description: Configure code roots, commit identity, and capture policy
+    description: Configure code roots, work identities, and evidence capture policy
