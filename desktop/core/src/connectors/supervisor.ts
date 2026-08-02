@@ -115,7 +115,7 @@ interface ActiveRunIntent {
   abort(): void;
   invalidateRuntime(): void;
   holdForIdentityMutation(): Promise<void>;
-  releaseIdentityMutation(): void;
+  releaseIdentityBarrier(): void;
   waitForIdentityMutation(): Promise<void>;
 }
 
@@ -438,7 +438,7 @@ export class ConnectorSupervisor {
       // so aborting the preserved intent cannot deadlock behind that claim.
       this.authManager.cancelAttemptsForSource(instanceId);
       claimedBrowserAttempt.expiresAt = undefined;
-      active?.releaseIdentityMutation();
+      active?.releaseIdentityBarrier();
     }
 	    if (active) {
 	      active.abort();
@@ -866,7 +866,7 @@ export class ConnectorSupervisor {
       // intent, while retaining the Connector exclusion through deletion.
       this.authManager.cancelAttemptsForSource(instanceId);
       claimedBrowserAttempt.expiresAt = undefined;
-      this.activeRuns.get(instanceId)?.releaseIdentityMutation();
+      this.activeRuns.get(instanceId)?.releaseIdentityBarrier();
     }
 
     // Disconnect is a readiness change, not Source removal: stop current use
@@ -1091,7 +1091,7 @@ export class ConnectorSupervisor {
         // otherwise an already-running callback could commit after the sweep.
         this.authManager.cancelAttemptsForSource(existing.sourceId);
         this.identityMutations.delete(connectorId);
-        this.activeRuns.get(existing.sourceId)?.releaseIdentityMutation();
+        this.activeRuns.get(existing.sourceId)?.releaseIdentityBarrier();
       } else {
         throw new ConnectorLifecycleConflictError(
           `Connector ${connectorId} already has an identity mutation in progress`,
@@ -1109,7 +1109,7 @@ export class ConnectorSupervisor {
   ): void {
     if (this.identityMutations.get(connectorId) !== claim) return;
     this.identityMutations.delete(connectorId);
-    this.activeRuns.get(claim.sourceId)?.releaseIdentityMutation();
+    this.activeRuns.get(claim.sourceId)?.releaseIdentityBarrier();
   }
 
   private async drainExecutionAttemptForIdentity(instanceId: string): Promise<void> {
@@ -1314,7 +1314,7 @@ export class ConnectorSupervisor {
       // An identity mutation may have parked this preserved run intent behind
       // its barrier. Pause terminates the intent, so wake that barrier before
       // awaiting it without releasing the Connector's mutation claim.
-      active.releaseIdentityMutation();
+      active.releaseIdentityBarrier();
       active.abort();
       await active.promise.catch(() => {});
     }
@@ -1790,7 +1790,7 @@ export class ConnectorSupervisor {
     });
     this.store.setStatus(instanceId, "running");
 
-    let releaseIdentityBarrier: (() => void) | undefined;
+    let resolveIdentityBarrier: (() => void) | undefined;
     const active: ActiveRunIntent = {
       instanceId,
       trigger,
@@ -1812,16 +1812,16 @@ export class ConnectorSupervisor {
       holdForIdentityMutation() {
         if (!this.identityBarrier) {
           this.identityBarrier = new Promise<void>((resolve) => {
-            releaseIdentityBarrier = resolve;
+            resolveIdentityBarrier = resolve;
           });
         }
         this.runtimeGeneration += 1;
         this.attemptController?.abort();
         return this.attemptSettled ?? Promise.resolve();
       },
-      releaseIdentityMutation() {
-        releaseIdentityBarrier?.();
-        releaseIdentityBarrier = undefined;
+      releaseIdentityBarrier() {
+        resolveIdentityBarrier?.();
+        resolveIdentityBarrier = undefined;
         this.identityBarrier = undefined;
       },
       waitForIdentityMutation() {
