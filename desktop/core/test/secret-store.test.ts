@@ -265,6 +265,55 @@ describe("Secret store and connector credential broker", () => {
     expect(calls).toBe(2);
   });
 
+  test("oauth token refresh request times out and marks the credential refresh_failed", async () => {
+    const secrets = new SqliteEncryptedSecretStore(opened.systemDb, createVaultKey());
+    const credentials = new CredentialStore(opened.systemDb);
+    let calls = 0;
+    let stalledSignal: AbortSignal | undefined;
+    const manager = new ConnectorAuthManager(secrets, {
+      credentialStore: credentials,
+      requestTimeoutMs: 5,
+      fetchImpl: async (_url, init) => {
+        calls++;
+        if (calls === 1) {
+          return jsonResponse({
+            access_token: "old",
+            refresh_token: "refresh",
+            expires_in: -1,
+          });
+        }
+        stalledSignal = init?.signal ?? undefined;
+        return pendingUntilAborted<Response>(stalledSignal);
+      },
+    });
+    const auth = {
+      type: "oauth2-public" as const,
+      authorizationEndpoint: "https://provider.example/authorize",
+      tokenEndpoint: "https://provider.example/token",
+      clientId: "client-id",
+    };
+    const sourceRecord = sourceFixture("oauth-timeout-ref");
+    const started = manager.startOAuth(sourceRecord, auth, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const state = new URL(started.authorizationUrl).searchParams.get("state")!;
+    await expect(
+      manager.completeOAuthCallback(new URLSearchParams({ state, code: "code-1" })),
+    ).resolves.toMatchObject({ status: "connected" });
+
+    await expect(authToken(manager.createHandle(auth, sourceRecord))).rejects.toThrow(
+      "Connector auth request timed out after 5ms",
+    );
+
+    expect(stalledSignal?.aborted).toBe(true);
+    expect(credentials.get("oauth-timeout-ref")).toMatchObject({
+      status: "refresh_failed",
+      metadata: {
+        refresh_error: "Connector auth request timed out after 5ms",
+      },
+    });
+  });
+
   test("Source removal prevents an in-flight OAuth refresh from restoring credentials", async () => {
     let releaseRefresh!: (response: Response) => void;
     let markRefreshStarted!: () => void;
@@ -410,6 +459,60 @@ describe("Secret store and connector credential broker", () => {
     await expect(manager.getOAuthAttempt("source-1", started.attemptId)).resolves.toMatchObject({
       status: "failed",
       error: "Managed provider capability endpoint returned an invalid token response",
+    });
+  });
+
+  test("managed provider capability body read times out and marks the credential refresh_failed", async () => {
+    const secrets = new SqliteEncryptedSecretStore(opened.systemDb, createVaultKey());
+    const credentials = new CredentialStore(opened.systemDb);
+    let calls = 0;
+    let stalledSignal: AbortSignal | undefined;
+    const manager = new ConnectorAuthManager(secrets, {
+      credentialStore: credentials,
+      managedProviderApiOrigin: "https://api.lamarck.ai",
+      lamarckSession: {
+        accessToken: async () => "desktop-session-token",
+        clearLocalSession: async () => {},
+      },
+      requestTimeoutMs: 5,
+      fetchImpl: async (_url, init) => {
+        calls++;
+        if (calls === 1) {
+          return jsonResponse({
+            tokenType: "Bearer",
+            accessToken: "lamarck-capability-token",
+            expiresAt: new Date(Date.now() + 120_000).toISOString(),
+            providerId: "oura",
+            sourceId: "source-1",
+          });
+        }
+        stalledSignal = init?.signal ?? undefined;
+        return responseWithBodyPendingUntilAborted(stalledSignal);
+      },
+    });
+    const auth = {
+      type: "managedProvider" as const,
+      providerId: "oura",
+    };
+    const sourceRecord = sourceFixture("managed-timeout-ref");
+    const started = await manager.startManagedProvider(sourceRecord, auth, {
+      appOrigin: "https://app.lamarck.ai",
+    });
+    await expect(manager.getOAuthAttempt(sourceRecord.id, started.attemptId)).resolves.toMatchObject({
+      status: "connected",
+      credentialId: "managed-timeout-ref",
+    });
+
+    await expect(authToken(manager.createHandle(auth, sourceRecord))).rejects.toThrow(
+      "Connector auth request timed out after 5ms",
+    );
+
+    expect(stalledSignal?.aborted).toBe(true);
+    expect(credentials.get("managed-timeout-ref")).toMatchObject({
+      status: "refresh_failed",
+      metadata: {
+        refresh_error: "Connector auth request timed out after 5ms",
+      },
     });
   });
 
@@ -653,6 +756,34 @@ function authToken(handle: ConnectorAuthHandle): Promise<string> {
 
 function jsonResponse(value: unknown): Response {
   return new Response(JSON.stringify(value), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function pendingUntilAborted<T>(signal: AbortSignal | undefined): Promise<T> {
+  return new Promise<T>((_resolve, reject) => {
+    const rejectWithReason = () => reject(signal?.reason ?? new Error("Request aborted"));
+    if (signal?.aborted) {
+      rejectWithReason();
+      return;
+    }
+    signal?.addEventListener("abort", rejectWithReason, { once: true });
+  });
+}
+
+function responseWithBodyPendingUntilAborted(signal: AbortSignal | undefined): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const failWithReason = () => controller.error(signal?.reason ?? new Error("Request aborted"));
+      if (signal?.aborted) {
+        failWithReason();
+        return;
+      }
+      signal?.addEventListener("abort", failWithReason, { once: true });
+    },
+  });
+  return new Response(body, {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });

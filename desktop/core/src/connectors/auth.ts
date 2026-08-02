@@ -116,6 +116,7 @@ class ManagedProviderNotConnectedError extends Error {
 interface ConnectorAuthManagerOptions {
   credentialStore?: CredentialStore;
   fetchImpl?: typeof fetch;
+  requestTimeoutMs?: number;
   refreshSkewMs?: number;
   attemptTtlMs?: number;
   now?: () => number;
@@ -126,6 +127,7 @@ interface ConnectorAuthManagerOptions {
 export class ConnectorAuthManager {
   private credentialStore: CredentialStore | undefined;
   private fetchImpl: typeof fetch;
+  private requestTimeoutMs: number;
   private refreshSkewMs: number;
   private attemptTtlMs: number;
   private now: () => number;
@@ -145,6 +147,7 @@ export class ConnectorAuthManager {
   ) {
     this.credentialStore = opts.credentialStore;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? 30_000;
     this.refreshSkewMs = opts.refreshSkewMs ?? 60_000;
     this.attemptTtlMs = opts.attemptTtlMs ?? 10 * 60_000;
     this.now = opts.now ?? Date.now;
@@ -691,7 +694,7 @@ export class ConnectorAuthManager {
       `/providers/${encodeURIComponent(providerId)}/capability-token`,
       normalizeOrigin(this.managedProviderApiOrigin),
     );
-    const res = await this.fetchImpl(url.toString(), {
+    const response = await this.fetchTextWithDeadline(url.toString(), {
       method: "POST",
       headers: {
         Accept: "application/json",
@@ -700,15 +703,14 @@ export class ConnectorAuthManager {
       },
       body: JSON.stringify({ sourceId }),
     });
-    const text = await res.text();
-    const data = text ? JSON.parse(text) as Partial<ManagedProviderCapabilityToken> & { error?: string; message?: string } : {};
-    if (!res.ok) {
-      const message = data.message ?? data.error ?? `Managed provider capability endpoint returned ${res.status}`;
-      if (isLamarckSessionInvalid(res.status, data.error)) {
+    const data = response.body ? JSON.parse(response.body) as Partial<ManagedProviderCapabilityToken> & { error?: string; message?: string } : {};
+    if (!response.ok) {
+      const message = data.message ?? data.error ?? `Managed provider capability endpoint returned ${response.status}`;
+      if (isLamarckSessionInvalid(response.status, data.error)) {
         await this.lamarckSession.clearLocalSession();
         throw new Error("Lamarck desktop session expired. Sign in again.");
       }
-      if (res.status === 409 || data.error === "managed_provider_not_connected") {
+      if (response.status === 409 || data.error === "managed_provider_not_connected") {
         throw new ManagedProviderNotConnectedError(message);
       }
       throw new Error(message);
@@ -839,18 +841,51 @@ export class ConnectorAuthManager {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
     };
-    const res = await this.fetchImpl(auth.tokenEndpoint, {
+    const response = await this.fetchTextWithDeadline(auth.tokenEndpoint, {
       method: "POST",
       headers,
       body,
     });
-    const text = await res.text();
-    const data = text ? JSON.parse(text) as TokenResponse : {};
-    if (!res.ok || data.error) {
-      throw new Error(data.error_description ?? data.error ?? `OAuth token endpoint returned ${res.status}`);
+    const data = response.body ? JSON.parse(response.body) as TokenResponse : {};
+    if (!response.ok || data.error) {
+      throw new Error(data.error_description ?? data.error ?? `OAuth token endpoint returned ${response.status}`);
     }
     requireAccessToken(data);
     return data;
+  }
+
+  private async fetchTextWithDeadline(
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ): Promise<{ ok: boolean; status: number; body: string }> {
+    const controller = new AbortController();
+    const timeoutError = new Error(
+      `Connector auth request timed out after ${this.requestTimeoutMs}ms`,
+    );
+    timeoutError.name = "ConnectorAuthRequestTimeoutError";
+    let timedOut = false;
+    // Enforce the deadline through the Fetch cancellation contract. Injected
+    // implementations must reject fetch and body consumption when aborted.
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(timeoutError);
+    }, this.requestTimeoutMs);
+    try {
+      const response = await this.fetchImpl(input, {
+        ...init,
+        signal: controller.signal,
+      });
+      return {
+        ok: response.ok,
+        status: response.status,
+        body: await response.text(),
+      };
+    } catch (err) {
+      if (timedOut) throw timeoutError;
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async persistOAuthToken(attempt: OAuthAttempt, token: TokenResponse): Promise<void> {
