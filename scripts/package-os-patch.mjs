@@ -20,6 +20,7 @@ const include = [
   "scripts/package-os-patch.mjs",
   "scripts/build-core.mjs",
   "scripts/build-electron-main.mjs",
+  "scripts/build-system-identity.mjs",
   "scripts/build-capsule-vm-macos.mjs",
   "scripts/stage-capsule-native.mjs",
   "scripts/build-macos-release-shell-inside.mjs",

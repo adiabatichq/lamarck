@@ -5,6 +5,13 @@ import { ulid } from "../utils/ulid";
 import { assertJsonValue } from "../json";
 import { ContentBlobStore } from "../blob-store";
 import type { DeviceIdentityState } from "../device-identity";
+import {
+  ProducerDescriptorStore,
+  createConnectorProducerDescriptor,
+  createProducerBinding,
+  type ProducerBinding,
+} from "../producer-descriptor";
+import type { SystemIdentity } from "../system-identity";
 import { ConnectorAuthManager } from "./auth";
 import type { OAuthAttemptView, OAuthStartResult } from "./auth";
 import {
@@ -28,6 +35,9 @@ import {
   validateConnectorManifest,
 } from "./manifest";
 import { WorkspaceConnectorRegistry, trustStatusForSource } from "./registry";
+import {
+  ConnectorPackageArchiveStore,
+} from "./connector-package-archive";
 import { validateConnectorDefinition } from "./runtime";
 import {
   ConnectorSourceStore,
@@ -100,6 +110,13 @@ interface Registration {
   definition?: ConnectorDefinition;
   package?: ConnectorPackageRecord;
   trust: ConnectorPackageTrust;
+  /** Explicit test/embedding identity; packaged Connectors derive this at admission. */
+  producer?: ProducerBinding;
+}
+
+interface OpenedTrustedSession {
+  session: RunnerSession;
+  producer?: ProducerBinding;
 }
 
 interface ActiveRunIntent {
@@ -139,6 +156,14 @@ export interface ConnectorSupervisorOptions {
   systemDb: DatabaseSync;
   guard: ConnectorHostGuard;
   workspacePath: string;
+  systemIdentity: SystemIdentity;
+  producerDescriptorStore?: ProducerDescriptorStore;
+  packageArchiveStore?: Pick<
+    ConnectorPackageArchiveStore,
+    "publish" | "requireExists"
+  >;
+  /** Required only for in-process test/embedding definitions that receive D0 capability. */
+  inProcessProducer?: ProducerBinding;
   platform?: ConnectorPlatform;
   authManager?: ConnectorAuthManager;
   officialCatalog?: ConnectorOfficialCatalogEntry[];
@@ -190,10 +215,23 @@ export class ConnectorSupervisor {
   private managedProviderAppOrigin: string;
   private deviceIdentity: DeviceIdentityState;
   private deviceDisplayName: string;
+  private systemIdentity: SystemIdentity;
+  private producerDescriptorStore: ProducerDescriptorStore;
+  private packageArchiveStore: Pick<
+    ConnectorPackageArchiveStore,
+    "publish" | "requireExists"
+  >;
+  private inProcessProducer: ProducerBinding | undefined;
 
   constructor(opts: ConnectorSupervisorOptions) {
     this.guard = opts.guard;
     this.workspacePath = opts.workspacePath;
+    this.systemIdentity = opts.systemIdentity;
+    this.producerDescriptorStore = opts.producerDescriptorStore
+      ?? new ProducerDescriptorStore(opts.workspacePath);
+    this.packageArchiveStore = opts.packageArchiveStore
+      ?? new ConnectorPackageArchiveStore(opts.workspacePath);
+    this.inProcessProducer = opts.inProcessProducer;
     this.store = new ConnectorSourceStore(opts.systemDb);
     this.store.recoverInterruptedRuns();
     this.authManager = opts.authManager ?? new ConnectorAuthManager();
@@ -229,6 +267,7 @@ export class ConnectorSupervisor {
       manifest: normalized,
       definition: definition as ConnectorDefinition,
       trust: MANUAL_TRUST,
+      producer: this.inProcessProducer,
     });
   }
 
@@ -248,6 +287,22 @@ export class ConnectorSupervisor {
       pkg.contentHash,
     );
     return pkg.manifest;
+  }
+
+  /** Exact-hash trust authority used by staged install/update admission. */
+  async verifyTrustedPackage(
+    connectorDir: string,
+    connectorId: string,
+  ): Promise<ConnectorPackageRecord> {
+    const pkg = await this.registry.loadPackage(connectorDir, connectorId);
+    if (!pkg.trust.runnable) {
+      throw new Error(`Connector ${pkg.connectorId} is not trusted: ${pkg.trust.status}`);
+    }
+    return pkg;
+  }
+
+  async publishPackageArchive(connectorDir: string, contentHash: string): Promise<void> {
+    await this.packageArchiveStore.publish(connectorDir, contentHash);
   }
 
   async withConnectorUpdate<T>(
@@ -334,6 +389,7 @@ export class ConnectorSupervisor {
       throw new Error(`Connector ${connectorId} was not loaded from a workspace package`);
     }
     const current = await this.registry.loadPackage(registration.package.dir);
+    await this.packageArchiveStore.publish(current.dir, current.contentHash);
     return this.withConnectorUpdate(connectorId, current.manifest, async () => {
       const approved = this.registry.approveCustomPackage(current);
       this.registrations.set(connectorId, {
@@ -1193,7 +1249,7 @@ export class ConnectorSupervisor {
     const controller = new AbortController();
     let session: RunnerSession | undefined;
     try {
-      session = await this.openTrustedSession(registration, controller.signal);
+      session = (await this.openTrustedSession(registration, controller.signal)).session;
       sourceRecord = this.store.get(instanceId)!;
       const result = await session.resolveSourceIdentity({
         connectorId: sourceRecord.connectorId,
@@ -1355,7 +1411,7 @@ export class ConnectorSupervisor {
 	    const controller = new AbortController();
 	    let session: RunnerSession | undefined;
 	    try {
-	      session = await this.openTrustedSession(registration, controller.signal);
+	      session = (await this.openTrustedSession(registration, controller.signal)).session;
 	      if (!registration.manifest.configPanels?.[panelId]) {
 	        throw new Error(`Connector ${sourceRecord.connectorId} does not declare config panel: ${panelId}`);
 	      }
@@ -1512,7 +1568,7 @@ export class ConnectorSupervisor {
     // Trust before handler: loading requirement handlers runs connector code,
     // so the package must pass the same trust gate as run(). Package handlers
     // execute in a separate runner process.
-    const session = await this.openTrustedSession(registration);
+    const session = (await this.openTrustedSession(registration)).session;
     try {
       const records = await this.evaluateRequirements(registration, sourceRecord, session, requirementIds);
       await this.refreshSetupStatus(instanceId, { reconcileTransition: true });
@@ -1538,7 +1594,7 @@ export class ConnectorSupervisor {
       );
     }
 
-    const session = await this.openTrustedSession(registration);
+    const session = (await this.openTrustedSession(registration)).session;
     try {
       if (!session.requirementIds().includes(requirementId)) {
         throw new Error(
@@ -1876,17 +1932,20 @@ export class ConnectorSupervisor {
           | { ok: true }
           | { ok: false; error: unknown };
         let session: RunnerSession | undefined;
+        let producer: ProducerBinding | undefined;
         try {
           await this.assertRunAuth(registration, sourceRecord);
           // The attempt signal is bound from the very first phase: a runtime
           // input generation change can replace a hanging import/check as well
           // as a connector that has already entered run(context).
-          session = await this.openTrustedSession(registration, attemptController.signal);
+          const opened = await this.openTrustedSession(registration, attemptController.signal);
+          session = opened.session;
+          producer = opened.producer;
           await this.assertRunRequirements(registration, sourceRecord, session);
           await session.run({
             config: mergeConfig(schemaDefaults(registration.manifest), sourceRecord.config),
             signal: attemptController.signal,
-            capabilities: this.buildRunCapabilities(registration, sourceRecord),
+            capabilities: this.buildRunCapabilities(registration, sourceRecord, producer),
           });
           attemptResult = { ok: true };
         } catch (err) {
@@ -1961,9 +2020,14 @@ export class ConnectorSupervisor {
   private async openTrustedSession(
     registration: Registration,
     abortSignal?: AbortSignal,
-  ): Promise<RunnerSession> {
+  ): Promise<OpenedTrustedSession> {
     if (!registration.package) {
-      if (registration.definition) return new InProcessRunnerSession(registration.definition);
+      if (registration.definition) {
+        return {
+          session: new InProcessRunnerSession(registration.definition),
+          producer: registration.producer,
+        };
+      }
       throw new Error(`Connector ${registration.manifest.id} has no package entry`);
     }
 
@@ -1980,6 +2044,16 @@ export class ConnectorSupervisor {
     if (!current.trust.runnable) {
       throw new Error(`Connector ${current.connectorId} is not trusted: ${current.trust.status}`);
     }
+    await this.packageArchiveStore.requireExists(current.contentHash);
+
+    const producer = createProducerBinding(
+      this.producerDescriptorStore,
+      createConnectorProducerDescriptor(
+        current.connectorId,
+        current.contentHash,
+        this.systemIdentity,
+      ),
+    );
 
     const session = new ProcessRunnerSession({
       entryPath: current.entryPath,
@@ -1991,19 +2065,26 @@ export class ConnectorSupervisor {
       commandTimeoutMs: this.runnerCommandTimeoutMs,
     });
     await session.open(abortSignal);
-    return session;
+    return { session, producer };
   }
 
   private buildRunCapabilities(
     registration: Registration,
     sourceRecord: ConnectorSource,
+    producer: ProducerBinding | undefined,
   ): RunnerCapabilities {
     if (!identityPairResolved(sourceRecord, registration.manifest.source.identity)) {
       throw new Error(`Connector Source identity is not resolved: ${sourceRecord.id}`);
     }
+    if (!producer) {
+      throw new Error(
+        `Connector ${sourceRecord.connectorId} requires an explicit Producer context`,
+      );
+    }
     const boundGuard = createBoundConnectorGuard(
       this.guard,
       sourceRecord.connectorId,
+      producer,
       sourceRecord.sourceKey ?? undefined,
     );
     const stateHandle = createConnectorStateHandle(this.store, sourceRecord.id);

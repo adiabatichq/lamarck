@@ -8,6 +8,7 @@ interface EventRow {
   id: string;
   schema_version: string;
   source: string;
+  producer_ref: string;
   type: string;
   external_id: string | null;
   started_at: number;
@@ -362,7 +363,7 @@ export function ActivityView({ onOpenDoc, initialEventId = null }: ActivityViewP
     params.push(EVENT_PAGE_SIZE + 1);
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const result = await api.query(
-      `SELECT id, schema_version, source, type, external_id, started_at, ended_at, payload, created_at
+      `SELECT id, schema_version, source, producer_ref, type, external_id, started_at, ended_at, payload, created_at
        FROM events
        ${where}
        ORDER BY started_at DESC, id DESC

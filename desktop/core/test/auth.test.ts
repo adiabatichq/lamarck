@@ -9,6 +9,7 @@ import {
 const FORGED_APP_ID_HEADER = "x-lamarck-app-id";
 const FORGED_BRIDGE_TOKEN_HEADER = "x-lamarck-bridge-token";
 const MANIFEST_DIGEST = `sha256:${"a".repeat(64)}` as const;
+const APP_COMMIT = "b".repeat(40);
 
 const secrets = {
   coreToken: "core-secret",
@@ -28,7 +29,13 @@ function authorization(
   writeTables: string[] = [],
   docGrants: string[] = [],
 ): AppAuthorizationSnapshot {
-  return { manifestGeneration, manifestDigest: MANIFEST_DIGEST, writeTables, docGrants };
+  return {
+    manifestGeneration,
+    manifestDigest: MANIFEST_DIGEST,
+    appCommit: APP_COMMIT,
+    writeTables,
+    docGrants,
+  };
 }
 
 describe("auth", () => {
@@ -69,6 +76,7 @@ describe("auth", () => {
       authorization: {
         manifestGeneration: 1,
         manifestDigest: MANIFEST_DIGEST,
+        appCommit: APP_COMMIT,
         writeTables: ["notes"],
         docGrants: ["apps/app-a/"],
       },
@@ -202,6 +210,27 @@ describe("auth", () => {
     expect(() => registry.issue("app-a", "service:Bad" as never, authorization())).toThrow(
       "Invalid app workload",
     );
+    expect(registry.size).toBe(0);
+  });
+
+  test("requires a Host-bound full App commit before issuing a capability", () => {
+    const registry = new AppCapabilityRegistry();
+    const invalidCommits: unknown[] = [
+      undefined,
+      "",
+      "a".repeat(12),
+      "A".repeat(40),
+      `${"a".repeat(40)}-dirty`,
+    ];
+
+    for (const appCommit of invalidCommits) {
+      expect(() => registry.issue("app-a", "ui", {
+        ...authorization(),
+        appCommit,
+      } as AppAuthorizationSnapshot)).toThrow(
+        "App authorization commit must be a full 40- or 64-character lowercase Git commit",
+      );
+    }
     expect(registry.size).toBe(0);
   });
 

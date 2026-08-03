@@ -1,5 +1,6 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -283,6 +284,27 @@ async function writeAppManifest(appId: string, tables: string[]): Promise<void> 
     },
     permissions: { writes: { docs: [], tables } },
   }, null, 2)}\n`, "utf8");
+  if (!existsSync(join(appDir, ".git"))) {
+    runAppGit(appDir, "init", "--quiet");
+    runAppGit(appDir, "config", "user.name", "Lamarck Test");
+    runAppGit(appDir, "config", "user.email", "lamarck-test@example.invalid");
+  }
+  runAppGit(appDir, "add", "--all");
+  runAppGit(
+    appDir,
+    "commit",
+    "--quiet",
+    "--no-gpg-sign",
+    "-m",
+    `Commit ${appId} activation`,
+  );
+}
+
+function runAppGit(appDir: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", appDir, ...args], {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
 }
 
 function seedDataDatabase(): void {

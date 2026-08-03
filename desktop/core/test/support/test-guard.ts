@@ -7,6 +7,8 @@ import { assertJsonValue } from "../../src/json";
 import { ulid } from "../../src/utils/ulid";
 import type { GuardSqlParams } from "../../src/guard-service/protocol";
 
+export const TEST_PRODUCER_REF = `producer:v1:sha256:${"1".repeat(64)}`;
+
 const UNCONDITIONAL_DOC_MUTATION = Symbol("unconditional-doc-mutation");
 type DocVersionExpectation = typeof UNCONDITIONAL_DOC_MUTATION | {
   hash: string | null;
@@ -23,11 +25,22 @@ export class TestGuard {
   public docChangeSubscribers: Array<(id: string) => void> = [];
 
   constructor(
-    private readonly opts: { db: DatabaseSync; source: string },
+    private readonly opts: { db: DatabaseSync; source: string; producerRef?: string },
   ) {}
 
-  withSource(source: string, options?: { copyDocHook?: boolean }): TestGuard {
-    const guard = new TestGuard({ db: this.opts.db, source });
+  withSource(
+    source: string,
+    options?: {
+      copyDocHook?: boolean;
+      producerRef?: string;
+      prepareProducer?: () => void | Promise<void>;
+    },
+  ): TestGuard {
+    const guard = new TestGuard({
+      db: this.opts.db,
+      source,
+      producerRef: options?.producerRef ?? this.opts.producerRef ?? TEST_PRODUCER_REF,
+    });
     guard.docChangeSubscribers = this.docChangeSubscribers;
     if (options?.copyDocHook !== false) guard.onDocChange = this.onDocChange;
     return guard;
@@ -54,12 +67,13 @@ export class TestGuard {
     const id = ulid();
     this.opts.db.prepare(
       `INSERT INTO events
-        (id, schema_version, source, type, external_id, started_at, ended_at, payload)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, schema_version, source, producer_ref, type, external_id, started_at, ended_at, payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       event.schemaVersion ?? D0_SCHEMA_VERSION,
       this.opts.source,
+      this.opts.producerRef ?? TEST_PRODUCER_REF,
       event.type,
       event.externalId ?? null,
       event.startedAt,

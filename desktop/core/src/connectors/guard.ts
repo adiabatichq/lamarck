@@ -3,6 +3,7 @@ import type { GuardSqlParams } from "../guard-service/protocol";
 import type { BoundConnectorGuard, ConnectorEventInput } from "./types";
 import { validateConnectorId, validateSourceKey } from "./manifest";
 import { validateConnectorEvent } from "./runtime";
+import type { ProducerBinding } from "../producer-descriptor";
 
 export function sourceForConnector(connectorId: string, sourceKey?: string): string {
   validateConnectorId(connectorId);
@@ -15,10 +16,14 @@ export function sourceForConnector(connectorId: string, sourceKey?: string): str
 export function createBoundConnectorGuard(
   rootGuard: ConnectorHostGuard,
   connectorId: string,
+  producer: ProducerBinding,
   sourceKey?: string,
 ): BoundConnectorGuard {
   const source = sourceForConnector(connectorId, sourceKey);
-  const guard = rootGuard.withSource(source);
+  const guard = rootGuard.withSource(source, {
+    producerRef: producer.producerRef,
+    prepareProducer: producer.prepareProducer,
+  });
   return {
     async writeEvent(event: ConnectorEventInput): Promise<{ id: string }> {
       validateConnectorEvent(event);
@@ -68,7 +73,10 @@ async function findExistingConnectorEvent(
 }
 
 export interface ConnectorHostGuard {
-  withSource(source: string): ConnectorHostGuard;
+  withSource(source: string, producer: {
+    producerRef: string;
+    prepareProducer?: () => void | Promise<void>;
+  }): ConnectorHostGuard;
   queryOne(sql: string, params?: GuardSqlParams): unknown | null | Promise<unknown | null>;
   writeEvent(event: EventInput): string | Promise<string>;
 }

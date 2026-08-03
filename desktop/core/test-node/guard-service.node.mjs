@@ -18,9 +18,12 @@ const ENTRY = process.env.LAMARCK_GUARD_ENTRY
 const TOKEN = "node-guard-test-token-0123456789";
 const DIRECT = process.env.LAMARCK_GUARD_TEST_DIRECT === "1";
 const require = createRequire(import.meta.url);
+const TEST_PRODUCER_REF = `producer:v1:sha256:${"1".repeat(64)}`;
+const OTHER_TEST_PRODUCER_REF = `producer:v1:sha256:${"2".repeat(64)}`;
 
 const host = {
   source: "system:test",
+  producerRef: TEST_PRODUCER_REF,
   tableGrants: "*",
   docGrants: "*",
   schemaGrant: true,
@@ -463,6 +466,7 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     await assertRpcRejects("mutate", {
       principal: {
         source: "app:forged-wildcard",
+        producerRef: TEST_PRODUCER_REF,
         tableGrants: "*",
         docGrants: [],
         schemaGrant: false,
@@ -511,6 +515,28 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
       principal: host,
       sql: "CREATE TABLE no_admin (id TEXT)",
     }, /DML|authorized/i);
+  });
+
+  test("principals require a strict logical Producer ref", async () => {
+    const missing = { ...host };
+    delete missing.producerRef;
+    await assertRpcRejects("query", {
+      principal: missing,
+      sql: "SELECT 1 AS ok",
+    }, /invalid principal producerRef/i);
+
+    for (const producerRef of [
+      "",
+      "producer:v1:sha256:abc",
+      `producer:v1:sha256:${"A".repeat(64)}`,
+      `producer:v1:sha512:${"1".repeat(64)}`,
+      `producer:v2:sha256:${"1".repeat(64)}`,
+    ]) {
+      await assertRpcRejects("query", {
+        principal: { ...host, producerRef },
+        sql: "SELECT 1 AS ok",
+      }, /invalid principal producerRef/i);
+    }
   });
 
   test("INSERT OR REPLACE authorizes and audits both actual side effects", async () => {
@@ -686,6 +712,34 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     assert.deepEqual(await auditPayloads(constraintSource), []);
   });
 
+  test("App D1 and D2 audit writes retain the initiating Producer ref", async () => {
+    const app = principal(
+      "app:producer-retention",
+      ["parents"],
+      ["apps/producer-retention/"],
+      OTHER_TEST_PRODUCER_REF,
+    );
+    await rpc("writeDoc", {
+      principal: app,
+      id: "apps/producer-retention/one",
+      content: "producer-bound",
+    });
+    await rpc("mutate", {
+      principal: app,
+      sql: "INSERT INTO parents (id, label) VALUES (?, ?)",
+      params: ["producer-retention", "producer-bound"],
+    });
+
+    assert.deepEqual(
+      (await d1Events("app:producer-retention")).map((event) => event.producerRef),
+      [OTHER_TEST_PRODUCER_REF],
+    );
+    assert.deepEqual(
+      (await auditPayloads("app:producer-retention")).map((event) => event.producerRef),
+      [OTHER_TEST_PRODUCER_REF],
+    );
+  });
+
   test("D1 and D0 helpers preserve envelopes and enforce path/event namespaces", async () => {
     const docs = principal("app:docs", [], ["apps/docs/", "shared/pinned"]);
     assert.deepEqual(await rpc("writeDoc", {
@@ -712,16 +766,54 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
       },
     });
     const event = (await queryRows(
-      "SELECT id, schema_version, source, type, external_id, payload FROM events WHERE id = ?",
+      "SELECT id, schema_version, source, producer_ref, type, external_id, payload FROM events WHERE id = ?",
       [eventId],
     ))[0];
     assert.deepEqual(event, {
       id: eventId,
       schema_version: "0.1",
       source: "app:docs",
+      producer_ref: TEST_PRODUCER_REF,
       type: "focus.completed",
       external_id: "focus-1",
       payload: '{"minutes":25}',
+    });
+
+    const replayId = await rpc("writeEvent", {
+      principal: principal("app:docs", [], [], OTHER_TEST_PRODUCER_REF),
+      event: {
+        type: "focus.completed",
+        externalId: "focus-1",
+        startedAt: 1_800_000_000_000,
+        payload: { minutes: 99 },
+      },
+    });
+    assert.equal(replayId, eventId);
+    assert.deepEqual((await queryRows(
+      "SELECT producer_ref, started_at, payload FROM events WHERE id = ?",
+      [eventId],
+    ))[0], {
+      producer_ref: TEST_PRODUCER_REF,
+      started_at: 1_700_000_000_000,
+      payload: '{"minutes":25}',
+    });
+
+    const crossSourceId = await rpc("writeEvent", {
+      principal: principal("app:docs-other-source", [], [], OTHER_TEST_PRODUCER_REF),
+      event: {
+        type: "focus.completed",
+        externalId: "focus-1",
+        startedAt: 1_800_000_000_000,
+        payload: { minutes: 99 },
+      },
+    });
+    assert.notEqual(crossSourceId, eventId);
+    assert.deepEqual((await queryRows(
+      "SELECT source, producer_ref FROM events WHERE id = ?",
+      [crossSourceId],
+    ))[0], {
+      source: "app:docs-other-source",
+      producer_ref: OTHER_TEST_PRODUCER_REF,
     });
     await assertRpcRejects("writeEvent", {
       principal: docs,
@@ -805,6 +897,25 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
       { id: "portable-file-dir/leaf", content: "file owner" },
       { id: "portable-shared/Spelling/one", content: "shared directory owner" },
     ]);
+  });
+
+  test("Host lifecycle writes retain the System Producer ref", async () => {
+    const eventId = await rpc("writeEvent", {
+      principal: host,
+      event: {
+        type: "app.created",
+        startedAt: 1_700_000_100_000,
+        payload: { app_id: "producer-test" },
+      },
+    });
+    assert.deepEqual((await queryRows(
+      "SELECT source, producer_ref, type FROM events WHERE id = ?",
+      [eventId],
+    ))[0], {
+      source: "system:test",
+      producer_ref: TEST_PRODUCER_REF,
+      type: "app.created",
+    });
   });
 
   test("only system principals can privately read complete Working Tree documents", async () => {
@@ -1296,6 +1407,7 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     const { GuardEngine } = require(ENTRY);
     const restartPrincipal = {
       source: "system:locked-restart",
+      producerRef: TEST_PRODUCER_REF,
       tableGrants: "*",
       docGrants: "*",
       schemaGrant: true,
@@ -1370,6 +1482,7 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     await assertRpcRejects("schema.plan", {
       principal: {
         source: "app:forged-schema",
+        producerRef: TEST_PRODUCER_REF,
         tableGrants: [],
         docGrants: [],
         schemaGrant: true,
@@ -1420,6 +1533,14 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
       approved: true,
       requestedBy: "node-test",
     });
+    assert.deepEqual(await queryRows(
+      `SELECT producer_ref
+       FROM events
+       WHERE source = ? AND type = 'ddl.promote'
+       ORDER BY created_at DESC, rowid DESC
+       LIMIT 1`,
+      [host.source],
+    ), [{ producer_ref: TEST_PRODUCER_REF }]);
     const result = await rpc("mutate", {
       principal: principal("app:schema-created", ["schema_created"]),
       sql: "INSERT INTO schema_created (id, value) VALUES (?, ?)",
@@ -1653,6 +1774,7 @@ function seedDataDb(path) {
         id TEXT PRIMARY KEY,
         schema_version TEXT NOT NULL DEFAULT '0.1',
         source TEXT NOT NULL,
+        producer_ref TEXT NOT NULL,
         type TEXT NOT NULL,
         external_id TEXT,
         started_at INTEGER NOT NULL,
@@ -1752,8 +1874,8 @@ function seedDataDb(path) {
   }
 }
 
-function principal(source, tableGrants, docGrants = []) {
-  return { source, tableGrants, docGrants, schemaGrant: false };
+function principal(source, tableGrants, docGrants = [], producerRef = TEST_PRODUCER_REF) {
+  return { source, producerRef, tableGrants, docGrants, schemaGrant: false };
 }
 
 function sha256(content) {
@@ -1814,18 +1936,26 @@ async function queryRows(sql, params) {
 
 async function auditPayloads(source) {
   const rows = await queryRows(
-    "SELECT type, payload FROM events WHERE source = ? AND type LIKE 'd2.%' ORDER BY created_at, rowid",
+    "SELECT type, producer_ref, payload FROM events WHERE source = ? AND type LIKE 'd2.%' ORDER BY created_at, rowid",
     [source],
   );
-  return rows.map((row) => ({ type: row.type, payload: JSON.parse(row.payload) }));
+  return rows.map((row) => ({
+    type: row.type,
+    producerRef: row.producer_ref,
+    payload: JSON.parse(row.payload),
+  }));
 }
 
 async function d1Events(source, docId) {
   const rows = await queryRows(
-    "SELECT type, payload FROM events WHERE source = ? AND type LIKE 'd1.%' ORDER BY created_at, rowid",
+    "SELECT type, producer_ref, payload FROM events WHERE source = ? AND type LIKE 'd1.%' ORDER BY created_at, rowid",
     [source],
   );
-  const events = rows.map((row) => ({ type: row.type, payload: JSON.parse(row.payload) }));
+  const events = rows.map((row) => ({
+    type: row.type,
+    producerRef: row.producer_ref,
+    payload: JSON.parse(row.payload),
+  }));
   return docId === undefined
     ? events
     : events.filter((event) => event.payload.doc_id === docId);

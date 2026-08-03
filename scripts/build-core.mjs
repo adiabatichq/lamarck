@@ -5,10 +5,15 @@ import * as esbuild from "esbuild";
 import {
   buildDeviceIdentityNative,
 } from "../desktop/core/src/device-identity/native/build.mjs";
+import {
+  resolveBuildSystemIdentity,
+  systemIdentityEsbuildDefine,
+} from "./build-system-identity.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const coreDir = resolve(root, "desktop/core");
 const outDir = resolve(coreDir, "dist");
+const buildIdentity = await resolveBuildSystemIdentity({ root });
 
 await mkdir(outDir, { recursive: true });
 
@@ -18,6 +23,7 @@ const common = {
   target: "node24",
   sourcemap: true,
   external: ["node:sqlite"],
+  define: systemIdentityEsbuildDefine(buildIdentity),
 };
 
 await Promise.all([

@@ -56,7 +56,13 @@ if (existsSync(archivePath)) {
 }
 
 console.log(`[alpha] Building Lamarck Alpha ${version} (ad-hoc signed, NOT for broad distribution)`);
-run("npm", ["run", "build"], { cwd: root });
+run("npm", ["run", "build"], {
+  cwd: root,
+  env: {
+    ...process.env,
+    LAMARCK_BUILD_VERSION: version,
+  },
+});
 
 // Every input below comes from the ordinary developer build/staging flow.
 const distRoot = join(shellRoot, "dist");
@@ -214,8 +220,8 @@ try {
   await rm(stagingRoot, { recursive: true, force: true });
 }
 
-function run(command, args, { cwd = root, allowFailure = false } = {}) {
-  const result = spawnSync(command, args, { cwd, stdio: "inherit" });
+function run(command, args, { cwd = root, allowFailure = false, env = process.env } = {}) {
+  const result = spawnSync(command, args, { cwd, env, stdio: "inherit" });
   if (result.error) throw result.error;
   if (result.status !== 0 && !allowFailure) {
     throw new Error(`${command} exited with ${result.status ?? result.signal}`);

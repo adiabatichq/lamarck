@@ -161,6 +161,7 @@ export async function listAvailableBuiltIns(
 
 export interface InstallConnectorFromSourceOptions extends InstallConnectorOptions {
   guard: ConnectorHostGuard;
+  supervisor: ConnectorSupervisor;
 }
 
 export interface UpdateConnectorFromSourceOptions extends InstallConnectorFromSourceOptions {
@@ -179,16 +180,31 @@ export interface UpdatedConnector extends InstalledConnector {
 export async function installConnectorFromSource(
   opts: InstallConnectorFromSourceOptions,
 ): Promise<InstalledConnector> {
-  const installed = await installConnector(opts);
-  await opts.guard.writeEvent({
-    type: "connector.installed",
-    startedAt: Date.now(),
-    payload: {
-      connector_id: installed.manifest.id,
-      package_hash: await hashConnectorPackage(installed.dir),
-    },
-  });
-  return installed;
+  const { sourceDir, manifest, connectorsDir, targetDir } = await prepareConnectorMaterialization(opts);
+  await mkdir(connectorsDir, { recursive: true });
+  if (await pathExists(targetDir)) {
+    throw new Error(`Connector already installed: ${manifest.id}`);
+  }
+
+  const stagingDir = await stageConnectorPackage(sourceDir, connectorsDir, "install");
+  try {
+    const candidate = await opts.supervisor.verifyTrustedPackage(stagingDir, manifest.id);
+    await opts.supervisor.publishPackageArchive(stagingDir, candidate.contentHash);
+    await rename(stagingDir, targetDir);
+    const registeredManifest = await opts.supervisor.registerDirectory(targetDir);
+    await opts.guard.writeEvent({
+      type: "connector.installed",
+      startedAt: Date.now(),
+      payload: {
+        connector_id: registeredManifest.id,
+        package_hash: candidate.contentHash,
+      },
+    });
+    return { manifest: registeredManifest, dir: targetDir };
+  } catch (error) {
+    await rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 // Update is Install's same package-materialization flow with a different
@@ -225,6 +241,11 @@ export async function updateConnectorFromSource(
       );
     }
     const candidateHash = await hashConnectorPackage(stagingDir);
+    const candidate = await opts.supervisor.verifyTrustedPackage(stagingDir, connectorId);
+    if (candidate.contentHash !== candidateHash) {
+      throw new Error(`Connector ${connectorId} candidate hash changed during trust verification`);
+    }
+    await opts.supervisor.publishPackageArchive(stagingDir, candidateHash);
     if (candidateHash === currentHash) {
       return {
         manifest: stagedManifest,

@@ -8,7 +8,7 @@ import { fileURLToPath } from "url";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { ContentBlobStore } from "../src/blob-store";
 import { openTestDatabases as openDatabases } from "./support/test-databases";
-import { TestGuard as Guard } from "./support/test-guard";
+import { TEST_PRODUCER_REF, TestGuard as Guard } from "./support/test-guard";
 import {
   ConnectorScheduler,
   ConnectorSupervisor,
@@ -34,9 +34,11 @@ import {
   nextCronRunAt,
   type ConnectorDefinition,
   type ConnectorManifest,
+  type ConnectorSupervisorOptions,
 } from "../src/connectors";
 import { defaultAuthRef } from "../src/connectors/state";
 import { MemorySecretStore } from "../src/credentials";
+import type { ProducerRef } from "../src/producer-descriptor";
 
 const TEST_EVENT_CATALOG = {
   catalogVersion: 1,
@@ -56,6 +58,29 @@ const TEST_EVENT_CATALOG = {
     },
   },
 } as const;
+
+const TEST_SYSTEM_IDENTITY = Object.freeze({
+  version: "0.0.0-test",
+  commit: "a".repeat(40),
+  platform: "darwin-arm64",
+});
+const TEST_IN_PROCESS_PRODUCER = Object.freeze({
+  producerRef: TEST_PRODUCER_REF as ProducerRef,
+  prepareProducer() {},
+});
+
+class TestConnectorSupervisor extends ConnectorSupervisor {
+  constructor(options: Omit<
+    ConnectorSupervisorOptions,
+    "inProcessProducer" | "systemIdentity"
+  >) {
+    super({
+      ...options,
+      systemIdentity: TEST_SYSTEM_IDENTITY,
+      inProcessProducer: TEST_IN_PROCESS_PRODUCER,
+    });
+  }
+}
 
 function writeTestEventCatalog(connectorDir: string): void {
   writeFileSync(
@@ -142,7 +167,7 @@ describe("Connector system", () => {
     systemDb = result.systemDb;
     close = result.close;
     secrets = new MemorySecretStore();
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -150,6 +175,19 @@ describe("Connector system", () => {
       authManager: new ConnectorAuthManager(secrets),
     });
   });
+
+  function useOfficialPackages(
+    entries: Array<{ id: string; hash: string }>,
+  ): void {
+    supervisor = new TestConnectorSupervisor({
+      systemDb,
+      guard: new Guard({ db: dataDb, source: "system:test" }),
+      workspacePath: workspace,
+      platform: "darwin",
+      authManager: new ConnectorAuthManager(secrets),
+      officialCatalog: entries,
+    });
+  }
 
   afterEach(() => {
     close();
@@ -846,7 +884,7 @@ auth:
        VALUES ('stale-run', ?, 'restart-recovery', 'schedule', 'running', 1)`,
     ).run(sourceRecord.id);
 
-    const restarted = new ConnectorSupervisor({
+    const restarted = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -1593,7 +1631,7 @@ auth:
     expect(failed.identityStatus).toBe("error");
 
     resolverAvailable = true;
-    const restarted = new ConnectorSupervisor({
+    const restarted = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -1642,7 +1680,7 @@ auth:
     });
     await supervisor.removeSource(owner.id);
 
-    const restarted = new ConnectorSupervisor({
+    const restarted = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -1767,7 +1805,7 @@ auth:
     const makeSupervisor = (deviceIdentity: { status: "resolved"; value: string } | {
       status: "unavailable";
       reason: string;
-    }) => new ConnectorSupervisor({
+    }) => new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -2265,7 +2303,7 @@ auth:
   });
 
   test("gates sources by platform", async () => {
-    const linuxSupervisor = new ConnectorSupervisor({
+    const linuxSupervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -8731,7 +8769,7 @@ auth:
 
   test("workspace boot cascades Sources whose Connector package is truly absent", async () => {
     const authManager = new ConnectorAuthManager(secrets);
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -8755,7 +8793,7 @@ auth:
     const sourceRecord = supervisor.ensureSource({ connectorId: "removed-outside-core" });
     await authManager.setToken(sourceRecord.authRef!, "orphan-token");
 
-    const restarted = new ConnectorSupervisor({
+    const restarted = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -8836,7 +8874,11 @@ auth:
   test("lists bundled built-ins as available and installs one explicitly", async () => {
     const guard = new Guard({ db: dataDb, source: "system:test" });
     const builtins = join(workspace, "builtins");
-    writeBuiltIn(builtins, "seed");
+    const seedDir = writeBuiltIn(builtins, "seed");
+    useOfficialPackages([{
+      id: "seed",
+      hash: await hashConnectorPackage(seedDir),
+    }]);
     const broken = join(builtins, "broken");
     mkdirSync(broken, { recursive: true });
     writeFileSync(join(broken, "connector.yaml"), "id: broken\n");
@@ -8856,6 +8898,7 @@ auth:
       workspacePath: workspace,
       connectorId: "seed",
       guard,
+      supervisor,
     });
     expect(installed.dir).toBe(join(workspace, "connectors", "seed"));
     expect(existsSync(join(installed.dir, "index.mjs"))).toBe(true);
@@ -8874,6 +8917,7 @@ auth:
         workspacePath: workspace,
         connectorId: "seed",
         guard,
+        supervisor,
       }),
     ).rejects.toThrow("Connector already installed: seed");
     expect(
@@ -8885,15 +8929,16 @@ auth:
     const guard = new Guard({ db: dataDb, source: "system:test" });
     const builtins = join(workspace, "builtins");
     const candidateDir = writeBuiltIn(builtins, "seed", "connector");
+    const admittedOldHash = await hashConnectorPackage(candidateDir);
+    useOfficialPackages([{ id: "seed", hash: admittedOldHash }]);
     await installConnectorFromSource({
       sourceDir: candidateDir,
       workspacePath: workspace,
       connectorId: "seed",
       guard,
+      supervisor,
     });
     const installedDir = join(workspace, "connectors", "seed");
-    await supervisor.registerDirectory(installedDir);
-    await supervisor.approveCurrentPackage("seed");
     const sourceRecord = await supervisor.addSource({
       connectorId: "seed",
       config: { accountId: "work", folder: "inbox" },
@@ -8916,6 +8961,12 @@ auth:
     const newHash = await hashConnectorPackage(candidateDir);
     expect(newHash).not.toBe(oldHash);
 
+    useOfficialPackages([
+      { id: "seed", hash: oldHash },
+      { id: "seed", hash: newHash },
+    ]);
+    await supervisor.registerDirectory(installedDir);
+
     const updated = await updateConnectorFromSource({
       sourceDir: candidateDir,
       workspacePath: workspace,
@@ -8930,13 +8981,6 @@ auth:
     });
     expect(readFileSync(join(installedDir, "index.mjs"), "utf8")).toContain("revision 2");
 
-    const awaitingApproval = supervisor.getSource(sourceRecord.id)!;
-    expect(awaitingApproval).toMatchObject({
-      sourceKey: "work",
-      identityStatus: "error",
-      setupStatus: "setup",
-    });
-    await supervisor.approveCurrentPackage("seed");
     const preserved = supervisor.getSource(sourceRecord.id)!;
     expect(preserved.id).toBe(sourceRecord.id);
     expect(preserved.sourceKey).toBe("work");
@@ -9011,15 +9055,22 @@ export default {
 };
 `;
     writeFileSync(join(sourceDir, "index.mjs"), packageSource(1));
+    const revisionOneHash = await hashConnectorPackage(sourceDir);
+    writeFileSync(join(sourceDir, "index.mjs"), packageSource(2));
+    const revisionTwoHash = await hashConnectorPackage(sourceDir);
+    writeFileSync(join(sourceDir, "index.mjs"), packageSource(1));
+    useOfficialPackages([
+      { id: "credential-update-fence", hash: revisionOneHash },
+      { id: "credential-update-fence", hash: revisionTwoHash },
+    ]);
     await installConnectorFromSource({
       sourceDir,
       workspacePath: workspace,
       connectorId: "credential-update-fence",
       guard,
+      supervisor,
     });
     const installedDir = join(workspace, "connectors", "credential-update-fence");
-    await supervisor.registerDirectory(installedDir);
-    await supervisor.approveCurrentPackage("credential-update-fence");
     const sourceRecord = supervisor.ensureSource({ connectorId: "credential-update-fence" });
     await expect(supervisor.connectSourceWithToken(sourceRecord.id, "old-token"))
       .resolves.toMatchObject({ sourceKey: "same-account", identityStatus: "resolved" });
@@ -9080,14 +9131,16 @@ export default {
     const guard = new Guard({ db: dataDb, source: "system:test" });
     const builtins = join(workspace, "builtins");
     const candidateDir = writeBuiltIn(builtins, "seed", "connector");
+    const admittedOldHash = await hashConnectorPackage(candidateDir);
+    useOfficialPackages([{ id: "seed", hash: admittedOldHash }]);
     await installConnectorFromSource({
       sourceDir: candidateDir,
       workspacePath: workspace,
       connectorId: "seed",
       guard,
+      supervisor,
     });
     const installedDir = join(workspace, "connectors", "seed");
-    await supervisor.registerDirectory(installedDir);
     const sourceRecord = await supervisor.addSource({
       connectorId: "seed",
       config: { accountId: "work" },
@@ -9095,6 +9148,12 @@ export default {
     const oldHash = await hashConnectorPackage(installedDir);
 
     writeBuiltIn(builtins, "seed", "single");
+    const incompatibleHash = await hashConnectorPackage(candidateDir);
+    useOfficialPackages([
+      { id: "seed", hash: oldHash },
+      { id: "seed", hash: incompatibleHash },
+    ]);
+    await supervisor.registerDirectory(installedDir);
     await expect(updateConnectorFromSource({
       sourceDir: candidateDir,
       workspacePath: workspace,
@@ -9114,8 +9173,17 @@ export default {
 };
 `,
     );
+    const rejectedHash = await hashConnectorPackage(candidateDir);
+    useOfficialPackages([
+      { id: "seed", hash: oldHash },
+      { id: "seed", hash: rejectedHash },
+    ]);
+    await supervisor.registerDirectory(installedDir);
     const failingGuard = {
-      withSource: (sourceName: string) => guard.withSource(sourceName),
+      withSource: (
+        sourceName: string,
+        producer: { producerRef: string; prepareProducer?: () => void | Promise<void> },
+      ) => guard.withSource(sourceName, producer),
       queryOne: (sql: string, params?: any) => guard.queryOne(sql, params),
       writeEvent: (event: any) => {
         if (event.type === "connector.updated") throw new Error("D0 unavailable");
@@ -9139,17 +9207,18 @@ export default {
   test("reinstall after removal works and D0 keeps the full history", async () => {
     const guard = new Guard({ db: dataDb, source: "system:test" });
     const builtins = join(workspace, "builtins");
-    writeBuiltIn(builtins, "seed");
+    const seedDir = writeBuiltIn(builtins, "seed");
+    useOfficialPackages([{ id: "seed", hash: await hashConnectorPackage(seedDir) }]);
     const installOnce = () =>
       installConnectorFromSource({
         sourceDir: join(builtins, "seed"),
         workspacePath: workspace,
         connectorId: "seed",
         guard,
+        supervisor,
       });
 
     await installOnce();
-    await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
     expect(supervisor.isRegistered("seed")).toBe(true);
 
     // The remove-connector flow cascades Sources before deleting the package,
@@ -9163,7 +9232,6 @@ export default {
 
     // Nothing restores it implicitly — reinstalling is an explicit action.
     await installOnce();
-    await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
     expect(existsSync(join(workspace, "connectors", "seed", "index.mjs"))).toBe(true);
 
     const history = dataDb
@@ -9180,17 +9248,18 @@ export default {
   test("remove connector cascades Sources and reinstall starts with zero Sources", async () => {
     const guard = new Guard({ db: dataDb, source: "system:test" });
     const builtins = join(workspace, "builtins");
-    writeBuiltIn(builtins, "seed", "connector");
+    const seedDir = writeBuiltIn(builtins, "seed", "connector");
+    useOfficialPackages([{ id: "seed", hash: await hashConnectorPackage(seedDir) }]);
     const installOnce = () =>
       installConnectorFromSource({
         sourceDir: join(builtins, "seed"),
         workspacePath: workspace,
         connectorId: "seed",
         guard,
+        supervisor,
       });
 
     await installOnce();
-    await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
     const work = await supervisor.addSource({
       connectorId: "seed",
       config: { accountId: "work" },
@@ -9204,7 +9273,6 @@ export default {
     expect(supervisor.getSource(work.id)).toBeUndefined();
 
     await installOnce();
-    await supervisor.registerDirectory(join(workspace, "connectors", "seed"));
     expect((await supervisor.list()).filter((row) => row.connectorId === "seed")).toEqual([]);
 
     const replacement = await supervisor.addSource({
@@ -9408,7 +9476,7 @@ auth:
   });
 
   test("holds connector identity ownership through pending browser auth and releases it on terminal status", async () => {
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -9501,7 +9569,7 @@ auth:
         headers: { "Content-Type": "application/json" },
       }),
     });
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -9587,7 +9655,7 @@ auth:
         return exchangeResponse;
       },
     });
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -9663,7 +9731,7 @@ auth:
 
   test("sweeps an expired browser identity claim and cancels its stale callback", async () => {
     const authManager = new ConnectorAuthManager(secrets, { now: () => 1 });
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -9739,7 +9807,7 @@ auth:
         await deletionRelease;
         await deleteCredentials(...args);
       });
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -9812,7 +9880,7 @@ auth:
         headers: { "Content-Type": "application/json" },
       }),
     });
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -9925,7 +9993,7 @@ auth:
         headers: { "Content-Type": "application/json" },
       }),
     });
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -9999,7 +10067,7 @@ auth:
   });
 
   test("oauth callback binds auth_ref to first-connect setup rows", async () => {
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -10083,7 +10151,7 @@ auth:
         });
       },
     });
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -10137,7 +10205,7 @@ auth:
         return exchangeResponse;
       },
     });
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -10189,7 +10257,7 @@ auth:
     const seenTokens: string[] = [];
     const reconciledSourceIds: string[] = [];
     let directOAuthTokenCalls = 0;
-    supervisor = new ConnectorSupervisor({
+    supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -10632,7 +10700,7 @@ auth:
 	  });
 
   test("config replacement restarts a package process while preserving its manual run intent", async () => {
-    const reconfigSupervisor = new ConnectorSupervisor({
+    const reconfigSupervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -10774,7 +10842,7 @@ auth:
   });
 
   test("force-kills runner processes that ignore abort", async () => {
-    const fastKillSupervisor = new ConnectorSupervisor({
+    const fastKillSupervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,
@@ -10886,7 +10954,7 @@ auth:
   });
 
   test("kills runner processes that hang during top-level import", async () => {
-    const hangSupervisor = new ConnectorSupervisor({
+    const hangSupervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
       workspacePath: workspace,

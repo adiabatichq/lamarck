@@ -19,6 +19,8 @@ import type {
 export interface GuardPrincipal {
   /** Injected into D0. Examples: system:server, app:focus, connector:oura. */
   source: string;
+  /** Host-bound logical reference to the immutable Producer Descriptor. */
+  producerRef: string;
   /** D2 table names this request may mutate. `*` is reserved for host code. */
   tableGrants: "*" | string[];
   /** D1 exact ids or slash-terminated prefixes this request may write/delete. */

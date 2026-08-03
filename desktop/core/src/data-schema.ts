@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS events (
   id          TEXT PRIMARY KEY,
   schema_version TEXT NOT NULL DEFAULT '${D0_SCHEMA_VERSION_V1}',
   source      TEXT NOT NULL,
+  producer_ref TEXT NOT NULL,
   type        TEXT NOT NULL,
   external_id TEXT,
   started_at  INTEGER NOT NULL,

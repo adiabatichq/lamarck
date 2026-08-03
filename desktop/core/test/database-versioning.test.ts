@@ -19,6 +19,7 @@ import {
 } from "../src/db";
 import { readDatabaseVersion } from "../src/database-migrations";
 import { GuardEngine } from "../src/guard-service/engine";
+import { TEST_PRODUCER_REF } from "./support/test-guard";
 
 describe("data.db and system.db schema versions", () => {
   let workspace: string;
@@ -58,7 +59,7 @@ describe("data.db and system.db schema versions", () => {
   test("pins the released migration inputs", () => {
     expect(SYSTEM_DATABASE_VERSION).toBe(1);
     expect(sha256(DATA_SCHEMA_V1))
-      .toBe("ec3182151699d26bcb3e00118fa5e93e6c2d4f5407de935e8f0351bf1cf6c395");
+      .toBe("c095c4c6e70ddbd10c9163e8c5438b4a43df1499b4f3e1f8fbb01a0d9432b66d");
     expect(sha256(SYSTEM_SCHEMA_V1))
       .toBe("d1c2d5b86fdfb29187ca55bd69b0f8d804405a9f010aecad1a7d2aa0641ad517");
   });
@@ -67,6 +68,7 @@ describe("data.db and system.db schema versions", () => {
     const guard = new GuardEngine({ workspacePath: workspace });
     const host = {
       source: "system:database-version-test",
+      producerRef: TEST_PRODUCER_REF,
       tableGrants: "*" as const,
       docGrants: "*" as const,
       schemaGrant: true,
@@ -241,6 +243,21 @@ describe("data.db and system.db schema versions", () => {
       .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
     expect(readDatabaseVersion(incompatible, DATA_DB_FILENAME)).toBe(0);
     incompatible.close();
+  });
+
+  test("refuses a declared data v1 that predates required producer_ref", () => {
+    const incompatible = new DatabaseSync(dataPath());
+    const oldBaseline = DATA_SCHEMA_V1.replace("  producer_ref TEXT NOT NULL,\n", "");
+    incompatible.exec(`${oldBaseline}\nPRAGMA user_version = 1;`);
+    incompatible.close();
+
+    expect(() => new GuardEngine({ workspacePath: workspace }))
+      .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
+    const reopened = new DatabaseSync(dataPath());
+    expect(readDatabaseVersion(reopened, DATA_DB_FILENAME)).toBe(1);
+    expect((reopened.prepare("PRAGMA table_info(events)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "producer_ref")).toBe(false);
+    reopened.close();
   });
 
   test("allows D2 extensions but rejects reserved control-plane objects in data v0", () => {

@@ -13,6 +13,7 @@ import { migrateDataDatabase } from "../data-migrations";
 import { DATA_DB_FILENAME } from "../data-schema";
 import { docIdsHavePortableMaterializationConflict, validateDocId } from "../doc-id";
 import { assertJsonValue, type JsonValue } from "../json";
+import { parseProducerRef } from "../producer-descriptor";
 import { foldSqliteIdentifier as normalizeName } from "../sqlite-identifiers";
 import { createUnifiedPatch } from "../utils/unified-diff";
 import { ulid } from "../utils/ulid";
@@ -124,6 +125,7 @@ type AuthorizerPolicy = QueryPolicy | D0Policy | MutatePolicy | D1Policy | Schem
 
 interface NormalizedPrincipal {
   source: string;
+  producerRef: string;
   tableGrants: "*" | Set<string>;
   docGrants: "*" | string[];
   schemaGrant: boolean;
@@ -405,27 +407,39 @@ export class GuardEngine {
     assertEventTypeAllowed(principal.source, event.type);
 
     const id = ulid();
+    let resolvedId = id;
     this.beginImmediate();
     try {
       this.withPolicy({ mode: "d0" }, () => {
         const result = this.db.prepare(
           `INSERT INTO events
-            (id, schema_version, source, type, external_id, started_at, ended_at, payload)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            (id, schema_version, source, producer_ref, type, external_id, started_at, ended_at, payload)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(source, external_id) WHERE external_id IS NOT NULL DO NOTHING`,
         ).run(
           id,
           event.schemaVersion ?? D0_SCHEMA_VERSION,
           principal.source,
+          principal.producerRef,
           event.type,
           event.externalId ?? null,
           event.startedAt,
           event.endedAt ?? null,
           JSON.stringify(event.payload),
         );
+        if (result.changes === 0 && event.externalId !== undefined) {
+          const existing = this.db.prepare(
+            "SELECT id FROM events WHERE source = ? AND external_id = ?",
+          ).get(principal.source, event.externalId) as { id: string } | undefined;
+          if (existing) {
+            resolvedId = existing.id;
+            return;
+          }
+        }
         assertSingleRowChange(result.changes, "D0 event insert");
       });
       this.commit();
-      return id;
+      return resolvedId;
     } catch (error) {
       this.rollback();
       throw error;
@@ -616,7 +630,7 @@ export class GuardEngine {
 
       if (!suppressContentAudit) {
         const before = existing?.content ?? "";
-        this.logD0(principal.source, "d1.write", {
+        this.logD0(principal, "d1.write", {
           doc_id: id,
           patch: createUnifiedPatch(before, content, {
             oldPath: existing ? `a/${id}` : "/dev/null",
@@ -696,7 +710,7 @@ export class GuardEngine {
       });
       this.assertNoD1SideEffects();
       if (!isLockedDocMetadata(storedMetadata)) {
-        this.logD0(principal.source, "d1.delete", {
+        this.logD0(principal, "d1.delete", {
           doc_id: id,
           content: existing.content,
           metadata: storedMetadata,
@@ -779,7 +793,7 @@ export class GuardEngine {
       // Rebuild row capture while the schema transaction is still open. A new
       // or altered table that cannot be captured never becomes durable.
       this.refreshCdcCapture(new Set([...targets.tableObjects, ...targets.indexTables]));
-      this.logD0(principal.source, kind === "promote" ? "ddl.promote" : "ddl.demote", {
+      this.logD0(principal, kind === "promote" ? "ddl.promote" : "ddl.demote", {
         ddl: statements,
         before_schema: before,
         after_schema: after,
@@ -983,7 +997,7 @@ export class GuardEngine {
           );
         }
       }
-      eventIds.push(this.logD0(principal.source, `d2.${group.op}`, payload));
+      eventIds.push(this.logD0(principal, `d2.${group.op}`, payload));
     }
     return eventIds;
   }
@@ -1281,16 +1295,30 @@ export class GuardEngine {
     );
   }
 
-  private logD0(source: string, type: string, payload: Record<string, unknown>): string {
+  private logD0(
+    principal: Pick<NormalizedPrincipal, "source" | "producerRef">,
+    type: string,
+    payload: Record<string, unknown>,
+  ): string {
     assertJsonSize(payload, this.maxAuditBytes, `Guard ${type} payload`);
     const id = ulid();
     const now = Date.now();
     this.withPolicy({ mode: "d0" }, () => {
       const result = this.db.prepare(
         `INSERT INTO events
-          (id, schema_version, source, type, external_id, started_at, ended_at, payload)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(id, D0_SCHEMA_VERSION, source, type, null, now, null, JSON.stringify(payload));
+          (id, schema_version, source, producer_ref, type, external_id, started_at, ended_at, payload)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        D0_SCHEMA_VERSION,
+        principal.source,
+        principal.producerRef,
+        type,
+        null,
+        now,
+        null,
+        JSON.stringify(payload),
+      );
       assertSingleRowChange(result.changes, "D0 audit insert");
     });
     return id;
@@ -1589,6 +1617,15 @@ function normalizePrincipal(input: GuardPrincipal): NormalizedPrincipal {
   if (source.trim() !== source || source.length > 200) {
     throw new GuardServiceError("GUARD_INVALID_PRINCIPAL", "Guard: invalid principal source");
   }
+  let producerRef: string;
+  try {
+    producerRef = parseProducerRef(input.producerRef);
+  } catch {
+    throw new GuardServiceError(
+      "GUARD_INVALID_PRINCIPAL",
+      "Guard: invalid principal producerRef",
+    );
+  }
   let tableGrants: "*" | Set<string>;
   if (input.tableGrants === "*") {
     if (!source.startsWith("system:")) {
@@ -1631,7 +1668,7 @@ function normalizePrincipal(input: GuardPrincipal): NormalizedPrincipal {
       "Guard: schema capability requires a system source",
     );
   }
-  return { source, tableGrants, docGrants, schemaGrant };
+  return { source, producerRef, tableGrants, docGrants, schemaGrant };
 }
 
 function assertDocGrant(principal: NormalizedPrincipal, id: string, op: "write" | "delete"): void {

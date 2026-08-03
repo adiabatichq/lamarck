@@ -23,7 +23,7 @@ import {
 } from "../src/working-tree";
 import { WorkingTreeStateStore } from "../src/working-tree-state";
 import { openTestDatabases } from "./support/test-databases";
-import { TestGuard } from "./support/test-guard";
+import { TEST_PRODUCER_REF, TestGuard } from "./support/test-guard";
 
 const A = hashWorkingTreeContent("A");
 const B = hashWorkingTreeContent("B");
@@ -634,7 +634,12 @@ describe("WorkingTree", () => {
     closeDatabases = databases.close;
     guard = new TestGuard({ db: dataDb, source: "system:test" });
     state = new WorkingTreeStateStore(systemDb);
-    tree = new WorkingTree({ guard, pagesDir, stateStore: state });
+    tree = new WorkingTree({
+      guard,
+      producer: { producerRef: TEST_PRODUCER_REF },
+      pagesDir,
+      stateStore: state,
+    });
     runtimeOpen = true;
   }
 

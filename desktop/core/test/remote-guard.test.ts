@@ -11,9 +11,12 @@ import {
   type GuardBinding,
   type GuardExecutionOptions,
 } from "../src/remote-guard";
+import { TEST_PRODUCER_REF } from "./support/test-guard";
 
 const STALE_HASH = "0".repeat(64);
 const MATCH_HASH = "1".repeat(64);
+const CONNECTOR_PRODUCER_REF = `producer:v1:sha256:${"2".repeat(64)}`;
+const APP_PRODUCER_REF = `producer:v1:sha256:${"3".repeat(64)}`;
 const STALE_UPDATED_AT = 100;
 const MATCH_UPDATED_AT = 101;
 
@@ -49,6 +52,7 @@ class FakeRpc {
 function createGuard(rpc: FakeRpc, binding?: Partial<GuardBinding>): RemoteGuard {
   return new RemoteGuard(rpc as unknown as GuardRpcClient, {
     source: "system:server",
+    producerRef: TEST_PRODUCER_REF,
     writeTables: null,
     docGrants: null,
     schemaGrant: true,
@@ -83,6 +87,7 @@ describe("RemoteGuard capability binding", () => {
       const issued = registry.issue("focus", "ui", {
         manifestGeneration: 1,
         manifestDigest: `sha256:${"a".repeat(64)}`,
+        appCommit: "a".repeat(40),
         writeTables: [],
         docGrants: [],
       });
@@ -118,7 +123,9 @@ describe("RemoteGuard capability binding", () => {
 
   test("source rebinding drops schema authority and serializes the principal", async () => {
     const rpc = new FakeRpc();
-    const connector = createGuard(rpc).withSource("connector:calendar");
+    const connector = createGuard(rpc).withSource("connector:calendar", {
+      producerRef: CONNECTOR_PRODUCER_REF,
+    });
 
     await connector.writeEvent({
       type: "calendar.item",
@@ -132,6 +139,7 @@ describe("RemoteGuard capability binding", () => {
       params: {
         principal: {
           source: "connector:calendar",
+          producerRef: CONNECTOR_PRODUCER_REF,
           tableGrants: [],
           docGrants: "*",
           schemaGrant: false,
@@ -146,9 +154,31 @@ describe("RemoteGuard capability binding", () => {
     });
   });
 
+  test("publishes the bound descriptor before a D0-producing call but not a query", async () => {
+    const rpc = new FakeRpc();
+    const callsObservedDuringPrepare: number[] = [];
+    const guard = createGuard(rpc, {
+      prepareProducer: () => {
+        callsObservedDuringPrepare.push(rpc.calls.length);
+      },
+    });
+
+    await guard.query("SELECT 1");
+    expect(callsObservedDuringPrepare).toEqual([]);
+    await guard.writeEvent({
+      type: "test.observation",
+      startedAt: 1,
+      payload: {},
+    });
+
+    expect(callsObservedDuringPrepare).toEqual([1]);
+    expect(rpc.calls.map((call) => call.method)).toEqual(["query", "writeEvent"]);
+  });
+
   test("app grants are concrete arrays and queryOne stays a client helper", async () => {
     const rpc = new FakeRpc();
     const app = createGuard(rpc).withSource("app:focus", {
+      producerRef: APP_PRODUCER_REF,
       writeTables: ["focus_sessions"],
       docGrants: ["apps/focus/"],
       schemaGrant: false,
@@ -160,6 +190,7 @@ describe("RemoteGuard capability binding", () => {
       params: {
         principal: {
           source: "app:focus",
+          producerRef: APP_PRODUCER_REF,
           tableGrants: ["focus_sessions"],
           docGrants: ["apps/focus/"],
           schemaGrant: false,
@@ -174,6 +205,7 @@ describe("RemoteGuard capability binding", () => {
     const rpc = new FakeRpc();
     const controller = new AbortController();
     const app = createGuard(rpc).withSource("app:focus", {
+      producerRef: APP_PRODUCER_REF,
       writeTables: ["focus_sessions"],
       docGrants: [],
       signal: controller.signal,
@@ -244,6 +276,7 @@ describe("RemoteGuard capability binding", () => {
         params: {
           principal: {
             source: "system:server",
+            producerRef: TEST_PRODUCER_REF,
             tableGrants: "*",
             docGrants: "*",
             schemaGrant: true,
@@ -260,6 +293,7 @@ describe("RemoteGuard capability binding", () => {
         params: {
           principal: {
             source: "system:server",
+            producerRef: TEST_PRODUCER_REF,
             tableGrants: "*",
             docGrants: "*",
             schemaGrant: true,
@@ -276,6 +310,7 @@ describe("RemoteGuard capability binding", () => {
         params: {
           principal: {
             source: "system:server",
+            producerRef: TEST_PRODUCER_REF,
             tableGrants: "*",
             docGrants: "*",
             schemaGrant: true,
@@ -290,6 +325,7 @@ describe("RemoteGuard capability binding", () => {
         params: {
           principal: {
             source: "system:server",
+            producerRef: TEST_PRODUCER_REF,
             tableGrants: "*",
             docGrants: "*",
             schemaGrant: true,
@@ -319,6 +355,7 @@ describe("RemoteGuard capability binding", () => {
       params: {
         principal: {
           source: "system:server",
+          producerRef: TEST_PRODUCER_REF,
           tableGrants: "*",
           docGrants: "*",
           schemaGrant: true,

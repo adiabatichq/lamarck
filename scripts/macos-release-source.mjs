@@ -38,6 +38,7 @@ export const MACOS_RELEASE_SOURCE_FILES = Object.freeze([
   "desktop/system-sdk/tsconfig.json",
   "scripts/build-desktop.mjs",
   "scripts/build-electron-main.mjs",
+  "scripts/build-system-identity.mjs",
   "scripts/build-capsule-vm-macos.mjs",
   "scripts/build-macos-release-shell-inside.mjs",
   "scripts/macos-release-signer.mjs",

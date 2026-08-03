@@ -75,6 +75,14 @@ import {
 import { createAppPackageJson, createAppPackageLock } from "./app-scaffold";
 import { APP_MANIFEST_DIGEST_PATTERN } from "../../capsule/src/app-manifest-authority";
 import { resolveDeviceIdentity } from "./device-identity";
+import { resolveCommittedAppRevision } from "./app-revision";
+import {
+  ProducerDescriptorStore,
+  createAppProducerDescriptor,
+  createProducerBinding,
+  createSystemProducerDescriptor,
+} from "./producer-descriptor";
+import { systemIdentityFromBuild } from "./system-identity";
 
 // Lamarck — HTTP server entry point
 // All routes go through here. Guard is the only write path.
@@ -99,7 +107,17 @@ await mkdir(lamarckDir, { recursive: true });
 
 // Boot
 const systemDb = openSystemDatabase(workspacePath);
-const guard = RemoteGuard.fromEnvironment("system:server");
+const systemIdentity = systemIdentityFromBuild();
+const producerDescriptorStore = new ProducerDescriptorStore(workspacePath);
+const systemProducer = createProducerBinding(
+  producerDescriptorStore,
+  createSystemProducerDescriptor(systemIdentity),
+);
+const guard = RemoteGuard.fromEnvironment(
+  "system:server",
+  systemProducer.producerRef,
+  systemProducer.prepareProducer,
+);
 await guard.health();
 const contentBlobStore = new ContentBlobStore(workspacePath);
 const settings = new SettingsStore(lamarckDir);
@@ -122,18 +140,30 @@ const authManager = new ConnectorAuthManager(
     lamarckSession: lamarckSessionManager,
   },
 );
+// Bundled packages become trusted only through their exact logical hashes.
+const builtinConnectorsDir = fileURLToPath(new URL("../../template/connectors", import.meta.url));
+const bundledConnectorCatalog = await listAvailableBuiltIns(builtinConnectorsDir, (dir, err) => {
+  const message = err instanceof Error ? err.message : String(err);
+  console.warn(`[lamarck] Skipping bundled connector ${dir}: ${message}`);
+});
+const officialConnectorCatalog = await Promise.all(bundledConnectorCatalog.map(async (entry) => ({
+  id: entry.manifest.id,
+  hash: await hashConnectorPackage(entry.dir),
+})));
 const connectorSupervisor = new ConnectorSupervisor({
   systemDb,
   guard,
   workspacePath,
+  systemIdentity,
+  producerDescriptorStore,
+  officialCatalog: officialConnectorCatalog,
   authManager,
   oauthRedirectUri,
   managedProviderAppOrigin,
   deviceIdentity,
 });
-// Built-ins are bundled catalog entries; installing one is an explicit user
-// action through the same install flow as any other connector package.
-const builtinConnectorsDir = fileURLToPath(new URL("../../template/connectors", import.meta.url));
+// Installing a bundled entry remains an explicit action through the same
+// exact-hash admission flow as any other trusted package.
 const connectorManifests = await registerWorkspaceConnectors(connectorSupervisor, workspacePath, {
   skipInvalid: true,
   onError(connectorDir, err) {
@@ -154,6 +184,7 @@ let appManifestGeneration = 1;
 let appRegistryTail: Promise<void> = Promise.resolve();
 const workingTree = new WorkingTree({
   guard,
+  producer: systemProducer,
   pagesDir,
   stateStore: new WorkingTreeStateStore(systemDb),
 });
@@ -236,7 +267,17 @@ function guardForRequest(auth: AuthContext, opts?: {
     });
   }
 
+  const appProducer = createProducerBinding(
+    producerDescriptorStore,
+    createAppProducerDescriptor(
+      auth.appId,
+      auth.authorization.appCommit,
+      systemIdentity,
+    ),
+  );
   return guard.withSource(sourceForAppWorkload(auth.appId, parseAppWorkload(auth.workload)), {
+    producerRef: appProducer.producerRef,
+    prepareProducer: appProducer.prepareProducer,
     // Authority is the immutable manifest snapshot bound when the Host issued
     // this channel. A later manifest edit can neither expand an in-flight
     // request nor revive this channel after its generation is invalidated.
@@ -878,9 +919,9 @@ const server = await serve<{ cwd: string }>({
           workspacePath,
           connectorId,
           guard,
+          supervisor: connectorSupervisor,
         });
-        const manifest = await connectorSupervisor.registerDirectory(installed.dir);
-        return json({ ok: true, manifest });
+        return json({ ok: true, manifest: installed.manifest });
       }
 
       const updateConnectorMatch = path.match(/^\/api\/connectors\/([^/]+)\/update$/);
@@ -1169,9 +1210,11 @@ const server = await serve<{ cwd: string }>({
         ) {
           return json({ error: "App manifest authority changed; refresh and retry" }, 409);
         }
+        const appCommit = await resolveCommittedAppRevision(app.dir);
         return json(appCapabilities.issue(body.appId, workload, {
           manifestGeneration: appManifestGeneration,
           manifestDigest: app.manifestDigest,
+          appCommit,
           writeTables: registry.getTableGrants(body.appId),
           docGrants: appDocGrants(body.appId, app.manifest.permissions.writes.docs),
         }));
@@ -1311,7 +1354,10 @@ const server = await serve<{ cwd: string }>({
         // D0 composition: a new capability unit was registered into the system.
         // Only the id is recorded — at creation name mirrors the id and the
         // write scope is always empty; both evolve later through app.commit.
-        await guardForRequest(auth!, { signal: requestGuardSignal }).writeEvent({
+        await guard.withExecution({
+          signal: requestGuardSignal,
+          deadlineMs: HOST_GUARD_DEADLINE_MS,
+        }).writeEvent({
           type: "app.created",
           startedAt: Date.now(),
           payload: { appId: id },
@@ -1334,7 +1380,10 @@ const server = await serve<{ cwd: string }>({
         // D0 composition: the capability was retired (recoverable, not deleted).
         // Only the id is recorded — the archive location is conventional
         // (.lamarck/archived-apps/<appId>) and the name is in the kept manifest.
-        await guardForRequest(auth!, { signal: requestGuardSignal }).writeEvent({
+        await guard.withExecution({
+          signal: requestGuardSignal,
+          deadlineMs: HOST_GUARD_DEADLINE_MS,
+        }).writeEvent({
           type: "app.archived",
           startedAt: Date.now(),
           payload: { appId },

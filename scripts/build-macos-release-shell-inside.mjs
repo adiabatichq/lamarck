@@ -31,6 +31,16 @@ const builderImageId = process.env.LAMARCK_BUILDER_IMAGE_ID;
 if (!/^sha256:[a-f0-9]{64}$/.test(builderImageId ?? "")) {
   throw new Error("macOS release builder image identity is missing");
 }
+const buildVersion = process.env.LAMARCK_BUILD_VERSION;
+const buildCommit = process.env.LAMARCK_BUILD_COMMIT;
+if (
+  typeof buildVersion !== "string"
+  || buildVersion.length < 1
+  || buildVersion.trim() !== buildVersion
+  || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(buildCommit ?? "")
+) {
+  throw new Error("macOS release System identity is missing or malformed");
+}
 
 await assertEmptyDirectory(exportRoot);
 await mkdir(home, { recursive: false, mode: 0o700 });
@@ -52,6 +62,8 @@ const environment = {
   npm_config_fund: "false",
   npm_config_update_notifier: "false",
   npm_config_registry: "https://registry.npmjs.org",
+  LAMARCK_BUILD_VERSION: buildVersion,
+  LAMARCK_BUILD_COMMIT: buildCommit,
 };
 run(process.execPath, [npmCli, "ci",
   "--workspace", "@lamarck/shell",

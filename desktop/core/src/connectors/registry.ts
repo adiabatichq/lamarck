@@ -80,12 +80,19 @@ export class WorkspaceConnectorRegistry {
     this.approvals.removeForConnector(connectorId);
   }
 
-  async loadPackage(connectorDir: string): Promise<ConnectorPackageRecord> {
+  async loadPackage(
+    connectorDir: string,
+    expectedConnectorId?: string,
+  ): Promise<ConnectorPackageRecord> {
     const dir = resolve(connectorDir);
     const manifest = await loadConnectorManifest(dir);
-    const folderId = basename(dir);
-    if (manifest.id !== folderId) {
-      throw new Error(`Connector manifest id "${manifest.id}" must match folder "${folderId}"`);
+    const requiredId = expectedConnectorId ?? basename(dir);
+    if (manifest.id !== requiredId) {
+      throw new Error(
+        expectedConnectorId === undefined
+          ? `Connector manifest id "${manifest.id}" must match folder "${requiredId}"`
+          : `Connector manifest id "${manifest.id}" must match expected id "${requiredId}"`,
+      );
     }
 
     const entryPath = await resolveConnectorEntry(dir, manifest.entry);
@@ -194,32 +201,50 @@ export async function resolveConnectorEntry(connectorDir: string, entry: string)
 }
 
 export async function hashConnectorPackage(connectorDir: string): Promise<string> {
-  const root = resolve(connectorDir);
+  return hashConnectorPackageTree(await readConnectorPackageTree(connectorDir));
+}
+
+export type ConnectorPackageTreeEntry =
+  | {
+      kind: "file";
+      relativePath: string;
+      bytes: Buffer;
+    }
+  | {
+      kind: "symlink";
+      relativePath: string;
+      target: string;
+    };
+
+/**
+ * Computes the established Connector package identity from an already-read
+ * logical tree. Archive publication and resolution use this same function so
+ * tar/gzip representation details can never become package identity.
+ */
+export function hashConnectorPackageTree(
+  entries: readonly ConnectorPackageTreeEntry[],
+): string {
   const hash = createHash("sha256");
-  const entries = await listPackageEntries(root);
-  for (const entry of entries) {
-    const rel = relative(root, entry.path).replace(/\\/g, "/");
+  for (const entry of normalizedPackageTree(entries)) {
     hash.update(entry.kind);
     hash.update("\0");
-    hash.update(rel);
+    hash.update(entry.relativePath);
     hash.update("\0");
-    hash.update(
-      entry.kind === "file"
-        ? await readFile(entry.path)
-        : await readlink(entry.path),
-    );
+    hash.update(entry.kind === "file" ? entry.bytes : entry.target);
     hash.update("\0");
   }
   return `sha256:${hash.digest("hex")}`;
 }
 
-interface ConnectorPackageHashEntry {
-  kind: "file" | "symlink";
-  path: string;
-}
-
-async function listPackageEntries(root: string): Promise<ConnectorPackageHashEntry[]> {
-  const packageEntries: ConnectorPackageHashEntry[] = [];
+/**
+ * Reads exactly the logical tree covered by hashConnectorPackage: regular
+ * files and symlinks, with .git and node_modules excluded at every depth.
+ */
+export async function readConnectorPackageTree(
+  connectorDir: string,
+): Promise<ConnectorPackageTreeEntry[]> {
+  const root = resolve(connectorDir);
+  const packageEntries: ConnectorPackageTreeEntry[] = [];
 
   async function walk(dir: string): Promise<void> {
     const entries = await readdir(dir, { withFileTypes: true });
@@ -229,13 +254,64 @@ async function listPackageEntries(root: string): Promise<ConnectorPackageHashEnt
       if (entry.isDirectory()) {
         await walk(fullPath);
       } else if (entry.isFile()) {
-        packageEntries.push({ kind: "file", path: fullPath });
+        packageEntries.push({
+          kind: "file",
+          relativePath: relative(root, fullPath).replace(/\\/g, "/"),
+          bytes: await readFile(fullPath),
+        });
       } else if (entry.isSymbolicLink()) {
-        packageEntries.push({ kind: "symlink", path: fullPath });
+        packageEntries.push({
+          kind: "symlink",
+          relativePath: relative(root, fullPath).replace(/\\/g, "/"),
+          target: await readlink(fullPath),
+        });
       }
     }
   }
 
   await walk(root);
-  return packageEntries.sort((a, b) => a.path.localeCompare(b.path));
+  return normalizedPackageTree(packageEntries);
+}
+
+function normalizedPackageTree(
+  entries: readonly ConnectorPackageTreeEntry[],
+): ConnectorPackageTreeEntry[] {
+  const sorted = [...entries].sort((a, b) =>
+    a.relativePath.localeCompare(b.relativePath));
+  let previousPath: string | undefined;
+  for (const entry of sorted) {
+    validateConnectorPackageRelativePath(entry.relativePath);
+    if (entry.relativePath === previousPath) {
+      throw new Error(`Duplicate Connector package path: ${entry.relativePath}`);
+    }
+    if (entry.kind === "file") {
+      if (!Buffer.isBuffer(entry.bytes)) {
+        throw new Error(`Connector package file bytes are invalid: ${entry.relativePath}`);
+      }
+    } else if (
+      typeof entry.target !== "string"
+      || entry.target.length === 0
+      || entry.target.includes("\0")
+    ) {
+      throw new Error(`Connector package symlink target is invalid: ${entry.relativePath}`);
+    }
+    previousPath = entry.relativePath;
+  }
+  return sorted;
+}
+
+export function validateConnectorPackageRelativePath(relativePath: string): void {
+  if (typeof relativePath !== "string" || relativePath.length === 0) {
+    throw new Error("Connector package path must be a non-empty string");
+  }
+  if (relativePath.includes("\0") || relativePath.includes("\\")) {
+    throw new Error(`Connector package path is malformed: ${relativePath}`);
+  }
+  if (relativePath.startsWith("/") || /^[A-Za-z]:/.test(relativePath)) {
+    throw new Error(`Connector package path must be relative: ${relativePath}`);
+  }
+  const segments = relativePath.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new Error(`Connector package path contains traversal: ${relativePath}`);
+  }
 }

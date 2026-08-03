@@ -13,6 +13,10 @@ import type {
 
 export interface GuardBinding {
   source: string;
+  /** Host-established Producer Descriptor ref; callers cannot override it per event. */
+  producerRef: string;
+  /** Publishes/verifies the bound descriptor before an operation can produce D0. */
+  prepareProducer?: () => void | Promise<void>;
   /** null means trusted host access; an array is an exact D2 table allowlist. */
   writeTables: string[] | null;
   /** null means trusted host access; grants are exact doc ids or prefixes ending in '/'. */
@@ -153,7 +157,11 @@ export class RemoteGuard {
     },
   ) {}
 
-  static fromEnvironment(source = "system:server"): RemoteGuard {
+  static fromEnvironment(
+    source: string,
+    producerRef: string,
+    prepareProducer?: () => void | Promise<void>,
+  ): RemoteGuard {
     const origin = process.env.LAMARCK_GUARD_ORIGIN;
     const token = process.env.LAMARCK_GUARD_TOKEN;
     if (!origin || !token) {
@@ -161,7 +169,14 @@ export class RemoteGuard {
     }
     return new RemoteGuard(
       new GuardRpcClient(origin, token),
-      { source, writeTables: null, docGrants: null, schemaGrant: true },
+      {
+        source,
+        producerRef,
+        prepareProducer,
+        writeTables: null,
+        docGrants: null,
+        schemaGrant: true,
+      },
     );
   }
 
@@ -169,7 +184,9 @@ export class RemoteGuard {
     await this.rpc.health();
   }
 
-  withSource(source: string, opts?: {
+  withSource(source: string, opts: {
+    producerRef: string;
+    prepareProducer?: () => void | Promise<void>;
     writeTables?: string[] | null;
     docGrants?: string[] | null;
     schemaGrant?: boolean;
@@ -179,6 +196,10 @@ export class RemoteGuard {
   }): RemoteGuard {
     const guard = new RemoteGuard(this.rpc, {
       source,
+      producerRef: opts.producerRef,
+      // Publication belongs to the new producer context and is never inherited
+      // merely because a caller changed Source.
+      prepareProducer: opts.prepareProducer,
       writeTables: opts?.writeTables === undefined
         ? this.binding.writeTables === null && !source.startsWith("system:")
           ? []
@@ -217,6 +238,7 @@ export class RemoteGuard {
   }
 
   async mutate(sql: string, params?: GuardSqlParams): Promise<GuardStatementResult> {
+    await this.prepareProducer();
     return this.call<GuardStatementResult>("mutate", {
       principal: this.principal(),
       sql,
@@ -225,6 +247,7 @@ export class RemoteGuard {
   }
 
   async transaction(statements: GuardStatement[]): Promise<GuardTransactionStatementResult[]> {
+    await this.prepareProducer();
     return this.call<GuardTransactionStatementResult[]>("transaction", {
       principal: this.principal(),
       statements: statements as RpcGuardStatement[],
@@ -232,10 +255,12 @@ export class RemoteGuard {
   }
 
   async writeEvent(event: EventInput): Promise<string> {
+    await this.prepareProducer();
     return this.call<string>("writeEvent", { principal: this.principal(), event });
   }
 
   async writeDoc(id: string, content: string, metadata?: Record<string, unknown>): Promise<void> {
+    await this.prepareProducer();
     await this.call("writeDoc", {
       principal: this.principal(),
       id,
@@ -270,6 +295,7 @@ export class RemoteGuard {
     content: string,
     metadata?: Record<string, unknown>,
   ): Promise<boolean> {
+    await this.prepareProducer();
     const applied = await this.call<boolean>("compareAndWriteDoc", {
       principal: this.principal(),
       id,
@@ -283,6 +309,7 @@ export class RemoteGuard {
   }
 
   async deleteDoc(id: string): Promise<boolean> {
+    await this.prepareProducer();
     const deleted = await this.call<boolean>("deleteDoc", {
       principal: this.principal(),
       id,
@@ -296,6 +323,7 @@ export class RemoteGuard {
     expectedHash: string,
     expectedUpdatedAt: number,
   ): Promise<boolean> {
+    await this.prepareProducer();
     const deleted = await this.call<boolean>("compareAndDeleteDoc", {
       principal: this.principal(),
       id,
@@ -333,6 +361,7 @@ export class RemoteGuard {
     ddl: string | string[],
     opts?: { approved?: boolean; requestedBy?: string },
   ): Promise<void> {
+    await this.prepareProducer();
     await this.call("schema.apply", {
       principal: this.principal(),
       kind,
@@ -345,6 +374,7 @@ export class RemoteGuard {
   private principal(): GuardPrincipal {
     return {
       source: this.binding.source,
+      producerRef: this.binding.producerRef,
       tableGrants: this.binding.writeTables ?? "*",
       docGrants: this.binding.docGrants ?? "*",
       schemaGrant: this.binding.schemaGrant,
@@ -353,6 +383,10 @@ export class RemoteGuard {
 
   private call<T>(method: string, params: Record<string, unknown>): Promise<T> {
     return this.rpc.call<T>(method, params, this.execution);
+  }
+
+  private async prepareProducer(): Promise<void> {
+    await this.binding.prepareProducer?.();
   }
 
   private notifyDocChange(id: string, content: string | null): void {

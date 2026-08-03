@@ -35,6 +35,7 @@ import {
 } from "./macos-release-publication.mjs";
 import { loadFrozenOsxSign } from "./macos-release-signer.mjs";
 import { runPackagedNodePtySmoke } from "./macos-release-runtime.mjs";
+import { resolveBuildSystemIdentity } from "./build-system-identity.mjs";
 import {
   assertExactBooleanEntitlements,
   assertExactCodeSignatureIdentity,
@@ -67,6 +68,10 @@ if (dryRun) {
 }
 
 async function packageRelease(releaseConfig, signingIdentity) {
+  const buildIdentity = await resolveBuildSystemIdentity({ root, requireClean: true });
+  if (buildIdentity.version !== releaseConfig.version) {
+    throw new Error("release build version does not match the packaging version");
+  }
   await mkdir(dirname(releaseConfig.outputRoot), { recursive: true, mode: 0o700 });
   const stagingRoot = await mkdtemp(`${releaseConfig.outputRoot}.staging-`);
   const appPath = join(stagingRoot, releaseConfig.appName);
@@ -99,6 +104,7 @@ async function packageRelease(releaseConfig, signingIdentity) {
       sourceSnapshotRoot,
       shellBuildExport,
       sourceSnapshot.manifestDigest,
+      buildIdentity,
     );
     await validateMacOsReleaseSourceSnapshot(sourceSnapshotRoot);
     await validateMacOsShellBuildExport(
@@ -355,7 +361,7 @@ async function writeAll(handle, buffer, position) {
   }
 }
 
-async function buildShellFromSnapshot(snapshotRoot, exportRoot, manifestDigest) {
+async function buildShellFromSnapshot(snapshotRoot, exportRoot, manifestDigest, buildIdentity) {
   if (!/^sha256:[a-f0-9]{64}$/.test(manifestDigest)) {
     throw new Error("macOS release source snapshot digest is invalid");
   }
@@ -393,6 +399,8 @@ async function buildShellFromSnapshot(snapshotRoot, exportRoot, manifestDigest) 
     "--volume", `${snapshotRoot}:/snapshot:ro`,
     "--volume", `${exportRoot}:/export:rw`,
     "--env", `LAMARCK_BUILDER_IMAGE_ID=${builderImageId}`,
+    "--env", `LAMARCK_BUILD_VERSION=${buildIdentity.version}`,
+    "--env", `LAMARCK_BUILD_COMMIT=${buildIdentity.commit}`,
     builderImageId,
     "/usr/local/bin/node",
     "/snapshot/scripts/build-macos-release-shell-inside.mjs",

@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { mkdirSync } from "fs";
+import { TEST_PRODUCER_REF } from "./support/test-guard";
 
 describe("DB", () => {
   let workspace: string;
@@ -81,6 +82,7 @@ describe("DB", () => {
     expect(names).toContain("id");
     expect(names).toContain("schema_version");
     expect(names).toContain("source");
+    expect(names).toContain("producer_ref");
     expect(names).toContain("type");
     expect(names).toContain("external_id");
     expect(names).toContain("started_at");
@@ -88,6 +90,15 @@ describe("DB", () => {
     expect(names).toContain("payload");
     expect(names).toContain("created_at");
 
+    close();
+  });
+
+  test("events require an explicit producer_ref", () => {
+    const { dataDb, close } = openDatabases(workspace);
+    expect(() => dataDb.prepare(
+      "INSERT INTO events (id, source, type, started_at, payload) VALUES (?, ?, ?, ?, ?)",
+    ).run("missing-producer", "system:test", "test.event", Date.now(), "{}"))
+      .toThrow(/producer_ref/);
     close();
   });
 
@@ -129,8 +140,8 @@ describe("DB", () => {
     const { dataDb, close } = openDatabases(workspace);
 
     dataDb.prepare(
-      "INSERT INTO events (id, source, type, started_at, payload) VALUES (?, ?, ?, ?, ?)"
-    ).run("e1", "system:test", "test.event", Date.now(), "{}");
+      "INSERT INTO events (id, source, producer_ref, type, started_at, payload) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run("e1", "system:test", TEST_PRODUCER_REF, "test.event", Date.now(), "{}");
 
     const event = dataDb.prepare("SELECT schema_version FROM events WHERE id = ?").get("e1") as {
       schema_version: string;
@@ -158,20 +169,20 @@ describe("DB", () => {
     const { dataDb, close } = openDatabases(workspace);
 
     dataDb.prepare(
-      "INSERT INTO events (id, source, type, external_id, started_at, payload) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run("e1", "connector:oura", "sleep.recorded", "oura-123", Date.now(), "{}");
+      "INSERT INTO events (id, source, producer_ref, type, external_id, started_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run("e1", "connector:oura", TEST_PRODUCER_REF, "sleep.recorded", "oura-123", Date.now(), "{}");
 
     // Same source + external_id should fail
     expect(() =>
       dataDb.prepare(
-        "INSERT INTO events (id, source, type, external_id, started_at, payload) VALUES (?, ?, ?, ?, ?, ?)"
-      ).run("e2", "connector:oura", "sleep.recorded", "oura-123", Date.now(), "{}")
+        "INSERT INTO events (id, source, producer_ref, type, external_id, started_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      ).run("e2", "connector:oura", TEST_PRODUCER_REF, "sleep.recorded", "oura-123", Date.now(), "{}")
     ).toThrow();
 
     // Different source + same external_id should succeed
     dataDb.prepare(
-      "INSERT INTO events (id, source, type, external_id, started_at, payload) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run("e3", "connector:github", "sleep.recorded", "oura-123", Date.now(), "{}");
+      "INSERT INTO events (id, source, producer_ref, type, external_id, started_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run("e3", "connector:github", TEST_PRODUCER_REF, "sleep.recorded", "oura-123", Date.now(), "{}");
 
     close();
   });
@@ -180,8 +191,8 @@ describe("DB", () => {
     const { dataDb, close } = openDatabases(workspace);
 
     dataDb.prepare(
-      "INSERT INTO events (id, source, type, started_at, payload) VALUES (?, ?, ?, ?, ?)"
-    ).run("e1", "system:test", "test.event", Date.now(), "{}");
+      "INSERT INTO events (id, source, producer_ref, type, started_at, payload) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run("e1", "system:test", TEST_PRODUCER_REF, "test.event", Date.now(), "{}");
 
     expect(() =>
       dataDb.prepare("UPDATE events SET type = ? WHERE id = ?").run("test.changed", "e1")

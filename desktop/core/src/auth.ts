@@ -3,6 +3,7 @@ import {
   APP_MANIFEST_DIGEST_PATTERN,
   type AppManifestDigest,
 } from "../../capsule/src/app-manifest-authority";
+import { validateFullGitCommit } from "./system-identity";
 
 export const APP_CAPABILITY_HEADER = "x-lamarck-app-capability";
 
@@ -16,6 +17,8 @@ export type HostAuthContext = Readonly<{ kind: "host" }>;
 export type AppAuthorizationSnapshot = Readonly<{
   manifestGeneration: number;
   manifestDigest: AppManifestDigest;
+  /** Host-resolved exact App activation commit; never accepted from App traffic. */
+  appCommit: string;
   writeTables: readonly string[];
   docGrants: readonly string[];
 }>;
@@ -306,6 +309,7 @@ function freezeAuthorizationSnapshot(
   return Object.freeze({
     manifestGeneration: authorization.manifestGeneration,
     manifestDigest: authorization.manifestDigest,
+    appCommit: validateFullGitCommit(authorization.appCommit, "App authorization commit"),
     writeTables: Object.freeze([...authorization.writeTables]),
     docGrants: Object.freeze([...authorization.docGrants]),
   });

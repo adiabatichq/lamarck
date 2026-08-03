@@ -11,3 +11,4 @@ export * from "./schedule";
 export * from "./install";
 export * from "./registry";
 export * from "./source-identity";
+export * from "./connector-package-archive";

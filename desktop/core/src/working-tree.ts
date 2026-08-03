@@ -49,12 +49,20 @@ const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export interface WorkingTreeOptions {
   guard: WorkingTreeGuard;
+  producer: {
+    producerRef: string;
+    prepareProducer?: () => void | Promise<void>;
+  };
   pagesDir: string;
   stateStore: WorkingTreeStateStore;
 }
 
 interface WorkingTreeGuard {
-  withSource(source: string, opts?: { copyDocHook?: boolean }): WorkingTreeGuard;
+  withSource(source: string, opts: {
+    producerRef: string;
+    prepareProducer?: () => void | Promise<void>;
+    copyDocHook?: boolean;
+  }): WorkingTreeGuard;
   query(sql: string, params?: GuardSqlParams): unknown[] | Promise<unknown[]>;
   readDocForWorkingTree(id: string): unknown | null | Promise<unknown | null>;
   listLockedDocHashesForWorkingTree(
@@ -232,7 +240,11 @@ export class WorkingTree {
 
   constructor(opts: WorkingTreeOptions) {
     this.guard = opts.guard;
-    this.fileGuard = opts.guard.withSource("working-tree:pages", { copyDocHook: false });
+    this.fileGuard = opts.guard.withSource("working-tree:pages", {
+      producerRef: opts.producer.producerRef,
+      prepareProducer: opts.producer.prepareProducer,
+      copyDocHook: false,
+    });
     this.pagesDir = opts.pagesDir;
     this.pagesRoot = resolve(opts.pagesDir);
     this.state = opts.stateStore;

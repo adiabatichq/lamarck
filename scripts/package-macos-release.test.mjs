@@ -47,6 +47,7 @@ import {
   buildDeviceIdentityNative,
   deviceIdentityNativeRequired,
 } from "../desktop/core/src/device-identity/native/build.mjs";
+import { resolveBuildSystemIdentity } from "./build-system-identity.mjs";
 import {
   DEVICE_IDENTITY_NATIVE_RESOURCE_PATH,
   assertDeviceIdentityNativeResourceLayout,
@@ -325,6 +326,72 @@ test("local and hermetic release builds share the canonical Desktop recipe", asy
   assert.equal(shellPackage.scripts.build, "node ../../scripts/build-desktop.mjs");
   assert.match(releaseBuilder, /join\(source, "scripts\/build-desktop\.mjs"\)/);
   assert.ok(MACOS_RELEASE_SOURCE_FILES.includes("scripts/build-desktop.mjs"));
+});
+
+test("alpha packaging passes its selected version into the System build identity", async () => {
+  const alphaPackager = await readFile(
+    join(root, "scripts", "package-macos-alpha.mjs"),
+    "utf8",
+  );
+
+  assert.match(alphaPackager, /run\("npm", \["run", "build"\], \{[\s\S]*?env: \{[\s\S]*?\.\.\.process\.env,[\s\S]*?LAMARCK_BUILD_VERSION: version,[\s\S]*?\}[\s\S]*?\}\);/);
+  assert.match(alphaPackager, /function run\([^)]*\{ cwd = root, allowFailure = false, env = process\.env \}/);
+  assert.match(alphaPackager, /spawnSync\(command, args, \{ cwd, env, stdio: "inherit" \}\)/);
+});
+
+test("clean production build identity binds an injected commit to Git HEAD", async (t) => {
+  const repository = await createGitIdentityFixture(t);
+  const head = captureGit(repository, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  const baseEnvironment = {
+    LAMARCK_BUILD_VERSION: "0.1.0-alpha.12",
+  };
+
+  assert.deepEqual(await resolveBuildSystemIdentity({
+    root: repository,
+    env: { ...baseEnvironment, LAMARCK_BUILD_COMMIT: head },
+    requireClean: true,
+  }), {
+    version: "0.1.0-alpha.12",
+    commit: head,
+  });
+  assert.deepEqual(await resolveBuildSystemIdentity({
+    root: repository,
+    env: baseEnvironment,
+    requireClean: true,
+  }), {
+    version: "0.1.0-alpha.12",
+    commit: head,
+  });
+
+  const mismatchingCommit = head === "a".repeat(40) ? "b".repeat(40) : "a".repeat(40);
+  await assert.rejects(resolveBuildSystemIdentity({
+    root: repository,
+    env: { ...baseEnvironment, LAMARCK_BUILD_COMMIT: mismatchingCommit },
+    requireClean: true,
+  }), /must match the checked-out Git HEAD/);
+
+  await writeFile(join(repository, "dirty.txt"), "dirty\n");
+  await assert.rejects(resolveBuildSystemIdentity({
+    root: repository,
+    env: { ...baseEnvironment, LAMARCK_BUILD_COMMIT: head },
+    requireClean: true,
+  }), /must be a clean Git revision/);
+});
+
+test("hermetic source snapshots may use an explicit commit without Git metadata", async (t) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "lamarck-build-identity-snapshot-"));
+  t.after(async () => await rm(temporaryRoot, { recursive: true, force: true }));
+  await writeFile(join(temporaryRoot, "package.json"), '{"version":"0.1.0"}\n');
+  const commit = "c".repeat(40);
+
+  assert.deepEqual(await resolveBuildSystemIdentity({
+    root: temporaryRoot,
+    env: { LAMARCK_BUILD_COMMIT: commit },
+    requireClean: false,
+  }), {
+    version: "0.1.0",
+    commit,
+  });
 });
 
 test("device identity native build and packaged lookup share one exact resource path", async (t) => {
@@ -826,4 +893,29 @@ async function createReleaseSourceFixture(t, suffix = "source") {
     await writeFile(join(directory, "fixture.txt"), `${relativeDirectory}\n`);
   }
   return { repository, snapshot };
+}
+
+async function createGitIdentityFixture(t) {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "lamarck-build-identity-git-"));
+  t.after(async () => await rm(temporaryRoot, { recursive: true, force: true }));
+  const repository = join(temporaryRoot, "repository");
+  await mkdir(repository);
+  await writeFile(join(repository, "package.json"), '{"version":"0.1.0"}\n');
+  captureGit(repository, ["init", "--quiet"]);
+  captureGit(repository, ["config", "user.name", "Lamarck Test"]);
+  captureGit(repository, ["config", "user.email", "test@lamarck.invalid"]);
+  captureGit(repository, ["add", "package.json"]);
+  captureGit(repository, ["commit", "--quiet", "-m", "fixture"]);
+  return repository;
+}
+
+function captureGit(repository, args) {
+  const result = spawnSync("git", ["-C", repository, ...args], {
+    encoding: "utf8",
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr.trim()}`);
+  }
+  return result.stdout.trim();
 }
