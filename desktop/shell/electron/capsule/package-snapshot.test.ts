@@ -64,8 +64,8 @@ describe("capsule-tree-v1 package snapshots", () => {
     await writeFile(join(packageDir, "src", "node_modules", "nested", "secret"), "nope");
 
     const first = await createCapsulePackageSnapshot({ packageDir, cacheDir });
-    // Non-executable source permission differences do not leak into the sealed format.
-    await chmod(join(packageDir, "z-last.txt"), 0o640);
+    // Host executable permission differences do not leak into the sealed format.
+    await chmod(join(packageDir, "z-last.txt"), 0o755);
     const second = await createCapsulePackageSnapshot({ packageDir, cacheDir });
     const bytes = await readSnapshot(first);
     const records = decodeTree(bytes);
@@ -104,10 +104,10 @@ describe("capsule-tree-v1 package snapshots", () => {
       mode: 0o755,
       content: "#!/bin/sh\nexit 0\n",
     });
-    expect(record(records, "z-last.txt")).toMatchObject({ type: "file", mode: 0o644, content: "z" });
+    expect(record(records, "z-last.txt")).toMatchObject({ type: "file", mode: 0o755, content: "z" });
     expect(record(records, "src/components/empty.ts")).toMatchObject({
       type: "file",
-      mode: 0o644,
+      mode: 0o755,
       content: "",
     });
 
@@ -115,6 +115,28 @@ describe("capsule-tree-v1 package snapshots", () => {
     expect(casInfo.isFile()).toBe(true);
     expect(casInfo.mode & 0o777).toBe(0o400);
     expect((await readdir(cacheDir)).filter((name) => name.startsWith(".snapshot-"))).toEqual([]);
+  });
+
+  test("uses one fixed executable mode and digest for App source across chmod changes", async () => {
+    const { packageDir, cacheDir } = await fixture();
+    const source = join(packageDir, "script.mjs");
+    await writeFile(source, "console.log('same bytes');\n");
+    await chmod(source, 0o600);
+    const nonExecutable = await createCapsulePackageSnapshot({ packageDir, cacheDir });
+
+    await chmod(source, 0o755);
+    const executable = await createCapsulePackageSnapshot({ packageDir, cacheDir });
+
+    expect(executable).toMatchObject({
+      digest: nonExecutable.digest,
+      path: nonExecutable.path,
+      bytes: nonExecutable.bytes,
+    });
+    expect(record(decodeTree(await readSnapshot(executable)), "script.mjs")).toMatchObject({
+      type: "file",
+      mode: 0o755,
+      content: "console.log('same bytes');\n",
+    });
   });
 
   test("the published snapshot is independent from later source edits", async () => {

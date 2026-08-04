@@ -732,13 +732,15 @@ async function collectEntries(
       if (!Number.isSafeInteger(size) || size < 0 || size > MAX_FILE_BYTES) {
         throw new Error(`Package file exceeds 512 MiB: ${entryPath}`);
       }
-      const executable = (Number(info.mode) & 0o111) !== 0;
       entries.push(snapshotEntry(
         absolutePath,
         entryPath,
         pathBytes,
         TYPE_FILE,
-        executable ? 0o755 : 0o644,
+        // App source executability is Capsule policy, not Host workspace
+        // metadata. Dependency artifacts use the separate virtual-tree path
+        // and retain the modes produced by the dependency build.
+        0o755,
         size,
         info,
       ));
