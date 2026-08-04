@@ -147,9 +147,7 @@ CREATE TABLE IF NOT EXISTS d1_working_tree_protected_hashes (
                CHECK (length(content_hash) = 64 AND content_hash NOT GLOB '*[^0-9a-f]*'),
   protected_at INTEGER NOT NULL CHECK (protected_at >= 0)
 );
-`;
 
-export const SYSTEM_SCHEMA_V2 = `${SYSTEM_SCHEMA_V1}
 CREATE TABLE IF NOT EXISTS connector_official_release_hashes (
   connector_id   TEXT NOT NULL,
   content_hash   TEXT NOT NULL,
@@ -158,8 +156,8 @@ CREATE TABLE IF NOT EXISTS connector_official_release_hashes (
 );
 `;
 
-export const SYSTEM_SCHEMA = SYSTEM_SCHEMA_V2;
-export const SYSTEM_DATABASE_VERSION = 2;
+export const SYSTEM_SCHEMA = SYSTEM_SCHEMA_V1;
+export const SYSTEM_DATABASE_VERSION = 1;
 
 const SYSTEM_MIGRATIONS: readonly DatabaseMigration[] = [
   {
@@ -170,25 +168,6 @@ const SYSTEM_MIGRATIONS: readonly DatabaseMigration[] = [
     },
     validate(db) {
       assertSchemaCompatible(db, SYSTEM_SCHEMA_V1, SYSTEM_DB_FILENAME, {
-        allowUnknownObjects: false,
-      });
-    },
-  },
-  {
-    version: 2,
-    name: "Marketplace exact-hash Connector trust",
-    up(db) {
-      db.exec(`
-        CREATE TABLE connector_official_release_hashes (
-          connector_id   TEXT NOT NULL,
-          content_hash   TEXT NOT NULL,
-          verified_at    INTEGER NOT NULL,
-          PRIMARY KEY (connector_id, content_hash)
-        );
-      `);
-    },
-    validate(db) {
-      assertSchemaCompatible(db, SYSTEM_SCHEMA_V2, SYSTEM_DB_FILENAME, {
         allowUnknownObjects: false,
       });
     },
