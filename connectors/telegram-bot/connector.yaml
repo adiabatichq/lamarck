@@ -1,5 +1,5 @@
 manifestVersion: 1
-id: telegram-bot
+id: lamarck.telegram-bot
 name: Telegram Bot
 description: Captures inbound Telegram messages received by a configured bot.
 eventCatalog: ./events.json

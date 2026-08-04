@@ -1,5 +1,5 @@
 manifestVersion: 1
-id: local-git
+id: lamarck.local-git
 name: Local Git
 description: Collects unique Git commits matching configured identities from user-selected local repositories as durable evidence for reconstructing coding work.
 eventCatalog: ./events.json

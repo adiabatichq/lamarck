@@ -1,5 +1,5 @@
 manifestVersion: 1
-id: macos-ax
+id: lamarck.macos-ax
 name: macOS AX Watcher
 description: Captures privacy-filtered desktop context and presence from macOS Accessibility APIs.
 eventCatalog: ./events.json
