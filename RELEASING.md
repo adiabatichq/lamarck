@@ -29,6 +29,71 @@ The Guest signing key must be backed up offline. It is materialized as a
 temporary mode-0600 file outside the checkout; it is never uploaded to R2,
 placed in an Actions artifact, or passed into a Docker build or container.
 
+## Official Marketplace package publishing
+
+Official Marketplace source packages live independently from Desktop
+packaging under `apps/<package>/` and `connectors/<package>/`. Every published
+manifest uses a scoped `lamarck.<name>` ID. Desktop does not bundle either
+collection, and `desktop/core/scaffolds/app-v1/` is only the local blank-App
+scaffold; it is not a Marketplace package.
+
+The **Publish Official Marketplace Packages** workflow runs for protected
+`main` changes to either collection and supports manual retry. It discovers
+every immediate package directory and applies one identical matrix job:
+
+1. Create an ordinary bounded `.tar.gz` transport archive, excluding only the
+   common `.git` and `node_modules` logical-tree exclusions. Backend applies
+   kind-specific policy such as the App-only `.lamarck` exclusion.
+2. Request a private upload slot from Marketplace Backend.
+3. Put the exact candidate bytes at the returned short-lived presigned URL.
+4. Complete the upload and poll the owned upload resource until Backend
+   reports `published` or a bounded validation error.
+
+The workflow does not parse package manifests, calculate an authoritative
+logical hash, choose a final object path, execute Connector content, or make a
+publication decision. Backend alone validates and canonicalizes the candidate,
+derives package identity and origin, assigns the release, publishes the public
+content-addressed artifact, and advances the index. Retry is safe through the
+upload resource and Backend content idempotency; a failed validation is not a
+public release and may be retried after fixing the source.
+
+Configure these non-secret variables on the protected
+`marketplace-official` GitHub environment:
+
+| Variable | Required value |
+|---|---|
+| `MARKETPLACE_API_ORIGIN` | `https://api.lamarck.ai` |
+| `MARKETPLACE_OIDC_AUDIENCE` | `https://api.lamarck.ai/marketplace/uploads` |
+
+Only the package-publish matrix job receives `contents: read` and
+`id-token: write`. It requests a short-lived GitHub Actions OIDC token for the
+exact configured audience. Marketplace Backend verifies that token directly,
+including issuer, signature, repository, workflow/ref, audience, and time
+claims, and maps it to the narrow Official publisher for the reserved
+`lamarck` namespace. No AWS federation is involved.
+
+Do not add R2 credentials, a long-lived Marketplace token, a Lamarck account
+token, or an OSS publishing secret to this workflow. OSS CI receives only the
+one-key presigned PUT. Private ingest cleanup and publication into
+`lamarck-desktop-releases-prod` are Backend responsibilities.
+
+For the initial coordinated release:
+
+1. Land and verify Backend publication plus the focused App and Connector
+   Desktop download/lifecycle smoke coverage.
+2. Deploy Backend routes, OIDC allowlist, namespace authority, signing key,
+   index, validation worker, and existing R2 configuration.
+3. Set the two non-secret GitHub variables, then run the OSS workflow from
+   protected `main` and wait for every matrix entry to publish.
+4. Verify catalog, exact/latest signed resolution, and public immutable
+   artifact reads before enabling the Web handoff.
+5. Ship the signed Desktop build containing the matching artifact consumer,
+   protocol registration, pinned API/release origins, and resolve trust root.
+
+For any later artifact-format revision, ship a Desktop reader that recognizes
+the revision before Backend begins emitting it. The blind OSS publisher does
+not change merely because the canonical artifact contract changes.
+
 ## Guest Release workflow
 
 Guest releases are low-frequency and tag-driven:

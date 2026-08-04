@@ -20,6 +20,7 @@ const gates = [
   ["Repository module boundaries", ["run", "verify:module-boundaries"]],
   ["System SDK consumer alignment", ["run", "verify:system-sdk-consumers"]],
   ["System SDK consumer sync tests", ["run", "test:system-sdk-consumer-sync"]],
+  ["Marketplace blind publisher tests", ["run", "test:marketplace-publisher"]],
   ["R2 object store tests", ["run", "test:r2-object-store"]],
   ["Guest download retry tests", ["run", "test:guest-download"]],
   ["Desktop production build", ["run", "build"]],
