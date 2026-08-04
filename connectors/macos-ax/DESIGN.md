@@ -74,7 +74,7 @@ Every D0 context span/window privacy summary should carry the action, policy ver
 
 Production should ship a precompiled `bin/ax-helper` inside the connector package. End-user machines must not need Xcode or Command Line Tools just to run the connector. The Swift source should stay in `helper/ax-helper.swift` for auditability, development, and reproducible rebuilds, but source execution is a development fallback only.
 
-Rebuild the production helper with `desktop/template/connectors/macos-ax/build-helper.sh`. The script builds arm64 and x86_64 slices, combines them into a universal Mach-O at `bin/ax-helper`, and applies an ad-hoc code signature. Distribution signing/notarization can replace that signature at app packaging time.
+Rebuild the production helper with `connectors/macos-ax/build-helper.sh`. The script builds arm64 and x86_64 slices, combines them into a universal Mach-O at `bin/ax-helper`, and applies an ad-hoc code signature. Distribution signing/notarization can replace that signature at app packaging time.
 
 Connector package hashing covers regular files recursively and skips only `.git` and `node_modules`, so `bin/ax-helper` is covered by the same `contentHash` trust gate as `index.mjs`. If the helper binary is modified, the connector package hash changes and the package should no longer match the official catalog hash.
 
