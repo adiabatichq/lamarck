@@ -41,6 +41,7 @@ export const MACOS_RELEASE_SOURCE_FILES = Object.freeze([
   "scripts/build-system-identity.mjs",
   "scripts/build-capsule-vm-macos.mjs",
   "scripts/build-macos-release-shell-inside.mjs",
+  "scripts/marketplace-trust-roots.mjs",
   "scripts/macos-release-signer.mjs",
   "scripts/macos-release-runtime.mjs",
   "scripts/package-macos-release-contract.mjs",

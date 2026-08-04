@@ -26,10 +26,18 @@ import {
   deviceIdentityNativeAddonPath,
 } from "../desktop/core/src/device-identity/native/resource-path.mjs";
 import { runPackagedNodePtySmoke } from "./macos-release-runtime.mjs";
+import {
+  requireMarketplaceTrustRoot,
+  validateMarketplaceTrustRootResource,
+} from "./marketplace-trust-roots.mjs";
 
 const ALPHA_BUNDLE_ID = "ai.lamarck.desktop.alpha";
 const ALPHA_APP_NAME = "Lamarck Alpha.app";
 const ALPHA_DISPLAY_NAME = "Lamarck Alpha";
+const MARKETPLACE_URL_TYPES = [{
+  CFBundleURLName: "ai.lamarck.marketplace",
+  CFBundleURLSchemes: ["lamarck"],
+}];
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const shellRoot = join(root, "desktop", "shell");
@@ -55,6 +63,8 @@ if (existsSync(archivePath)) {
   throw new Error(`alpha archive already exists; bump the version: ${archivePath}`);
 }
 
+requireMarketplaceTrustRoot(process.env);
+
 console.log(`[alpha] Building Lamarck Alpha ${version} (ad-hoc signed, NOT for broad distribution)`);
 run("npm", ["run", "build"], {
   cwd: root,
@@ -76,6 +86,7 @@ const FIXED_ELECTRON_FILES = [
   "core.mjs",
   "guard-service.cjs",
   "main.cjs",
+  "marketplace-trust-roots.json",
   "preload.cjs",
   "pty-helper.cjs",
 ];
@@ -143,6 +154,14 @@ try {
     ["CFBundleVersion", version],
   ]) run("plutil", ["-replace", key, "-string", value, plist]);
   run("plutil", ["-replace", "LamarckReleaseChannel", "-string", "alpha", plist]);
+  run("plutil", ["-remove", "CFBundleURLTypes", plist], { allowFailure: true });
+  run("plutil", ["-insert", "CFBundleURLTypes", "-json", JSON.stringify(MARKETPLACE_URL_TYPES), plist]);
+  const packagedUrlTypes = JSON.parse(capture("plutil", [
+    "-extract", "CFBundleURLTypes", "json", "-o", "-", plist,
+  ]));
+  if (JSON.stringify(packagedUrlTypes) !== JSON.stringify(MARKETPLACE_URL_TYPES)) {
+    throw new Error("packaged Info.plist Marketplace URL scheme is incorrect");
+  }
 
   await mkdir(electronResources, { recursive: true });
   await writeFile(join(appResources, "package.json"), `${JSON.stringify({
@@ -162,6 +181,10 @@ try {
   assertDeviceIdentityNativeResourceLayout(
     electronResources,
     join(electronResources, "native"),
+  );
+  await validateMarketplaceTrustRootResource(
+    join(electronResources, "marketplace-trust-roots.json"),
+    process.env,
   );
 
   // Runtime dependency closure: node-pty and its single runtime dependency,
@@ -238,6 +261,15 @@ function run(command, args, { cwd = root, allowFailure = false, env = process.en
   if (result.status !== 0 && !allowFailure) {
     throw new Error(`${command} exited with ${result.status ?? result.signal}`);
   }
+}
+
+function capture(command, args, { cwd = root, env = process.env } = {}) {
+  const result = spawnSync(command, args, { cwd, env, encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`${command} exited with ${result.status ?? result.signal}: ${result.stderr}`);
+  }
+  return result.stdout;
 }
 
 async function requireDirectory(path, label) {

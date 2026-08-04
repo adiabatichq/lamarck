@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { basename, dirname, join } from "path";
+import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { ContentBlobStore } from "../src/blob-store";
@@ -18,10 +18,8 @@ import {
   listInstalledConnectorDirs,
   installConnectorFromSource,
   isPlatformSupported,
-  listAvailableBuiltIns,
   loadConnectorEventCatalog,
   loadConnectorManifest,
-  materializeBuiltInConnector,
   registerWorkspaceConnectors,
   removeConnectorFromWorkspace,
   removeInstalledConnector,
@@ -95,7 +93,7 @@ function writeConnectorManifestFixture(path: string, contents: string): void {
 }
 
 const telegramBotApiReference = JSON.parse(readFileSync(
-  new URL("../../template/connectors/telegram-bot/api-reference.json", import.meta.url),
+  new URL("../../../connectors/telegram-bot/api-reference.json", import.meta.url),
   "utf8",
 )) as {
   schemaVersion: number;
@@ -3934,92 +3932,8 @@ auth:
     expect(event).toBeFalsy();
   });
 
-  test("app-commits syncs app git repos with per-app cursors", async () => {
-    const appCommitsUrl = new URL("../../template/connectors/app-commits/index.mjs", import.meta.url).href;
-    const { syncOnce } = await import(appCommitsUrl) as {
-      syncOnce(context: unknown): Promise<void>;
-    };
-    const appDir = join(workspace, "apps", "hello-world");
-    mkdirSync(appDir, { recursive: true });
-    execFileSync("git", ["-C", appDir, "init"], { stdio: "ignore" });
-    execFileSync("git", ["-C", appDir, "config", "user.name", "Test User"], { stdio: "ignore" });
-    execFileSync("git", ["-C", appDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
-
-    writeFileSync(join(appDir, "index.tsx"), "export default function App() { return null; }\n");
-    execFileSync("git", ["-C", appDir, "add", "."], { stdio: "ignore" });
-    execFileSync("git", ["-C", appDir, "commit", "-m", "Initial app"], { stdio: "ignore" });
-    const firstSha = execFileSync("git", ["-C", appDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-
-    let syncState: unknown;
-    const events: any[] = [];
-	    const context = {
-      guard: {
-        async writeEvent(event: any) {
-          events.push(event);
-          return { id: `event-${events.length}` };
-        },
-      },
-      state: {
-        async get() {
-          return syncState;
-        },
-        async set(next: unknown) {
-          syncState = next;
-        },
-      },
-      host: { workspacePath: workspace },
-      signal: new AbortController().signal,
-    };
-
-    await syncOnce(context);
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
-      type: "app.commit",
-      externalId: `hello-world:${firstSha}`,
-      payload: {
-        appId: "hello-world",
-        commitSha: firstSha,
-        authorName: "Test User",
-        authorEmail: "test@example.com",
-        message: "Initial app",
-      },
-    });
-
-    writeFileSync(join(appDir, "index.tsx"), "export default function App() { return 'updated'; }\n");
-    execFileSync("git", ["-C", appDir, "add", "."], { stdio: "ignore" });
-    execFileSync("git", ["-C", appDir, "commit", "-m", "Update app", "-m", "Refine the render path."], { stdio: "ignore" });
-    const secondSha = execFileSync("git", ["-C", appDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-
-    await syncOnce(context);
-    expect(events).toHaveLength(2);
-    expect(events[1].externalId).toBe(`hello-world:${secondSha}`);
-    // Full multi-line message (subject + body) is captured, not just the subject.
-    expect(events[1].payload.message).toBe("Update app\n\nRefine the render path.");
-    expect(syncState).toEqual({
-      apps: {
-        "hello-world": { lastSha: secondSha },
-      },
-    });
-
-    syncState = {
-      apps: {
-        "hello-world": { lastSha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
-      },
-    };
-    const fallbackStart = events.length;
-    await syncOnce(context);
-    expect(events).toHaveLength(fallbackStart + 2);
-    expect(events[fallbackStart].payload.message).toBe("Initial app");
-    expect(events[fallbackStart + 1].payload.message).toBe("Update app\n\nRefine the render path.");
-    expect(syncState).toEqual({
-      apps: {
-        "hello-world": { lastSha: secondSha },
-      },
-    });
-  });
-
   test("local-git syncs matching commits from code roots", async () => {
-    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const localGitUrl = new URL("../../../connectors/local-git/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(localGitUrl) as {
       syncOnce(context: unknown): Promise<void>;
     };
@@ -4121,7 +4035,7 @@ auth:
   });
 
   test("local-git limits commit writes to the configured backfill days", async () => {
-    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const localGitUrl = new URL("../../../connectors/local-git/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(localGitUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -4200,7 +4114,7 @@ auth:
   });
 
   test("local-git applies explicit repo capture overrides", async () => {
-    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const localGitUrl = new URL("../../../connectors/local-git/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(localGitUrl) as {
       syncOnce(context: unknown): Promise<void>;
     };
@@ -4292,7 +4206,7 @@ auth:
   });
 
   test("local-git does not treat repo overrides as data sources", async () => {
-    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const localGitUrl = new URL("../../../connectors/local-git/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(localGitUrl) as {
       syncOnce(context: unknown): Promise<void>;
     };
@@ -4358,7 +4272,7 @@ auth:
   });
 
   test("local-git aborts git scans without advancing repo state", async () => {
-    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const localGitUrl = new URL("../../../connectors/local-git/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(localGitUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -4428,7 +4342,7 @@ auth:
   });
 
   test("local-git rescans history when identity emails change", async () => {
-    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const localGitUrl = new URL("../../../connectors/local-git/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(localGitUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -4509,7 +4423,7 @@ auth:
   });
 
   test("local-git commit ids do not depend on origin", async () => {
-    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const localGitUrl = new URL("../../../connectors/local-git/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(localGitUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -4595,7 +4509,7 @@ auth:
   });
 
   test("local-git commit ids survive moving a repo", async () => {
-    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const localGitUrl = new URL("../../../connectors/local-git/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(localGitUrl) as {
       syncOnce(context: unknown): Promise<void>;
     };
@@ -4662,7 +4576,7 @@ auth:
   });
 
   test("local-git namespaces commit ids by Git object format", async () => {
-    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const localGitUrl = new URL("../../../connectors/local-git/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(localGitUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -4730,7 +4644,7 @@ auth:
   });
 
   test("local-git opens code roots through the connector-owned macOS picker", async () => {
-    const localGitUrl = new URL("../../template/connectors/local-git/index.mjs", import.meta.url).href;
+    const localGitUrl = new URL("../../../connectors/local-git/index.mjs", import.meta.url).href;
     const { chooseCodeRoot } = await import(localGitUrl) as {
       chooseCodeRoot(deps?: unknown): Promise<{ paths: string[] }>;
     };
@@ -4812,7 +4726,7 @@ auth:
   }
 
   test("code-agent-transcripts collapses Windows home paths without matching sibling names", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { collapseHome } = await import(agentUrl) as {
       collapseHome(value: string, homeValue: string): string;
     };
@@ -4833,7 +4747,7 @@ auth:
   });
 
   test("code-agent-transcripts surfaces permission errors during transcript discovery", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -4859,7 +4773,7 @@ auth:
   });
 
   test("code-agent-transcripts discovers resumed Codex rollouts for 90 days while backfilling 30", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -4941,7 +4855,7 @@ auth:
   });
 
   test("code-agent-transcripts applies lookback days to events inside a resumed transcript", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -5040,7 +4954,7 @@ auth:
   });
 
   test("code-agent-transcripts packs one Codex interaction into human and agent events", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -5206,7 +5120,7 @@ auth:
   });
 
   test("code-agent-transcripts preserves current Codex tool calls and outputs in selected raw", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -5263,7 +5177,7 @@ auth:
   });
 
   test("code-agent-transcripts preserves Codex inter-agent communication in root raw", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -5328,7 +5242,7 @@ auth:
   });
 
   test("code-agent-transcripts redacts structured secrets inside JSON-encoded tool payloads", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -5407,7 +5321,7 @@ auth:
 
   test("code-agent-transcripts redacts a structured field that exceeds its inspection depth", async () => {
     const redactionUrl = new URL(
-      "../../template/connectors/code-agent-transcripts/redaction.mjs",
+      "../../../connectors/code-agent-transcripts/redaction.mjs",
       import.meta.url,
     ).href;
     const { redactValue } = await import(redactionUrl) as {
@@ -5426,7 +5340,7 @@ auth:
 
   test("code-agent-transcripts elides only explicit provider-native base64 payloads", async () => {
     const redactionUrl = new URL(
-      "../../template/connectors/code-agent-transcripts/redaction.mjs",
+      "../../../connectors/code-agent-transcripts/redaction.mjs",
       import.meta.url,
     ).href;
     const { redactValue } = await import(redactionUrl) as {
@@ -5448,7 +5362,7 @@ auth:
   });
 
   test("code-agent-transcripts keeps replayed parent turns and native fork turns on their own sessions", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -5559,7 +5473,7 @@ auth:
   });
 
   test("code-agent-transcripts preserves the model for each Codex turn closed in one scan", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -5637,7 +5551,7 @@ auth:
   });
 
   test("code-agent-transcripts excludes internal Codex sessions from D0", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -5698,7 +5612,7 @@ auth:
   });
 
   test("code-agent-transcripts marks a Codex task_complete terminal error as failed", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -5764,7 +5678,7 @@ auth:
   });
 
   test("code-agent-transcripts ignores Codex subagents and emits the root without waiting", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -5926,7 +5840,7 @@ auth:
   });
 
   test("code-agent-transcripts fast-forwards a non-root Codex transcript after canonical metadata", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncTranscriptFile } = await import(agentUrl) as {
       syncTranscriptFile(options: unknown): Promise<any>;
     };
@@ -5994,7 +5908,7 @@ auth:
   });
 
   test("code-agent-transcripts keeps a persistent unreadable child isolated from root capture", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { runWatch } = await import(agentUrl) as {
       runWatch(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6074,7 +5988,7 @@ auth:
   });
 
   test("code-agent-transcripts suppresses Claude subagent transcript files and inline sidechain records", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6161,7 +6075,7 @@ auth:
   });
 
   test("code-agent-transcripts keeps bounded cursor state while a Codex turn is open", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6235,7 +6149,7 @@ auth:
   });
 
   test("code-agent-transcripts leaves a complete JSON record pending until its newline arrives", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6289,7 +6203,7 @@ auth:
   });
 
   test("code-agent-transcripts isolates an unsignaled AbortError during root materialization", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6363,7 +6277,7 @@ auth:
   });
 
   test("code-agent-transcripts exhausts retries for a root identified during initial materialization", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { runWatch } = await import(agentUrl) as {
       runWatch(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6437,7 +6351,7 @@ auth:
   });
 
   test("code-agent-transcripts watch retries transient failures, exits on cancellation, and enforces its retry budget", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { runWatch } = await import(agentUrl) as {
       runWatch(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6610,7 +6524,7 @@ auth:
   });
 
   test("code-agent-transcripts applies the 8192-byte content and human raw limits", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6653,7 +6567,7 @@ auth:
   });
 
   test("code-agent-transcripts elides multi-megabyte data URLs without overflowing", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6746,7 +6660,7 @@ auth:
   });
 
   test("code-agent-transcripts packs Claude Code tool activity and strips reasoning by default", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6865,7 +6779,7 @@ auth:
   });
 
   test("code-agent-transcripts accepts Claude prompts without origin and keeps steering in one agent turn", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -6971,7 +6885,7 @@ auth:
   });
 
   test("code-agent-transcripts keeps a Claude interaction on its opening session", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -7033,7 +6947,7 @@ auth:
   });
 
   test("code-agent-transcripts includes redacted Claude reasoning only when enabled", async () => {
-    const agentUrl = new URL("../../template/connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -7091,7 +7005,7 @@ auth:
   });
 
   test("telegram-bot records its rolling Bot API compatibility reference", () => {
-    expect(existsSync(new URL("../../template/connectors/telegram-bot/docs", import.meta.url))).toBe(false);
+    expect(existsSync(new URL("../../../connectors/telegram-bot/docs", import.meta.url))).toBe(false);
     expect(telegramBotApiReference).toMatchObject({
       schemaVersion: 1,
       provider: "telegram",
@@ -7114,7 +7028,7 @@ auth:
   });
 
   test("telegram-bot resolves Source identity from getMe and rejects invalid bot ids", async () => {
-    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
     const { resolveSourceIdentity } = await import(telegramUrl) as {
       resolveSourceIdentity(context: unknown, deps?: unknown): Promise<{
         key: string;
@@ -7155,7 +7069,7 @@ auth:
   });
 
   test("telegram-bot connect verifies bot identity and stores connection state", async () => {
-    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
     const { connectOnce } = await import(telegramUrl) as {
       connectOnce(context: unknown, deps?: unknown): Promise<unknown>;
     };
@@ -7220,7 +7134,7 @@ auth:
   });
 
   test("telegram-bot captures inbound messages as raw-first events", async () => {
-    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(telegramUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<{ updates: number; events: number }>;
     };
@@ -7371,7 +7285,7 @@ auth:
   });
 
   test("telegram-bot preserves raw messages and extracts media refs", async () => {
-    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
     const { eventFromUpdate } = await import(telegramUrl) as {
       eventFromUpdate(update: unknown, opts?: unknown): any;
     };
@@ -7605,7 +7519,7 @@ auth:
   });
 
   test("telegram-bot pairs a direct-message user with a one-time code", async () => {
-    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
     const { syncOnce, pairingChallengeForCode } = await import(telegramUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<{ updates: number; events: number }>;
       pairingChallengeForCode(code: string, nowMs: number, opts?: { salt?: string }): unknown;
@@ -7737,7 +7651,7 @@ auth:
   });
 
   test("telegram-bot pairs a group with a one-time code", async () => {
-    const telegramUrl = new URL("../../template/connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
     const { syncOnce, pairingChallengeForCode } = await import(telegramUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<{ updates: number; events: number }>;
       pairingChallengeForCode(code: string, nowMs: number, opts?: { salt?: string }): unknown;
@@ -7863,7 +7777,7 @@ auth:
   });
 
   test("oura resolves Source identity through the managed provider origin", async () => {
-    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const ouraUrl = new URL("../../../connectors/oura/index.mjs", import.meta.url).href;
     const { resolveSourceIdentity } = await import(ouraUrl) as {
       resolveSourceIdentity(context: unknown, deps?: unknown): Promise<{
         key: string;
@@ -7913,7 +7827,7 @@ auth:
   });
 
   test("oura sync uses revision-aware external ids and per-stream cursors", async () => {
-    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const ouraUrl = new URL("../../../connectors/oura/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(ouraUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -8017,7 +7931,7 @@ auth:
   });
 
   test("oura backfill completes available chunks after incremental sync", async () => {
-    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const ouraUrl = new URL("../../../connectors/oura/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(ouraUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -8113,7 +8027,7 @@ auth:
   });
 
   test("oura datetime backfill uses provider-safe 30 day chunks", async () => {
-    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const ouraUrl = new URL("../../../connectors/oura/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(ouraUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -8172,7 +8086,7 @@ auth:
   });
 
   test("oura backfill records errors and resumes from the failed chunk", async () => {
-    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const ouraUrl = new URL("../../../connectors/oura/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(ouraUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -8295,7 +8209,7 @@ auth:
   });
 
   test("oura heartrate sync emits 15 minute batch events", async () => {
-    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const ouraUrl = new URL("../../../connectors/oura/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(ouraUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -8396,7 +8310,7 @@ auth:
   });
 
   test("oura ring battery sync emits threshold transition events", async () => {
-    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const ouraUrl = new URL("../../../connectors/oura/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(ouraUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -8520,7 +8434,7 @@ auth:
   });
 
   test("oura ring battery sync debounces charge-state recovery flaps", async () => {
-    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const ouraUrl = new URL("../../../connectors/oura/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(ouraUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -8616,7 +8530,7 @@ auth:
   });
 
   test("oura ring configuration sync is throttled by state", async () => {
-    const ouraUrl = new URL("../../template/connectors/oura/index.mjs", import.meta.url).href;
+    const ouraUrl = new URL("../../../connectors/oura/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(ouraUrl) as {
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
@@ -8761,37 +8675,6 @@ auth:
     expect(await listInstalledConnectorDirs(workspace)).toEqual([]);
   });
 
-  test("materializes built-in connectors through the same workspace connectors path", async () => {
-    const sourceDir = join(workspace, "built-in-connectors", "app-commits");
-    mkdirSync(sourceDir, { recursive: true });
-    writeFileSync(
-      join(sourceDir, "connector.json"),
-      JSON.stringify({
-        manifestVersion: 1,
-        id: "app-commits",
-        name: "App Commits",
-        description: "Test connector manifest.",
-        eventCatalog: "./events.json",
-        entry: "./index.mjs",
-        runtime: { mode: "watch" },
-        source: { identity: "single" },
-        platforms: { darwin: {} },
-        auth: { type: "none" },
-      }),
-    );
-    writeFileSync(
-      join(sourceDir, "index.mjs"),
-      "export default { async run() {} };\n",
-    );
-    writeTestEventCatalog(sourceDir);
-
-    const installed = await materializeBuiltInConnector({ sourceDir, workspacePath: workspace });
-    expect(installed.dir).toBe(join(workspace, "connectors", "app-commits"));
-    expect((await loadConnectorManifest(installed.dir)).id).toBe("app-commits");
-    await expect(materializeBuiltInConnector({ sourceDir, workspacePath: workspace }))
-      .rejects.toThrow("Connector already installed: app-commits");
-  });
-
   test("workspace boot cascades Sources whose Connector package is truly absent", async () => {
     const authManager = new ConnectorAuthManager(secrets);
     supervisor = new TestConnectorSupervisor({
@@ -8896,30 +8779,19 @@ auth:
     expect(isPlatformSupported(darwinOnly, "linux")).toBe(false);
   });
 
-  test("lists bundled built-ins as available and installs one explicitly", async () => {
+  test("installs a Connector package explicitly through the managed lifecycle", async () => {
     const guard = new Guard({ db: dataDb, source: "system:test" });
-    const builtins = join(workspace, "builtins");
-    const seedDir = writeBuiltIn(builtins, "seed");
+    const packages = join(workspace, "packages");
+    const seedDir = writeBuiltIn(packages, "seed");
     useOfficialPackages([{
       id: "seed",
       hash: await hashConnectorPackage(seedDir),
     }]);
-    const broken = join(builtins, "broken");
-    mkdirSync(broken, { recursive: true });
-    writeFileSync(join(broken, "connector.yaml"), "id: broken\n");
-
-    // Listing is read-only: valid entries surface, invalid ones are reported.
-    const errors: string[] = [];
-    const available = await listAvailableBuiltIns(builtins, (dir) => errors.push(dir));
-    expect(available.map((entry) => entry.manifest.id)).toEqual(["seed"]);
-    expect(errors).toEqual([broken]);
     expect(existsSync(join(workspace, "connectors", "seed"))).toBe(false);
-    // Missing builtins dir (packaged without templates) is a quiet no-op.
-    expect(await listAvailableBuiltIns(join(workspace, "no-such-dir"))).toEqual([]);
 
     // Explicit install: copies the package and records connector.installed.
     const installed = await installConnectorFromSource({
-      sourceDir: join(builtins, "seed"),
+      sourceDir: join(packages, "seed"),
       workspacePath: workspace,
       connectorId: "seed",
       guard,
@@ -8938,7 +8810,7 @@ auth:
     // Double-install is rejected and leaves no extra D0 record.
     await expect(
       installConnectorFromSource({
-        sourceDir: join(builtins, "seed"),
+        sourceDir: join(packages, "seed"),
         workspacePath: workspace,
         connectorId: "seed",
         guard,
@@ -8948,6 +8820,29 @@ auth:
     expect(
       dataDb.prepare("SELECT COUNT(*) AS n FROM events WHERE type = ?").get("connector.installed"),
     ).toMatchObject({ n: 1 });
+  });
+
+  test("publishes same-hash Official release provenance into live Connector and Source trust", async () => {
+    const packageDir = writeBuiltIn(join(workspace, "packages"), "marketplace-live");
+    const installed = await installConnector({ sourceDir: packageDir, workspacePath: workspace });
+    await registerWorkspaceConnectors(supervisor, workspace);
+    const sourceRecord = supervisor.ensureSource({ connectorId: "marketplace-live" });
+    expect(supervisor.listInstalledConnectors()).toEqual([
+      expect.objectContaining({ connectorId: "marketplace-live", packageTrust: "untrusted" }),
+    ]);
+    expect(supervisor.getSource(sourceRecord.id)?.trustStatus).toBe("untrusted");
+
+    const contentHash = await hashConnectorPackage(installed.dir);
+    supervisor.recordOfficialMarketplaceRelease("marketplace-live", contentHash);
+
+    expect(supervisor.listInstalledConnectors()).toEqual([
+      expect.objectContaining({
+        connectorId: "marketplace-live",
+        packageHash: contentHash,
+        packageTrust: "official",
+      }),
+    ]);
+    expect(supervisor.getSource(sourceRecord.id)?.trustStatus).toBe("official");
   });
 
   test("updates a same-id Connector by hash while preserving every Source", async () => {

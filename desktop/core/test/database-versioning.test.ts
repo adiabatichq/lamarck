@@ -16,6 +16,7 @@ import {
   SYSTEM_DATABASE_VERSION,
   SYSTEM_DB_FILENAME,
   SYSTEM_SCHEMA_V1,
+  SYSTEM_SCHEMA_V2,
 } from "../src/db";
 import { readDatabaseVersion } from "../src/database-migrations";
 import { GuardEngine } from "../src/guard-service/engine";
@@ -49,6 +50,8 @@ describe("data.db and system.db schema versions", () => {
     expect(schemaObject(systemDb, "d1_working_tree_mirrors")).toBeTruthy();
     expect(schemaObject(systemDb, "d1_working_tree_conflicts")).toBeTruthy();
     expect(schemaObject(systemDb, "d1_working_tree_protected_hashes")).toBeTruthy();
+    expect(schemaObject(systemDb, "connector_official_release_hashes")).toBeTruthy();
+    expect(schemaObject(systemDb, "connector_marketplace_approvals")).toBeUndefined();
     systemDb.close();
 
     const dataDb = new DatabaseSync(dataPath());
@@ -57,11 +60,13 @@ describe("data.db and system.db schema versions", () => {
   });
 
   test("pins the released migration inputs", () => {
-    expect(SYSTEM_DATABASE_VERSION).toBe(1);
+    expect(SYSTEM_DATABASE_VERSION).toBe(2);
     expect(sha256(DATA_SCHEMA_V1))
       .toBe("c095c4c6e70ddbd10c9163e8c5438b4a43df1499b4f3e1f8fbb01a0d9432b66d");
     expect(sha256(SYSTEM_SCHEMA_V1))
       .toBe("d1c2d5b86fdfb29187ca55bd69b0f8d804405a9f010aecad1a7d2aa0641ad517");
+    expect(sha256(SYSTEM_SCHEMA_V2))
+      .toBe("90e13503ef7b23aa3aee486484a7a3f31cd9a66d79205d0bb2adde64c587a4f3");
   });
 
   test("D2 promotion and demotion do not change the data database version", () => {

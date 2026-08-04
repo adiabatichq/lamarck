@@ -28,6 +28,7 @@ const GENERATED_HOST_PATHS = [
   "preload.cjs",
   "app-preload.cjs",
   "pty-helper.cjs",
+  "marketplace-trust-roots.json",
 ];
 const APP_SCAFFOLD_FILES = [
   "index.html",

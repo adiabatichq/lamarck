@@ -563,8 +563,20 @@ export async function loadConnectorManifest(connectorDir: string): Promise<Conne
   } finally {
     await handle.close();
   }
-  const raw = filename.endsWith(".json") ? JSON.parse(text) : parseSimpleYaml(text);
-  return validateConnectorManifest(raw);
+  return parseConnectorManifestText(filename, text);
+}
+
+/** Parse through the existing Desktop Connector document parser. */
+export function parseConnectorManifestDocument(filename: string, text: string): unknown {
+  if (filename !== "connector.yaml" && filename !== "connector.yml" && filename !== "connector.json") {
+    throw new Error(`Unsupported Connector manifest filename: ${filename}`);
+  }
+  return filename.endsWith(".json") ? JSON.parse(text) : parseSimpleYaml(text);
+}
+
+/** Parse and validate through the existing Desktop Connector contract authority. */
+export function parseConnectorManifestText(filename: string, text: string): ConnectorManifest {
+  return validateConnectorManifest(parseConnectorManifestDocument(filename, text));
 }
 
 function validateAuthSpec(connectorId: string, value: unknown): ConnectorAuthSpec {

@@ -64,6 +64,8 @@ const environment = {
   npm_config_registry: "https://registry.npmjs.org",
   LAMARCK_BUILD_VERSION: buildVersion,
   LAMARCK_BUILD_COMMIT: buildCommit,
+  LAMARCK_MARKETPLACE_SIGNING_KEY_ID: process.env.LAMARCK_MARKETPLACE_SIGNING_KEY_ID,
+  LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: process.env.LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY,
 };
 run(process.execPath, [npmCli, "ci",
   "--workspace", "@lamarck/shell",

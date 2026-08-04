@@ -61,6 +61,8 @@ jobs:
       - name: Package alpha build
         env:
           ALPHA_VERSION: ${{ inputs.version }}
+          LAMARCK_MARKETPLACE_SIGNING_KEY_ID: ${{ vars.LAMARCK_MARKETPLACE_SIGNING_KEY_ID }}
+          LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: ${{ vars.LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           if test -n "$ALPHA_VERSION"; then

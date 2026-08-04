@@ -9,6 +9,7 @@ import {
   resolveBuildSystemIdentity,
   systemIdentityEsbuildDefine,
 } from "./build-system-identity.mjs";
+import { writeMarketplaceTrustRootResource } from "./marketplace-trust-roots.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const shellDir = resolve(root, "desktop/shell");
@@ -74,6 +75,10 @@ await cp(
   resolve(coreDir, "scaffolds/app-v1"),
   resolve(outDir, "scaffolds/app-v1"),
   { recursive: true, force: false, errorOnExist: true },
+);
+await writeMarketplaceTrustRootResource(
+  resolve(outDir, "marketplace-trust-roots.json"),
+  process.env,
 );
 await buildDeviceIdentityNative({
   bundleDirectory: outDir,

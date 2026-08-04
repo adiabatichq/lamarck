@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { cp, mkdir, readdir, rename, rm, stat } from "fs/promises";
+import { chmod, cp, mkdir, readdir, rename, rm, stat } from "fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "path";
 import {
   loadConnectorEventCatalog,
@@ -61,6 +61,7 @@ export async function installConnector(
   // package squatting on the connector's directory.
   const stagingDir = await stageConnectorPackage(sourceDir, connectorsDir, "install");
   try {
+    await normalizeConnectorMaterializationModes(stagingDir);
     await rename(stagingDir, targetDir);
   } catch (err) {
     await rm(stagingDir, { recursive: true, force: true });
@@ -71,12 +72,6 @@ export async function installConnector(
     manifest,
     dir: targetDir,
   };
-}
-
-export async function materializeBuiltInConnector(
-  opts: InstallConnectorOptions,
-): Promise<InstalledConnector> {
-  return installConnector(opts);
 }
 
 export async function removeInstalledConnector(
@@ -119,46 +114,6 @@ export async function listInstalledConnectorDirs(workspacePath: string): Promise
     .sort();
 }
 
-// Built-ins are bundled catalog entries: packages shipped with the app that
-// can be installed without a download. Listing them never copies anything —
-// installation is always an explicit user action through the same install
-// flow as any other connector package.
-// A bundled package without a valid manifest is not a catalog entry. That is
-// already how any invalid package is treated here, so packages parked without
-// an approved Source identity need no list of their own: the manifest gate
-// rejects them and onError reports which ones, by name, on every listing.
-export async function listAvailableBuiltIns(
-  builtinsDir: string,
-  onError?: (connectorDir: string, error: unknown) => void,
-): Promise<InstalledConnector[]> {
-  let entries;
-  try {
-    entries = await readdir(builtinsDir, { withFileTypes: true });
-  } catch (err) {
-    if (isNotFoundError(err)) return [];
-    throw err;
-  }
-
-  const available: InstalledConnector[] = [];
-  for (const entry of entries
-    .filter((e) => e.isDirectory() && !e.name.startsWith("."))
-    .sort((a, b) => a.name.localeCompare(b.name))) {
-    const dir = join(builtinsDir, entry.name);
-    try {
-      const manifest = await loadConnectorManifest(dir);
-      if (manifest.id !== entry.name) {
-        throw new Error(`Connector manifest id "${manifest.id}" must match folder "${entry.name}"`);
-      }
-      await loadConnectorEventCatalog(dir, manifest);
-      available.push({ manifest, dir });
-    } catch (err) {
-      if (!onError) throw err;
-      onError(dir, err);
-    }
-  }
-  return available;
-}
-
 export interface InstallConnectorFromSourceOptions extends InstallConnectorOptions {
   guard: ConnectorHostGuard;
   supervisor: ConnectorSupervisor;
@@ -190,6 +145,9 @@ export async function installConnectorFromSource(
   try {
     const candidate = await opts.supervisor.verifyTrustedPackage(stagingDir, manifest.id);
     await opts.supervisor.publishPackageArchive(stagingDir, candidate.contentHash);
+    // Verification and immutable-archive publication see the source modes.
+    // Only the confirmed workspace materialization is made executable.
+    await normalizeConnectorMaterializationModes(stagingDir);
     await rename(stagingDir, targetDir);
     const registeredManifest = await opts.supervisor.registerDirectory(targetDir);
     await opts.guard.writeEvent({
@@ -255,6 +213,10 @@ export async function updateConnectorFromSource(
         toHash: candidateHash,
       };
     }
+    // Keep downloaded/verification staging normalized to regular-file 0644
+    // through trust and archive publication. Mode is local runtime material,
+    // not Connector logical identity or archive metadata.
+    await normalizeConnectorMaterializationModes(stagingDir);
 
     return await opts.supervisor.withConnectorUpdate(
       connectorId,
@@ -348,7 +310,12 @@ async function stageConnectorPackage(
 ): Promise<string> {
   const stagingDir = join(connectorsDir, `.${action}-staging-${randomUUID()}`);
   try {
-    await cp(sourceDir, stagingDir, { recursive: true });
+    await cp(sourceDir, stagingDir, {
+      recursive: true,
+      // Connector symlink targets are logical package bytes. Preserve them
+      // exactly while staging instead of resolving them against sourceDir.
+      verbatimSymlinks: true,
+    });
     const manifest = await loadConnectorManifest(stagingDir);
     await loadConnectorEventCatalog(stagingDir, manifest);
     await hashConnectorPackage(stagingDir);
@@ -356,6 +323,26 @@ async function stageConnectorPackage(
   } catch (err) {
     await rm(stagingDir, { recursive: true, force: true });
     throw err;
+  }
+}
+
+/**
+ * Apply the workspace execution modes to a fully verified Connector candidate.
+ *
+ * Connector logical identity deliberately excludes filesystem mode. This runs
+ * only on the hidden install/update staging tree immediately before its atomic
+ * rename into connectors/<id>; symlinks are retained without being followed.
+ */
+async function normalizeConnectorMaterializationModes(root: string): Promise<void> {
+  await chmod(root, 0o755);
+  const entries = await readdir(root, { withFileTypes: true });
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      await normalizeConnectorMaterializationModes(path);
+    } else if (entry.isFile()) {
+      await chmod(path, 0o700);
+    }
   }
 }
 

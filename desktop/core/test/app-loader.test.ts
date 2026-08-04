@@ -4,6 +4,7 @@ import {
   loadApps,
   sourceForAppUi,
   sourceForAppWorkload,
+  validateAppManifest,
   type AppManifest,
 } from "../src/app-loader";
 import {

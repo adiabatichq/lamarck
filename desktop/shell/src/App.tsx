@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppLauncher } from "./components/AppLauncher";
+import { MarketplaceHandoffController } from "./components/MarketplaceHandoffController";
 import { SchemaApprovalModal } from "./components/SchemaApprovalModal";
 import { WorkspaceSetup } from "./components/WorkspaceSetup";
 import { WorkingTreeConflictModal } from "./components/WorkingTreeConflictModal";
@@ -113,6 +114,7 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
   const [coreError, setCoreError] = useState<string | null>(null);
   const [schemaRequest, setSchemaRequest] = useState<SchemaRequest | null>(null);
   const [workingTreeConflictOpen, setWorkingTreeConflictOpen] = useState(false);
+  const [marketplaceHandoffOpen, setMarketplaceHandoffOpen] = useState(false);
   const [lamarckSession, setLamarckSession] = useState<LamarckSessionView>({ status: "signed_out" });
   const [identityBusy, setIdentityBusy] = useState(false);
   const storageKey = useWorkspaceStateKey(workspace.vaultId);
@@ -360,7 +362,7 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
     }
   }, []);
 
-  const viewerOccluded = Boolean(schemaRequest) || workingTreeConflictOpen;
+  const viewerOccluded = Boolean(schemaRequest) || workingTreeConflictOpen || marketplaceHandoffOpen;
   const systemNeedsAttention = coreStatus === "offline" || viewerOccluded;
 
   return (
@@ -426,6 +428,13 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
           onReject={handleRejectSchema}
         />
       )}
+      <MarketplaceHandoffController
+        onAppliedApp={async (appId) => {
+          await refreshApps();
+          openApp(appId);
+        }}
+        onVisibilityChange={setMarketplaceHandoffOpen}
+      />
       <WorkingTreeConflictModal
         connected={coreStatus === "connected"}
         paused={Boolean(schemaRequest)}

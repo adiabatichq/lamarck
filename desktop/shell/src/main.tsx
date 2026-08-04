@@ -22,6 +22,8 @@ if (import.meta.env.DEV && !window.lamarckHost) {
     openExternal: async (url: string) => {
       window.open(url, "_blank", "noopener");
     },
+    marketplaceReady: async () => ({ ok: true as const }),
+    onMarketplaceHandoff: () => () => {},
     getWorkspaceState: async () => ({
       status: "ready" as const,
       workspace: { path: "browser", vaultId: "browser" },

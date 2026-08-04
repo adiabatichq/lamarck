@@ -94,6 +94,51 @@ For any later artifact-format revision, ship a Desktop reader that recognizes
 the revision before Backend begins emitting it. The blind OSS publisher does
 not change merely because the canonical artifact contract changes.
 
+## Marketplace Desktop cutover and rollback
+
+Desktop resolves Marketplace identities through `https://api.lamarck.ai` by
+default. `LAMARCK_API_ORIGIN` may point local development at another API, but a
+signed artifact path is always resolved against the pinned
+`https://releases.lamarck.ai` origin. Alpha and release builds must set both of
+these non-secret build inputs:
+
+| Variable | Value |
+|---|---|
+| `LAMARCK_MARKETPLACE_SIGNING_KEY_ID` | The active Backend resolve-signing key ID |
+| `LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY` | Canonical base64 for the matching raw 32-byte Ed25519 public key |
+
+Set the same names as GitHub repository variables for the Alpha Desktop
+workflow; export them directly for a local release build.
+
+The public key must be the exact counterpart of the private signing key in the
+private production configuration. The private key never enters this repository
+or Desktop CI. Packaging seals the public trust root into the App and fails if
+either release input is absent or the staged resource differs. The macOS App
+also registers the exact `lamarck` URL scheme in `Info.plist`; no web origin or
+artifact URL is registered as protocol authority.
+
+Use a coordinated cutover:
+
+1. Configure and deploy the Backend signer, Official index, resolve routes, and
+   immutable release storage mapping first.
+2. Publish the Official packages and verify exact and latest signed resolution
+   plus public artifact reads.
+3. Build Desktop with the matching public trust root and verify cold-launch and
+   warm-process handoffs from a Web App detail page and a Connector detail page.
+4. Confirm tampered resolve fields and artifact bytes fail closed, App creation
+   records only `createdFrom`, Connector exact-hash install/update works, and an
+   update preserves existing Sources.
+5. Enable the Web Marketplace handoff only after those checks pass.
+
+If cutover must be reversed, disable the Web handoff and deploy the prior
+Backend or Desktop build as appropriate. Published Marketplace artifacts are
+immutable and can remain in R2; rollback does not delete or rewrite them and
+there is no Marketplace `latest.json` object to repair. A Desktop build whose
+trust root no longer matches the active Backend signer fails closed until a
+matching build is shipped. Key generation, private-key placement, production
+Backend configuration, release build variables, package publication, and the
+Web enablement remain explicit manual deployment actions.
+
 ## Guest Release workflow
 
 Guest releases are low-frequency and tag-driven:

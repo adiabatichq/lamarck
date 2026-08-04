@@ -206,7 +206,7 @@ const NON_MUTATING_RPC_METHODS: ReadonlySet<RunnerRpcMethod> = new Set([
   "configGet",
 ]);
 const CONNECTOR_OS_ENV_KEYS = [
-  // Executable and user-directory discovery used by bundled Connectors.
+  // Executable and user-directory discovery used by Connector packages.
   "PATH",
   "HOME",
   // Temporary-directory conventions across POSIX and Windows.

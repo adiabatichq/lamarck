@@ -56,6 +56,13 @@ interface Window {
     retryCore(): Promise<{ coreBaseUrl: string }>;
     rotateCorePort(): Promise<{ coreBaseUrl: string }>;
     openExternal(url: string): Promise<void>;
+    marketplaceReady(): Promise<{ ok: true }>;
+    onMarketplaceHandoff(
+      callback: (handoff: {
+        kind: "app" | "connector";
+        packageId: string;
+      }) => void,
+    ): () => void;
     getWorkspaceState(): Promise<HostWorkspaceState>;
     chooseWorkspacePath(purpose: "create" | "open"): Promise<{ path: string | null }>;
     createWorkspace(path: string): Promise<{

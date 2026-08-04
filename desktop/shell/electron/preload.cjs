@@ -15,6 +15,12 @@ contextBridge.exposeInMainWorld("lamarckHost", {
   retryCore: () => ipcRenderer.invoke("core:retry"),
   rotateCorePort: () => ipcRenderer.invoke("core:rotatePort"),
   openExternal: (url) => ipcRenderer.invoke("shell:openExternal", url),
+  marketplaceReady: () => ipcRenderer.invoke("marketplace:rendererReady"),
+  onMarketplaceHandoff: (callback) => {
+    const listener = (_event, handoff) => callback(Object.freeze({ ...handoff }));
+    ipcRenderer.on("marketplace:handoff", listener);
+    return () => ipcRenderer.removeListener("marketplace:handoff", listener);
+  },
   getWorkspaceState: () => ipcRenderer.invoke("workspace:getState"),
   chooseWorkspacePath: (purpose) => ipcRenderer.invoke("workspace:choose", purpose),
   createWorkspace: (path) => ipcRenderer.invoke("workspace:create", { path }),

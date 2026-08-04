@@ -350,6 +350,57 @@ export function createApp(
   });
 }
 
+export type MarketplacePackageKind = "app" | "connector";
+export type MarketplaceLifecycleAction =
+  | "create"
+  | "install"
+  | "update"
+  | "already-installed";
+
+export interface MarketplacePreparedPackage {
+  stageId: string;
+  kind: MarketplacePackageKind;
+  packageId: string;
+  releaseId: string;
+  contentHash: string;
+  origin: "Official";
+  name: string;
+  description: string;
+  action: MarketplaceLifecycleAction;
+  localIdConflict: boolean;
+}
+
+export function prepareMarketplacePackage(
+  kind: MarketplacePackageKind,
+  packageId: string,
+): Promise<MarketplacePreparedPackage> {
+  return request("/api/marketplace/prepare", {
+    method: "POST",
+    body: JSON.stringify({ kind, packageId }),
+  });
+}
+
+export function applyMarketplacePackage(
+  stageId: string,
+  localId?: string,
+): Promise<{
+  ok: true;
+  kind: MarketplacePackageKind;
+  id: string;
+  disposition: MarketplaceLifecycleAction;
+}> {
+  return request(`/api/marketplace/stages/${encodeURIComponent(stageId)}/apply`, {
+    method: "POST",
+    body: JSON.stringify(localId === undefined ? {} : { localId }),
+  });
+}
+
+export function cancelMarketplacePackage(stageId: string): Promise<{ ok: true }> {
+  return request(`/api/marketplace/stages/${encodeURIComponent(stageId)}`, {
+    method: "DELETE",
+  });
+}
+
 export async function archiveApp(appId: string): Promise<{ ok: true; id: string }> {
   if (window.lamarckHost) return window.lamarckHost.archiveApp(appId);
   return request(`/api/apps/${encodeURIComponent(appId)}/archive`, {

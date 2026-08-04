@@ -49,6 +49,11 @@ import {
 } from "../desktop/core/src/device-identity/native/build.mjs";
 import { resolveBuildSystemIdentity } from "./build-system-identity.mjs";
 import {
+  marketplaceTrustRootDocument,
+  validateMarketplaceTrustRootResource,
+  writeMarketplaceTrustRootResource,
+} from "./marketplace-trust-roots.mjs";
+import {
   DEVICE_IDENTITY_NATIVE_RESOURCE_PATH,
   assertDeviceIdentityNativeResourceLayout,
   deviceIdentityNativeAddonPath,
@@ -69,6 +74,8 @@ const validEnvironment = {
   LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW: "1",
   LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW: "1",
   LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW: "1",
+  LAMARCK_MARKETPLACE_SIGNING_KEY_ID: "marketplace-test-1",
+  LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: Buffer.alloc(32, 7).toString("base64"),
 };
 
 test("release credentials fail closed when signing identity is absent or ad-hoc", () => {
@@ -345,6 +352,46 @@ test("alpha packaging passes its selected version into the System build identity
   assert.match(alphaPackager, /run\("npm", \["run", "build"\], \{[\s\S]*?env: \{[\s\S]*?\.\.\.process\.env,[\s\S]*?LAMARCK_BUILD_VERSION: version,[\s\S]*?\}[\s\S]*?\}\);/);
   assert.match(alphaPackager, /function run\([^)]*\{ cwd = root, allowFailure = false, env = process\.env \}/);
   assert.match(alphaPackager, /spawnSync\(command, args, \{ cwd, env, stdio: "inherit" \}\)/);
+});
+
+test("Marketplace trust roots are sealed at build time and required by macOS packagers", async (t) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "lamarck-marketplace-root-"));
+  t.after(async () => await rm(temporaryRoot, { recursive: true, force: true }));
+  const resource = join(temporaryRoot, "marketplace-trust-roots.json");
+
+  assert.deepEqual(marketplaceTrustRootDocument({}), { schemaVersion: 1, keys: [] });
+  assert.throws(
+    () => marketplaceTrustRootDocument({}, { required: true }),
+    /LAMARCK_MARKETPLACE_SIGNING_KEY_ID is required/,
+  );
+  await writeMarketplaceTrustRootResource(resource, validEnvironment);
+  await assert.doesNotReject(validateMarketplaceTrustRootResource(resource, validEnvironment));
+  await assert.rejects(
+    validateMarketplaceTrustRootResource(resource, {
+      ...validEnvironment,
+      LAMARCK_MARKETPLACE_SIGNING_KEY_ID: "different-key",
+    }),
+    /does not match/,
+  );
+
+  const [alphaPackager, releasePackager] = await Promise.all([
+    readFile(join(root, "scripts/package-macos-alpha.mjs"), "utf8"),
+    readFile(join(root, "scripts/package-macos-release.mjs"), "utf8"),
+  ]);
+  for (const packager of [alphaPackager, releasePackager]) {
+    assert.match(packager, /requireMarketplaceTrustRoot\(process\.env\)/);
+    assert.match(packager, /marketplace-trust-roots\.json/);
+    assert.match(packager, /CFBundleURLSchemes: \["lamarck"\]/);
+  }
+});
+
+test("Alpha Desktop workflow supplies the sealed Marketplace trust root", async () => {
+  const workflow = await readFile(
+    join(root, ".github", "workflows", "alpha-desktop.yml"),
+    "utf8",
+  );
+  assert.match(workflow, /vars\.LAMARCK_MARKETPLACE_SIGNING_KEY_ID/);
+  assert.match(workflow, /vars\.LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY/);
 });
 
 test("clean production build identity binds an injected commit to Git HEAD", async (t) => {

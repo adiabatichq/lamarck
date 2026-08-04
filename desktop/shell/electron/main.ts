@@ -30,7 +30,7 @@ import {
   writeFileSync,
 } from "fs";
 import { createServer } from "net";
-import { join } from "path";
+import { join, resolve } from "path";
 import { performance } from "perf_hooks";
 import { pathToFileURL } from "url";
 import {
@@ -82,6 +82,11 @@ import {
   inspectWorkspaceForOpen,
   type WorkspaceDescriptor,
 } from "./workspace-files";
+import {
+  marketplaceDeepLinksFromArgv,
+  parseMarketplaceDeepLink,
+  type MarketplaceDeepLink,
+} from "./marketplace-deep-link";
 import { PACKAGE_ID_PATTERN } from "./package-id";
 
 app.setName("Lamarck");
@@ -139,6 +144,10 @@ const unspawnedCoreFailures = new WeakSet<ChildProcess>();
 const handledCoreLosses = new WeakSet<ChildProcess>();
 const handledGuardLosses = new WeakSet<UtilityProcess>();
 const terminalSessions = new Map<string, { proc: ChildProcess; ownerWebContentsId: number }>();
+const MARKETPLACE_HANDOFF_QUEUE_LIMIT = 32;
+const marketplaceHandoffs: MarketplaceDeepLink[] = [];
+let marketplaceRendererWebContentsId: number | null = null;
+let mainWindow: BrowserWindow | null = null;
 
 interface ShellWebContentsState {
   readonly allowsUrl: (url: string) => boolean;
@@ -147,6 +156,80 @@ interface ShellWebContentsState {
 }
 
 const shellWebContents = new Map<number, ShellWebContentsState>();
+
+const ownsSingleInstance = app.requestSingleInstanceLock();
+if (!ownsSingleInstance) {
+  app.quit();
+} else {
+  app.on("open-url", (event, rawUrl) => {
+    event.preventDefault();
+    acceptMarketplaceHandoff(rawUrl);
+  });
+  app.on("second-instance", (_event, argv) => {
+    for (const handoff of marketplaceDeepLinksFromArgv(argv)) {
+      queueMarketplaceHandoff(handoff);
+    }
+  });
+  for (const handoff of marketplaceDeepLinksFromArgv(process.argv)) {
+    queueMarketplaceHandoff(handoff, false);
+  }
+}
+
+function acceptMarketplaceHandoff(rawUrl: unknown): boolean {
+  try {
+    return queueMarketplaceHandoff(parseMarketplaceDeepLink(rawUrl));
+  } catch (error) {
+    console.warn(`[electron] Rejected Marketplace URL: ${errorMessage(error)}`);
+    return false;
+  }
+}
+
+function queueMarketplaceHandoff(handoff: MarketplaceDeepLink, focus = true): boolean {
+  if (marketplaceHandoffs.length >= MARKETPLACE_HANDOFF_QUEUE_LIMIT) {
+    console.warn("[electron] Rejected Marketplace URL because the handoff queue is full");
+    return false;
+  }
+  marketplaceHandoffs.push(handoff);
+  if (focus && mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+  flushMarketplaceHandoffs();
+  return true;
+}
+
+function flushMarketplaceHandoffs(): void {
+  if (coreRuntime.snapshot().phase !== "ready" || marketplaceHandoffs.length === 0) return;
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) return;
+  const contents = window.webContents;
+  if (
+    contents.isDestroyed()
+    || marketplaceRendererWebContentsId !== contents.id
+    || !shellWebContents.has(contents.id)
+  ) return;
+  while (marketplaceHandoffs.length > 0) {
+    const handoff = marketplaceHandoffs[0];
+    try {
+      contents.send("marketplace:handoff", handoff);
+    } catch {
+      return;
+    }
+    marketplaceHandoffs.shift();
+  }
+}
+
+function registerMarketplaceProtocolClient(): void {
+  const registered = app.isPackaged
+    ? app.setAsDefaultProtocolClient("lamarck")
+    : typeof process.argv[1] === "string"
+      ? app.setAsDefaultProtocolClient("lamarck", process.execPath, [resolve(process.argv[1])])
+      : false;
+  if (!registered) {
+    console.warn("[electron] The lamarck:// development protocol handler could not be registered");
+  }
+}
 
 interface AppViewerRecord {
   appId: string;
@@ -764,6 +847,7 @@ function notifyCoreRuntimeState(state: CoreRuntimeState): void {
       && !contents.isDestroyed()
     ) contents.send("core:runtimeState", state);
   }
+  if (state.phase === "ready") flushMarketplaceHandoffs();
 }
 
 function markCoreStarting(): number {
@@ -2632,6 +2716,7 @@ async function createWindow(): Promise<void> {
       preload: join(__dirname, "preload.cjs"),
     },
   });
+  mainWindow = win;
   const shellContents = win.webContents;
   const shellWebContentsId = shellContents.id;
   const shellState: ShellWebContentsState = {
@@ -2644,6 +2729,7 @@ async function createWindow(): Promise<void> {
   };
   shellWebContents.set(shellWebContentsId, shellState);
   const replaceShellRenderer = () => {
+    marketplaceRendererWebContentsId = null;
     const retiredOwner = shellState.currentOwner;
     shellState.currentOwner = Object.freeze({
       webContentsId: shellWebContentsId,
@@ -2679,6 +2765,8 @@ async function createWindow(): Promise<void> {
     // Electron destroys BrowserWindow before emitting "closed". Only use the
     // identifier captured while the window and its WebContents were alive.
     shellWebContents.delete(shellWebContentsId);
+    marketplaceRendererWebContentsId = null;
+    mainWindow = null;
     disposeTerminalsForWebContents(shellWebContentsId);
     const cleanup = closeAppViewersForOwner(shellState.currentOwner);
     void Promise.allSettled([shellState.retirement, cleanup]);
@@ -2706,6 +2794,8 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
+  if (!ownsSingleInstance) return;
+  registerMarketplaceProtocolClient();
   const initialWorkspace = initializeWorkspaceSelection();
   if (initialWorkspace) {
     workspace = initialWorkspace.path;
@@ -2772,6 +2862,12 @@ app.whenReady().then(async () => {
     requireShellIpc(event);
     const externalUrl = parseAllowedExternalUrl(rawUrl);
     return shell.openExternal(externalUrl.toString());
+  });
+  ipcMain.handle("marketplace:rendererReady", (event) => {
+    requireShellIpc(event);
+    marketplaceRendererWebContentsId = event.sender.id;
+    flushMarketplaceHandoffs();
+    return { ok: true as const };
   });
   ipcMain.handle("workspace:getState", (event) => {
     requireShellIpc(event);

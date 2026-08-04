@@ -1,16 +1,25 @@
 import {
+  accessSync,
+  chmodSync,
+  constants,
+  cpSync,
   existsSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
+  readFileSync,
+  readlinkSync,
   readdirSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { EventInput } from "../src/guard-types";
 import type { GuardSqlParams } from "../src/guard-service/protocol";
 import {
@@ -22,6 +31,10 @@ import {
   updateConnectorFromSource,
   type ConnectorHostGuard,
 } from "../src/connectors";
+import {
+  extractVerifiedMarketplaceArtifact,
+  verifyMarketplaceArtifact,
+} from "../src/marketplace/artifact";
 import { ProducerDescriptorStore } from "../src/producer-descriptor";
 import { openTestDatabases } from "./support/test-databases";
 import { TEST_PRODUCER_REF, TestGuard } from "./support/test-guard";
@@ -217,6 +230,69 @@ describe("Connector package provenance workflows", () => {
     await expect(archiveStore.resolve(digest)).resolves.toMatchObject({ digest });
   });
 
+  test("materializes the verified macos-ax helper as executable without changing package identity", async () => {
+    const connectorId = "lamarck.macos-ax";
+    const officialSource = fileURLToPath(
+      new URL("../../../connectors/macos-ax", import.meta.url),
+    );
+    const candidateSource = join(workspace, "marketplace-candidate", connectorId);
+    cpSync(officialSource, candidateSource, { recursive: true });
+    symlinkSync("privacy-lists", join(candidateSource, "privacy-alias"));
+    const sourceModeDigest = await hashConnectorPackage(candidateSource);
+    chmodSync(join(candidateSource, "bin", "ax-helper"), 0o644);
+    expect(await hashConnectorPackage(candidateSource)).toBe(sourceModeDigest);
+
+    // Produce canonical Connector bytes, then run the actual independent
+    // Marketplace verifier/extractor to create the confirmation staging tree.
+    const producerStore = new ConnectorPackageArchiveStore(
+      join(workspace, "backend-shaped-artifact"),
+    );
+    const publication = await producerStore.publish(candidateSource, sourceModeDigest);
+    const verifiedArtifact = verifyMarketplaceArtifact({
+      kind: "connector",
+      packageId: connectorId,
+      contentHash: sourceModeDigest,
+      archiveBytes: readFileSync(publication.path),
+    });
+    const verifiedSource = join(workspace, "marketplace-staging", connectorId);
+    mkdirSync(join(workspace, "marketplace-staging"), { recursive: true });
+    await extractVerifiedMarketplaceArtifact(verifiedArtifact, verifiedSource);
+    expectTreeModes(verifiedSource, 0o644);
+    expect(await hashConnectorPackage(verifiedSource)).toBe(sourceModeDigest);
+
+    const targetDir = join(workspace, "connectors", connectorId);
+    const supervisor = createSupervisor([{ id: connectorId, hash: sourceModeDigest }]);
+    archiveStore.onPublish = async (stagingDir, publishedDigest) => {
+      expect(publishedDigest).toBe(sourceModeDigest);
+      expect(existsSync(targetDir)).toBe(false);
+      // Download/verification staging remains non-executable through immutable
+      // archive publication. Materialization happens after this boundary.
+      expectTreeModes(stagingDir, 0o644);
+    };
+
+    const installed = await installConnectorFromSource({
+      sourceDir: verifiedSource,
+      workspacePath: workspace,
+      connectorId,
+      guard,
+      supervisor,
+    });
+
+    expect(installed.dir).toBe(targetDir);
+    expectTreeModes(verifiedSource, 0o644);
+    expectTreeModes(targetDir, 0o700);
+    expect(lstatSync(join(targetDir, "privacy-alias")).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(join(targetDir, "privacy-alias"))).toBe("privacy-lists");
+    expect(lstatSync(join(targetDir, "privacy-lists")).mode & 0o777).toBe(0o755);
+    const installedHelper = join(targetDir, "bin", "ax-helper");
+    expect(lstatSync(installedHelper).mode & 0o777).toBe(0o700);
+    expect(() => accessSync(installedHelper, constants.X_OK)).not.toThrow();
+    expect(await hashConnectorPackage(targetDir)).toBe(sourceModeDigest);
+    await expect(archiveStore.resolve(sourceModeDigest)).resolves.toMatchObject({
+      digest: sourceModeDigest,
+    });
+  });
+
   test("archive failure prevents trusted install completion", async () => {
     const connectorId = "failed-install";
     const sourceDir = writePackage(
@@ -268,9 +344,25 @@ describe("Connector package provenance workflows", () => {
       supervisor,
     });
 
+    const originalWithConnectorUpdate = supervisor.withConnectorUpdate.bind(supervisor);
+    const updateBoundary = vi.spyOn(supervisor, "withConnectorUpdate");
+    updateBoundary.mockImplementation(async (id, nextManifest, update) => {
+      const stagingName = readdirSync(join(workspace, "connectors")).find((name) =>
+        name.startsWith(".update-staging-"));
+      expect(stagingName).toBeDefined();
+      // The candidate is mode-normalized while still hidden; the live package
+      // remains the old tree until the guarded atomic swap begins.
+      expectTreeModes(join(workspace, "connectors", stagingName!), 0o700);
+      expectTreeModes(targetDir, 0o700);
+      expect(await hashConnectorPackage(targetDir)).toBe(oldDigest);
+      return originalWithConnectorUpdate(id, nextManifest, update);
+    });
+
     archiveStore.onPublish = async (stagingDir, publishedDigest) => {
       if (publishedDigest !== newDigest) return;
       expect(stagingDir).toContain(".update-staging-");
+      expectTreeModes(stagingDir, 0o644);
+      expectTreeModes(targetDir, 0o700);
       expect(await hashConnectorPackage(targetDir)).toBe(oldDigest);
       expect(supervisor.listInstalledConnectors()).toEqual([
         expect.objectContaining({ packageHash: oldDigest }),
@@ -291,6 +383,8 @@ describe("Connector package provenance workflows", () => {
       toHash: newDigest,
       dir: targetDir,
     });
+    expect(updateBoundary).toHaveBeenCalledOnce();
+    expectTreeModes(targetDir, 0o700);
     expect(await hashConnectorPackage(targetDir)).toBe(newDigest);
     expect(supervisor.listInstalledConnectors()).toEqual([
       expect.objectContaining({ packageHash: newDigest, packageTrust: "official" }),
@@ -324,7 +418,13 @@ describe("Connector package provenance workflows", () => {
       guard,
       supervisor,
     });
+    expectTreeModes(targetDir, 0o700);
     archiveStore.failDigests.add(newDigest);
+    archiveStore.onPublish = async (stagingDir, publishedDigest) => {
+      if (publishedDigest !== newDigest) return;
+      expectTreeModes(stagingDir, 0o644);
+      expectTreeModes(targetDir, 0o700);
+    };
 
     await expect(updateConnectorFromSource({
       sourceDir: newSource,
@@ -334,11 +434,65 @@ describe("Connector package provenance workflows", () => {
     })).rejects.toThrow("injected archive failure");
 
     expect(await hashConnectorPackage(targetDir)).toBe(oldDigest);
+    expectTreeModes(targetDir, 0o700);
     expect(supervisor.listInstalledConnectors()).toEqual([
       expect.objectContaining({ packageHash: oldDigest, packageTrust: "official" }),
     ]);
     expect(eventCount("connector.updated")).toBe(0);
     expect(connectorStagingEntries()).toEqual([]);
+  });
+
+  test("rolls back a mode-normalized update when the post-swap audit fails", async () => {
+    const connectorId = "mode-rollback";
+    const oldSource = writePackage(
+      join(workspace, "package-sources", `${connectorId}-v1`),
+      connectorId,
+      "rollback-v1",
+    );
+    const newSource = writePackage(
+      join(workspace, "package-sources", `${connectorId}-v2`),
+      connectorId,
+      "rollback-v2",
+    );
+    const oldDigest = await hashConnectorPackage(oldSource);
+    const newDigest = await hashConnectorPackage(newSource);
+    const supervisor = createSupervisor([
+      { id: connectorId, hash: oldDigest },
+      { id: connectorId, hash: newDigest },
+    ]);
+    const targetDir = join(workspace, "connectors", connectorId);
+    await installConnectorFromSource({
+      sourceDir: oldSource,
+      workspacePath: workspace,
+      guard,
+      supervisor,
+    });
+    expectTreeModes(targetDir, 0o700);
+
+    const failingGuard: ConnectorHostGuard = {
+      withSource: (source, producer) => guard.withSource(source, producer),
+      queryOne: (sql, params) => guard.queryOne(sql, params),
+      writeEvent: (event) => {
+        if (event.type === "connector.updated") throw new Error("injected audit failure");
+        return guard.writeEvent(event);
+      },
+    };
+    await expect(updateConnectorFromSource({
+      sourceDir: newSource,
+      workspacePath: workspace,
+      guard: failingGuard,
+      supervisor,
+    })).rejects.toThrow("injected audit failure");
+
+    expect(await hashConnectorPackage(targetDir)).toBe(oldDigest);
+    expectTreeModes(targetDir, 0o700);
+    expect(supervisor.listInstalledConnectors()).toEqual([
+      expect.objectContaining({ packageHash: oldDigest, packageTrust: "official" }),
+    ]);
+    expect(eventCount("connector.updated")).toBe(0);
+    expect(connectorStagingEntries()).toEqual([]);
+    expect(readdirSync(join(workspace, "connectors")).some((name) =>
+      name.startsWith(".update-backup-"))).toBe(false);
   });
 
   test("trusted Source start fails before runner capability when its archive is missing", async () => {
@@ -553,4 +707,16 @@ auth:
 `,
   );
   return dir;
+}
+
+function expectTreeModes(root: string, fileMode: number): void {
+  expect(lstatSync(root).mode & 0o777).toBe(0o755);
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      expectTreeModes(path, fileMode);
+    } else if (entry.isFile()) {
+      expect(lstatSync(path).mode & 0o777).toBe(fileMode);
+    }
+  }
 }

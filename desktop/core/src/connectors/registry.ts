@@ -30,6 +30,36 @@ export class ConnectorApprovalStore {
     ).run(connectorId, hash, approvedAt);
   }
 
+  recordOfficialRelease(connectorId: string, hash: string, verifiedAt = Date.now()): void {
+    validateConnectorId(connectorId);
+    assertPackageHash(hash);
+    this.systemDb.prepare(
+      `INSERT OR REPLACE INTO connector_official_release_hashes
+         (connector_id, content_hash, verified_at)
+       VALUES (?, ?, ?)`
+    ).run(connectorId, hash, verifiedAt);
+  }
+
+  isOfficialRelease(connectorId: string, hash: string): boolean {
+    validateConnectorId(connectorId);
+    const row = this.systemDb.prepare(
+      `SELECT 1 FROM connector_official_release_hashes
+       WHERE connector_id = ? AND content_hash = ?
+       LIMIT 1`
+    ).get(connectorId, hash);
+    return Boolean(row);
+  }
+
+  hasOfficialReleaseForConnector(connectorId: string): boolean {
+    validateConnectorId(connectorId);
+    const row = this.systemDb.prepare(
+      `SELECT 1 FROM connector_official_release_hashes
+       WHERE connector_id = ?
+       LIMIT 1`
+    ).get(connectorId);
+    return Boolean(row);
+  }
+
   isApproved(connectorId: string, hash: string): boolean {
     validateConnectorId(connectorId);
     const row = this.systemDb.prepare(
@@ -55,6 +85,9 @@ export class ConnectorApprovalStore {
     this.systemDb.prepare(
       "DELETE FROM connector_custom_approvals WHERE connector_id = ?",
     ).run(connectorId);
+    this.systemDb.prepare(
+      "DELETE FROM connector_official_release_hashes WHERE connector_id = ?",
+    ).run(connectorId);
   }
 }
 
@@ -74,6 +107,10 @@ export class WorkspaceConnectorRegistry {
 
   getApprovalStore(): ConnectorApprovalStore {
     return this.approvals;
+  }
+
+  recordOfficialRelease(connectorId: string, contentHash: string): void {
+    this.approvals.recordOfficialRelease(connectorId, contentHash);
   }
 
   removeApprovals(connectorId: string): void {
@@ -129,7 +166,7 @@ export class WorkspaceConnectorRegistry {
   classify(connectorId: string, contentHash: string): ConnectorPackageTrust {
     validateConnectorId(connectorId);
     const officialHashes = this.officialHashes.get(connectorId);
-    if (officialHashes?.has(contentHash)) {
+    if (officialHashes?.has(contentHash) || this.approvals.isOfficialRelease(connectorId, contentHash)) {
       return {
         status: "official",
         badge: "Official",
@@ -143,7 +180,11 @@ export class WorkspaceConnectorRegistry {
         runnable: true,
       };
     }
-    if (officialHashes?.size || this.approvals.hasApprovalForConnector(connectorId)) {
+    if (
+      officialHashes?.size
+      || this.approvals.hasOfficialReleaseForConnector(connectorId)
+      || this.approvals.hasApprovalForConnector(connectorId)
+    ) {
       return {
         status: "modified",
         badge: "Modified",
@@ -157,6 +198,12 @@ export class WorkspaceConnectorRegistry {
       runnable: false,
       reason: "Connector package hash is not official or human-approved",
     };
+  }
+}
+
+function assertPackageHash(hash: string): void {
+  if (!/^sha256:[a-f0-9]{64}$/.test(hash)) {
+    throw new Error("Connector package hash must be a canonical sha256 digest");
   }
 }
 

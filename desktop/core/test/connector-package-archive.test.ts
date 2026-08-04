@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { ConnectorPackageArchiveStore } from "../src/connectors/connector-package-archive";
 import {
@@ -47,6 +48,12 @@ describe("ConnectorPackageArchiveStore", () => {
     const digestHex = digest.slice("sha256:".length);
     const store = new ConnectorPackageArchiveStore(workspace);
     const published = await store.publish(connectorDir, digest);
+
+    // Fixed black-box vectors freeze the pre-Marketplace Connector logical
+    // identity and canonical archive representation.
+    expect(digest).toBe("sha256:a0bfc5019a32d9fd678550bd075951e847c26bfafb1a35e8c6df698fd64c19d9");
+    expect(createHash("sha256").update(readFileSync(published.path)).digest("hex"))
+      .toBe("1e7ca4bb628d06da9c5a9522a11fb4417d6e2689bcd93488c5171bfe4b57df9f");
 
     expect(published).toEqual({
       digest,

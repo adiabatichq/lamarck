@@ -1,6 +1,6 @@
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdir, readdir, readFile, stat, writeFile } from "fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "fs/promises";
 import { randomBytes } from "crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { openSystemDatabase } from "./db";
@@ -33,9 +33,13 @@ import {
   ConnectorScheduler,
   ConnectorLifecycleConflictError,
   ConnectorSupervisor,
+  hashConnectorPackage,
+  installConnectorFromSource,
   isDirectOAuthAuthType,
   registerWorkspaceConnectors,
   removeConnectorFromWorkspace,
+  resolveWorkspaceConnectorDir,
+  updateConnectorFromSource,
 } from "./connectors";
 import {
   ConnectorAuthManager,
@@ -66,7 +70,7 @@ import {
   parseRequestedWorkload,
 } from "./app-runtime-policy";
 import { instantiateBlankApp } from "./app-scaffold";
-import { PACKAGE_ID_PATTERN } from "./package-id";
+import { PACKAGE_ID_PATTERN, SCOPED_PACKAGE_ID_PATTERN } from "./package-id";
 import { APP_MANIFEST_DIGEST_PATTERN } from "../../capsule/src/app-manifest-authority";
 import { resolveDeviceIdentity } from "./device-identity";
 import { resolveCommittedAppRevision } from "./app-revision";
@@ -77,6 +81,9 @@ import {
   createSystemProducerDescriptor,
 } from "./producer-descriptor";
 import { systemIdentityFromBuild } from "./system-identity";
+import { instantiateMarketplaceApp } from "./marketplace/app-instantiation";
+import { loadMarketplaceTrustRootsFile } from "./marketplace/client";
+import { MarketplaceService } from "./marketplace/service";
 
 // Lamarck — HTTP server entry point
 // All routes go through here. Guard is the only write path.
@@ -86,6 +93,9 @@ const pagesDir = join(workspacePath, "pages");
 const appsDir = join(workspacePath, "apps");
 const lamarckDir = join(workspacePath, ".lamarck");
 const appScaffoldDir = fileURLToPath(new URL("./scaffolds/app-v1/", import.meta.url));
+const marketplaceTrustRootsPath = fileURLToPath(
+  new URL("./marketplace-trust-roots.json", import.meta.url),
+);
 const authSecrets: AuthSecrets = {
   coreToken: requireSecret("LAMARCK_CORE_TOKEN"),
 };
@@ -164,6 +174,48 @@ const connectorScheduler = new ConnectorScheduler({
 let registry = await loadApps(appsDir);
 let appManifestGeneration = 1;
 let appRegistryTail: Promise<void> = Promise.resolve();
+const marketplaceService = await MarketplaceService.initialize({
+  workspacePath,
+  apiOrigin: lamarckApiOrigin,
+  trustRoots: await loadMarketplaceTrustRootsFile(marketplaceTrustRootsPath),
+  lifecycle: {
+    async appExists(localId) {
+      try {
+        return (await stat(join(appsDir, localId))).isDirectory();
+      } catch (error) {
+        if (isNotFoundError(error)) return false;
+        throw error;
+      }
+    },
+    instantiateApp: instantiateVerifiedMarketplaceApp,
+    async connectorHash(packageId) {
+      if (!connectorSupervisor.isRegistered(packageId)) return undefined;
+      return hashConnectorPackage(resolveWorkspaceConnectorDir(workspacePath, packageId));
+    },
+    recordOfficialConnectorRelease(packageId, contentHash) {
+      connectorSupervisor.recordOfficialMarketplaceRelease(packageId, contentHash);
+    },
+    async installConnector(verifiedSourceDir, packageId) {
+      await installConnectorFromSource({
+        sourceDir: verifiedSourceDir,
+        workspacePath,
+        connectorId: packageId,
+        supervisor: connectorSupervisor,
+        guard,
+      });
+    },
+    async updateConnector(verifiedSourceDir, packageId) {
+      const updated = await updateConnectorFromSource({
+        sourceDir: verifiedSourceDir,
+        workspacePath,
+        connectorId: packageId,
+        supervisor: connectorSupervisor,
+        guard,
+      });
+      return { updated: updated.updated };
+    },
+  },
+});
 const workingTree = new WorkingTree({
   guard,
   producer: systemProducer,
@@ -477,6 +529,47 @@ function runProcess(command: string, args: string[], cwd: string): Promise<void>
       ));
     });
   });
+}
+
+async function instantiateVerifiedMarketplaceApp(input: {
+  verifiedSourceDir: string;
+  packageId: string;
+  releaseId: string;
+  localId?: string;
+}): Promise<{ id: string }> {
+  const created = await instantiateMarketplaceApp({
+    verifiedSourceDir: input.verifiedSourceDir,
+    appsDir,
+    packageId: input.packageId,
+    releaseId: input.releaseId,
+    ...(input.localId === undefined ? {} : { localId: input.localId }),
+    initializeGit: (dir) => runProcess("git", ["init", "--quiet"], dir),
+  });
+  try {
+    await reloadAppRegistry();
+    await guard.writeEvent({
+      type: "app.created",
+      startedAt: Date.now(),
+      payload: { appId: created.id },
+    });
+    return { id: created.id };
+  } catch (error) {
+    const failures: unknown[] = [error];
+    await rm(created.dir, { recursive: true, force: true }).catch((rollbackError) => {
+      failures.push(rollbackError);
+    });
+    await reloadAppRegistry().catch((rollbackError) => {
+      failures.push(rollbackError);
+    });
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        `Marketplace App ${created.id} creation failed and rollback was incomplete`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
 }
 
 async function fileResponse(
@@ -837,6 +930,45 @@ const server = await serve<{ cwd: string }>({
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const request = rejectSchemaRequest(decodeURIComponent(rejectMatch[1]));
         return json({ request });
+      }
+
+      // -- Marketplace verified staging --
+      if (path === "/api/marketplace/prepare" && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readJsonBody<Record<string, unknown>>(req, 4 * 1024);
+        assertAllowedRequestFields(body, ["kind", "packageId"]);
+        if (
+          (body.kind !== "app" && body.kind !== "connector")
+          || typeof body.packageId !== "string"
+          || !SCOPED_PACKAGE_ID_PATTERN.test(body.packageId)
+        ) {
+          return json({ error: "kind and scoped packageId are required" }, 400);
+        }
+        return json(await marketplaceService.prepare(body.kind, body.packageId));
+      }
+
+      const marketplaceStageMatch = path.match(/^\/api\/marketplace\/stages\/([^/]+)$/);
+      if (marketplaceStageMatch && method === "DELETE") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        await marketplaceService.cancel(decodeURIComponent(marketplaceStageMatch[1]));
+        return json({ ok: true });
+      }
+
+      const marketplaceApplyMatch = path.match(/^\/api\/marketplace\/stages\/([^/]+)\/apply$/);
+      if (marketplaceApplyMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readJsonBody<Record<string, unknown>>(req, 4 * 1024);
+        assertAllowedRequestFields(body, ["localId"]);
+        if (
+          body.localId !== undefined
+          && (typeof body.localId !== "string" || !PACKAGE_ID_PATTERN.test(body.localId))
+        ) {
+          return json({ error: "localId is invalid" }, 400);
+        }
+        return json(await marketplaceService.apply(
+          decodeURIComponent(marketplaceApplyMatch[1]),
+          body.localId as string | undefined,
+        ));
       }
 
       // -- Connectors --
@@ -1215,10 +1347,6 @@ const server = await serve<{ cwd: string }>({
         // Reloading invalidates every channel issued from the prior manifest
         // generation before the new App becomes visible.
         await reloadAppRegistry();
-
-        // D0 composition: a new capability unit was registered into the system.
-        // Only the id is recorded — at creation name mirrors the id and the
-        // write scope is always empty; both evolve later through app.commit.
         await guard.withExecution({
           signal: requestGuardSignal,
           deadlineMs: HOST_GUARD_DEADLINE_MS,
@@ -1398,6 +1526,12 @@ function assertAllowedRequestFields(
   if (unknown) {
     throw new HttpStatusError(400, `request body has unknown field: ${unknown}`);
   }
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof Error
+    && "code" in error
+    && (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
 function assertDisplayNameField(

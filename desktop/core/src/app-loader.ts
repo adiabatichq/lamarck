@@ -66,7 +66,7 @@ export interface AppRegistry {
   canWriteDoc(appId: string, id: string, op: DocOp): boolean;
 }
 
-type ValidationResult =
+export type AppManifestValidationResult =
   | { ok: true; manifest: AppManifest }
   | { ok: false; error: string };
 
@@ -147,7 +147,7 @@ export async function loadApps(appsDir: string): Promise<AppRegistry> {
 async function loadSettledManifest(
   path: string,
   directoryName: string,
-): Promise<ValidationResult> {
+): Promise<AppManifestValidationResult> {
   for (let attempt = 0; attempt < MANIFEST_SETTLE_ATTEMPTS; attempt += 1) {
     try {
       const raw = await readStableManifest(path);
@@ -161,7 +161,7 @@ async function loadSettledManifest(
         }
         return invalid("manifest.json is not valid JSON");
       }
-      const validation = validateManifest(parsed, directoryName);
+      const validation = validateAppManifest(parsed, directoryName);
       // A complete but semantically invalid manifest is an authoritative
       // fail-closed state, not a transient snapshot to keep retrying.
       return validation;
@@ -300,7 +300,10 @@ export async function archiveApp(
   return target;
 }
 
-function validateManifest(value: unknown, directoryName: string): ValidationResult {
+export function validateAppManifest(
+  value: unknown,
+  expectedId?: string,
+): AppManifestValidationResult {
   if (!isObject(value)) {
     return invalid("manifest must be an object");
   }
@@ -315,8 +318,8 @@ function validateManifest(value: unknown, directoryName: string): ValidationResu
   if (typeof value.id !== "string" || !PACKAGE_ID_PATTERN.test(value.id)) {
     return invalid("id must be one or more lowercase alphanumeric/hyphen segments separated by dots");
   }
-  if (value.id !== directoryName) {
-    return invalid(`manifest id "${value.id}" does not match directory name`);
+  if (expectedId !== undefined && value.id !== expectedId) {
+    return invalid(`manifest id "${value.id}" does not match expected id "${expectedId}"`);
   }
   if (typeof value.name !== "string" || value.name.length === 0 || value.name.trim() !== value.name) {
     return invalid("name must be a non-empty, trimmed string");
@@ -451,7 +454,7 @@ function validateManifest(value: unknown, directoryName: string): ValidationResu
   };
 }
 
-function invalid(error: string): ValidationResult {
+function invalid(error: string): AppManifestValidationResult {
   return { ok: false, error };
 }
 

@@ -37,6 +37,10 @@ import { loadFrozenOsxSign } from "./macos-release-signer.mjs";
 import { runPackagedNodePtySmoke } from "./macos-release-runtime.mjs";
 import { resolveBuildSystemIdentity } from "./build-system-identity.mjs";
 import {
+  requireMarketplaceTrustRoot,
+  validateMarketplaceTrustRootResource,
+} from "./marketplace-trust-roots.mjs";
+import {
   assertExactBooleanEntitlements,
   assertExactCodeSignatureIdentity,
   assertExactMachOArchitecture,
@@ -48,6 +52,10 @@ import {
 } from "./package-macos-release-contract.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const MARKETPLACE_URL_TYPES = [{
+  CFBundleURLName: "ai.lamarck.marketplace",
+  CFBundleURLSchemes: ["lamarck"],
+}];
 const rootPackage = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 const dryRun = parseArguments(process.argv.slice(2));
 const config = loadMacOsReleaseConfig({ root, packageVersion: rootPackage.version });
@@ -216,6 +224,7 @@ async function packageRelease(releaseConfig, signingIdentity) {
 }
 
 async function preflight(releaseConfig) {
+  requireMarketplaceTrustRoot(process.env);
   const resolvedSigningIdentity = resolveInstalledDeveloperIdIdentity(
     releaseConfig.codesignIdentity,
     captureCombined("security", ["find-identity", "-v", "-p", "codesigning"]),
@@ -401,6 +410,8 @@ async function buildShellFromSnapshot(snapshotRoot, exportRoot, manifestDigest, 
     "--env", `LAMARCK_BUILDER_IMAGE_ID=${builderImageId}`,
     "--env", `LAMARCK_BUILD_VERSION=${buildIdentity.version}`,
     "--env", `LAMARCK_BUILD_COMMIT=${buildIdentity.commit}`,
+    "--env", `LAMARCK_MARKETPLACE_SIGNING_KEY_ID=${process.env.LAMARCK_MARKETPLACE_SIGNING_KEY_ID}`,
+    "--env", `LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY=${process.env.LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY}`,
     builderImageId,
     "/usr/local/bin/node",
     "/snapshot/scripts/build-macos-release-shell-inside.mjs",
@@ -452,6 +463,8 @@ async function assembleApplication(
   ]) {
     run("plutil", ["-replace", key, "-string", value, plist]);
   }
+  run("plutil", ["-remove", "CFBundleURLTypes", plist], { allowFailure: true });
+  run("plutil", ["-insert", "CFBundleURLTypes", "-json", JSON.stringify(MARKETPLACE_URL_TYPES), plist]);
 
   await mkdir(electronResources, { recursive: true, mode: 0o755 });
   await writeFile(join(appResources, "package.json"), `${JSON.stringify({
@@ -472,6 +485,7 @@ async function assembleApplication(
     "core.mjs",
     "guard-service.cjs",
     "main.cjs",
+    "marketplace-trust-roots.json",
     "preload.cjs",
     "pty-helper.cjs",
   ];
@@ -509,6 +523,7 @@ async function validatePackagedApplication(appPath, releaseConfig) {
     "core.mjs",
     "guard-service.cjs",
     "main.cjs",
+    "marketplace-trust-roots.json",
     "native",
     "preload.cjs",
     "pty-helper.cjs",
@@ -517,6 +532,10 @@ async function validatePackagedApplication(appPath, releaseConfig) {
   assertDeviceIdentityNativeResourceLayout(
     electronResources,
     join(electronResources, "native"),
+  );
+  await validateMarketplaceTrustRootResource(
+    join(electronResources, "marketplace-trust-roots.json"),
+    process.env,
   );
   assertExactList(
     await sortedEntries(join(electronResources, "scaffolds")),
@@ -556,6 +575,12 @@ async function validatePackagedApplication(appPath, releaseConfig) {
   ]) {
     const actual = capture("plutil", ["-extract", key, "raw", "-o", "-", plist]).trim();
     if (actual !== expected) throw new Error(`packaged Info.plist ${key} is incorrect`);
+  }
+  const packagedUrlTypes = JSON.parse(capture("plutil", [
+    "-extract", "CFBundleURLTypes", "json", "-o", "-", plist,
+  ]));
+  if (JSON.stringify(packagedUrlTypes) !== JSON.stringify(MARKETPLACE_URL_TYPES)) {
+    throw new Error("packaged Info.plist Marketplace URL scheme is incorrect");
   }
   const plistDescription = capture("plutil", ["-p", plist]);
   for (const forbiddenKey of [

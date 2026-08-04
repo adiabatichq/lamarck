@@ -301,6 +301,29 @@ export class ConnectorSupervisor {
     return pkg;
   }
 
+  /** Record one Backend-verified Official Connector release by exact logical hash. */
+  recordOfficialMarketplaceRelease(connectorId: string, contentHash: string): void {
+    this.registry.recordOfficialRelease(connectorId, contentHash);
+    const registration = this.registrations.get(connectorId);
+    if (!registration?.package || registration.package.contentHash !== contentHash) return;
+
+    // Same-hash Marketplace confirmation does not reinstall the package, so
+    // publish the verified exact-hash provenance into the live registration
+    // and Source views immediately rather than waiting for a Core restart.
+    const trust = this.registry.classify(connectorId, contentHash);
+    const packageRecord = { ...registration.package, trust };
+    this.registrations.set(connectorId, {
+      ...registration,
+      package: packageRecord,
+      trust,
+    });
+    this.store.setTrustForConnector(
+      connectorId,
+      trustStatusForSource(trust),
+      contentHash,
+    );
+  }
+
   async publishPackageArchive(connectorDir: string, contentHash: string): Promise<void> {
     await this.packageArchiveStore.publish(connectorDir, contentHash);
   }
