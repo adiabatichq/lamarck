@@ -42,12 +42,12 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         packageDirectory: resolvedPackageDirectory,
         candidatePath,
       });
-      const token = await requestGitHubOidcToken({
+      const getToken = createGitHubOidcTokenProvider({
         audience: requireEnvironment("MARKETPLACE_OIDC_AUDIENCE"),
       });
       const result = await publishMarketplaceCandidate({
         apiOrigin: requireEnvironment("MARKETPLACE_API_ORIGIN"),
-        token,
+        getToken,
         kind,
         namespace: "lamarck",
         candidatePath,
@@ -145,9 +145,23 @@ export async function requestGitHubOidcToken({
   return body.value;
 }
 
+export function createGitHubOidcTokenProvider({
+  audience,
+  requestOidcToken = requestGitHubOidcToken,
+  now = Date.now,
+}) {
+  let cachedToken;
+  return async function getToken() {
+    if (!cachedToken || oidcTokenExpiresSoon(cachedToken, now())) {
+      cachedToken = await requestOidcToken({ audience });
+    }
+    return cachedToken;
+  };
+}
+
 export async function publishMarketplaceCandidate({
   apiOrigin,
-  token,
+  getToken,
   kind,
   namespace,
   candidatePath,
@@ -175,8 +189,9 @@ export async function publishMarketplaceCandidate({
   if (!Number.isSafeInteger(pollTimeoutMs) || pollTimeoutMs < 1 || pollTimeoutMs > 30 * 60_000) {
     throw new Error("Marketplace poll timeout is invalid");
   }
+  if (typeof getToken !== "function") throw new Error("Marketplace OIDC token provider is required");
 
-  const create = await apiJson(fetchImpl, new URL("/marketplace/uploads", origin), token, {
+  const create = await apiJson(fetchImpl, new URL("/marketplace/uploads", origin), await getToken(), {
     method: "POST",
     body: JSON.stringify({
       kind,
@@ -223,7 +238,7 @@ export async function publishMarketplaceCandidate({
   const complete = await apiJson(
     fetchImpl,
     new URL(`/marketplace/uploads/${encodeURIComponent(uploadId)}/complete`, origin),
-    token,
+    await getToken(),
     { method: "POST" },
   );
   if (complete.response.status !== 202 || !isUploadStatus(complete.body, uploadId)) {
@@ -237,7 +252,7 @@ export async function publishMarketplaceCandidate({
     const status = await apiJson(
       fetchImpl,
       new URL(`/marketplace/uploads/${encodeURIComponent(uploadId)}`, origin),
-      token,
+      await getToken(),
       { method: "GET" },
     );
     if (status.response.status !== 200 || !isUploadStatus(status.body, uploadId)) {
@@ -326,6 +341,16 @@ function apiFailure(operation, response, body) {
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function oidcTokenExpiresSoon(token, nowMs) {
+  try {
+    const payload = token.split(".")[1];
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    return !Number.isSafeInteger(claims.exp) || claims.exp * 1000 - nowMs < 60_000;
+  } catch {
+    return true;
+  }
 }
 
 function requireEnvironment(name) {

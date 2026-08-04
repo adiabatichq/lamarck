@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 
 import {
+  createGitHubOidcTokenProvider,
   createCandidateArchive,
   discoverOfficialPackages,
   publishMarketplaceCandidate,
@@ -112,7 +113,7 @@ test("uses the common upload resource and sends no authority to the presigned PU
 
   const result = await publishMarketplaceCandidate({
     apiOrigin: "https://api.lamarck.ai",
-    token: "github-oidc-jwt",
+    getToken: async () => "github-oidc-jwt",
     kind: "app",
     namespace: "lamarck",
     candidatePath,
@@ -167,7 +168,7 @@ test("reports deterministic Backend validation failures", async (t) => {
 
   await assert.rejects(publishMarketplaceCandidate({
     apiOrigin: "https://api.lamarck.ai",
-    token: "token",
+    getToken: async () => "token",
     kind: "app",
     namespace: "lamarck",
     candidatePath,
@@ -179,8 +180,77 @@ test("reports deterministic Backend validation failures", async (t) => {
   }), /manifest_namespace_mismatch: wrong namespace/);
 });
 
+test("refreshes an expiring OIDC token while polling", async (t) => {
+  const root = await temporaryRoot(t);
+  const candidatePath = join(root, "candidate.tar.gz");
+  await writeFile(candidatePath, "x");
+  const uploadId = `upl_${"c".repeat(24)}`;
+  let nowMs = 1_800_000_000_000;
+  const tokens = [
+    jwt(Math.floor(nowMs / 1000) + 300),
+    jwt(Math.floor(nowMs / 1000) + 900),
+  ];
+  let tokenRequests = 0;
+  const getToken = createGitHubOidcTokenProvider({
+    audience: "https://api.lamarck.ai/marketplace/uploads",
+    now: () => nowMs,
+    requestOidcToken: async () => tokens[tokenRequests++],
+  });
+  const authorizations = [];
+  const fetchImpl = async (input, init = {}) => {
+    const url = new URL(input);
+    if (url.hostname === "upload.example") {
+      return new Response(null, { status: 200 });
+    }
+    authorizations.push(init.headers.Authorization);
+    if (url.pathname === "/marketplace/uploads") {
+      return Response.json({
+        uploadId,
+        status: "awaiting_upload",
+        uploadUrl: "https://upload.example/candidate",
+        uploadMethod: "PUT",
+        uploadHeaders: { "content-type": "application/gzip" },
+      }, { status: 201 });
+    }
+    if (url.pathname.endsWith("/complete")) {
+      nowMs += 250_000;
+      return Response.json({ uploadId, status: "queued" }, { status: 202 });
+    }
+    return Response.json({
+      uploadId,
+      status: "published",
+      packageId: "lamarck.notes",
+      releaseId: "rel_1",
+    });
+  };
+
+  await publishMarketplaceCandidate({
+    apiOrigin: "https://api.lamarck.ai",
+    getToken,
+    kind: "app",
+    namespace: "lamarck",
+    candidatePath,
+    candidateBytes: 1,
+    sourceRepository: "adiabatichq/lamarck",
+    sourceCommit: "3".repeat(40),
+    fetchImpl,
+    pollIntervalMs: 0,
+  });
+
+  assert.equal(tokenRequests, 2);
+  assert.deepEqual(authorizations, [
+    `Bearer ${tokens[0]}`,
+    `Bearer ${tokens[0]}`,
+    `Bearer ${tokens[1]}`,
+  ]);
+});
+
 async function temporaryRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "lamarck-marketplace-publisher-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   return root;
+}
+
+function jwt(exp) {
+  return `header.${Buffer.from(JSON.stringify({ exp })).toString("base64url")}.signature`;
 }
