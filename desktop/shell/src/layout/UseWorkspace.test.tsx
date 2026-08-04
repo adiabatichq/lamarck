@@ -76,4 +76,29 @@ describe("Use workspace App rail", () => {
     expect(markup).toContain('aria-label="Open Mail"');
     expect(markup).toContain("appPinDormant");
   });
+
+  test("offers blank App creation and Marketplace discovery in an empty Workspace", () => {
+    const markup = renderToStaticMarkup(
+      <UseWorkspace
+        apps={[]}
+        activeApp={null}
+        pinnedIds={[]}
+        openIds={[]}
+        launcherOpen={false}
+        launcher={null}
+        appSurface={null}
+        coreStatus="connected"
+        systemNeedsAttention={false}
+        onToggleLauncher={() => {}}
+        onOpenApp={() => {}}
+        onCloseApp={() => {}}
+        onTogglePin={() => {}}
+        onOpenSystem={() => {}}
+      />,
+    );
+
+    expect(markup).toContain("Create Blank App");
+    expect(markup).toContain("Explore Marketplace");
+    expect(markup).not.toContain("Include starter apps");
+  });
 });

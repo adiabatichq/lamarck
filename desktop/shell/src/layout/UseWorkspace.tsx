@@ -1,5 +1,5 @@
-import type { ReactNode } from "react";
-import type { AppInfo } from "../lib/api";
+import { useState, type FormEvent, type ReactNode } from "react";
+import { createApp, type AppInfo } from "../lib/api";
 import { AppMark } from "../components/AppMark";
 import {
   emptyWorkspaceCopy,
@@ -215,9 +215,29 @@ function EmptyUseWorkspace({
   onOpen: () => void;
   onOpenSystem: () => void;
 }) {
+  const [creating, setCreating] = useState(false);
+  const [id, setId] = useState("");
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [createPending, setCreatePending] = useState(false);
   const offline = coreStatus === "offline";
   const checking = coreStatus === "checking";
   const copy = emptyWorkspaceCopy(coreStatus, hasApps);
+
+  async function submitBlankApp(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setCreatePending(true);
+    setCreateError(null);
+    try {
+      await createApp(id.trim(), name.trim() || id.trim(), description.trim());
+      window.location.reload();
+    } catch (error) {
+      setCreateError(error instanceof Error ? error.message : String(error));
+      setCreatePending(false);
+    }
+  }
+
   return (
     <section className={styles.empty}>
       <div className={styles.emptyOrbit} aria-hidden="true">
@@ -228,18 +248,93 @@ function EmptyUseWorkspace({
         <span className={styles.emptyEyebrow}>{copy.eyebrow}</span>
         <h1>{copy.title}</h1>
         <p>{copy.detail}</p>
-        <div className={styles.emptyActions}>
-          {!offline && !checking && (
-            <button type="button" className={styles.primaryAction} onClick={onOpen}>
-              <OpenIcon />
-              Open an app
+        {!offline && !checking && !hasApps && creating ? (
+          <form className={styles.createForm} onSubmit={(event) => void submitBlankApp(event)}>
+            <div className={styles.createFields}>
+              <label>
+                <span>App ID</span>
+                <input
+                  value={id}
+                  onChange={(event) => setId(event.target.value)}
+                  placeholder="daily-notes"
+                  autoComplete="off"
+                  required
+                />
+              </label>
+              <label>
+                <span>Name</span>
+                <input
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  placeholder="Daily Notes"
+                  autoComplete="off"
+                />
+              </label>
+              <label className={styles.descriptionField}>
+                <span>Purpose</span>
+                <input
+                  value={description}
+                  onChange={(event) => setDescription(event.target.value)}
+                  placeholder="A private place to shape daily notes."
+                  autoComplete="off"
+                  required
+                />
+              </label>
+            </div>
+            {createError && <p className={styles.createError} role="alert">{createError}</p>}
+            <div className={styles.emptyActions}>
+              <button
+                type="submit"
+                className={styles.primaryAction}
+                disabled={createPending || !id.trim() || !description.trim()}
+              >
+                {createPending ? "Creating…" : "Create Blank App"}
+              </button>
+              <button
+                type="button"
+                className={styles.textAction}
+                disabled={createPending}
+                onClick={() => setCreating(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className={styles.emptyActions}>
+            {!offline && !checking && (
+              hasApps ? (
+                <button type="button" className={styles.primaryAction} onClick={onOpen}>
+                  <OpenIcon />
+                  Open an app
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className={styles.primaryAction}
+                  onClick={() => setCreating(true)}
+                >
+                  <OpenIcon />
+                  Create Blank App
+                </button>
+              )
+            )}
+            {!offline && !checking && !hasApps && (
+              <button
+                type="button"
+                className={styles.textAction}
+                onClick={() => void window.lamarckHost?.openExternal("https://app.lamarck.ai")}
+              >
+                Explore Marketplace
+                <span aria-hidden="true">↗</span>
+              </button>
+            )}
+            <button type="button" className={styles.textAction} onClick={onOpenSystem}>
+              {offline ? "Open System" : "Inspect System"}
+              <span aria-hidden="true">↗</span>
             </button>
-          )}
-          <button type="button" className={styles.textAction} onClick={onOpenSystem}>
-            {offline ? "Open System" : "Inspect System"}
-            <span aria-hidden="true">↗</span>
-          </button>
-        </div>
+          </div>
+        )}
       </div>
       <div className={styles.emptyIndex} aria-hidden="true">USE / 00</div>
     </section>

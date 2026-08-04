@@ -451,6 +451,58 @@
   margin-top: 26px;
 }
 
+.createForm {
+  margin-top: 24px;
+}
+
+.createFields {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1fr);
+  gap: 12px;
+  text-align: left;
+}
+
+.createFields label {
+  display: grid;
+  gap: 6px;
+  color: var(--use-muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.createFields input {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid var(--use-line-strong);
+  border-radius: 9px;
+  padding: 0 11px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--use-ink);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.createFields input:focus-visible {
+  border-color: var(--use-action);
+  outline: 2px solid rgba(37, 99, 235, 0.15);
+  outline-offset: 1px;
+}
+
+.descriptionField {
+  grid-column: 1 / -1;
+}
+
+.empty .createError {
+  margin-top: 10px;
+  color: #a83c32;
+  font-size: 11px;
+}
+
 .primaryAction {
   display: inline-flex;
   min-height: 39px;
@@ -512,6 +564,9 @@
   .coreState { border: 0; padding: 0; }
   .coreState { font-size: 0; }
   .empty { padding: 28px; }
+  .emptyActions { flex-wrap: wrap; }
+  .createFields { grid-template-columns: 1fr; }
+  .descriptionField { grid-column: auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {

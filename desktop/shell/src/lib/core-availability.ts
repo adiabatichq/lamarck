@@ -81,9 +81,9 @@ export function emptyWorkspaceCopy(
     };
   }
   return {
-    eyebrow: "Quiet canvas",
-    title: "Nothing needs to be here.",
-    detail: "Apps with a UI will appear here when you build or install them.",
+    eyebrow: "Empty workspace",
+    title: "Choose your first building block.",
+    detail: "Start with a blank local App, or explore official Apps and Connectors in Marketplace.",
   };
 }
 
