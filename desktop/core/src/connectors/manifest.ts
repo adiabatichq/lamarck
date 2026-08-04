@@ -19,8 +19,8 @@ import type {
   ConnectorSourceSpec,
 } from "./types";
 import { validateConnectorSchedule } from "./schedule";
+import { ENTRY_ID_PATTERN, PACKAGE_ID_PATTERN } from "../package-id";
 
-const CONNECTOR_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const SOURCE_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$/;
 const EVENT_TYPE_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 const CONNECTOR_MODES = new Set<ConnectorRuntimeMode>(["watch", "poll", "manual"]);
@@ -79,7 +79,7 @@ const EVENT_CATALOG_MAX_BYTES = 1024 * 1024;
 type PlainObject = Record<string, unknown>;
 
 export function validateConnectorId(id: string): void {
-  if (!CONNECTOR_ID_PATTERN.test(id)) {
+  if (!PACKAGE_ID_PATTERN.test(id)) {
     throw new Error(`Invalid connector id: ${id}`);
   }
 }
@@ -342,7 +342,7 @@ function validateConfigPanels(
   );
   const normalized: Record<string, ConnectorConfigPanel> = {};
   for (const [id, value] of Object.entries(panelMap)) {
-    if (!CONNECTOR_ID_PATTERN.test(id)) {
+    if (!ENTRY_ID_PATTERN.test(id)) {
       throw new Error(`Connector ${connectorId} config panel "${id}" has an invalid id`);
     }
     const context = `Connector ${connectorId} config panel "${id}"`;
@@ -380,7 +380,7 @@ function validateConfigSchema(
   );
   const normalized: Record<string, ConnectorConfigField> = {};
   for (const [key, value] of Object.entries(configMap)) {
-    if (!CONNECTOR_ID_PATTERN.test(key)) {
+    if (!ENTRY_ID_PATTERN.test(key)) {
       throw new Error(`Connector ${connectorId} config field "${key}" has an invalid key`);
     }
     const context = `Connector ${connectorId} config field "${key}"`;
@@ -615,7 +615,7 @@ function validateAuthSpec(connectorId: string, value: unknown): ConnectorAuthSpe
 
 function validateProviderIdAuthField(connectorId: string, auth: Record<string, unknown>): string {
   const value = auth.providerId;
-  if (typeof value !== "string" || !CONNECTOR_ID_PATTERN.test(value)) {
+  if (typeof value !== "string" || !ENTRY_ID_PATTERN.test(value)) {
     throw new Error(`Connector ${connectorId} managedProvider auth requires a valid providerId`);
   }
   return value;

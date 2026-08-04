@@ -311,6 +311,10 @@ export interface AppInfo {
   id: string;
   name: string;
   description: string;
+  createdFrom?: {
+    packageId: string;
+    releaseId: string;
+  };
   runtime: {
     ui?: {
       command: string[];

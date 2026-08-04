@@ -4,6 +4,7 @@ import {
   type AppManifestDigest,
 } from "../../capsule/src/app-manifest-authority";
 import { validateFullGitCommit } from "./system-identity";
+import { ENTRY_ID_PATTERN, PACKAGE_ID_PATTERN } from "./package-id";
 
 export const APP_CAPABILITY_HEADER = "x-lamarck-app-capability";
 
@@ -61,8 +62,6 @@ export type AuthAdmission = Readonly<{
   release: () => void;
 }>;
 
-const APP_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
-const ENTRY_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const RAW_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const HOST_CONTEXT: HostAuthContext = Object.freeze({ kind: "host" });
 const HOST_SIGNAL = new AbortController().signal;
@@ -273,7 +272,7 @@ function secretEquals(candidate: string, expected: string): boolean {
 }
 
 function validateAppIdentity(appId: string, workload: AppWorkload): void {
-  if (!APP_ID_PATTERN.test(appId)) {
+  if (!PACKAGE_ID_PATTERN.test(appId)) {
     throw new Error(`Invalid app id: ${appId}`);
   }
   if (workload === "ui") return;

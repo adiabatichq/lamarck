@@ -73,6 +73,7 @@ import {
   parseRequestedWorkload,
 } from "./app-runtime-policy";
 import { createAppPackageJson, createAppPackageLock } from "./app-scaffold";
+import { PACKAGE_ID_PATTERN } from "./package-id";
 import { APP_MANIFEST_DIGEST_PATTERN } from "../../capsule/src/app-manifest-authority";
 import { resolveDeviceIdentity } from "./device-identity";
 import { resolveCommittedAppRevision } from "./app-revision";
@@ -1245,6 +1246,9 @@ const server = await serve<{ cwd: string }>({
           id: a.manifest.id,
           name: a.manifest.name,
           description: a.manifest.description,
+          ...(a.manifest.createdFrom === undefined
+            ? {}
+            : { createdFrom: a.manifest.createdFrom }),
           runtime: a.manifest.runtime,
           permissions: a.manifest.permissions,
           manifestGeneration: appManifestGeneration,
@@ -1272,9 +1276,10 @@ const server = await serve<{ cwd: string }>({
         const body = await readBody<{ id: string; name?: string; description: string }>(req);
         const id = body.id;
 
-        // Validate id: lowercase, alphanumeric + hyphens
-        if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) {
-          return json({ error: "Invalid app id. Use lowercase alphanumeric + hyphens." }, 400);
+        if (typeof id !== "string" || !PACKAGE_ID_PATTERN.test(id)) {
+          return json({
+            error: "Invalid app id. Use lowercase alphanumeric/hyphen segments separated by dots.",
+          }, 400);
         }
         if (
           body.name !== undefined &&

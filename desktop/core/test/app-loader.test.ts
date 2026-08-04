@@ -94,6 +94,69 @@ describe("App Loader", () => {
     expect(registry.getTableGrants("unknown-app")).toEqual([]);
   });
 
+  test("accepts dotted package ids while named workload ids remain unscoped", async () => {
+    const manifest = validManifest("lamarck.daily-review");
+    manifest.runtime.services = {
+      indexer: { command: ["node", "indexer.mjs"] },
+    };
+    writeApp("lamarck.daily-review", manifest);
+    writeApp("lamarck.bad-workload", {
+      ...validManifest("lamarck.bad-workload"),
+      runtime: { services: { "not.scoped": { command: ["node", "service.mjs"] } } },
+    });
+
+    const registry = await loadApps(appsDir);
+    expect([...registry.apps.keys()]).toEqual(["lamarck.daily-review"]);
+    expect(sourceForAppUi("lamarck.daily-review")).toBe("app:lamarck.daily-review:ui");
+    expect(sourceForAppWorkload("lamarck.daily-review", {
+      kind: "service",
+      entryId: "indexer",
+    })).toBe("app:lamarck.daily-review:service:indexer");
+    expect(() => sourceForAppWorkload("lamarck.daily-review", {
+      kind: "service",
+      entryId: "not.scoped",
+    })).toThrow("Invalid service entry id");
+  });
+
+  test.each([
+    ".lamarck-tools",
+    "lamarck-tools.",
+    "lamarck..tools",
+    "lamarck.Tools",
+    "lamarck_tools",
+    "lamarck/tools",
+  ])("rejects malformed dotted package id %s", async (id) => {
+    writeApp("candidate", { ...validManifest("candidate"), id });
+    expect((await loadApps(appsDir)).apps.size).toBe(0);
+  });
+
+  test("accepts strict optional Marketplace template provenance", async () => {
+    const manifest = {
+      ...validManifest("my-tools"),
+      createdFrom: {
+        packageId: "lamarck.tools",
+        releaseId: "rel_01HXYZ",
+      },
+    } satisfies AppManifest;
+    writeApp("my-tools", manifest);
+
+    const app = (await loadApps(appsDir)).apps.get("my-tools");
+    expect(app?.manifest.createdFrom).toEqual(manifest.createdFrom);
+    expect(app?.manifestDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
+  });
+
+  test.each([
+    { packageId: "tools", releaseId: "rel_1" },
+    { packageId: ".tools", releaseId: "rel_1" },
+    { packageId: "lamarck..tools", releaseId: "rel_1" },
+    { packageId: "lamarck.tools", releaseId: "" },
+    { packageId: "lamarck.tools", releaseId: " padded " },
+    { packageId: "lamarck.tools", releaseId: "rel_1", unexpected: true },
+  ])("rejects malformed createdFrom provenance %#", async (createdFrom) => {
+    writeApp("candidate", { ...validManifest("candidate"), createdFrom });
+    expect((await loadApps(appsDir)).apps.size).toBe(0);
+  });
+
   test("derives one deterministic digest from the normalized authority manifest", async () => {
     const manifest = validManifest("authority");
     manifest.permissions.writes.tables = ["reviews"];

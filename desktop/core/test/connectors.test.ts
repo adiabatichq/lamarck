@@ -287,25 +287,27 @@ auth:
     );
   });
 
-  test("keeps bundled Connector templates valid under the V1 package contract", async () => {
-    const templatesDir = fileURLToPath(new URL("../../template/connectors", import.meta.url));
-    const rejected: string[] = [];
-    const available = await listAvailableBuiltIns(templatesDir, (dir) => rejected.push(basename(dir)));
+  test("keeps official Connector sources valid under the V1 package contract", async () => {
+    const officialDir = fileURLToPath(new URL("../../../connectors", import.meta.url));
+    const available = await Promise.all(
+      readdirSync(officialDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .sort((left, right) => left.name.localeCompare(right.name))
+        .map(async (entry) => {
+          const dir = join(officialDir, entry.name);
+          return { dir, manifest: await loadConnectorManifest(dir) };
+        }),
+    );
 
     expect(available.map(({ manifest }) => manifest.id).sort()).toEqual([
-      "code-agent-transcripts",
-      "local-git",
-      "macos-ax",
-      "oura",
-      "telegram-bot",
+      "lamarck.code-agent-transcripts",
+      "lamarck.local-git",
+      "lamarck.macos-ax",
+      "lamarck.oura",
+      "lamarck.telegram-bot",
     ]);
-    // The manifest gate is what keeps a parked package out of the catalog; no
-    // package is excluded by name. app-commits still declares the retired
-    // `integrations` block and cannot be revived until its replacement owns
-    // an approved Source identity.
-    expect(rejected).toEqual(["app-commits"]);
     expect(
-      available.find(({ manifest }) => manifest.id === "code-agent-transcripts")?.manifest.source.identity,
+      available.find(({ manifest }) => manifest.id === "lamarck.code-agent-transcripts")?.manifest.source.identity,
     ).toBe("device");
     for (const entry of available) {
       const catalog = await loadConnectorEventCatalog(entry.dir, entry.manifest);
@@ -326,6 +328,17 @@ auth:
     };
 
     expect(() => validateConnectorManifest({ ...base, id: "../demo" })).toThrow("Invalid connector id");
+    expect(validateConnectorManifest({ ...base, id: "lamarck.demo" }).id).toBe("lamarck.demo");
+    for (const id of [
+      ".lamarck-demo",
+      "lamarck-demo.",
+      "lamarck..demo",
+      "lamarck.Demo",
+      "lamarck_demo",
+      "lamarck/demo",
+    ]) {
+      expect(() => validateConnectorManifest({ ...base, id })).toThrow("Invalid connector id");
+    }
     expect(() =>
       validateConnectorManifest({ ...base, source: undefined as any })
     ).toThrow("requires an explicit source.identity");
@@ -540,6 +553,18 @@ auth:
     expect(() =>
       validateConnectorManifest({ ...base, config: { x: { type: "json" as any, label: "X" } } })
     ).toThrow("invalid type");
+    expect(() => validateConnectorManifest({
+      ...base,
+      config: { "dotted.key": { type: "string", label: "Dotted" } },
+    })).toThrow("invalid key");
+    expect(() => validateConnectorManifest({
+      ...base,
+      configPanels: { "dotted.panel": { label: "Dotted" } },
+    })).toThrow("invalid id");
+    expect(() => validateConnectorManifest({
+      ...base,
+      auth: { type: "managedProvider", providerId: "dotted.provider" },
+    })).toThrow("valid providerId");
     expect(() =>
       validateConnectorManifest({ ...base, config: { x: { type: "number" } as any } })
     ).toThrow("requires a label");

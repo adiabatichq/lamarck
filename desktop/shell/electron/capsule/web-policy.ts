@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { PACKAGE_ID_PATTERN } from "../package-id";
 
 export interface AppViewerOriginBinding {
   protocol: string;
@@ -55,7 +56,7 @@ function appViewerIdentityDigest(
   if (workspaceId.length < 1 || workspaceId.includes("\0")) {
     throw new Error("Viewer workspace identity is invalid");
   }
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(appId)) throw new Error("Viewer App identity is invalid");
+  if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Viewer App identity is invalid");
   if (generation !== undefined && (generation.length < 1 || generation.length > 512)) {
     throw new Error("Browser channel generation must be bounded and nonempty");
   }

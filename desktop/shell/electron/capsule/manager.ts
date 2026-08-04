@@ -11,8 +11,8 @@ import {
   APP_MANIFEST_DIGEST_PATTERN,
   type AppManifestDigest,
 } from "../../../capsule/src/app-manifest-authority";
+import { PACKAGE_ID_PATTERN } from "../package-id";
 
-const APP_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const STOP_ALL_QUIESCENCE_TIMEOUT_MS = 20_000;
 
 interface AppInfo {
@@ -239,7 +239,7 @@ export class CapsuleManager {
     verifyPreparedViewer: VerifyPreparedViewer,
   ): Promise<OpenedAppViewer> {
     if (this.#terminalFailure) throw this.#terminalFailure;
-    if (!APP_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
     const owner = validatedViewerOwner(ownerValue);
     if (
       this.#stoppingAll
@@ -507,7 +507,7 @@ export class CapsuleManager {
     publishReloadedViewer: PublishReloadedViewer,
   ): Promise<ReloadedApp> {
     if (this.#terminalFailure) throw this.#terminalFailure;
-    if (!APP_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
     if (this.#stoppingAll || this.#stoppingApps.has(appId)) {
       throw new Error(`App "${appId}" is stopping`);
     }
@@ -680,7 +680,7 @@ export class CapsuleManager {
   }
 
   stopApp(appId: string): Promise<void> {
-    if (!APP_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
     if (this.#stopAllOperation) return this.#stopAllOperation;
     if (this.#terminalFailure) return Promise.reject(this.#terminalFailure);
     const existing = this.#stopOperations.get(appId);
@@ -734,7 +734,7 @@ export class CapsuleManager {
   /** Establishes a synchronous fence which remains held across Core archive. */
   beginAppRetirement(appId: string): void {
     if (this.#terminalFailure) throw this.#terminalFailure;
-    if (!APP_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
     if (this.#stoppingAll) throw new Error("App Capsule is stopping");
     if (this.#stoppingApps.has(appId)) throw new Error(`App "${appId}" is stopping`);
     this.#stoppingApps.add(appId);
@@ -754,7 +754,7 @@ export class CapsuleManager {
   }
 
   retireApp(appId: string): Promise<void> {
-    if (!APP_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
     if (this.#terminalFailure) return Promise.reject(this.#terminalFailure);
     if (this.#stoppingAll) {
       return Promise.reject(new Error("App Capsule is stopping"));

@@ -82,6 +82,7 @@ import {
   inspectWorkspaceForOpen,
   type WorkspaceDescriptor,
 } from "./workspace-files";
+import { PACKAGE_ID_PATTERN } from "./package-id";
 
 app.setName("Lamarck");
 
@@ -2465,7 +2466,7 @@ async function stopAppViewers(appId: string): Promise<void> {
 }
 
 function archiveAppFromHost(appId: string): Promise<{ ok: true; id: string }> {
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(appId)) throw new Error("Invalid App id");
+  if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
   const existing = appArchiveOperations.get(appId);
   if (existing) return existing;
 

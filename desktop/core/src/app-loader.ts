@@ -8,6 +8,11 @@ import {
   digestNormalizedAppManifest,
   type AppManifestDigest,
 } from "../../capsule/src/app-manifest-authority";
+import {
+  ENTRY_ID_PATTERN,
+  PACKAGE_ID_PATTERN,
+  SCOPED_PACKAGE_ID_PATTERN,
+} from "./package-id";
 
 // App Loader — scans apps/ directory, reads manifests, builds registry.
 
@@ -16,6 +21,10 @@ export interface AppManifest {
   id: string;
   name: string;
   description: string;
+  createdFrom?: {
+    packageId: string;
+    releaseId: string;
+  };
   runtime: {
     ui?: {
       command: string[];
@@ -61,12 +70,12 @@ type ValidationResult =
   | { ok: true; manifest: AppManifest }
   | { ok: false; error: string };
 
-const APP_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const MANIFEST_FIELDS = new Set([
   "manifestVersion",
   "id",
   "name",
   "description",
+  "createdFrom",
   "runtime",
   "permissions",
 ]);
@@ -83,11 +92,11 @@ export function sourceForAppUi(appId: string): string {
 }
 
 export function sourceForAppWorkload(appId: string, workload: AppWorkloadIdentity): string {
-  if (!APP_ID_PATTERN.test(appId)) {
+  if (!PACKAGE_ID_PATTERN.test(appId)) {
     throw new Error(`Invalid app id: ${appId}`);
   }
   if (workload.kind === "ui") return `app:${appId}:ui`;
-  if (!APP_ID_PATTERN.test(workload.entryId)) {
+  if (!ENTRY_ID_PATTERN.test(workload.entryId)) {
     throw new Error(`Invalid ${workload.kind} entry id: ${workload.entryId}`);
   }
   return `app:${appId}:${workload.kind}:${workload.entryId}`;
@@ -303,8 +312,8 @@ function validateManifest(value: unknown, directoryName: string): ValidationResu
   if (value.manifestVersion !== 1) {
     return invalid("manifestVersion must be 1");
   }
-  if (typeof value.id !== "string" || !APP_ID_PATTERN.test(value.id)) {
-    return invalid("id must match ^[a-z0-9][a-z0-9-]*$");
+  if (typeof value.id !== "string" || !PACKAGE_ID_PATTERN.test(value.id)) {
+    return invalid("id must be one or more lowercase alphanumeric/hyphen segments separated by dots");
   }
   if (value.id !== directoryName) {
     return invalid(`manifest id "${value.id}" does not match directory name`);
@@ -318,6 +327,37 @@ function validateManifest(value: unknown, directoryName: string): ValidationResu
     || value.description.trim() !== value.description
   ) {
     return invalid("description must be a non-empty, trimmed string");
+  }
+
+  let createdFrom: AppManifest["createdFrom"];
+  if (hasOwn(value, "createdFrom")) {
+    if (!isObject(value.createdFrom)) {
+      return invalid("createdFrom must be an object");
+    }
+    const unexpectedCreatedFromField = findUnexpectedField(
+      value.createdFrom,
+      new Set(["packageId", "releaseId"]),
+    );
+    if (unexpectedCreatedFromField) {
+      return invalid(`unknown createdFrom field "${unexpectedCreatedFromField}"`);
+    }
+    if (
+      typeof value.createdFrom.packageId !== "string"
+      || !SCOPED_PACKAGE_ID_PATTERN.test(value.createdFrom.packageId)
+    ) {
+      return invalid("createdFrom.packageId must be a scoped namespace.name package ID");
+    }
+    if (
+      typeof value.createdFrom.releaseId !== "string"
+      || value.createdFrom.releaseId.length === 0
+      || value.createdFrom.releaseId.trim() !== value.createdFrom.releaseId
+    ) {
+      return invalid("createdFrom.releaseId must be a non-empty, trimmed string");
+    }
+    createdFrom = {
+      packageId: value.createdFrom.packageId,
+      releaseId: value.createdFrom.releaseId,
+    };
   }
 
   if (!isObject(value.runtime)) {
@@ -399,6 +439,7 @@ function validateManifest(value: unknown, directoryName: string): ValidationResu
       id: value.id,
       name: value.name,
       description: value.description,
+      ...(createdFrom === undefined ? {} : { createdFrom }),
       runtime,
       permissions: {
         writes: {
@@ -454,7 +495,7 @@ function validateNamedWorkloads(value: unknown, path: string): NamedWorkloadVali
   // lookups independent of Object.prototype.
   const workloads = Object.create(null) as Record<string, AppWorkload>;
   for (const [entryId, rawWorkload] of Object.entries(value)) {
-    if (!APP_ID_PATTERN.test(entryId)) {
+    if (!ENTRY_ID_PATTERN.test(entryId)) {
       return { ok: false, error: `${path} entry id "${entryId}" must match ^[a-z0-9][a-z0-9-]*$` };
     }
     if (!isObject(rawWorkload)) {
