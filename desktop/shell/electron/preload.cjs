@@ -17,10 +17,7 @@ contextBridge.exposeInMainWorld("lamarckHost", {
   openExternal: (url) => ipcRenderer.invoke("shell:openExternal", url),
   getWorkspaceState: () => ipcRenderer.invoke("workspace:getState"),
   chooseWorkspacePath: (purpose) => ipcRenderer.invoke("workspace:choose", purpose),
-  createWorkspace: (path, options) => ipcRenderer.invoke("workspace:create", {
-    path,
-    includeStarterApps: options.includeStarterApps,
-  }),
+  createWorkspace: (path) => ipcRenderer.invoke("workspace:create", { path }),
   openWorkspace: (path, recoveryCode) => ipcRenderer.invoke("workspace:open", {
     path,
     ...(recoveryCode === undefined ? {} : { recoveryCode }),

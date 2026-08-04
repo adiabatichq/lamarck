@@ -1,5 +1,4 @@
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -36,20 +35,6 @@ function temporaryRoot(): string {
   return root;
 }
 
-function template(root: string): string {
-  const templatePath = join(root, "template");
-  mkdirSync(join(templatePath, "apps", "hello-world"), { recursive: true });
-  writeFileSync(
-    join(templatePath, "apps", "hello-world", "manifest.json"),
-    JSON.stringify({ id: "hello-world" }),
-  );
-  mkdirSync(join(templatePath, "connectors", "built-in"), { recursive: true });
-  writeFileSync(join(templatePath, "connectors", "built-in", "connector.yaml"), "id: built-in\n");
-  mkdirSync(join(templatePath, ".lamarck"), { recursive: true });
-  writeFileSync(join(templatePath, ".lamarck", "data.db"), "developer state");
-  return templatePath;
-}
-
 function expectCode(operation: () => unknown, code: WorkspaceValidationError["code"]): void {
   try {
     operation();
@@ -77,28 +62,12 @@ describe("Workspace filesystem lifecycle", () => {
   test("creates a deterministic empty Workspace without copying Host state", () => {
     const root = temporaryRoot();
     const target = join(root, "new-workspace");
-    const path = initializeWorkspaceDirectory(target, template(root), {
-      includeStarterApps: false,
-    });
+    const path = initializeWorkspaceDirectory(target);
 
     expect(readdirSync(path).sort()).toEqual([".lamarck", "apps", "connectors", "pages"]);
     expect(readdirSync(join(path, ".lamarck"))).toEqual([]);
     expect(readdirSync(join(path, "apps"))).toEqual([]);
     expect(readdirSync(join(path, "connectors"))).toEqual([]);
-  });
-
-  test("copies starter Apps only when explicitly requested", () => {
-    const root = temporaryRoot();
-    const target = join(root, "new-workspace");
-    const path = initializeWorkspaceDirectory(target, template(root), {
-      includeStarterApps: true,
-    });
-
-    expect(JSON.parse(
-      readFileSync(join(path, "apps", "hello-world", "manifest.json"), "utf8"),
-    )).toEqual({ id: "hello-world" });
-    expect(readdirSync(join(path, "connectors"))).toEqual([]);
-    expect(readdirSync(join(path, ".lamarck"))).toEqual([]);
   });
 
   test("accepts an empty folder and harmless Finder metadata", () => {
@@ -107,9 +76,7 @@ describe("Workspace filesystem lifecycle", () => {
     mkdirSync(target);
     writeFileSync(join(target, ".DS_Store"), "");
 
-    initializeWorkspaceDirectory(target, template(root), {
-      includeStarterApps: false,
-    });
+    initializeWorkspaceDirectory(target);
 
     expect(readdirSync(target).sort()).toEqual([
       ".DS_Store",
@@ -123,13 +90,11 @@ describe("Workspace filesystem lifecycle", () => {
   test("rolls back a failed finalize and preserves existing Finder metadata", () => {
     const root = temporaryRoot();
     const target = join(root, "empty");
-    const templatePath = template(root);
     mkdirSync(target);
     writeFileSync(join(target, ".DS_Store"), "existing metadata");
     const failure = new Error("settings write failed");
 
-    expect(() => initializeWorkspaceDirectory(target, templatePath, {
-      includeStarterApps: true,
+    expect(() => initializeWorkspaceDirectory(target, {
       finalize(path) {
         writeFileSync(join(path, ".lamarck", "settings.json"), "partial");
         throw failure;
@@ -139,8 +104,7 @@ describe("Workspace filesystem lifecycle", () => {
     expect(readdirSync(target)).toEqual([".DS_Store"]);
     expect(readFileSync(join(target, ".DS_Store"), "utf8")).toBe("existing metadata");
 
-    const path = initializeWorkspaceDirectory(target, templatePath, {
-      includeStarterApps: false,
+    const path = initializeWorkspaceDirectory(target, {
       finalize(finalizedPath) {
         writeFileSync(
           join(finalizedPath, ".lamarck", "settings.json"),
@@ -157,33 +121,13 @@ describe("Workspace filesystem lifecycle", () => {
     });
   });
 
-  test("removes a new target after starter App copying fails so Create can retry", () => {
-    const root = temporaryRoot();
-    const target = join(root, "new-workspace");
-    const missingTemplate = join(root, "missing-template");
-
-    expect(() => initializeWorkspaceDirectory(target, missingTemplate, {
-      includeStarterApps: true,
-    })).toThrow();
-    expect(existsSync(target)).toBe(false);
-
-    const path = initializeWorkspaceDirectory(target, template(root), {
-      includeStarterApps: true,
-    });
-    expect(readFileSync(
-      join(path, "apps", "hello-world", "manifest.json"),
-      "utf8",
-    )).toContain("hello-world");
-  });
-
   test("refuses existing, reserved, and generic non-empty targets without modifying them", () => {
     const root = temporaryRoot();
-    const templatePath = template(root);
 
     const existing = join(root, "existing");
     mkdirSync(join(existing, ".lamarck"), { recursive: true });
     expectCode(
-      () => initializeWorkspaceDirectory(existing, templatePath, { includeStarterApps: false }),
+      () => initializeWorkspaceDirectory(existing),
       "WORKSPACE_ALREADY_EXISTS",
     );
     expect(readdirSync(existing)).toEqual([".lamarck"]);
@@ -191,7 +135,7 @@ describe("Workspace filesystem lifecycle", () => {
     const reserved = join(root, "reserved");
     mkdirSync(join(reserved, "pages"), { recursive: true });
     expectCode(
-      () => initializeWorkspaceDirectory(reserved, templatePath, { includeStarterApps: false }),
+      () => initializeWorkspaceDirectory(reserved),
       "WORKSPACE_RESERVED_CONTENT",
     );
     expect(readdirSync(reserved)).toEqual(["pages"]);
@@ -200,7 +144,7 @@ describe("Workspace filesystem lifecycle", () => {
     mkdirSync(nonempty);
     writeFileSync(join(nonempty, "notes.txt"), "mine");
     expectCode(
-      () => initializeWorkspaceDirectory(nonempty, templatePath, { includeStarterApps: false }),
+      () => initializeWorkspaceDirectory(nonempty),
       "WORKSPACE_NOT_EMPTY",
     );
     expect(readdirSync(nonempty)).toEqual(["notes.txt"]);

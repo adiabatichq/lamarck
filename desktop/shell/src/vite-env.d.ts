@@ -58,10 +58,10 @@ interface Window {
     openExternal(url: string): Promise<void>;
     getWorkspaceState(): Promise<HostWorkspaceState>;
     chooseWorkspacePath(purpose: "create" | "open"): Promise<{ path: string | null }>;
-    createWorkspace(
-      path: string,
-      options: { includeStarterApps: boolean },
-    ): Promise<{ status: "ready"; workspace: HostWorkspaceDescriptor }>;
+    createWorkspace(path: string): Promise<{
+      status: "ready";
+      workspace: HostWorkspaceDescriptor;
+    }>;
     openWorkspace(path: string, recoveryCode?: string): Promise<HostWorkspaceOpenResult>;
     onOpenLauncher(callback: () => void): () => void;
     openAppViewer(appId: string): Promise<

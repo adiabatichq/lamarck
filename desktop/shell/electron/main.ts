@@ -86,7 +86,6 @@ import { PACKAGE_ID_PATTERN } from "./package-id";
 
 app.setName("Lamarck");
 
-const TEMPLATE = join(__dirname, "..", "..", "template");
 const CORE_ENTRY = join(__dirname, "core.mjs");
 const PTY_HELPER = join(__dirname, "pty-helper.cjs");
 const APP_PRELOAD = join(__dirname, "app-preload.cjs");
@@ -645,10 +644,7 @@ async function requireVerifiedWorkspaceVaultKey(
   return vaultKey;
 }
 
-async function initializeWorkspace(
-  path: string,
-  options: { includeStarterApps: boolean },
-): Promise<WorkspaceDescriptor> {
+async function initializeWorkspace(path: string): Promise<WorkspaceDescriptor> {
   inspectWorkspaceForCreate(path);
   const vaultId = randomBytes(16).toString("base64url");
   if (!isWorkspaceVaultId(vaultId)) {
@@ -664,8 +660,7 @@ async function initializeWorkspace(
     const recoveryCode = await createVaultKey(vaultId);
     keyRecordCreated = true;
     const vaultKeyVerifier = createWorkspaceVaultVerifier(vaultId, recoveryCode);
-    const initializedPath = initializeWorkspaceDirectory(path, TEMPLATE, {
-      ...options,
+    const initializedPath = initializeWorkspaceDirectory(path, {
       finalize(targetPath) {
         saveWorkspaceSettings({ vaultId, vaultKeyVerifier, corePort }, targetPath);
       },
@@ -1391,9 +1386,8 @@ async function activateWorkspace(
 
 async function createWorkspace(
   path: string,
-  options: { includeStarterApps: boolean },
 ): Promise<WorkspaceDescriptor> {
-  const candidate = await initializeWorkspace(path, options);
+  const candidate = await initializeWorkspace(path);
   return activateWorkspace(candidate);
 }
 
@@ -2809,25 +2803,18 @@ app.whenReady().then(async () => {
         : result.filePaths[0],
     };
   });
-  ipcMain.handle("workspace:create", (event, payload: {
-    path?: unknown;
-    includeStarterApps?: unknown;
-  }) => {
+  ipcMain.handle("workspace:create", (event, payload: { path?: unknown }) => {
     requireShellIpc(event);
     if (
       !payload
       || typeof payload.path !== "string"
-      || typeof payload.includeStarterApps !== "boolean"
     ) {
       throw new Error("Create Workspace request is invalid");
     }
     const nextPath = payload.path;
-    const includeStarterApps = payload.includeStarterApps;
     return enqueueRuntime(async () => ({
       status: "ready" as const,
-      workspace: await createWorkspace(nextPath, {
-        includeStarterApps,
-      }),
+      workspace: await createWorkspace(nextPath),
     }));
   });
   ipcMain.handle("workspace:open", (event, payload: {

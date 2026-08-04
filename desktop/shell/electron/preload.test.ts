@@ -7,10 +7,7 @@ const PRELOAD_SOURCE = readFileSync(new URL("./preload.cjs", import.meta.url), "
 interface WorkspacePreloadHost {
   getWorkspaceState(): Promise<unknown>;
   chooseWorkspacePath(purpose: "create" | "open"): Promise<unknown>;
-  createWorkspace(
-    path: string,
-    options: { includeStarterApps: boolean },
-  ): Promise<unknown>;
+  createWorkspace(path: string): Promise<unknown>;
   openWorkspace(path: string, recoveryCode?: string): Promise<unknown>;
 }
 
@@ -49,9 +46,7 @@ describe("Shell Workspace preload contract", () => {
     await host.getWorkspaceState();
     await host.chooseWorkspacePath("create");
     await host.chooseWorkspacePath("open");
-    await host.createWorkspace("/Users/person/New Lamarck", {
-      includeStarterApps: false,
-    });
+    await host.createWorkspace("/Users/person/New Lamarck");
     await host.openWorkspace("/Volumes/Data/Lamarck");
     await host.openWorkspace("/Volumes/Data/Lamarck", "recovery-code");
 
@@ -63,7 +58,6 @@ describe("Shell Workspace preload contract", () => {
         "workspace:create",
         {
           path: "/Users/person/New Lamarck",
-          includeStarterApps: false,
         },
       ],
       [

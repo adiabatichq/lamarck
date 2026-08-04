@@ -15,7 +15,6 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [coreBaseUrl, setCoreBaseUrl] = useState("");
-  const [includeStarterApps, setIncludeStarterApps] = useState(true);
   const [pendingOpen, setPendingOpen] = useState<HostWorkspaceDescriptor | null>(null);
   const [pendingRecoveryInput, setPendingRecoveryInput] = useState("");
   const [recoveryCode, setRecoveryCode] = useState("");
@@ -83,9 +82,7 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
       const selection = await window.lamarckHost.chooseWorkspacePath("create");
       if (!selection.path) return;
       setMessage("Creating workspace...");
-      const result = await window.lamarckHost.createWorkspace(selection.path, {
-        includeStarterApps,
-      });
+      const result = await window.lamarckHost.createWorkspace(selection.path);
       await finishWorkspaceSwitch(result.workspace);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -93,7 +90,7 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
     } finally {
       setBusy(false);
     }
-  }, [finishWorkspaceSwitch, includeStarterApps]);
+  }, [finishWorkspaceSwitch]);
 
   const openWorkspace = useCallback(async () => {
     if (!window.lamarckHost) return;
@@ -274,19 +271,6 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
               </span>
             </div>
           </div>
-
-          <label className={styles.checkboxRow}>
-            <input
-              type="checkbox"
-              checked={includeStarterApps}
-              onChange={(event) => setIncludeStarterApps(event.target.checked)}
-              disabled={!hasHost || busy}
-            />
-            <span>
-              Include starter apps
-              <small>Used only when creating a new workspace.</small>
-            </span>
-          </label>
 
           <div className={styles.buttonRow}>
             <button className={styles.button} onClick={createWorkspace} disabled={!hasHost || busy}>

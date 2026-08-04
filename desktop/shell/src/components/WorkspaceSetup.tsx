@@ -59,7 +59,6 @@ function setupCopy(reason: WorkspaceSetupState["reason"]): {
 
 export function WorkspaceSetup({ state, onReady }: WorkspaceSetupProps) {
   const [createPath, setCreatePath] = useState(state.suggestedPath);
-  const [includeStarterApps, setIncludeStarterApps] = useState(true);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
   const [error, setError] = useState<string | null>(null);
   const [recoveryWorkspace, setRecoveryWorkspace] = useState<WorkspaceDescriptor | null>(null);
@@ -105,7 +104,7 @@ export function WorkspaceSetup({ state, onReady }: WorkspaceSetupProps) {
     setPendingAction("create");
     setError(null);
     try {
-      const result = await host.createWorkspace(path, { includeStarterApps });
+      const result = await host.createWorkspace(path);
       await finish(result.workspace);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -291,24 +290,6 @@ export function WorkspaceSetup({ state, onReady }: WorkspaceSetupProps) {
                 <p id="workspace-path-rule" className={styles.pathRule}>
                   Lamarck will never merge a new Workspace into a folder that already has files.
                 </p>
-
-                <label className={styles.checkbox}>
-                  <input
-                    type="checkbox"
-                    checked={includeStarterApps}
-                    disabled={busy}
-                    onChange={(event) => setIncludeStarterApps(event.target.checked)}
-                  />
-                  <span className={styles.checkmark} aria-hidden="true">
-                    <svg viewBox="0 0 12 9">
-                      <path d="M1 4.5 4.25 8 11 1" />
-                    </svg>
-                  </span>
-                  <span>
-                    <strong>Include starter apps</strong>
-                    <small>Add a few examples you can explore or remove later.</small>
-                  </span>
-                </label>
 
                 <button
                   type="button"

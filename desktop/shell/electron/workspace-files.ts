@@ -1,5 +1,4 @@
 import {
-  cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -178,11 +177,9 @@ export function inspectWorkspaceForCreate(input: string): string {
 
 export function initializeWorkspaceDirectory(
   input: string,
-  templatePath: string,
   options: {
-    includeStarterApps: boolean;
     finalize?: (path: string) => void;
-  },
+  } = {},
 ): string {
   const requestedPath = inspectWorkspaceForCreate(input);
   const rootAlreadyExisted = existsSync(requestedPath);
@@ -200,13 +197,6 @@ export function initializeWorkspaceDirectory(
       const entryPath = join(path, entry);
       mkdirSync(entryPath);
       createdEntries.push(entryPath);
-    }
-    if (options.includeStarterApps) {
-      cpSync(join(templatePath, "apps"), join(path, "apps"), {
-        recursive: true,
-        errorOnExist: true,
-        force: false,
-      });
     }
     options.finalize?.(path);
     return path;
