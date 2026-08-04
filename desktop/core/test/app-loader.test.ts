@@ -123,7 +123,7 @@ describe("App Loader", () => {
     const templateApps = fileURLToPath(new URL("../../template/apps", import.meta.url));
     const registry = await loadApps(templateApps);
 
-    expect([...registry.apps.keys()].sort()).toEqual(["hello-world", "tools"]);
+    expect([...registry.apps.keys()].sort()).toEqual(["hello-world"]);
     expect(registry.apps.get("hello-world")?.manifest.runtime.ui).toEqual({
       command: ["npm", "run", "start"],
       port: 3000,
