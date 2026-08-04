@@ -33,16 +33,9 @@ import {
   ConnectorScheduler,
   ConnectorLifecycleConflictError,
   ConnectorSupervisor,
-  currentConnectorPlatform,
-  hashConnectorPackage,
-  installConnectorFromSource,
   isDirectOAuthAuthType,
-  isPlatformSupported,
-  listAvailableBuiltIns,
   registerWorkspaceConnectors,
   removeConnectorFromWorkspace,
-  resolveWorkspaceConnectorDir,
-  updateConnectorFromSource,
 } from "./connectors";
 import {
   ConnectorAuthManager,
@@ -142,30 +135,17 @@ const authManager = new ConnectorAuthManager(
     lamarckSession: lamarckSessionManager,
   },
 );
-// Bundled packages become trusted only through their exact logical hashes.
-const builtinConnectorsDir = fileURLToPath(new URL("../../template/connectors", import.meta.url));
-const bundledConnectorCatalog = await listAvailableBuiltIns(builtinConnectorsDir, (dir, err) => {
-  const message = err instanceof Error ? err.message : String(err);
-  console.warn(`[lamarck] Skipping bundled connector ${dir}: ${message}`);
-});
-const officialConnectorCatalog = await Promise.all(bundledConnectorCatalog.map(async (entry) => ({
-  id: entry.manifest.id,
-  hash: await hashConnectorPackage(entry.dir),
-})));
 const connectorSupervisor = new ConnectorSupervisor({
   systemDb,
   guard,
   workspacePath,
   systemIdentity,
   producerDescriptorStore,
-  officialCatalog: officialConnectorCatalog,
   authManager,
   oauthRedirectUri,
   managedProviderAppOrigin,
   deviceIdentity,
 });
-// Installing a bundled entry remains an explicit action through the same
-// exact-hash admission flow as any other trusted package.
 const connectorManifests = await registerWorkspaceConnectors(connectorSupervisor, workspacePath, {
   skipInvalid: true,
   onError(connectorDir, err) {
@@ -871,83 +851,6 @@ const server = await serve<{ cwd: string }>({
           // Compatibility alias while callers migrate to the ownership model.
           connectors: sources,
           packages: connectorSupervisor.listInstalledConnectors(),
-        });
-      }
-
-      // Bundled catalog entries; installed reflects whether the package is
-      // currently registered in the workspace.
-      if (path === "/api/connectors/available" && method === "GET") {
-        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const platform = currentConnectorPlatform();
-        const entries = await listAvailableBuiltIns(builtinConnectorsDir, (dir, err) => {
-          const message = err instanceof Error ? err.message : String(err);
-          console.warn(`[lamarck] Skipping bundled connector ${dir}: ${message}`);
-        });
-        const installedById = new Map(
-          connectorSupervisor.listInstalledConnectors()
-            .map((connector) => [connector.connectorId, connector] as const),
-        );
-        const available = await Promise.all(entries.map(async (entry) => {
-          const installed = installedById.get(entry.manifest.id);
-          const catalogHash = await hashConnectorPackage(entry.dir);
-          const installedHash = installed
-            ? await hashConnectorPackage(
-                resolveWorkspaceConnectorDir(workspacePath, entry.manifest.id),
-              ).catch(() => installed.packageHash)
-            : undefined;
-          return {
-            connectorId: entry.manifest.id,
-            name: entry.manifest.name,
-            description: entry.manifest.description,
-            mode: entry.manifest.runtime.mode,
-            identityKind: entry.manifest.source.identity,
-            authType: entry.manifest.auth?.type ?? "none",
-            supported: isPlatformSupported(entry.manifest, platform),
-            installed: installed !== undefined,
-            catalogHash,
-            installedHash,
-            updateAvailable: installedHash !== undefined && installedHash !== catalogHash,
-          };
-        }));
-        return json({ available });
-      }
-
-      const installConnectorMatch = path.match(/^\/api\/connectors\/([^/]+)\/install$/);
-      if (installConnectorMatch && method === "POST") {
-        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const connectorId = decodeURIComponent(installConnectorMatch[1]);
-        const installed = await installConnectorFromSource({
-          sourceDir: join(builtinConnectorsDir, connectorId),
-          workspacePath,
-          connectorId,
-          guard,
-          supervisor: connectorSupervisor,
-        });
-        return json({ ok: true, manifest: installed.manifest });
-      }
-
-      const updateConnectorMatch = path.match(/^\/api\/connectors\/([^/]+)\/update$/);
-      if (updateConnectorMatch && method === "POST") {
-        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const connectorId = decodeURIComponent(updateConnectorMatch[1]);
-        const result = await updateConnectorFromSource({
-          sourceDir: join(builtinConnectorsDir, connectorId),
-          workspacePath,
-          connectorId,
-          supervisor: connectorSupervisor,
-          guard,
-        });
-        if (result.updated) {
-          connectorScheduler.tick().catch((err) => {
-            console.warn(`[lamarck] Connector scheduler tick after update failed: ${err}`);
-          });
-        }
-        return json({
-          ok: true,
-          updated: result.updated,
-          manifest: result.manifest,
-          fromHash: result.fromHash,
-          toHash: result.toHash,
         });
       }
 

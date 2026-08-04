@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState, type ReactElement } from "re
 import { AppMark } from "../components/AppMark";
 import { WorkspacePanel } from "../components/WorkspacePanel";
 import { ActivityView } from "../content/ActivityView";
-import { ConnectorCatalogView } from "../content/ConnectorCatalogView";
 import { ConnectorsView } from "../content/ConnectorsView";
 import { TableView } from "../content/TableView";
 import { appWorkloads } from "../lib/app-visual";
@@ -79,7 +78,6 @@ export function SystemRoom({
   const [snapshot, setSnapshot] = useState<SystemSnapshot>(EMPTY_SNAPSHOT);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [showConnectorCatalog, setShowConnectorCatalog] = useState(false);
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
@@ -130,7 +128,6 @@ export function SystemRoom({
   }, [coreStatus, refresh]);
 
   useEffect(() => {
-    setShowConnectorCatalog(false);
     setSelectedTable(null);
     setSelectedDocId(null);
     if (section !== "timeline") setSelectedEventId(null);
@@ -234,18 +231,7 @@ export function SystemRoom({
         )}
         {section === "sources" && (
           <div className={styles.fullSurface}>
-            {showConnectorCatalog ? (
-              <div className={styles.catalogSurface}>
-                <button type="button" className={styles.surfaceBack} onClick={() => setShowConnectorCatalog(false)}>
-                  <BackIcon /> Source console
-                </button>
-                <div className={styles.surfaceFill}>
-                  <ConnectorCatalogView onOpenConsole={() => setShowConnectorCatalog(false)} />
-                </div>
-              </div>
-            ) : (
-              <ConnectorsView onOpenCatalog={() => setShowConnectorCatalog(true)} />
-            )}
+            <ConnectorsView />
           </div>
         )}
         {section === "apps" && (

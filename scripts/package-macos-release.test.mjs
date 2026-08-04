@@ -55,6 +55,14 @@ import {
 } from "../desktop/core/src/device-identity/native/resource-path.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const APP_V1_SCAFFOLD_FILES = [
+  "index.html",
+  "index.tsx",
+  "main.tsx",
+  "package-lock.json",
+  "package.json",
+  "vite.config.ts",
+];
 const validEnvironment = {
   LAMARCK_CODESIGN_IDENTITY: "Developer ID Application: Lamarck Test (ABCDE12345)",
   LAMARCK_NOTARY_PROFILE: "lamarck-notary",
@@ -502,16 +510,45 @@ test("Desktop and macOS release outputs do not bundle an App System SDK copy", a
   assert.doesNotMatch(releasePackager, /electronResources, "system-sdk"/);
 });
 
+test("Desktop build and packaging checks own exactly the app-v1 scaffold files", async () => {
+  assert.deepEqual(
+    (await readdir(join(root, "desktop", "core", "scaffolds", "app-v1"))).sort(),
+    APP_V1_SCAFFOLD_FILES,
+  );
+
+  const [coreBuilder, electronBuilder, desktopBuilder, alphaPackager, releasePackager] =
+    await Promise.all([
+      readFile(join(root, "scripts", "build-core.mjs"), "utf8"),
+      readFile(join(root, "scripts", "build-electron-main.mjs"), "utf8"),
+      readFile(join(root, "scripts", "build-desktop.mjs"), "utf8"),
+      readFile(join(root, "scripts", "package-macos-alpha.mjs"), "utf8"),
+      readFile(join(root, "scripts", "package-macos-release.mjs"), "utf8"),
+    ]);
+  for (const builder of [coreBuilder, electronBuilder]) {
+    assert.match(builder, /scaffolds\/app-v1/);
+  }
+  assert.match(desktopBuilder, /APP_SCAFFOLD_FILES/);
+  assert.match(alphaPackager, /requireExactEntries\(scaffoldRoot, APP_SCAFFOLD_FILES/);
+  assert.match(releasePackager, /"packaged blank App scaffold"/);
+});
+
 test("macOS release source snapshot is exact, private, and excludes ambient output", async (t) => {
   const fixture = await createReleaseSourceFixture(t);
   await mkdir(join(fixture.repository, "node_modules"));
   await writeFile(join(fixture.repository, "node_modules", "ambient.js"), "untrusted\n");
   await mkdir(join(fixture.repository, "desktop", "shell", "dist"), { recursive: true });
   await writeFile(join(fixture.repository, "desktop", "shell", "dist", "stale.js"), "stale\n");
-  await mkdir(join(fixture.repository, "desktop", "template", ".lamarck"), { recursive: true });
+  await mkdir(join(fixture.repository, "apps", "ambient-official-app"), { recursive: true });
   await writeFile(
-    join(fixture.repository, "desktop", "template", ".lamarck", "system.db"),
-    "private host state\n",
+    join(fixture.repository, "apps", "ambient-official-app", "manifest.json"),
+    "official App must not enter Desktop inputs\n",
+  );
+  await mkdir(join(fixture.repository, "connectors", "ambient-official-connector"), {
+    recursive: true,
+  });
+  await writeFile(
+    join(fixture.repository, "connectors", "ambient-official-connector", "connector.yaml"),
+    "official Connector must not enter Desktop inputs\n",
   );
   const result = await createMacOsReleaseSourceSnapshot(
     fixture.repository,
@@ -547,9 +584,17 @@ test("macOS release source snapshot is exact, private, and excludes ambient outp
     readFile(join(fixture.snapshot, "desktop", "shell", "dist", "stale.js")),
     /ENOENT/,
   );
-  await assert.rejects(
-    readFile(join(fixture.snapshot, "desktop", "template", ".lamarck", "system.db")),
-    /ENOENT/,
+  await assert.rejects(readFile(
+    join(fixture.snapshot, "apps", "ambient-official-app", "manifest.json"),
+  ), /ENOENT/);
+  await assert.rejects(readFile(
+    join(fixture.snapshot, "connectors", "ambient-official-connector", "connector.yaml"),
+  ), /ENOENT/);
+  assert.equal(MACOS_RELEASE_SOURCE_DIRECTORIES.includes("desktop/template"), false);
+  assert.equal(MACOS_RELEASE_SOURCE_DIRECTORIES.includes("desktop/core/scaffolds/app-v1"), true);
+  assert.deepEqual(
+    (await readdir(join(fixture.snapshot, "desktop", "core", "scaffolds", "app-v1"))).sort(),
+    APP_V1_SCAFFOLD_FILES,
   );
 });
 
@@ -890,7 +935,13 @@ async function createReleaseSourceFixture(t, suffix = "source") {
   for (const relativeDirectory of MACOS_RELEASE_SOURCE_DIRECTORIES) {
     const directory = join(repository, relativeDirectory);
     await mkdir(directory, { recursive: true });
-    await writeFile(join(directory, "fixture.txt"), `${relativeDirectory}\n`);
+    if (relativeDirectory === "desktop/core/scaffolds/app-v1") {
+      for (const filename of APP_V1_SCAFFOLD_FILES) {
+        await writeFile(join(directory, filename), `${relativeDirectory}/${filename}\n`);
+      }
+    } else {
+      await writeFile(join(directory, "fixture.txt"), `${relativeDirectory}\n`);
+    }
   }
   return { repository, snapshot };
 }

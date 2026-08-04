@@ -546,46 +546,6 @@ export function listConnectors(): Promise<{
   return request("/api/connectors");
 }
 
-// Bundled catalog entries. Installing one is an explicit action through the
-// same flow as any other connector package; installed mirrors whether the
-// package is currently registered in the workspace.
-export interface AvailableConnectorView {
-  connectorId: string;
-  name: string;
-  description: string;
-  mode: "watch" | "poll" | "manual";
-  identityKind: ConnectorSourceIdentityKind;
-  authType: ConnectorAuthType;
-  supported: boolean;
-  installed: boolean;
-  catalogHash: string;
-  installedHash?: string;
-  updateAvailable: boolean;
-}
-
-export function listAvailableConnectors(): Promise<{ available: AvailableConnectorView[] }> {
-  return request("/api/connectors/available");
-}
-
-export function installConnector(connectorId: string): Promise<{ ok: true }> {
-  return request(`/api/connectors/${encodeURIComponent(connectorId)}/install`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
-}
-
-export function updateConnector(connectorId: string): Promise<{
-  ok: true;
-  updated: boolean;
-  fromHash: string;
-  toHash: string;
-}> {
-  return request(`/api/connectors/${encodeURIComponent(connectorId)}/update`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
-}
-
 export function approveConnector(connectorId: string): Promise<{ ok: true }> {
   return request(`/api/connectors/${encodeURIComponent(connectorId)}/approve`, {
     method: "POST",

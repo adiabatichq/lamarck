@@ -68,7 +68,7 @@ run("npm", ["run", "build"], {
 const distRoot = join(shellRoot, "dist");
 const electronOutRoot = join(shellRoot, "dist-electron");
 const nativeRoot = join(electronOutRoot, "native");
-const templateRoot = join(root, "desktop", "template");
+const scaffoldRoot = join(electronOutRoot, "scaffolds", "app-v1");
 const electronSourceApp = join(root, "node_modules", "electron", "dist", "Electron.app");
 const FIXED_ELECTRON_FILES = [
   "app-preload.cjs",
@@ -79,6 +79,14 @@ const FIXED_ELECTRON_FILES = [
   "preload.cjs",
   "pty-helper.cjs",
 ];
+const APP_SCAFFOLD_FILES = [
+  "index.html",
+  "index.tsx",
+  "main.tsx",
+  "package-lock.json",
+  "package.json",
+  "vite.config.ts",
+];
 
 await requireDirectory(distRoot, "renderer build output (npm run build)");
 await requireDirectory(nativeRoot, "capsule native staging (npm run capsule-guest:stage)");
@@ -87,7 +95,8 @@ await requireFile(
   "device identity native addon (npm run build)",
 );
 const guestRelease = await validateGuestRelease(join(nativeRoot, "capsule-guest"));
-await requireDirectory(templateRoot, "workspace template");
+await requireDirectory(scaffoldRoot, "blank App scaffold");
+await requireExactEntries(scaffoldRoot, APP_SCAFFOLD_FILES, "blank App scaffold");
 await requireDirectory(electronSourceApp, "Electron.app (node node_modules/electron/install.js)");
 await requireFile(appIconSource, "Lamarck app icon");
 for (const name of FIXED_ELECTRON_FILES) {
@@ -114,6 +123,7 @@ try {
 
   await rm(join(resources, "default_app.asar"), { force: true });
   await rm(join(resources, "electron.icns"), { force: true });
+  await rm(join(resources, "template"), { recursive: true, force: true });
   await cp(appIconSource, join(resources, "Lamarck.icns"));
   for (const key of [
     "ElectronAsarIntegrity",
@@ -145,12 +155,14 @@ try {
   for (const name of FIXED_ELECTRON_FILES) {
     await cp(join(electronOutRoot, name), join(electronResources, name));
   }
+  await cp(scaffoldRoot, join(electronResources, "scaffolds", "app-v1"), {
+    recursive: true,
+  });
   await cp(nativeRoot, join(electronResources, "native"), { recursive: true });
   assertDeviceIdentityNativeResourceLayout(
     electronResources,
     join(electronResources, "native"),
   );
-  await cp(templateRoot, join(resources, "template"), { recursive: true });
 
   // Runtime dependency closure: node-pty and its single runtime dependency,
   // shaped exactly like the release exportNodePtyRuntime() output.
@@ -237,6 +249,14 @@ async function requireDirectory(path, label) {
 async function requireFile(path, label) {
   const details = await stat(path).catch(() => null);
   if (!details?.isFile() || details.size < 1) throw new Error(`missing ${label}: ${path}`);
+}
+
+async function requireExactEntries(path, expected, label) {
+  const actual = (await readdir(path)).sort();
+  const wanted = [...expected].sort();
+  if (JSON.stringify(actual) !== JSON.stringify(wanted)) {
+    throw new Error(`${label} has unexpected entries: ${actual.join(", ")}`);
+  }
 }
 
 function utcStamp() {

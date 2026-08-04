@@ -25,9 +25,7 @@ import {
   startConnectorConfigPanel,
   startConnectorAuth,
   stopConnectorConfigPanelSession,
-  updateConnector,
   updateConnectorSource,
-  type AvailableConnectorView,
   type ConnectorSourceView,
   type InstalledConnectorView,
   type ConnectorRequirementView,
@@ -63,8 +61,10 @@ const PAUSE_PRESETS = [
   { label: "1 hour", durationMs: 60 * 60_000 },
 ] as const;
 
-export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }) {
-  const { sources, packages, available, loading, error, refresh } = useConnectors();
+const CONNECTOR_MARKETPLACE_URL = "https://app.lamarck.ai/connectors";
+
+export function ConnectorsView() {
+  const { sources, packages, loading, error, refresh } = useConnectors();
   const [busy, setBusy] = useState<Record<string, string>>({});
   const [authPending, setAuthPending] = useState<Record<string, AuthPendingAttempt>>({});
   const [actionError, setActionError] = useState<string | null>(null);
@@ -191,9 +191,6 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
 
   const groups = useMemo(() => {
     const byConnector = new Map<string, ConnectorSourceView[]>();
-    const catalogByConnector = new Map(
-      available.map((entry) => [entry.connectorId, entry]),
-    );
     for (const c of sources) {
       const list = byConnector.get(c.connectorId) ?? [];
       list.push(c);
@@ -202,9 +199,8 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
     return packages.map((connector) => ({
       connector,
       sources: byConnector.get(connector.connectorId) ?? [],
-      catalogEntry: catalogByConnector.get(connector.connectorId),
     }));
-  }, [sources, packages, available]);
+  }, [sources, packages]);
 
   const counts = useMemo(() => {
     const tally: Record<SourceLifecycle | "setup", number> = {
@@ -231,11 +227,12 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
           <TallyItem tone="paused" label="paused" count={counts.paused} />
           <TallyItem tone="setup" label="needs setup" count={counts.setup} />
         </div>
-        {onOpenCatalog && (
-          <button className={styles.ghostBtn} onClick={onOpenCatalog}>
-            Connector Catalog
-          </button>
-        )}
+        <button
+          className={styles.ghostBtn}
+          onClick={() => void window.lamarckHost?.openExternal(CONNECTOR_MARKETPLACE_URL)}
+        >
+          Open Marketplace
+        </button>
       </header>
 
       {(error || actionError) && (
@@ -257,15 +254,12 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
           <div className={styles.empty}>
             <span className={styles.emptyGlyph}>⌀</span>
             <span>no Connectors installed</span>
-            {onOpenCatalog ? (
-              <button className={styles.ghostBtn} onClick={onOpenCatalog}>
-                Browse Connector Catalog
-              </button>
-            ) : (
-              <span className={styles.emptyHint}>
-                install a connector package into workspace/connectors/
-              </span>
-            )}
+            <button
+              className={styles.ghostBtn}
+              onClick={() => void window.lamarckHost?.openExternal(CONNECTOR_MARKETPLACE_URL)}
+            >
+              Open Marketplace
+            </button>
           </div>
         ) : (
           groups.map((group, index) => (
@@ -273,7 +267,6 @@ export function ConnectorsView({ onOpenCatalog }: { onOpenCatalog?: () => void }
               key={group.connector.connectorId}
               connector={group.connector}
               sources={group.sources}
-              catalogEntry={group.catalogEntry}
               index={index}
               busy={busy}
               authPending={authPending}
@@ -327,7 +320,6 @@ function TallyItem({
 interface ConnectorCardProps {
   connector: InstalledConnectorView;
   sources: ConnectorSourceView[];
-  catalogEntry?: AvailableConnectorView;
   index: number;
   busy: Record<string, string>;
   authPending: Record<string, AuthPendingAttempt>;
@@ -340,7 +332,6 @@ interface ConnectorCardProps {
 function ConnectorCard({
   connector,
   sources,
-  catalogEntry,
   index,
   busy,
   authPending,
@@ -350,7 +341,6 @@ function ConnectorCard({
   onDismissAuthAttempt,
 }: ConnectorCardProps) {
   const connectorId = connector.connectorId;
-  const updateAvailable = catalogEntry?.updateAvailable === true;
   const trust = trustView(connector);
   const trusted = trust === "official" || trust === "custom";
   const interactive = connector.supported && trust !== "broken";
@@ -369,32 +359,20 @@ function ConnectorCard({
       ? !sources.some((sourceRecord) => sourceRunsHere(sourceRecord))
       : sources.length === 0);
 
-  const [panel, setPanel] = useState<"approve" | "update" | "remove" | "add" | null>(null);
+  const [panel, setPanel] = useState<"approve" | "remove" | "add" | null>(null);
   const [addNameInput, setAddNameInput] = useState("");
-
-  useEffect(() => {
-    if (panel === "update" && !updateAvailable) {
-      setPanel(null);
-    }
-  }, [panel, updateAvailable]);
 
   return (
     <article
-      className={`${styles.card} ${
-        updateAvailable && connectorCondition === "ready"
-          ? styles.card_update
-          : styles[`card_${connectorCondition}`]
-      }`}
+      className={`${styles.card} ${styles[`card_${connectorCondition}`]}`}
       style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
     >
       <div className={styles.cardRail} />
       <div className={styles.cardBody}>
         <div className={styles.cardTop}>
-          <span className={`${styles.stateBadge} ${
-            updateAvailable ? styles.tone_setup : styles.tone_ready
-          }`}>
+          <span className={`${styles.stateBadge} ${styles.tone_ready}`}>
             <span className={styles.stateDot} />
-            {updateAvailable ? "UPDATE AVAILABLE" : "INSTALLED"}
+            INSTALLED
           </span>
           <h2 className={styles.cardName}>{connector.name}</h2>
           <span className={styles.cardMeta}>
@@ -408,11 +386,6 @@ function ConnectorCard({
             {trust === "broken" && <span className={styles.brokenSeal}>missing</span>}
           </span>
           <div className={styles.cardTopActions}>
-            {updateAvailable && panel !== "update" && (
-              <button className={styles.primaryBtn} onClick={() => setPanel("update")}>
-                Update connector…
-              </button>
-            )}
             {trust === "needs-approval" && panel !== "approve" && (
               <button className={styles.hazardBtn} onClick={() => setPanel("approve")}>
                 Review &amp; Approve
@@ -440,48 +413,6 @@ function ConnectorCard({
             )}
           </div>
         </div>
-
-        {panel === "update" && catalogEntry && (
-          <div className={styles.confirmPanel}>
-            <div className={styles.confirmText}>
-              Update <strong>{connector.name}</strong> from{" "}
-              <code>{shortHash(catalogEntry.installedHash ?? connector.packageHash)}</code>
-              {" → "}<code>{shortHash(catalogEntry.catalogHash)}</code>?
-              {sources.length === 1 ? (
-                <>
-                  {" "}Its Source keeps its account, settings, schedule, pause policy, and sync
-                  progress.
-                </>
-              ) : sources.length > 1 ? (
-                <>
-                  {" "}All {sources.length} Sources keep their accounts, settings, schedules,
-                  pause policies, and sync progress.
-                </>
-              ) : (
-                <> The installed package will be replaced; no Sources are configured yet.</>
-              )}{" "}
-              Active runs stop during the package switch, and validation failure restores the
-              installed revision. A custom package may require approval again for its new hash.
-            </div>
-            <div className={styles.confirmActions}>
-              <button
-                className={styles.primaryBtn}
-                disabled={Boolean(busy[connectorId])}
-                onClick={() =>
-                  onAct(connectorId, "update", async () => {
-                    await updateConnector(connectorId);
-                    setPanel(null);
-                  })
-                }
-              >
-                {busy[connectorId] === "update" ? "updating…" : "Update connector"}
-              </button>
-              <button className={styles.ghostBtn} onClick={() => setPanel(null)}>
-                Cancel
-              </button>
-            </div>
-          </div>
-        )}
 
         {panel === "approve" && (
           <div className={styles.confirmPanel}>
@@ -1410,11 +1341,6 @@ function clearAuthPendingAttempt(
   const next = { ...attempts };
   delete next[sourceId];
   return next;
-}
-
-function shortHash(hash: string | undefined): string {
-  if (!hash) return "unknown";
-  return hash.startsWith("sha256:") ? hash.slice(7, 19) : hash.slice(0, 12);
 }
 
 interface RequirementChipProps {

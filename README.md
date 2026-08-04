@@ -196,14 +196,15 @@ The full contracts live in the technical docs:
 
 ```text
 lamarck/
+├── apps/                  Official Marketplace App source packages
+├── connectors/            Official Marketplace Connector source packages
 ├── desktop/
 │   ├── capsule/           Guest protocol, OCI policy, and isolation model
 │   ├── capsule-guest/     Buildroot Guest image and in-guest supervisor
 │   ├── capsule-vm-macos/  macOS VM host helper
-│   ├── core/              Core, Guard, connectors, credentials, CLI
+│   ├── core/              Core, Guard, local App scaffold, connectors, CLI
 │   ├── shell/             Electron + React desktop shell
 │   ├── system-sdk/        Browser and Node app SDK
-│   └── template/          Starter workspace, apps, and connectors
 ├── scripts/               Build, verification, packaging, release
 └── .github/               Public CI and package publishing
 ```

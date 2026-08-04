@@ -9,7 +9,6 @@ vi.mock("../hooks/useConnectors", () => ({
   useConnectors: mocks.useConnectors,
 }));
 
-import { ConnectorCatalogView } from "./ConnectorCatalogView";
 import { ConnectorsView } from "./ConnectorsView";
 import type { ConnectorSourceView } from "../lib/api";
 
@@ -22,33 +21,6 @@ const installedConnector = {
   supported: true,
   packageTrust: "official" as const,
   packageHash: "sha256:installed-package",
-};
-
-const updateCandidate = {
-  connectorId: "github",
-  name: "GitHub",
-  description: "GitHub activity.",
-  mode: "poll" as const,
-  identityKind: "connector" as const,
-  authType: "managedProvider" as const,
-  supported: true,
-  installed: true,
-  catalogHash: "sha256:catalog-package",
-  installedHash: "sha256:installed-package",
-  updateAvailable: true,
-};
-
-const installCandidate = {
-  connectorId: "google-calendar",
-  name: "Google Calendar",
-  description: "Calendar activity.",
-  mode: "poll" as const,
-  identityKind: "connector" as const,
-  authType: "oauth2-public" as const,
-  supported: true,
-  installed: false,
-  catalogHash: "sha256:calendar-package",
-  updateAvailable: false,
 };
 
 const identitySource: ConnectorSourceView = {
@@ -83,38 +55,27 @@ describe("Connector surface responsibilities", () => {
     mocks.useConnectors.mockReturnValue({
       sources: [],
       packages: [installedConnector],
-      available: [updateCandidate, installCandidate],
       loading: false,
       error: null,
       refresh: vi.fn(),
     });
   });
 
-  test("keeps installed Connector lifecycle actions out of the Catalog", () => {
-    const markup = renderToStaticMarkup(
-      <ConnectorCatalogView onOpenConsole={() => {}} />,
-    );
-
-    expect(markup).toContain("UPDATE AVAILABLE");
-    expect(markup).toContain("Install connector");
-    expect(markup).toContain("Manage in Source Console");
-    expect(markup).not.toContain("Update connector");
-    expect(markup).not.toContain("Add source");
-    expect(markup).not.toContain("Remove connector");
-  });
-
-  test("offers available package updates from the Source Console", () => {
+  test("keeps installed management and delegates discovery to Marketplace", () => {
     const markup = renderToStaticMarkup(<ConnectorsView />);
 
-    expect(markup).toContain("UPDATE AVAILABLE");
-    expect(markup).toContain("Update connector…");
+    expect(markup).toContain("Open Marketplace");
+    expect(markup).toContain("INSTALLED");
+    expect(markup).toContain("Add source");
+    expect(markup).toContain("Remove connector");
+    expect(markup).not.toContain("UPDATE AVAILABLE");
+    expect(markup).not.toContain("Connector Catalog");
   });
 
   test("shows Source identity, ownership, conflict, rename, and retry controls", () => {
     mocks.useConnectors.mockReturnValue({
       sources: [identitySource],
       packages: [installedConnector],
-      available: [updateCandidate],
       loading: false,
       error: null,
       refresh: vi.fn(),
@@ -143,7 +104,6 @@ describe("Connector surface responsibilities", () => {
         setupPending: [],
       }],
       packages: [installedConnector],
-      available: [],
       loading: false,
       error: null,
       refresh: vi.fn(),

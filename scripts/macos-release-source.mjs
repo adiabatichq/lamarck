@@ -52,10 +52,10 @@ export const MACOS_RELEASE_SOURCE_DIRECTORIES = Object.freeze([
   "desktop/capsule/src",
   "desktop/capsule-vm-macos/Sources",
   "desktop/core/src",
+  "desktop/core/scaffolds/app-v1",
   "desktop/shell/electron",
   "desktop/shell/src",
   "desktop/system-sdk/src",
-  "desktop/template",
 ]);
 
 const MAX_SOURCE_FILES = 20_000;
@@ -388,14 +388,8 @@ async function collectFiles(repository, relativeDirectory, result) {
   }
 }
 
-function isExcludedSourcePath(relativePath) {
-  const templatePrefix = "desktop/template/";
-  if (!relativePath.startsWith(templatePrefix)) return false;
-  const templateRelativePath = relativePath.slice(templatePrefix.length);
-  const topLevel = templateRelativePath.split("/")[0] ?? "";
-  // Template source is user-facing content only. Host-managed or ambient
-  // hidden state is created at runtime and must never become a release input.
-  return topLevel.startsWith(".");
+function isExcludedSourcePath(_relativePath) {
+  return false;
 }
 
 async function describeStableSourceFile(path) {

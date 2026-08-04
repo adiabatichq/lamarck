@@ -481,12 +481,15 @@ async function assembleApplication(
       join(electronResources, name),
     );
   }
+  await copyRealTree(
+    join(shellBuildExport, "dist-electron", "scaffolds"),
+    join(electronResources, "scaffolds"),
+  );
   await copyRealTree(nativeRoot, join(electronResources, "native"));
   assertDeviceIdentityNativeResourceLayout(
     electronResources,
     join(electronResources, "native"),
   );
-  await copyRealTree(join(sourceSnapshotRoot, "desktop", "template"), join(resources, "template"));
 }
 
 async function validatePackagedApplication(appPath, releaseConfig) {
@@ -509,10 +512,21 @@ async function validatePackagedApplication(appPath, releaseConfig) {
     "native",
     "preload.cjs",
     "pty-helper.cjs",
+    "scaffolds",
   ], "packaged Electron resources");
   assertDeviceIdentityNativeResourceLayout(
     electronResources,
     join(electronResources, "native"),
+  );
+  assertExactList(
+    await sortedEntries(join(electronResources, "scaffolds")),
+    ["app-v1"],
+    "packaged scaffold collection",
+  );
+  assertExactList(
+    await sortedEntries(join(electronResources, "scaffolds", "app-v1")),
+    ["index.html", "index.tsx", "main.tsx", "package-lock.json", "package.json", "vite.config.ts"],
+    "packaged blank App scaffold",
   );
   const expectedPackage = {
     name: "@lamarck/shell",
@@ -560,7 +574,9 @@ async function validatePackagedApplication(appPath, releaseConfig) {
   await requireRealFile(join(resources, "Lamarck.icns"), "packaged Lamarck app icon");
   await requireAbsent(join(resources, "electron.icns"), "Electron default app icon");
   await requireAbsent(join(resources, "default_app.asar"), "Electron default app archive");
-  await requireRealDirectory(join(resources, "template"), "packaged workspace template");
+  await requireAbsent(join(resources, "template"), "obsolete packaged workspace template");
+  await requireAbsent(join(resources, "apps"), "official App collection in Desktop resources");
+  await requireAbsent(join(resources, "connectors"), "official Connector collection in Desktop resources");
   assertExactList(
     (await readdir(join(appPath, "Contents", "Frameworks"), { withFileTypes: true }))
       .filter((entry) => entry.isDirectory() && entry.name.endsWith(".app"))
