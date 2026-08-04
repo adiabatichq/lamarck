@@ -15,12 +15,16 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     throw new Error("Usage: node scripts/update-system-sdk-consumers.mjs <stable-version>");
   }
   const release = await fetchPublishedRelease(version);
+  const consumerDirectories = await discoverConsumerDirectories({
+    appsDirectory: join(root, "apps"),
+    scaffoldDirectory: join(root, "desktop", "core", "scaffolds", "app-v1"),
+  });
   const changed = await updateConsumerLocks({
-    appsDirectory: join(root, "desktop", "template", "apps"),
+    consumerDirectories,
     release,
   });
   if (changed.length === 0) {
-    process.stdout.write(`First-party starter locks already use @lamarck/system ${version}\n`);
+    process.stdout.write(`First-party App consumer locks already use @lamarck/system ${version}\n`);
   } else {
     process.stdout.write(`Updated @lamarck/system ${version} in:\n${changed.join("\n")}\n`);
   }
@@ -48,7 +52,7 @@ export async function fetchPublishedRelease(version, fetchImpl = fetch) {
     throw new Error(`npm registry returned invalid @lamarck/system ${version} metadata`);
   }
   if (metadata.dependencies && Object.keys(metadata.dependencies).length > 0) {
-    throw new Error("Starter lock updater requires @lamarck/system to have no runtime dependencies");
+    throw new Error("App consumer lock updater requires @lamarck/system to have no runtime dependencies");
   }
   return {
     version,
@@ -58,17 +62,31 @@ export async function fetchPublishedRelease(version, fetchImpl = fetch) {
   };
 }
 
-export async function updateConsumerLocks({ appsDirectory, release }) {
-  validateRelease(release);
-  const appIds = (await readdir(appsDirectory, { withFileTypes: true }))
+export async function discoverConsumerDirectories({ appsDirectory, scaffoldDirectory }) {
+  let entries;
+  try {
+    entries = await readdir(appsDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (!isNodeError(error, "ENOENT")) throw error;
+    entries = [];
+  }
+  const appDirectories = entries
     .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
+    .map((entry) => join(appsDirectory, entry.name))
     .sort();
-  if (appIds.length < 1) throw new Error("No first-party starter Apps found");
+  return [...appDirectories, scaffoldDirectory];
+}
+
+export async function updateConsumerLocks({ consumerDirectories, release }) {
+  validateRelease(release);
+  if (!Array.isArray(consumerDirectories) || consumerDirectories.length < 1) {
+    throw new Error("No first-party App consumers found");
+  }
 
   const updates = [];
-  for (const appId of appIds) {
-    const appDirectory = join(appsDirectory, appId);
+  for (const appDirectory of consumerDirectories) {
+    const appId = appDirectory.split(/[\\/]/).at(-1);
+    if (!appId) throw new Error("Invalid App consumer directory");
     const packageDocument = await readJson(join(appDirectory, "package.json"));
     const lockPath = join(appDirectory, "package-lock.json");
     const lock = await readJson(lockPath);
@@ -123,6 +141,10 @@ function isSha512Integrity(value) {
 
 function isStableVersion(value) {
   return typeof value === "string" && stableVersionPattern.test(value);
+}
+
+function isNodeError(error, code) {
+  return error instanceof Error && "code" in error && error.code === code;
 }
 
 function stableVersionSatisfiesCaret(version, range) {

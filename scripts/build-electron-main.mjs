@@ -1,4 +1,4 @@
-import { cp, mkdir } from "node:fs/promises";
+import { cp, mkdir, rm } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
@@ -18,6 +18,7 @@ const buildIdentity = await resolveBuildSystemIdentity({ root });
 const buildIdentityDefine = systemIdentityEsbuildDefine(buildIdentity);
 
 await mkdir(outDir, { recursive: true });
+await rm(resolve(outDir, "scaffolds"), { recursive: true, force: true });
 await esbuild.build({
   entryPoints: [resolve(shellDir, "electron/main.ts")],
   outfile: resolve(outDir, "main.cjs"),
@@ -69,6 +70,11 @@ await esbuild.build({
 });
 await cp(resolve(shellDir, "electron/preload.cjs"), resolve(outDir, "preload.cjs"));
 await cp(resolve(coreDir, "src/pty-helper.cjs"), resolve(outDir, "pty-helper.cjs"));
+await cp(
+  resolve(coreDir, "scaffolds/app-v1"),
+  resolve(outDir, "scaffolds/app-v1"),
+  { recursive: true, force: false, errorOnExist: true },
+);
 await buildDeviceIdentityNative({
   bundleDirectory: outDir,
   nativeRoot: resolve(outDir, "native"),

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-import { readdir, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
+import { discoverConsumerDirectories } from "./update-system-sdk-consumers.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const stableVersionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
@@ -16,18 +17,18 @@ if (corePackage.dependencies?.["@lamarck/system"] !== sdkPackage.version) {
   violations.push(`desktop/core must depend on exact @lamarck/system ${sdkPackage.version}`);
 }
 
-const appsDirectory = join(root, "desktop", "template", "apps");
-const appIds = (await readdir(appsDirectory, { withFileTypes: true }))
-  .filter((entry) => entry.isDirectory())
-  .map((entry) => entry.name)
-  .sort();
-if (appIds.length < 1) violations.push("repository has no first-party App consumers to verify");
+const appsDirectory = join(root, "apps");
+const appDirectories = await discoverConsumerDirectories({
+  appsDirectory,
+  scaffoldDirectory: join(root, "desktop", "core", "scaffolds", "app-v1"),
+});
+if (appDirectories.length < 1) violations.push("repository has no first-party App consumers to verify");
 
 let canonicalRange;
 let canonicalEntry;
 let canonicalAppId;
-for (const appId of appIds) {
-  const appDirectory = join(appsDirectory, appId);
+for (const appDirectory of appDirectories) {
+  const appId = appDirectory.split(/[\\/]/).at(-1);
   const appPackage = await readJson(join(appDirectory, "package.json"));
   const lock = await readJson(join(appDirectory, "package-lock.json"));
   const declaredRange = appPackage.dependencies?.["@lamarck/system"];
@@ -63,7 +64,7 @@ if (violations.length > 0) {
 }
 
 process.stdout.write(
-  `Core uses @lamarck/system ${sdkPackage.version}; ${appIds.length} starter Apps share ${canonicalRange}\n`,
+  `Core uses @lamarck/system ${sdkPackage.version}; ${appDirectories.length} App consumers share ${canonicalRange}\n`,
 );
 
 function isCanonicalCaretRange(value) {

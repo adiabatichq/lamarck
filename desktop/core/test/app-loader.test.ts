@@ -17,7 +17,6 @@ import {
 import { open } from "fs/promises";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
-import { fileURLToPath } from "url";
 
 describe("App Loader", () => {
   let workspace: string;
@@ -180,17 +179,6 @@ describe("App Loader", () => {
     }));
     expect((await loadApps(appsDir)).apps.get("authority")?.manifestDigest)
       .not.toBe(first.manifestDigest);
-  });
-
-  test("keeps bundled App templates valid under the V1 loader", async () => {
-    const templateApps = fileURLToPath(new URL("../../template/apps", import.meta.url));
-    const registry = await loadApps(templateApps);
-
-    expect([...registry.apps.keys()].sort()).toEqual(["hello-world"]);
-    expect(registry.apps.get("hello-world")?.manifest.runtime.ui).toEqual({
-      command: ["npm", "run", "start"],
-      port: 3000,
-    });
   });
 
   test("builds stable workload sources from validated ids", () => {

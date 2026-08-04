@@ -1,4 +1,4 @@
-import { cp, mkdir } from "node:fs/promises";
+import { cp, mkdir, rm } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
@@ -16,6 +16,7 @@ const outDir = resolve(coreDir, "dist");
 const buildIdentity = await resolveBuildSystemIdentity({ root });
 
 await mkdir(outDir, { recursive: true });
+await rm(resolve(outDir, "scaffolds"), { recursive: true, force: true });
 
 const common = {
   bundle: true,
@@ -52,6 +53,11 @@ await Promise.all([
     format: "esm",
   }),
   cp(resolve(coreDir, "src/pty-helper.cjs"), resolve(outDir, "pty-helper.cjs")),
+  cp(
+    resolve(coreDir, "scaffolds/app-v1"),
+    resolve(outDir, "scaffolds/app-v1"),
+    { recursive: true, force: false, errorOnExist: true },
+  ),
   buildDeviceIdentityNative({
     bundleDirectory: outDir,
     nativeRoot: resolve(outDir, "native"),

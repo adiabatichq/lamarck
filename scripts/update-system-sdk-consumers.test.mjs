@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { fetchPublishedRelease, updateConsumerLocks } from "./update-system-sdk-consumers.mjs";
+import {
+  discoverConsumerDirectories,
+  fetchPublishedRelease,
+  updateConsumerLocks,
+} from "./update-system-sdk-consumers.mjs";
 
 const release = {
   version: "0.1.1",
@@ -13,12 +17,13 @@ const release = {
   engines: { node: ">=24.10.0" },
 };
 
-test("updates every compatible starter lock from one registry release", async (t) => {
-  const appsDirectory = await createApps(t, ["hello-world", "tools"]);
-  const changed = await updateConsumerLocks({ appsDirectory, release });
+test("updates every compatible App consumer lock from one registry release", async (t) => {
+  const appsDirectory = await createApps(t, ["calendar", "journal"]);
+  const consumerDirectories = ["calendar", "journal"].map((id) => join(appsDirectory, id));
+  const changed = await updateConsumerLocks({ consumerDirectories, release });
   assert.equal(changed.length, 2);
 
-  for (const appId of ["hello-world", "tools"]) {
+  for (const appId of ["calendar", "journal"]) {
     const lock = await readJson(join(appsDirectory, appId, "package-lock.json"));
     assert.deepEqual(lock.packages["node_modules/@lamarck/system"], {
       version: release.version,
@@ -28,29 +33,41 @@ test("updates every compatible starter lock from one registry release", async (t
     });
   }
 
-  assert.deepEqual(await updateConsumerLocks({ appsDirectory, release }), []);
+  assert.deepEqual(await updateConsumerLocks({ consumerDirectories, release }), []);
 });
 
 test("rejects an incompatible release without partially rewriting locks", async (t) => {
-  const appsDirectory = await createApps(t, ["hello-world", "tools"]);
-  const toolsPackagePath = join(appsDirectory, "tools", "package.json");
-  const toolsLockPath = join(appsDirectory, "tools", "package-lock.json");
-  const toolsPackage = await readJson(toolsPackagePath);
-  const toolsLock = await readJson(toolsLockPath);
-  toolsPackage.dependencies["@lamarck/system"] = "^0.2.0";
-  toolsLock.packages[""].dependencies["@lamarck/system"] = "^0.2.0";
-  await writeFile(toolsPackagePath, `${JSON.stringify(toolsPackage, null, 2)}\n`);
-  await writeFile(toolsLockPath, `${JSON.stringify(toolsLock, null, 2)}\n`);
-  const before = await readFile(join(appsDirectory, "hello-world", "package-lock.json"), "utf8");
+  const appsDirectory = await createApps(t, ["calendar", "journal"]);
+  const journalPackagePath = join(appsDirectory, "journal", "package.json");
+  const journalLockPath = join(appsDirectory, "journal", "package-lock.json");
+  const journalPackage = await readJson(journalPackagePath);
+  const journalLock = await readJson(journalLockPath);
+  journalPackage.dependencies["@lamarck/system"] = "^0.2.0";
+  journalLock.packages[""].dependencies["@lamarck/system"] = "^0.2.0";
+  await writeFile(journalPackagePath, `${JSON.stringify(journalPackage, null, 2)}\n`);
+  await writeFile(journalLockPath, `${JSON.stringify(journalLock, null, 2)}\n`);
+  const before = await readFile(join(appsDirectory, "calendar", "package-lock.json"), "utf8");
 
   await assert.rejects(
-    updateConsumerLocks({ appsDirectory, release }),
+    updateConsumerLocks({
+      consumerDirectories: ["calendar", "journal"].map((id) => join(appsDirectory, id)),
+      release,
+    }),
     /does not declare a compatible SDK range/,
   );
   assert.equal(
-    await readFile(join(appsDirectory, "hello-world", "package-lock.json"), "utf8"),
+    await readFile(join(appsDirectory, "calendar", "package-lock.json"), "utf8"),
     before,
   );
+});
+
+test("treats a missing Official App collection as an empty collection", async (t) => {
+  const fixtureRoot = await createApps(t, ["app-v1"]);
+  const scaffoldDirectory = join(fixtureRoot, "app-v1");
+  assert.deepEqual(await discoverConsumerDirectories({
+    appsDirectory: join(fixtureRoot, "absent-apps"),
+    scaffoldDirectory,
+  }), [scaffoldDirectory]);
 });
 
 test("accepts exact dependency-free npm registry metadata", async () => {

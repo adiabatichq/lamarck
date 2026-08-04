@@ -29,6 +29,14 @@ const GENERATED_HOST_PATHS = [
   "app-preload.cjs",
   "pty-helper.cjs",
 ];
+const APP_SCAFFOLD_FILES = [
+  "index.html",
+  "index.tsx",
+  "main.tsx",
+  "package-lock.json",
+  "package.json",
+  "vite.config.ts",
+];
 
 export async function buildDesktop(options = {}) {
   const context = buildContext(options);
@@ -75,6 +83,10 @@ async function cleanHostOutputs(context) {
     recursive: true,
     force: true,
   });
+  await rm(join(context.shellDir, "dist-electron", "scaffolds"), {
+    recursive: true,
+    force: true,
+  });
   await Promise.all(GENERATED_HOST_PATHS.map((name) =>
     rm(join(context.shellDir, "dist-electron", name), { force: true })
   ));
@@ -106,6 +118,7 @@ function hostOutputPaths(context) {
   const outputRoot = join(context.shellDir, "dist-electron");
   return [
     ...GENERATED_HOST_PATHS.map((name) => join(outputRoot, name)),
+    ...APP_SCAFFOLD_FILES.map((name) => join(outputRoot, "scaffolds", "app-v1", name)),
     ...(deviceIdentityNativeRequired(context.platform)
       ? [deviceIdentityNativeAddonPath(join(outputRoot, "native"))]
       : []),

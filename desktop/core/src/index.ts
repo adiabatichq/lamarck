@@ -72,7 +72,7 @@ import {
   isDeclaredWorkload,
   parseRequestedWorkload,
 } from "./app-runtime-policy";
-import { createAppPackageJson, createAppPackageLock } from "./app-scaffold";
+import { instantiateBlankApp } from "./app-scaffold";
 import { PACKAGE_ID_PATTERN } from "./package-id";
 import { APP_MANIFEST_DIGEST_PATTERN } from "../../capsule/src/app-manifest-authority";
 import { resolveDeviceIdentity } from "./device-identity";
@@ -92,6 +92,7 @@ const workspacePath = resolve(process.argv[2] || process.cwd());
 const pagesDir = join(workspacePath, "pages");
 const appsDir = join(workspacePath, "apps");
 const lamarckDir = join(workspacePath, ".lamarck");
+const appScaffoldDir = fileURLToPath(new URL("./scaffolds/app-v1/", import.meta.url));
 const authSecrets: AuthSecrets = {
   coreToken: requireSecret("LAMARCK_CORE_TOKEN"),
 };
@@ -1273,7 +1274,7 @@ const server = await serve<{ cwd: string }>({
 
       // -- Create App --
       if (path === "/api/apps" && method === "POST") {
-        const body = await readBody<{ id: string; name?: string; description: string }>(req);
+        const body = await readBody<{ id?: unknown; name?: unknown; description?: unknown }>(req);
         const id = body.id;
 
         if (typeof id !== "string" || !PACKAGE_ID_PATTERN.test(id)) {
@@ -1299,58 +1300,14 @@ const server = await serve<{ cwd: string }>({
         }
         const description = body.description;
 
-        const appDir = join(appsDir, id);
-        await mkdir(appDir, { recursive: true });
-
-        const manifest = {
-          manifestVersion: 1,
+        await instantiateBlankApp({
+          appsDir,
+          scaffoldDir: appScaffoldDir,
           id,
           name,
           description,
-          runtime: {
-            ui: {
-              command: ["npm", "run", "start"],
-              port: 3000,
-            },
-          },
-          permissions: {
-            writes: {
-              docs: [],
-              tables: [],
-            },
-          },
-        };
-        await writeFile(
-          join(appDir, "package.json"),
-          createAppPackageJson(id),
-        );
-        await writeFile(join(appDir, "package-lock.json"), createAppPackageLock(id));
-        await writeFile(
-          join(appDir, "vite.config.ts"),
-          `import { defineConfig } from "vite";\nimport react from "@vitejs/plugin-react";\n\nexport default defineConfig({ plugins: [react()] });\n`,
-        );
-        await writeFile(
-          join(appDir, "index.tsx"),
-          `import React from "react";\n\nconst appName = ${JSON.stringify(name)};\n\nexport default function App() {\n  return <div>{appName}</div>;\n}\n`,
-        );
-        await writeFile(
-          join(appDir, "main.tsx"),
-          `import { StrictMode } from "react";\nimport { createRoot } from "react-dom/client";\nimport App from "./index";\n\nconst root = document.getElementById("root");\nif (!root) throw new Error("Missing #root element");\ncreateRoot(root).render(<StrictMode><App /></StrictMode>);\n`,
-        );
-        await writeFile(
-          join(appDir, "index.html"),
-          `<!doctype html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>${escapeHtml(name)}</title>\n  </head>\n  <body>\n    <div id="root"></div>\n    <script type="module" src="/main.tsx"></script>\n  </body>\n</html>\n`,
-        );
-        try {
-          await runProcess("git", ["init"], appDir);
-        } catch (err) {
-          console.warn(`[lamarck] Could not initialize git for ${id}:`, err);
-        }
-
-        // Publish the authority-bearing manifest last. A failed composition
-        // therefore remains invisible rather than exposing a valid manifest
-        // whose runtime files are only partially written.
-        await writeFile(join(appDir, "manifest.json"), JSON.stringify(manifest, null, 2));
+          initializeGit: (dir) => runProcess("git", ["init", "--quiet"], dir),
+        });
 
         // Reloading invalidates every channel issued from the prior manifest
         // generation before the new App becomes visible.

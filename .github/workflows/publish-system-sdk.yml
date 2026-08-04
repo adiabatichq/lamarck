@@ -84,17 +84,17 @@ jobs:
           test "$(node --version)" = "v24.18.0"
           test "$(npm --version)" = "11.16.0"
 
-      - name: Refresh first-party starter locks
+      - name: Refresh first-party App consumer locks
         id: refresh
         run: |
           version="${GITHUB_REF_NAME#system-sdk-v}"
           node scripts/update-system-sdk-consumers.mjs "$version"
           npm run verify:system-sdk-consumers
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if git diff --quiet -- desktop/template/apps; then
+          if git diff --quiet -- apps desktop/core/scaffolds/app-v1/package-lock.json; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            git diff --check -- desktop/template/apps
+            git diff --check -- apps desktop/core/scaffolds/app-v1/package-lock.json
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -105,7 +105,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SDK_VERSION: ${{ steps.refresh.outputs.version }}
         run: |
-          existing_pr="$(gh pr list --state open --base main --search "Update starter Apps for @lamarck/system ${SDK_VERSION} in:title" --json number --jq '.[0].number // empty')"
+          existing_pr="$(gh pr list --state open --base main --search "Update App consumers for @lamarck/system ${SDK_VERSION} in:title" --json number --jq '.[0].number // empty')"
           if test -n "$existing_pr"; then
             echo "A downstream PR already exists: #$existing_pr"
             exit 0
@@ -114,18 +114,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git add -- desktop/template/apps
+          git add -- apps desktop/core/scaffolds/app-v1/package-lock.json
           git diff --cached --name-only | while IFS= read -r path; do
             case "$path" in
-              desktop/template/apps/*/package-lock.json) ;;
+              apps/*/package-lock.json|desktop/core/scaffolds/app-v1/package-lock.json) ;;
               *) echo "Unexpected downstream change: $path" >&2; exit 1 ;;
             esac
           done
-          git commit -m "Update starter Apps for @lamarck/system ${SDK_VERSION}"
+          git commit -m "Update App consumers for @lamarck/system ${SDK_VERSION}"
           git push --set-upstream origin "$branch"
           gh pr create \
             --base main \
             --head "$branch" \
-            --title "Update starter Apps for @lamarck/system ${SDK_VERSION}" \
-            --body "Updates first-party starter lockfiles from the npm registry bytes verified by the system-sdk-v${SDK_VERSION} publication workflow."
+            --title "Update App consumers for @lamarck/system ${SDK_VERSION}" \
+            --body "Updates the official App and blank-App scaffold lockfiles from the npm registry bytes verified by the system-sdk-v${SDK_VERSION} publication workflow."
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
