@@ -1,0 +1,39 @@
+{
+  "format": "lamarck-marketplace-v1",
+  "ordering": "unsigned-utf8-byte-lexicographic",
+  "kind": "app",
+  "packageId": "lamarck.hash-vector",
+  "contentHash": "sha256:049fe230a34d6ede55802d1806da5e7d72f5db735f6ff3408b13a510a877ac30",
+  "canonicalArchiveBytes": 399,
+  "canonicalArchiveSha256": "9de5fa7dcc95d0673b27df035190fdbf5cca4adb57ddf5ef1b88c37b270396fc",
+  "entries": [
+    {
+      "relativePath": "ä.txt",
+      "contentBase64": "YWNjZW50Cg=="
+    },
+    {
+      "relativePath": "ab.txt",
+      "contentBase64": "cGxhaW4K"
+    },
+    {
+      "relativePath": "a_b.txt",
+      "contentBase64": "dW5kZXJzY29yZQo="
+    },
+    {
+      "relativePath": "manifest.json",
+      "contentBase64": "eyJtYW5pZmVzdFZlcnNpb24iOjEsImlkIjoibGFtYXJjay5oYXNoLXZlY3RvciIsIm5hbWUiOiJIYXNoIFZlY3RvciIsImRlc2NyaXB0aW9uIjoiVVRGLTggYnl0ZS13aXNlIHBhdGggb3JkZXJpbmcuIiwicnVudGltZSI6eyJ1aSI6eyJjb21tYW5kIjpbIm5wbSIsInJ1biIsInN0YXJ0Il0sInBvcnQiOjMwMDB9fSwicGVybWlzc2lvbnMiOnsid3JpdGVzIjp7ImRvY3MiOltdLCJ0YWJsZXMiOltdfX19"
+    },
+    {
+      "relativePath": "a.b.txt",
+      "contentBase64": "ZG90Cg=="
+    },
+    {
+      "relativePath": "A.txt",
+      "contentBase64": "dXBwZXIK"
+    },
+    {
+      "relativePath": "a-b.txt",
+      "contentBase64": "aHlwaGVuCg=="
+    }
+  ]
+}

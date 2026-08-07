@@ -4,6 +4,7 @@ import { link, lstat, mkdir, readFile, unlink, writeFile } from "node:fs/promise
 import { dirname, join, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import {
+  comparePackageTreePaths,
   hashConnectorPackageTree,
   readConnectorPackageTree,
   validateConnectorPackageRelativePath,
@@ -179,7 +180,7 @@ function parseLogicalDigest(logicalDigest: string): string {
 function encodeTar(entries: readonly ConnectorPackageTreeEntry[]): Buffer {
   const chunks: Buffer[] = [];
   const sorted = [...entries].sort((a, b) =>
-    a.relativePath.localeCompare(b.relativePath));
+    comparePackageTreePaths(a.relativePath, b.relativePath));
 
   for (const [index, entry] of sorted.entries()) {
     validateConnectorPackageRelativePath(entry.relativePath);

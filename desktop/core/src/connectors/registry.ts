@@ -283,6 +283,10 @@ export function hashConnectorPackageTree(
   return `sha256:${hash.digest("hex")}`;
 }
 
+export function comparePackageTreePaths(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
 /**
  * Reads exactly the logical tree covered by hashConnectorPackage: regular
  * files and symlinks, with .git and node_modules excluded at every depth.
@@ -324,7 +328,7 @@ function normalizedPackageTree(
   entries: readonly ConnectorPackageTreeEntry[],
 ): ConnectorPackageTreeEntry[] {
   const sorted = [...entries].sort((a, b) =>
-    a.relativePath.localeCompare(b.relativePath));
+    comparePackageTreePaths(a.relativePath, b.relativePath));
   let previousPath: string | undefined;
   for (const entry of sorted) {
     validateConnectorPackageRelativePath(entry.relativePath);

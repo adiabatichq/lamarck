@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { TextDecoder } from "node:util";
 import { gunzipSync } from "node:zlib";
 import {
+  comparePackageTreePaths,
   hashConnectorPackageTree,
   validateConnectorPackageRelativePath,
   type ConnectorPackageTreeEntry,
@@ -368,7 +369,7 @@ function assertNoPathPrefixCollision(seen: Set<string>, path: string): void {
 function hashAppPackageTree(entries: readonly MarketplaceArtifactEntry[]): string {
   const hash = createHash("sha256");
   for (const entry of [...entries].sort((left, right) =>
-    left.relativePath.localeCompare(right.relativePath))) {
+    comparePackageTreePaths(left.relativePath, right.relativePath))) {
     if (entry.kind !== "file") {
       throw new Error("Marketplace App logical tree contains a non-file entry");
     }

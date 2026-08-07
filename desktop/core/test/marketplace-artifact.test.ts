@@ -71,6 +71,29 @@ describe("Marketplace artifact consumer", () => {
     expect((await lstat(join(destination, "index.tsx"))).mode & 0o777).toBe(0o644);
   });
 
+  test("uses the public UTF-8 byte-wise logical-tree compatibility vector", async () => {
+    const vectorRoot = new URL(
+      "../../../test-vectors/marketplace/app-tree-v1/",
+      import.meta.url,
+    );
+    const vector = JSON.parse(await readFile(
+      new URL("expected.json", vectorRoot),
+      "utf8",
+    )) as LogicalTreeVector;
+    const archiveBytes = await readFile(new URL("canonical.tar.gz", vectorRoot));
+
+    expect(archiveBytes.byteLength).toBe(vector.canonicalArchiveBytes);
+    expect(createHash("sha256").update(archiveBytes).digest("hex"))
+      .toBe(vector.canonicalArchiveSha256);
+
+    expect(verifyMarketplaceArtifact({
+      kind: vector.kind,
+      packageId: vector.packageId,
+      contentHash: vector.contentHash,
+      archiveBytes,
+    }).contentHash).toBe(vector.contentHash);
+  });
+
   test("consumes the existing Connector logical hash and archive bytes unchanged", async () => {
     const root = await temporaryRoot();
     const connectorDir = join(root, "source", "lamarck.sample");
@@ -304,9 +327,18 @@ interface TestEntry {
   mode?: number;
 }
 
+interface LogicalTreeVector {
+  kind: "app";
+  packageId: string;
+  contentHash: string;
+  canonicalArchiveBytes: number;
+  canonicalArchiveSha256: string;
+}
+
 function hashFiles(entries: readonly Pick<TestEntry, "path" | "bytes">[]): string {
   const hash = createHash("sha256");
-  for (const entry of [...entries].sort((a, b) => a.path.localeCompare(b.path))) {
+  for (const entry of [...entries].sort((a, b) =>
+    Buffer.compare(Buffer.from(a.path, "utf8"), Buffer.from(b.path, "utf8")))) {
     hash.update("file\0");
     hash.update(entry.path);
     hash.update("\0");
