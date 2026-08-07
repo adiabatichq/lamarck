@@ -107,8 +107,11 @@ these non-secret build inputs:
 | `LAMARCK_MARKETPLACE_SIGNING_KEY_ID` | The active Backend resolve-signing key ID |
 | `LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY` | Canonical base64 for the matching raw 32-byte Ed25519 public key |
 
-Set the same names as GitHub repository variables for the Alpha Desktop
-workflow; export them directly for a local release build.
+Provide both values as GitHub environment secrets under `r2-releases`, which
+the Alpha Desktop package job reads. Their external source of truth and sync
+mechanism are release-operations concerns outside this repository. Export them
+directly for a local release build. Never place the Backend private key in
+GitHub or the Desktop build environment.
 
 The public key must be the exact counterpart of the private signing key in the
 private production configuration. The private key never enters this repository

@@ -390,8 +390,9 @@ test("Alpha Desktop workflow supplies the sealed Marketplace trust root", async 
     join(root, ".github", "workflows", "alpha-desktop.yml"),
     "utf8",
   );
-  assert.match(workflow, /vars\.LAMARCK_MARKETPLACE_SIGNING_KEY_ID/);
-  assert.match(workflow, /vars\.LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY/);
+  assert.match(workflow, /environment: r2-releases/);
+  assert.match(workflow, /secrets\.LAMARCK_MARKETPLACE_SIGNING_KEY_ID/);
+  assert.match(workflow, /secrets\.LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY/);
 });
 
 test("clean production build identity binds an injected commit to Git HEAD", async (t) => {

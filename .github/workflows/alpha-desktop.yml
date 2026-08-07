@@ -24,6 +24,7 @@ jobs:
     if: github.repository == 'adiabatichq/lamarck' && github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 90
+    environment: r2-releases
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -61,8 +62,8 @@ jobs:
       - name: Package alpha build
         env:
           ALPHA_VERSION: ${{ inputs.version }}
-          LAMARCK_MARKETPLACE_SIGNING_KEY_ID: ${{ vars.LAMARCK_MARKETPLACE_SIGNING_KEY_ID }}
-          LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: ${{ vars.LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY }}
+          LAMARCK_MARKETPLACE_SIGNING_KEY_ID: ${{ secrets.LAMARCK_MARKETPLACE_SIGNING_KEY_ID }}
+          LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: ${{ secrets.LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           if test -n "$ALPHA_VERSION"; then
