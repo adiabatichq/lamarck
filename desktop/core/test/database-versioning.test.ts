@@ -56,7 +56,7 @@ describe("greenfield data.db and system.db V1 schemas", () => {
     expect(sha256(DATA_SCHEMA_V1))
       .toBe("0dad836ef5969c2dc2eb71202881ca802281de079ec73866a62dfa19c5ed0979");
     expect(sha256(SYSTEM_SCHEMA_V1))
-      .toBe("0668946eb090b7a0a3221d100d2030439405367931fde5803da93bb4cc170bed");
+      .toBe("d1645aa52007ac3412a9ddfe8aa11ec0bbc9f6bc6fa8506925b920edf5fe3105");
   });
 
   test("D2 promotion and demotion do not change the data database version", () => {

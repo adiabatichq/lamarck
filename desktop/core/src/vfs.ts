@@ -29,6 +29,7 @@ import { D1Sequencer } from "./d1-sequencer";
 import {
   compareFileSnapshots,
   externalizeFileChanges,
+  metadataOnlyFileSnapshots,
   readStableD1File,
   recordedChanges,
   scanD1Files,
@@ -48,6 +49,11 @@ interface OpenHandle {
   path: string;
   digest: string;
   workloadId: string;
+}
+
+interface MutationPlan {
+  snapshotRoots: string[];
+  mappings: Array<{ from: string; path: string }>;
 }
 
 export const MAX_VFS_OPEN_HANDLES_PER_WORKLOAD = 256;
@@ -171,25 +177,34 @@ export class VfsService {
     let exitCode = 0;
     let before = new Map<string, D1FileSnapshot>();
     let after = before;
-    let moveMappings: Array<{ from: string; path: string }> = [];
+    let plan: MutationPlan | null = null;
+    let snapshotTaken = false;
     try {
-      before = await this.scanRecordedFiles();
-      await this.preflight(caller, parsed);
+      plan = await this.preflight(caller, parsed);
+      before = await this.scanRecordedFiles(plan.snapshotRoots, new Map());
+      snapshotTaken = true;
       const stdin = decodeStdin(options.stdin);
-      const execution = await this.performMutation(parsed, stdin);
+      const execution = await this.performMutation(parsed, stdin, plan.mappings);
       stdout = execution.stdout;
-      moveMappings = execution.moves;
     } catch (error) {
       exitCode = 1;
       stderr = Buffer.from(`${errorMessage(error)}\n`);
     }
 
     try {
-      after = await this.scanRecordedFiles();
-      let changes = compareFileSnapshots(before, after);
-      if (parsed.name === "mv" && moveMappings.length > 0) {
-        changes = rewriteExplicitMoves(changes, before, after, moveMappings);
+      if (!plan || !snapshotTaken) {
+        return result(
+          exitCode,
+          options.stdout === "ignore" ? Buffer.alloc(0) : stdout,
+          stderr,
+        );
       }
+      after = await this.scanRecordedFiles(plan.snapshotRoots, before);
+      let changes = compareFileSnapshots(before, after);
+      if (parsed.name === "mv" && plan.mappings.length > 0) {
+        changes = rewriteExplicitMoves(changes, before, after, plan.mappings);
+      }
+      const metadataUpdates = metadataOnlyFileSnapshots(before, after);
       if (changes.length > 0) {
         const payload = {
           argv: parsed.argv,
@@ -201,7 +216,9 @@ export class VfsService {
           startedAt: Date.now(),
           payload,
         });
-        this.state.apply(eventId, recordedChanges(changes), after);
+        this.state.apply(eventId, recordedChanges(changes), after, metadataUpdates);
+      } else {
+        this.state.refreshMetadata(metadataUpdates);
       }
     } catch (error) {
       // A filesystem effect without D0/checkpoint completion must surface as a
@@ -215,14 +232,19 @@ export class VfsService {
     );
   }
 
-  private async scanRecordedFiles(): Promise<Map<string, D1FileSnapshot>> {
+  private async scanRecordedFiles(
+    roots: readonly string[],
+    previous: ReadonlyMap<string, D1FileSnapshot>,
+  ): Promise<Map<string, D1FileSnapshot>> {
     return scanD1Files(this.filesRoot, {
       isExcluded: (path) => this.state.isExcluded(path),
       onWarning: (message) => console.warn(`[lamarck:d1] ${message}`),
+      previous,
+      roots,
     });
   }
 
-  private async preflight(caller: VfsCaller, parsed: ParsedVfsCommand): Promise<void> {
+  private async preflight(caller: VfsCaller, parsed: ParsedVfsCommand): Promise<MutationPlan> {
     const force = parsed.flags.has("f");
     if (parsed.name === "tee") {
       for (const path of parsed.operands) {
@@ -232,7 +254,7 @@ export class VfsService {
         await assertWritableFileTarget(this.filesRoot, path);
       }
       await this.assertNoCollisions(parsed.operands);
-      return;
+      return { snapshotRoots: [...parsed.operands], mappings: [] };
     }
     if (parsed.name === "mkdir") {
       for (const path of parsed.operands) {
@@ -243,7 +265,7 @@ export class VfsService {
         await assertDirectoryTarget(this.filesRoot, path);
       }
       await this.assertNoCollisions(parsed.operands);
-      return;
+      return { snapshotRoots: [...parsed.operands], mappings: [] };
     }
     if (parsed.name === "rm") {
       for (const path of parsed.operands) {
@@ -255,7 +277,7 @@ export class VfsService {
           throw new Error(`rm: ${path}: is a directory`);
         }
       }
-      return;
+      return { snapshotRoots: [...parsed.operands], mappings: [] };
     }
     if (parsed.name === "cp" || parsed.name === "mv") {
       const mappings = await resolveCopyMappings(this.filesRoot, parsed);
@@ -289,7 +311,13 @@ export class VfsService {
           ...(force ? mappings.map((mapping) => mapping.path) : []),
         ],
       );
-      return;
+      return {
+        snapshotRoots: [
+          ...(parsed.name === "mv" ? mappings.map((mapping) => mapping.from) : []),
+          ...mappings.map((mapping) => mapping.path),
+        ],
+        mappings,
+      };
     }
     if (parsed.name === "import") {
       const destination = parsed.operands[1]!;
@@ -306,7 +334,9 @@ export class VfsService {
         for (const entry of replacedEntries) requireGrant(caller, entry.path, "replace");
       }
       await this.assertNoCollisions(importedPaths, force ? [destination] : []);
+      return { snapshotRoots: [destination], mappings: [] };
     }
+    throw new Error(`Unsupported mutating command: ${parsed.name}`);
   }
 
   private async assertNoCollisions(paths: readonly string[], replaced: readonly string[] = []): Promise<void> {
@@ -326,6 +356,7 @@ export class VfsService {
   private async performMutation(
     parsed: ParsedVfsCommand,
     stdin: Buffer,
+    mappings: readonly { from: string; path: string }[],
   ): Promise<{ stdout: Buffer; moves: Array<{ from: string; path: string }> }> {
     const force = parsed.flags.has("f");
     if (parsed.name === "tee") {
@@ -352,7 +383,6 @@ export class VfsService {
       return { stdout: Buffer.alloc(0), moves: [] };
     }
     if (parsed.name === "cp" || parsed.name === "mv") {
-      const mappings = await resolveCopyMappings(this.filesRoot, parsed);
       for (const mapping of mappings) {
         const source = resolveD1Path(this.filesRoot, mapping.from);
         const destination = resolveD1Path(this.filesRoot, mapping.path);
@@ -369,7 +399,7 @@ export class VfsService {
           }
         }
       }
-      return { stdout: Buffer.alloc(0), moves: parsed.name === "mv" ? mappings : [] };
+      return { stdout: Buffer.alloc(0), moves: parsed.name === "mv" ? [...mappings] : [] };
     }
     if (parsed.name === "import") {
       const source = resolve(parsed.operands[0]!);

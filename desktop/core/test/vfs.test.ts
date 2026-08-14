@@ -7,6 +7,7 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,7 +23,9 @@ import {
   externalizeFileChanges,
   INLINE_CHANGES_BYTES,
   INLINE_PATCH_BYTES,
+  observerFilesToSnapshots,
   readStableD1File,
+  recordedChanges,
   scanD1Files,
 } from "../src/filesystem-changes";
 import { openSystemDatabase } from "../src/db";
@@ -86,14 +89,15 @@ describe("D1 VFS", () => {
   let guard: EventGuard;
   let vfs: VfsService;
   let sequencer: D1Sequencer;
+  let systemDb: ReturnType<typeof openSystemDatabase>;
   let closeDb: () => void;
 
   beforeEach(async () => {
     workspace = mkdtempSync(join(tmpdir(), "lamarck-vfs-"));
     mkdirSync(join(workspace, ".lamarck"), { recursive: true });
-    const db = openSystemDatabase(workspace);
-    closeDb = () => db.close();
-    state = new D1ObserverState(db);
+    systemDb = openSystemDatabase(workspace);
+    closeDb = () => systemDb.close();
+    state = new D1ObserverState(systemDb);
     blobs = new ContentBlobStore(workspace);
     guard = new EventGuard();
     sequencer = new D1Sequencer();
@@ -158,6 +162,153 @@ describe("D1 VFS", () => {
       "tee", "--", "notes/result.md",
     ]);
     expect((guard.events[0]!.payload as Record<string, JsonValue>).author).toBe("codex");
+  });
+
+  test("keeps unrelated external edits out of authored VFS evidence", async () => {
+    mkdirSync(join(filesRoot, "notes"));
+    mkdirSync(join(filesRoot, "external"));
+    writeFileSync(join(filesRoot, "notes/managed.md"), "managed before");
+    writeFileSync(join(filesRoot, "external/unrelated.md"), "external before");
+    const observer = new D1Observer(
+      filesRoot,
+      guard as unknown as RemoteGuard,
+      state,
+      blobs,
+      sequencer,
+    );
+    await observer.observe();
+
+    writeFileSync(join(filesRoot, "external/unrelated.md"), "external changed later");
+    const mutation = await vfs.command(hostCaller(guard), "tee -- notes/managed.md", {
+      stdin: { encoding: "utf8", data: "managed changed" },
+      author: "codex",
+    });
+    expect(mutation.success).toBe(true);
+    expect(guard.events[1]!.payload).toMatchObject({
+      argv: ["tee", "--", "notes/managed.md"],
+      author: "codex",
+      changes: [expect.objectContaining({ kind: "modified", path: "notes/managed.md" })],
+    });
+
+    await observer.observe();
+    expect(guard.events).toHaveLength(3);
+    expect(guard.events[2]!.payload).toEqual({
+      changes: [expect.objectContaining({ kind: "modified", path: "external/unrelated.md" })],
+    });
+  });
+
+  test("metadata-first scans do not reread unchanged files", async () => {
+    writeFileSync(join(filesRoot, "unchanged.bin"), Buffer.from([1, 2, 3]));
+    writeFileSync(join(filesRoot, "changed.md"), "before");
+    const initial = await scanD1Files(filesRoot);
+    state.apply(
+      "event-cache",
+      recordedChanges(compareFileSnapshots(new Map(), initial)),
+      initial,
+    );
+
+    const cached = observerFilesToSnapshots(state.listFiles());
+    const unchangedReads: string[] = [];
+    const unchanged = await scanD1Files(filesRoot, {
+      previous: cached,
+      onRead: (path) => unchangedReads.push(path),
+    });
+    expect(unchangedReads).toEqual([]);
+
+    writeFileSync(join(filesRoot, "changed.md"), "after with a different length");
+    const changedReads: string[] = [];
+    await scanD1Files(filesRoot, {
+      previous: unchanged,
+      onRead: (path) => changedReads.push(path),
+    });
+    expect(changedReads).toEqual(["changed.md"]);
+  });
+
+  test("does not write observer cache rows during an unchanged scan", async () => {
+    writeFileSync(join(filesRoot, "one.md"), "one");
+    writeFileSync(join(filesRoot, "two.bin"), Buffer.from([2]));
+    const observer = new D1Observer(
+      filesRoot,
+      guard as unknown as RemoteGuard,
+      state,
+      blobs,
+      sequencer,
+    );
+    await observer.observe();
+    installCacheUpdateRecorder(systemDb);
+    const changesBefore = sqliteTotalChanges(systemDb);
+
+    await observer.observe();
+
+    expect(guard.events).toHaveLength(1);
+    expect(cacheUpdatePaths(systemDb)).toEqual([]);
+    expect(sqliteTotalChanges(systemDb)).toBe(changesBefore);
+  });
+
+  test("refreshes only metadata-changed cache rows without emitting D0", async () => {
+    writeFileSync(join(filesRoot, "affected.md"), "same content");
+    writeFileSync(join(filesRoot, "unchanged.md"), "untouched");
+    const observer = new D1Observer(
+      filesRoot,
+      guard as unknown as RemoteGuard,
+      state,
+      blobs,
+      sequencer,
+    );
+    await observer.observe();
+    const before = new Map(state.listFiles().map((file) => [file.path, file]));
+    installCacheUpdateRecorder(systemDb);
+
+    utimesSync(join(filesRoot, "affected.md"), new Date(1_000), new Date(2_000));
+    await observer.observe();
+
+    const after = new Map(state.listFiles().map((file) => [file.path, file]));
+    expect(guard.events).toHaveLength(1);
+    expect(cacheUpdatePaths(systemDb)).toEqual(["affected.md"]);
+    expect(after.get("affected.md")?.digest).toBe(before.get("affected.md")?.digest);
+    expect(after.get("affected.md")?.statFingerprint)
+      .not.toBe(before.get("affected.md")?.statFingerprint);
+    expect(after.get("unchanged.md")).toEqual(before.get("unchanged.md"));
+  });
+
+  test("keeps content-change evidence and checkpoint updates unchanged", async () => {
+    writeFileSync(join(filesRoot, "content.md"), "before");
+    const observer = new D1Observer(
+      filesRoot,
+      guard as unknown as RemoteGuard,
+      state,
+      blobs,
+      sequencer,
+    );
+    await observer.observe();
+    installCacheUpdateRecorder(systemDb);
+
+    writeFileSync(join(filesRoot, "content.md"), "after with real content");
+    await observer.observe();
+
+    expect(guard.events).toHaveLength(2);
+    const payload = guard.events[1]!.payload as {
+      changes: Array<{ kind: string; path: string; digest: string; prevDigest: string; patch: string }>;
+    };
+    expect(payload).toEqual({
+      changes: [expect.objectContaining({
+        kind: "modified",
+        path: "content.md",
+        digest: expect.stringMatching(/^sha256:/),
+        prevDigest: expect.stringMatching(/^sha256:/),
+        patch: expect.any(String),
+      })],
+    });
+    expect(applyPatch("before", payload.changes[0]!.patch)).toBe("after with real content");
+    expect(cacheUpdatePaths(systemDb)).toEqual(["content.md"]);
+    expect(state.listFiles()).toEqual([
+      expect.objectContaining({
+        path: "content.md",
+        digest: payload.changes[0]!.digest,
+        markdownBaseline: Buffer.from("after with real content"),
+      }),
+    ]);
+    expect(state.cursor()).toBe("event-0002");
   });
 
   test("does not let the observer scan between a VFS filesystem effect and its checkpoint", async () => {
@@ -555,6 +706,28 @@ function readFileMaybe(path: string): Buffer | null {
     }
     throw error;
   }
+}
+
+function installCacheUpdateRecorder(db: ReturnType<typeof openSystemDatabase>): void {
+  db.exec(`
+    CREATE TEMP TABLE d1_observer_file_update_log (path TEXT NOT NULL);
+    CREATE TEMP TRIGGER record_d1_observer_file_update
+    AFTER UPDATE ON d1_observer_files
+    BEGIN
+      INSERT INTO d1_observer_file_update_log (path) VALUES (NEW.path);
+    END;
+  `);
+}
+
+function cacheUpdatePaths(db: ReturnType<typeof openSystemDatabase>): string[] {
+  return (db.prepare(
+    "SELECT path FROM d1_observer_file_update_log ORDER BY rowid",
+  ).all() as Array<{ path: string }>).map((row) => row.path);
+}
+
+function sqliteTotalChanges(db: ReturnType<typeof openSystemDatabase>): number {
+  const row = db.prepare("SELECT total_changes() AS value").get() as { value: number };
+  return row.value;
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {

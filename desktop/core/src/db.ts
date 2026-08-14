@@ -117,7 +117,8 @@ CREATE TABLE IF NOT EXISTS d1_observer_files (
                       AND length(digest) = 71
                       AND substr(digest, 8) NOT GLOB '*[^0-9a-f]*'),
   byte_length       INTEGER NOT NULL CHECK (byte_length >= 0),
-  markdown_baseline BLOB
+  markdown_baseline BLOB,
+  stat_fingerprint  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS d1_observer_cursor (

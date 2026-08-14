@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { open, readdir } from "node:fs/promises";
+import { constants, type BigIntStats } from "node:fs";
+import { lstat, open, readdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import type { ContentBlobRef } from "@lamarck/system/protocol";
@@ -53,12 +53,15 @@ export async function scanD1Files(
     isExcluded?: (path: string) => boolean;
     onWarning?: (message: string) => void;
     onDeferred?: (path: string) => void;
+    onRead?: (path: string) => void;
+    previous?: ReadonlyMap<string, D1FileSnapshot>;
+    roots?: readonly string[];
   } = {},
 ): Promise<Map<string, D1FileSnapshot>> {
   const snapshots = new Map<string, D1FileSnapshot>();
   const admittedPaths: string[] = [];
 
-  const visit = async (relativeDirectory: string): Promise<void> => {
+  const visitDirectory = async (relativeDirectory: string): Promise<void> => {
     const directory = relativeDirectory ? join(filesRoot, relativeDirectory) : filesRoot;
     let entries;
     try {
@@ -70,40 +73,86 @@ export async function scanD1Files(
     entries.sort((left, right) => Buffer.from(left.name).compare(Buffer.from(right.name)));
     for (const entry of entries) {
       const path = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
-      if (isReservedD1Path(path) || options.isExcluded?.(path)) continue;
-      try {
-        validateD1Path(path);
-      } catch (error) {
-        options.onWarning?.(`Ignoring unsupported D1 path ${JSON.stringify(path)}: ${errorMessage(error)}`);
-        continue;
-      }
-      const collision = admittedPaths.find((candidate) => d1PathsConflict(candidate, path));
-      if (collision) {
-        options.onWarning?.(`Ignoring D1 path ${JSON.stringify(path)} because it collides with ${JSON.stringify(collision)}`);
-        continue;
-      }
-      if (entry.isDirectory()) {
-        admittedPaths.push(path);
-        await visit(path);
-        continue;
-      }
-      if (!entry.isFile()) {
-        options.onWarning?.(`Ignoring unsupported D1 filesystem entry ${JSON.stringify(path)}`);
-        options.onDeferred?.(path);
-        continue;
-      }
-      try {
-        const snapshot = await readStableD1File(filesRoot, path);
-        admittedPaths.push(path);
-        snapshots.set(path, snapshot);
-      } catch (error) {
-        options.onWarning?.(`Deferring unstable or unsupported D1 file ${JSON.stringify(path)}: ${errorMessage(error)}`);
-        options.onDeferred?.(path);
-      }
+      await visitPath(path, true);
     }
   };
 
-  await visit("");
+  const visitPath = async (path: string, deferIfMissing: boolean): Promise<void> => {
+    if (isReservedD1Path(path) || options.isExcluded?.(path)) return;
+    try {
+      validateD1Path(path);
+    } catch (error) {
+      options.onWarning?.(`Ignoring unsupported D1 path ${JSON.stringify(path)}: ${errorMessage(error)}`);
+      return;
+    }
+    const collision = admittedPaths.find((candidate) => d1PathsConflict(candidate, path));
+    if (collision) {
+      options.onWarning?.(`Ignoring D1 path ${JSON.stringify(path)} because it collides with ${JSON.stringify(collision)}`);
+      return;
+    }
+
+    let info: BigIntStats;
+    try {
+      await assertSafeD1Parents(filesRoot, path);
+      info = await lstat(join(filesRoot, ...path.split("/")), { bigint: true });
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        if (deferIfMissing) options.onDeferred?.(path);
+        return;
+      }
+      options.onWarning?.(`Deferring unstable or unsupported D1 file ${JSON.stringify(path)}: ${errorMessage(error)}`);
+      options.onDeferred?.(path);
+      return;
+    }
+
+    if (info.isDirectory()) {
+      admittedPaths.push(path);
+      await visitDirectory(path);
+      return;
+    }
+    if (info.isFile() && info.nlink !== 1n) {
+      options.onWarning?.(
+        `Deferring unstable or unsupported D1 file ${JSON.stringify(path)}: D1 admits only regular, non-hard-linked files`,
+      );
+      options.onDeferred?.(path);
+      return;
+    }
+    if (!info.isFile()) {
+      options.onWarning?.(`Ignoring unsupported D1 filesystem entry ${JSON.stringify(path)}`);
+      options.onDeferred?.(path);
+      return;
+    }
+
+    const fingerprint = statFingerprint(info);
+    const previous = options.previous?.get(path);
+    if (
+      previous
+      && previous.statFingerprint === fingerprint
+      && BigInt(previous.byteLength) === info.size
+    ) {
+      admittedPaths.push(path);
+      snapshots.set(path, previous);
+      return;
+    }
+
+    try {
+      options.onRead?.(path);
+      const snapshot = await readStableD1File(filesRoot, path);
+      admittedPaths.push(path);
+      snapshots.set(path, snapshot);
+    } catch (error) {
+      options.onWarning?.(`Deferring unstable or unsupported D1 file ${JSON.stringify(path)}: ${errorMessage(error)}`);
+      options.onDeferred?.(path);
+    }
+  };
+
+  if (options.roots === undefined) {
+    await visitDirectory("");
+  } else {
+    for (const path of normalizeRoots(options.roots)) {
+      await visitPath(path, false);
+    }
+  }
   return snapshots;
 }
 
@@ -135,6 +184,7 @@ export async function readStableD1File(filesRoot: string, path: string): Promise
           digest,
           byteLength: bytes.byteLength,
           markdownBaseline: markdown ? Buffer.from(bytes) : null,
+          statFingerprint: statFingerprint(after),
           bytes: Buffer.from(bytes),
           markdown,
         };
@@ -186,6 +236,28 @@ export function compareFileSnapshots(
     }
   }
   return changes;
+}
+
+export function metadataOnlyFileSnapshots(
+  before: ReadonlyMap<string, D1FileSnapshot>,
+  after: ReadonlyMap<string, D1FileSnapshot>,
+): Map<string, D1FileSnapshot> {
+  const updates = new Map<string, D1FileSnapshot>();
+  for (const [path, current] of after) {
+    const previous = before.get(path);
+    if (
+      previous
+      && previous.digest === current.digest
+      && current.statFingerprint !== null
+      && (
+        previous.byteLength !== current.byteLength
+        || previous.statFingerprint !== current.statFingerprint
+      )
+    ) {
+      updates.set(path, current);
+    }
+  }
+  return updates;
 }
 
 export function externalizeFileChanges(
@@ -292,6 +364,18 @@ function commonRoot(changes: readonly D1FileChange[]): string | null {
 
 function comparePaths(left: string, right: string): number {
   return Buffer.from(left).compare(Buffer.from(right));
+}
+
+function statFingerprint(info: BigIntStats): string {
+  return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
+}
+
+function normalizeRoots(roots: readonly string[]): string[] {
+  const normalized = [...new Set(roots)].sort(comparePaths);
+  for (const path of normalized) validateD1Path(path);
+  return normalized.filter((path, index) => !normalized.some((candidate, candidateIndex) => (
+    candidateIndex !== index && path.startsWith(`${candidate}/`)
+  )));
 }
 
 function isNodeError(error: unknown, code: string): boolean {

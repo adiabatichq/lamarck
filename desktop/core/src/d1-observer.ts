@@ -8,6 +8,7 @@ import {
   compareFileSnapshots,
   digestBytes,
   externalizeFileChanges,
+  metadataOnlyFileSnapshots,
   observerFilesToSnapshots,
   recordedChanges,
   scanD1Files,
@@ -92,6 +93,7 @@ export class D1Observer {
       isExcluded: (path) => this.state.isExcluded(path),
       onDeferred: (path) => deferred.add(path),
       onWarning: (message) => console.warn(`[lamarck:d1] ${message}`),
+      previous: before,
     });
     for (const path of deferred) {
       for (const [recordedPath, snapshot] of before) {
@@ -101,13 +103,17 @@ export class D1Observer {
       }
     }
     const changes = compareFileSnapshots(before, after);
-    if (changes.length === 0) return;
+    const metadataUpdates = metadataOnlyFileSnapshots(before, after);
+    if (changes.length === 0) {
+      this.state.refreshMetadata(metadataUpdates);
+      return;
+    }
     const eventId = await this.guard.writeWorkspaceEvent({
       type: "workspace.files.changed",
       startedAt: Date.now(),
       payload: externalizeFileChanges(changes, this.blobStore) as JsonValue,
     });
-    this.state.apply(eventId, recordedChanges(changes), after);
+    this.state.apply(eventId, recordedChanges(changes), after, metadataUpdates);
   }
 
   private async catchUpFromD0(): Promise<void> {
@@ -124,6 +130,7 @@ export class D1Observer {
       const current = await scanD1Files(this.filesRoot, {
         isExcluded: (path) => this.state.isExcluded(path),
         onWarning: (message) => console.warn(`[lamarck:d1] ${message}`),
+        previous: materialized,
       });
       for (const row of rows) {
         const payload = typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload;
@@ -151,7 +158,9 @@ export class D1Observer {
     if (change.kind === "deleted") return null;
     if (change.kind === "moved") {
       const source = materialized.get(change.from);
-      return source?.digest === change.digest ? { ...source, path: change.path } : null;
+      return source?.digest === change.digest
+        ? { ...source, path: change.path, statFingerprint: null }
+        : null;
     }
     const patch = this.resolvePatch(change);
     if (patch === null) return null;
@@ -167,6 +176,7 @@ export class D1Observer {
       digest: change.digest,
       byteLength: bytes.byteLength,
       markdownBaseline: bytes,
+      statFingerprint: null,
       bytes,
       markdown: true,
     };

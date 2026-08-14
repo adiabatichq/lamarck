@@ -168,6 +168,7 @@ describe("DB", () => {
       "digest",
       "byte_length",
       "markdown_baseline",
+      "stat_fingerprint",
     ]);
     close();
   });
