@@ -110,6 +110,8 @@ describe("auth", () => {
 
   test("revocation closes admission immediately and drains active requests", async () => {
     const registry = new AppCapabilityRegistry();
+    const deletedChannels: string[] = [];
+    registry.onChannelDeleted((channelId) => deletedChannels.push(channelId));
     const appA = registry.issue("app-a", "ui", authorization());
     const appB = registry.issue("app-b", "job:daily-etl", authorization());
     const active = admitRequest(appRequest(appA.capability), secrets, registry);
@@ -129,6 +131,7 @@ describe("auth", () => {
     active.release();
     active.release();
     await expect(revocation).resolves.toBe(true);
+    expect(deletedChannels).toEqual([appA.channelId]);
     expect(await registry.revoke(appA.channelId)).toBe(false);
     const appBAdmission = admitRequest(appRequest(appB.capability), secrets, registry);
     expect(appBAdmission?.context).toMatchObject({

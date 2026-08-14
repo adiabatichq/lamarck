@@ -212,6 +212,9 @@ const marketplaceService = await MarketplaceService.initialize({
 const d1ObserverState = new D1ObserverState(systemDb);
 const d1Sequencer = new D1Sequencer();
 const vfs = new VfsService(workspacePath, d1ObserverState, contentBlobStore, d1Sequencer);
+appCapabilities.onChannelDeleted((channelId) => {
+  vfs.closeWorkload(channelId);
+});
 await vfs.initialize();
 const observerGuard = guard.withSource("system:vfs:observer", {
   producerRef: systemProducer.producerRef,

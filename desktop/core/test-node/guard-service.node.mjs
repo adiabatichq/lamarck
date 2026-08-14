@@ -750,6 +750,7 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
       "CREATE TABLE rejected_nullable_pk (id TEXT PRIMARY KEY, value TEXT)",
       "CREATE TABLE rejected_missing_pk (id TEXT NOT NULL, value TEXT)",
       "CREATE TABLE rejected_composite_pk (a TEXT NOT NULL, b TEXT, PRIMARY KEY (a, b))",
+      "CREATE TABLE rejected_desc_integer_pk (id INTEGER PRIMARY KEY DESC, value TEXT)",
     ]) {
       await assertRpcRejects("schema.apply", {
         principal: host,

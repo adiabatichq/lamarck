@@ -914,9 +914,13 @@ export class GuardEngine {
         const sql = table.sql ?? "";
         const tableProvidesNonNullPrimaryKey = /\bWITHOUT\s+ROWID\b/i.test(sql)
           || /(?:\)|,)\s*STRICT(?:\s*,\s*WITHOUT\s+ROWID)?\s*$/i.test(sql);
+        const hasSeparatePrimaryKeyIndex = (this.db.prepare(
+          `PRAGMA main.index_list(${quoteIdent(table.name)})`,
+        ).all() as Array<{ origin: string }>).some((index) => index.origin === "pk");
         const invalid = primaryKey.find((column) => {
           const integerPrimaryKey = primaryKey.length === 1
-            && normalizeName(column.type.trim()) === "integer";
+            && normalizeName(column.type.trim()) === "integer"
+            && !hasSeparatePrimaryKeyIndex;
           return column.notnull !== 1 && !integerPrimaryKey && !tableProvidesNonNullPrimaryKey;
         });
         if (invalid) {

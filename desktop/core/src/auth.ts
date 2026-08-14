@@ -82,6 +82,7 @@ const HOST_ADMISSION: AuthAdmission = Object.freeze({
 export class AppCapabilityRegistry {
   #channelsByDigest = new Map<string, StoredChannel>();
   #channelsById = new Map<string, StoredChannel>();
+  #channelDeletedListeners = new Set<(channelId: string) => void>();
   #invalidManifestGeneration = 0;
 
   get size(): number {
@@ -90,6 +91,11 @@ export class AppCapabilityRegistry {
 
   isOpen(channelId: string): boolean {
     return this.#channelsById.get(channelId)?.open === true;
+  }
+
+  onChannelDeleted(listener: (channelId: string) => void): () => void {
+    this.#channelDeletedListeners.add(listener);
+    return () => this.#channelDeletedListeners.delete(listener);
   }
 
   issue(
@@ -233,7 +239,10 @@ export class AppCapabilityRegistry {
 
   #deleteDrained(channel: StoredChannel): void {
     if (channel.open || channel.activeRequests !== 0) return;
-    this.#channelsById.delete(channel.context.channelId);
+    if (!this.#channelsById.delete(channel.context.channelId)) return;
+    for (const listener of this.#channelDeletedListeners) {
+      listener(channel.context.channelId);
+    }
   }
 }
 

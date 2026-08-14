@@ -27,7 +27,11 @@ import {
 } from "../src/filesystem-changes";
 import { openSystemDatabase } from "../src/db";
 import type { JsonValue } from "../src/json";
-import { VfsService, type VfsCaller } from "../src/vfs";
+import {
+  MAX_VFS_OPEN_HANDLES_PER_WORKLOAD,
+  VfsService,
+  type VfsCaller,
+} from "../src/vfs";
 import type { EventInput } from "../src/guard-types";
 import type { RemoteGuard } from "../src/remote-guard";
 
@@ -339,6 +343,24 @@ describe("D1 VFS", () => {
     });
     writeFileSync(join(filesRoot, "image.png"), Buffer.from([4, 5, 6]));
     expect(await vfs.resolveOpen(token, () => true)).toBeNull();
+  });
+
+  test("bounds open handles per workload and releases them when the workload closes", async () => {
+    writeFileSync(join(filesRoot, "image.png"), Buffer.from([1, 2, 3]));
+    const caller = { ...appCaller(guard, []), workloadId: "channel-1" };
+    const tokens: string[] = [];
+    for (let index = 0; index < MAX_VFS_OPEN_HANDLES_PER_WORKLOAD; index += 1) {
+      const url = await vfs.open(caller, "image.png", "http://core.test");
+      tokens.push(new URL(url).pathname.split("/").at(-1)!);
+    }
+    await expect(vfs.open(caller, "image.png", "http://core.test")).rejects.toThrow(
+      "handle limit exceeded",
+    );
+    expect(vfs.closeWorkload("channel-1")).toBe(MAX_VFS_OPEN_HANDLES_PER_WORKLOAD);
+    expect(await vfs.resolveOpen(tokens[0]!, () => true)).toBeNull();
+    await expect(vfs.open(caller, "image.png", "http://core.test")).resolves.toMatch(
+      /^http:\/\/core\.test\/api\/vfs\/open\//,
+    );
   });
 
   test("externalizes patches and manifests at the specified byte limits", async () => {

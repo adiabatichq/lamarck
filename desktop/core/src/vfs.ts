@@ -50,6 +50,8 @@ interface OpenHandle {
   workloadId: string;
 }
 
+export const MAX_VFS_OPEN_HANDLES_PER_WORKLOAD = 256;
+
 export interface VfsOpenContent {
   bytes: Buffer;
   mediaType: string;
@@ -58,6 +60,7 @@ export interface VfsOpenContent {
 export class VfsService {
   readonly filesRoot: string;
   private readonly openHandles = new Map<string, OpenHandle>();
+  private readonly openHandleTokensByWorkload = new Map<string, Set<string>>();
 
   constructor(
     workspacePath: string,
@@ -104,6 +107,10 @@ export class VfsService {
 
   async open(caller: VfsCaller, path: string, origin: string): Promise<string> {
     if (!caller.workloadId) throw new Error("system.vfs.open requires a bound workload");
+    const workloadTokens = this.openHandleTokensByWorkload.get(caller.workloadId) ?? new Set<string>();
+    if (workloadTokens.size >= MAX_VFS_OPEN_HANDLES_PER_WORKLOAD) {
+      throw new Error("system.vfs.open handle limit exceeded for this workload");
+    }
     const snapshot = await readStableD1File(this.filesRoot, path);
     const token = randomBytes(32).toString("base64url");
     this.openHandles.set(token, {
@@ -111,19 +118,29 @@ export class VfsService {
       digest: snapshot.digest,
       workloadId: caller.workloadId,
     });
+    workloadTokens.add(token);
+    this.openHandleTokensByWorkload.set(caller.workloadId, workloadTokens);
     return new URL(`/api/vfs/open/${token}`, origin).toString();
+  }
+
+  closeWorkload(workloadId: string): number {
+    const tokens = this.openHandleTokensByWorkload.get(workloadId);
+    if (!tokens) return 0;
+    for (const token of tokens) this.openHandles.delete(token);
+    this.openHandleTokensByWorkload.delete(workloadId);
+    return tokens.size;
   }
 
   async resolveOpen(token: string, workloadIsOpen: (id: string) => boolean): Promise<VfsOpenContent | null> {
     const handle = this.openHandles.get(token);
     if (!handle || !workloadIsOpen(handle.workloadId)) {
-      this.openHandles.delete(token);
+      this.deleteOpenHandle(token, handle);
       return null;
     }
     try {
       const snapshot = await readStableD1File(this.filesRoot, handle.path);
       if (snapshot.digest !== handle.digest) {
-        this.openHandles.delete(token);
+        this.deleteOpenHandle(token, handle);
         return null;
       }
       return {
@@ -131,9 +148,17 @@ export class VfsService {
         mediaType: mediaTypeForPath(handle.path),
       };
     } catch {
-      this.openHandles.delete(token);
+      this.deleteOpenHandle(token, handle);
       return null;
     }
+  }
+
+  private deleteOpenHandle(token: string, handle = this.openHandles.get(token)): void {
+    this.openHandles.delete(token);
+    if (!handle) return;
+    const workloadTokens = this.openHandleTokensByWorkload.get(handle.workloadId);
+    workloadTokens?.delete(token);
+    if (workloadTokens?.size === 0) this.openHandleTokensByWorkload.delete(handle.workloadId);
   }
 
   private async executeMutation(
