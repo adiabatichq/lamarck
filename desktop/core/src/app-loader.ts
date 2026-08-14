@@ -1,8 +1,7 @@
 import { constants } from "node:fs";
 import { mkdir, open, readdir, rename, stat } from "fs/promises";
 import { join } from "path";
-import { validateDocId } from "./doc-id";
-import type { DocOp } from "./guard-types";
+import { validateD1Grant } from "@lamarck/system/internal/vfs";
 import {
   APP_MANIFEST_MAX_BYTES,
   digestNormalizedAppManifest,
@@ -35,9 +34,9 @@ export interface AppManifest {
   };
   permissions: {
     writes: {
-      // D1 doc grants beyond the implicit home prefix `apps/<appId>/`.
-      // Each grant is a doc-id prefix ending in "/" or an exact doc id.
-      docs: string[];
+      // D1 file grants beyond the implicit home prefix `apps/<appId>/`.
+      // Each grant is a path prefix ending in "/" or an exact real file path.
+      files: string[];
       // D2 tables this app can write to.
       tables: string[];
     };
@@ -63,7 +62,7 @@ export interface LoadedApp {
 export interface AppRegistry {
   apps: Map<string, LoadedApp>;
   getTableGrants(appId: string): string[];
-  canWriteDoc(appId: string, id: string, op: DocOp): boolean;
+  getFileGrants(appId: string): string[];
 }
 
 export type AppManifestValidationResult =
@@ -83,7 +82,7 @@ const RUNTIME_FIELDS = new Set(["ui", "services", "jobs"]);
 const UI_FIELDS = new Set(["command", "port"]);
 const WORKLOAD_FIELDS = new Set(["command"]);
 const PERMISSION_FIELDS = new Set(["writes"]);
-const WRITE_PERMISSION_FIELDS = new Set(["docs", "tables"]);
+const WRITE_PERMISSION_FIELDS = new Set(["files", "tables"]);
 const MANIFEST_SETTLE_ATTEMPTS = 3;
 const MANIFEST_SETTLE_DELAY_MS = 20;
 
@@ -422,13 +421,13 @@ export function validateAppManifest(
   if (unexpectedWritePermissionField) {
     return invalid(`unknown permissions.writes field "${unexpectedWritePermissionField}"`);
   }
-  const docs = value.permissions.writes.docs;
-  if (!Array.isArray(docs)) {
-    return invalid("permissions.writes.docs must be an array");
+  const files = value.permissions.writes.files;
+  if (!Array.isArray(files)) {
+    return invalid("permissions.writes.files must be an array");
   }
-  const badDocGrant = docs.find((grant) => !isValidDocGrant(grant));
-  if (badDocGrant !== undefined) {
-    return invalid(`invalid D1 doc grant ${JSON.stringify(badDocGrant)}`);
+  const badFileGrant = files.find((grant) => !isValidFileGrant(grant));
+  if (badFileGrant !== undefined) {
+    return invalid(`invalid D1 file grant ${JSON.stringify(badFileGrant)}`);
   }
   const tables = value.permissions.writes.tables;
   if (!Array.isArray(tables) || tables.some((table) => !isValidTableGrant(table))) {
@@ -446,7 +445,7 @@ export function validateAppManifest(
       runtime,
       permissions: {
         writes: {
-          docs: [...docs] as string[],
+          files: [...files] as string[],
           tables: [...tables] as string[],
         },
       },
@@ -515,14 +514,9 @@ function validateNamedWorkloads(value: unknown, path: string): NamedWorkloadVali
   return { ok: true, workloads };
 }
 
-// A doc grant is a prefix ending in "/" (matches every doc id under it) or an
-// exact doc id. Grant bodies obey the same character rules as doc ids, so a
-// grant can never reach outside the pages/ root.
-function isValidDocGrant(grant: unknown): boolean {
-  if (typeof grant !== "string" || grant.length === 0) return false;
-  const body = grant.endsWith("/") ? grant.slice(0, -1) : grant;
+function isValidFileGrant(grant: unknown): boolean {
   try {
-    validateDocId(body);
+    validateD1Grant(grant as string);
     return true;
   } catch {
     return false;
@@ -539,13 +533,10 @@ function createRegistry(apps: Map<string, LoadedApp>): AppRegistry {
     getTableGrants(appId: string): string[] {
       return apps.get(appId)?.manifest.permissions.writes.tables ?? [];
     },
-    canWriteDoc(appId: string, id: string, _op: DocOp): boolean {
+    getFileGrants(appId: string): string[] {
       const app = apps.get(appId);
-      if (!app) return false;
-      // Implicit home prefix: every app owns its own doc namespace,
-      // materialized at pages/apps/<appId>/. Declared grants extend it.
-      const grants = [`apps/${appId}/`, ...app.manifest.permissions.writes.docs];
-      return grants.some((grant) => grant.endsWith("/") ? id.startsWith(grant) : id === grant);
+      if (!app) return [];
+      return [`apps/${appId}/`, ...app.manifest.permissions.writes.files];
     },
   };
 }

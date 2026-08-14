@@ -305,6 +305,7 @@ const capsuleBackend = new MacOsCapsuleBackend({
   stateDirectory: join(capsuleCacheRoot, "vm"),
   cacheDirectory: join(capsuleCacheRoot, "cache"),
   artifactRoot: join(capsuleCacheRoot, "artifacts"),
+  workspaceFilesPath: () => join(workspace, "files"),
   systemStreamServer,
 });
 const capsuleManager = new CapsuleManager({
@@ -2932,6 +2933,36 @@ app.whenReady().then(async () => {
       payload.path as string,
       payload.recoveryCode as string | undefined,
     ));
+  });
+  ipcMain.handle("workspace:openFiles", async (event, application: "finder" | "obsidian") => {
+    requireShellIpc(event);
+    if (application !== "finder" && application !== "obsidian") {
+      throw new Error("Workspace files application is invalid");
+    }
+    if (!activeWorkspace) throw new Error("No Workspace is active");
+    const filesPath = join(activeWorkspace.path, "files");
+    if (application === "finder") {
+      const error = await shell.openPath(filesPath);
+      if (error) throw new Error(error);
+    } else {
+      await shell.openExternal(`obsidian://open?path=${encodeURIComponent(filesPath)}`);
+    }
+    return { ok: true as const };
+  });
+  ipcMain.handle("workspace:chooseVfsTransferPath", async (event, purpose: "import" | "export") => {
+    const owner = requireShellIpc(event);
+    if (purpose !== "import" && purpose !== "export") {
+      throw new Error("VFS transfer purpose is invalid");
+    }
+    if (purpose === "import") {
+      const result = await dialog.showOpenDialog(owner, {
+        title: "Choose a file or folder to import",
+        properties: ["openFile", "openDirectory"],
+      });
+      return { path: result.canceled ? null : result.filePaths[0] ?? null };
+    }
+    const result = await dialog.showSaveDialog(owner, { title: "Choose an export destination" });
+    return { path: result.canceled ? null : result.filePath ?? null };
   });
   ipcMain.handle("app-viewer:open", async (event, appId: string) => {
     const owner = requireShellRendererOwner(event);

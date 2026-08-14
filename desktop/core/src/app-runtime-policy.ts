@@ -38,6 +38,6 @@ export function isAppSystemRoute(path: string, method: string): boolean {
   if (path === "/api/mutate" && method === "POST") return true;
   if (path === "/api/transaction" && method === "POST") return true;
   if (path === "/api/events" && method === "POST") return true;
-  if (path === "/api/docs" && method === "POST") return true;
-  return path.startsWith("/api/docs/") && method === "DELETE";
+  if (path === "/api/vfs/command" && method === "POST") return true;
+  return path === "/api/vfs/open" && method === "POST";
 }

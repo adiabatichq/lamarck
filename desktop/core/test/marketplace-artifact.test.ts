@@ -309,7 +309,7 @@ function appManifest(id: string) {
     name: "Sample",
     description: "A Marketplace artifact compatibility fixture.",
     runtime: { ui: { command: ["npm", "run", "start"], port: 3000 } },
-    permissions: { writes: { docs: [], tables: [] } },
+    permissions: { writes: { files: [], tables: [] } },
   };
 }
 

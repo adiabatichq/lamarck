@@ -287,16 +287,17 @@ async function runCapsuleCoreGuard(): Promise<void> {
       runtime: {
         ui: { command: ["/bin/capsule-runtime-probe", "system-rpc"], port: 3000 },
       },
-      permissions: { writes: { docs: [], tables: ["capsule_items"] } },
+      permissions: { writes: { files: [], tables: ["capsule_items"] } },
     }, null, 2)}\n`, "utf8");
     const db = new DatabaseSync(join(workspace, ".lamarck", "data.db"));
     try {
       db.exec(DATA_SCHEMA);
       db.exec(`
         CREATE TABLE capsule_items (
-          id TEXT PRIMARY KEY,
+          id TEXT PRIMARY KEY NOT NULL,
           value TEXT NOT NULL
         );
+        PRAGMA user_version = 1;
       `);
     } finally {
       db.close();
@@ -412,7 +413,7 @@ async function runCapsuleCoreGuard(): Promise<void> {
           FROM capsule_items AS i
           JOIN events AS e
             ON e.source = 'app:app-a:ui'
-           AND e.type = 'd2.insert'
+           AND e.type = 'workspace.table.rows.inserted'
           WHERE i.id = 'from-real-runc'
         `,
       }),
@@ -429,7 +430,7 @@ async function runCapsuleCoreGuard(): Promise<void> {
         id: "from-real-runc",
         value: "committed",
         source: "app:app-a:ui",
-        type: "d2.insert",
+        type: "workspace.table.rows.inserted",
       },
     );
     const payload = JSON.parse(String(query.rows[0]!.payload)) as Record<string, unknown>;

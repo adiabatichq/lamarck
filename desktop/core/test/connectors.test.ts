@@ -931,7 +931,6 @@ auth:
         if (!guard.writeTextBlob) throw new Error("missing writeTextBlob capability");
         const result = await guard.writeTextBlob({
           text: blobText,
-          variant: "redacted-text",
           mediaType: "application/json",
         });
         writtenRef = result.ref;
@@ -971,7 +970,6 @@ auth:
       kind: "content-blob",
       version: 1,
       digest: `sha256:${digestHex}`,
-      variant: "redacted-text",
       mediaType: "application/json",
       encoding: "gzip",
     });
@@ -1007,7 +1005,6 @@ auth:
       bytes: Buffer.byteLength(text),
       digest: written.ref.digest,
       mediaType: "text/plain; charset=utf-8",
-      variant: "redacted-text",
     });
 
     const jsonText = '{"root":{"role":"main"},"childTrajectories":[]}';
@@ -1022,7 +1019,6 @@ auth:
       bytes: Buffer.byteLength(jsonText),
       digest: writtenJson.ref.digest,
       mediaType: "application/json",
-      variant: "redacted-text",
     });
 
     expect(() => store.writeText({
@@ -4690,7 +4686,6 @@ auth:
               kind: "content-blob",
               version: 1,
               digest: "sha256:" + digest,
-              variant: input.variant,
               mediaType: input.mediaType,
               encoding: "gzip",
             },
@@ -10490,7 +10485,6 @@ export default {
   async run({ guard }) {
     const result = await guard.writeTextBlob({
       text: blobText,
-      variant: "redacted-text",
       mediaType: "text/plain; charset=utf-8",
     });
     await guard.writeEvent({
@@ -10523,7 +10517,6 @@ export default {
       kind: "content-blob",
       version: 1,
       digest: `sha256:${digestHex}`,
-      variant: "redacted-text",
       mediaType: "text/plain; charset=utf-8",
       encoding: "gzip",
     });

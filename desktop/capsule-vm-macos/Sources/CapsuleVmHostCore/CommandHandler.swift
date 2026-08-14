@@ -294,6 +294,7 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
     private func parseStartDescriptor(_ params: [String: Any]) throws -> CapsuleVmStartDescriptor {
         let expectedKeys: Set<String> = [
             "imageBundlePath",
+            "workspaceFilesPath",
             "statePreparationId",
             "expectedManifestDigest",
             "manifestPublicKey",
@@ -307,6 +308,7 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
             )
         }
         guard let imagePath = absolutePath(params["imageBundlePath"]),
+              let workspaceFilesPath = absolutePath(params["workspaceFilesPath"]),
               let statePreparationID = canonicalPreparationID(params["statePreparationId"]) else {
             throw CapsuleVmCommandError(
                 code: "guest_image_required",
@@ -344,6 +346,7 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
                 expectedArchitecture: .currentHost,
                 pinnedPublicKey: publicKey
             ),
+            workspaceFilesURL: URL(fileURLWithPath: workspaceFilesPath, isDirectory: true),
             statePreparationID: statePreparationID,
             cpuCount: cpuCount,
             memorySize: memorySize

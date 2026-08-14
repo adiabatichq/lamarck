@@ -31,11 +31,20 @@ describe("DB", () => {
     ).get();
     expect(events).toBeTruthy();
 
-    // Check docs table exists
+    // D1 has no database table; files/ is its only local authority.
     const docs = dataDb.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name='docs'"
     ).get();
-    expect(docs).toBeTruthy();
+    expect(docs).toBeFalsy();
+
+    for (const table of ["d1_observer_files", "d1_observer_cursor", "d1_history_exclusions"]) {
+      expect(dataDb.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name = ?"
+      ).get(table)).toBeFalsy();
+      expect(systemDb.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name = ?"
+      ).get(table)).toBeTruthy();
+    }
 
     const dataConnectorSources = dataDb.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name='connector_sources'"
@@ -151,17 +160,15 @@ describe("DB", () => {
     close();
   });
 
-  test("docs table has correct columns", () => {
-    const { dataDb, close } = openDatabases(workspace);
-    const columns = dataDb.prepare("PRAGMA table_info(docs)").all() as { name: string }[];
-    const names = columns.map((c) => c.name);
-
-    expect(names).toContain("id");
-    expect(names).toContain("content");
-    expect(names).toContain("metadata");
-    expect(names).toContain("created_at");
-    expect(names).toContain("updated_at");
-
+  test("observer checkpoint stores exact Markdown baselines in system.db", () => {
+    const { systemDb, close } = openDatabases(workspace);
+    const columns = systemDb.prepare("PRAGMA table_info(d1_observer_files)").all() as { name: string }[];
+    expect(columns.map((column) => column.name)).toEqual([
+      "path",
+      "digest",
+      "byte_length",
+      "markdown_baseline",
+    ]);
     close();
   });
 

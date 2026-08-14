@@ -300,8 +300,7 @@
 .overview,
 .inventoryPage,
 .dataPage,
-.workspacePage,
-.documentInspector {
+.workspacePage {
   height: 100%;
   overflow-y: auto;
   padding: 34px 38px 56px;
@@ -325,8 +324,7 @@
   text-transform: uppercase;
 }
 
-.pageHeader h1,
-.documentInspector header h1 {
+.pageHeader h1 {
   margin-top: 8px;
   font-family: var(--font-display);
   font-size: clamp(32px, 4vw, 49px);
@@ -599,7 +597,7 @@
 
 .sourceNode { grid-column: 1; grid-row: 1; }
 .timelineNode { grid-column: 3; grid-row: 1; border-color: rgba(79, 227, 193, 0.24); }
-.documentNode { grid-column: 3; grid-row: 3; }
+.fileNode { grid-column: 3; grid-row: 3; }
 .tableNode { grid-column: 4; grid-row: 3; }
 .appNode { grid-column: 5; grid-row: 1 / span 3; align-self: stretch; border-color: rgba(143, 223, 255, 0.23); }
 .appNode > i { color: var(--system-link); }
@@ -938,6 +936,247 @@
 .dataList small { color: var(--system-faint); font-family: var(--font-mono); font-size: 7.5px; }
 .dataList > button > b { color: var(--system-faint); font-weight: 400; }
 
+.filesPanel {
+  display: grid;
+  gap: 9px;
+  padding: 9px;
+}
+
+.filesRootCard,
+.markdownFocus {
+  min-width: 0;
+  border: 1px solid var(--system-line);
+  background: rgba(7, 9, 13, 0.72);
+}
+
+.filesRootCard {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  gap: 15px;
+  padding: 17px;
+}
+
+.filesRootRail {
+  position: relative;
+  display: grid;
+  min-height: 82px;
+  place-items: center;
+  border: 1px solid rgba(79, 227, 193, 0.2);
+  background: linear-gradient(180deg, rgba(79, 227, 193, 0.07), rgba(79, 227, 193, 0.015));
+  color: var(--system-active);
+}
+
+.filesRootRail::before,
+.filesRootRail::after {
+  content: "";
+  position: absolute;
+  top: 16px;
+  bottom: 16px;
+  left: 50%;
+  width: 1px;
+  background: rgba(79, 227, 193, 0.22);
+}
+
+.filesRootRail::after {
+  top: auto;
+  right: 9px;
+  bottom: 16px;
+  left: 50%;
+  width: auto;
+  height: 1px;
+}
+
+.filesRootRail i {
+  position: absolute;
+  top: 12px;
+  left: calc(50% - 3px);
+  z-index: 1;
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--system-active);
+  background: #0a0c11;
+  transform: rotate(45deg);
+}
+
+.filesRootRail span {
+  position: relative;
+  z-index: 1;
+  padding: 4px;
+  background: #0a0c11;
+  font-family: var(--font-mono);
+  font-size: 7px;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+}
+
+.filesEyebrow {
+  color: var(--system-active);
+  font-family: var(--font-mono);
+  font-size: 7px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.filesRootCard h2 {
+  margin-top: 6px;
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 580;
+  letter-spacing: -0.025em;
+}
+
+.filesRootCard p,
+.historyPanel > p {
+  margin-top: 7px;
+  color: var(--system-faint);
+  font-size: 9px;
+  line-height: 1.55;
+}
+
+.fileActions {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, auto)) 1fr repeat(2, minmax(0, auto));
+  gap: 6px;
+}
+
+.fileActions button,
+.pathComposer button,
+.focusTools button,
+.ruleComposer button {
+  min-height: 31px;
+  border: 1px solid var(--system-line-strong);
+  padding: 0 10px;
+  color: var(--system-text);
+  font-size: 8px;
+  font-weight: 680;
+}
+
+.fileActions button:hover,
+.fileActions button:focus-visible,
+.pathComposer button:hover:not(:disabled),
+.pathComposer button:focus-visible,
+.focusTools button:hover:not(:disabled),
+.focusTools button:focus-visible,
+.ruleComposer button:hover:not(:disabled),
+.ruleComposer button:focus-visible {
+  border-color: rgba(79, 227, 193, 0.55);
+  color: var(--system-active);
+}
+
+.fileActions .quietAction { color: var(--system-muted); }
+
+.focusHeading {
+  display: flex;
+  min-height: 49px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 13px;
+  border-bottom: 1px solid var(--system-line);
+}
+
+.focusHeading > div { display: grid; gap: 3px; }
+.focusHeading span,
+.focusHeading small {
+  color: var(--system-faint);
+  font-family: var(--font-mono);
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.focusHeading strong { font-family: var(--font-display); font-size: 12px; font-weight: 580; }
+
+.pathComposer,
+.ruleComposer {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 0;
+  margin: 12px;
+  border: 1px solid var(--system-line-strong);
+  background: rgba(4, 6, 9, 0.7);
+}
+
+.pathComposer > span,
+.ruleComposer > span {
+  display: flex;
+  align-items: center;
+  border-right: 1px solid var(--system-line);
+  padding: 0 8px;
+  color: var(--system-active);
+  font-family: var(--font-mono);
+  font-size: 8px;
+}
+
+.pathComposer input,
+.ruleComposer input {
+  min-width: 0;
+  border: 0;
+  padding: 0 9px;
+  background: transparent;
+  color: var(--system-text);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  outline: 0;
+}
+
+.pathComposer:focus-within,
+.ruleComposer:focus-within { border-color: rgba(79, 227, 193, 0.5); }
+.pathComposer button,
+.ruleComposer button { border-width: 0 0 0 1px; }
+.pathComposer button:disabled,
+.focusTools button:disabled,
+.ruleComposer button:disabled { opacity: 0.38; }
+
+.focusTools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px 12px;
+}
+
+.focusTools span {
+  color: var(--system-faint);
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.markdownPreview {
+  max-height: 310px;
+  overflow: auto;
+  border-top: 1px solid var(--system-line);
+  padding: 15px;
+  color: var(--system-text);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.markdownEmpty,
+.ruleEmpty {
+  border-top: 1px solid var(--system-line);
+  padding: 17px 13px;
+  color: var(--system-faint);
+  font-size: 8.5px;
+}
+
+.markdownEmpty code,
+.historyPanel code { color: var(--system-muted); font-family: var(--font-mono); }
+
+.inspectorNotice {
+  margin: 0 12px 12px;
+  border: 1px solid rgba(79, 227, 193, 0.24);
+  padding: 10px;
+  color: var(--system-active);
+  font-family: var(--font-mono);
+  font-size: 8px;
+}
+
 .fullSurface,
 .catalogSurface,
 .inspectorPage {
@@ -970,64 +1209,6 @@
 
 .surfaceBack:hover { color: var(--system-active); }
 .surfaceFill { min-height: 0; overflow: hidden; border-top: 1px solid var(--system-line); }
-
-.documentInspector header {
-  padding-bottom: 22px;
-  border-bottom: 1px solid var(--system-line);
-}
-
-.documentInspector > .surfaceBack {
-  margin: -18px 0 20px -17px;
-}
-
-.documentInspector header > span {
-  color: var(--system-active);
-  font-family: var(--font-mono);
-  font-size: 8px;
-  font-weight: 700;
-  letter-spacing: 0.11em;
-  text-transform: uppercase;
-}
-
-.documentInspector header h1 { overflow-wrap: anywhere; }
-.documentInspector header p { margin-top: 9px; color: var(--system-faint); font-family: var(--font-mono); font-size: 8px; }
-
-.documentBody {
-  display: grid;
-  grid-template-columns: minmax(0, 1.7fr) minmax(250px, 0.7fr);
-  gap: 11px;
-  margin-top: 17px;
-}
-
-.documentBody section {
-  min-width: 0;
-  border: 1px solid var(--system-line);
-  background: rgba(12, 15, 21, 0.86);
-}
-
-.documentBody section > span {
-  display: block;
-  padding: 11px 13px;
-  border-bottom: 1px solid var(--system-line);
-  color: var(--system-faint);
-  font-family: var(--font-mono);
-  font-size: 7px;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-
-.documentBody pre {
-  max-height: calc(100vh - 260px);
-  overflow: auto;
-  padding: 16px;
-  color: var(--system-text);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  line-height: 1.65;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
 
 .inspectorError,
 .inspectorLoading {
@@ -1094,9 +1275,29 @@
 .identityPanel > button:disabled { opacity: 0.45; }
 .identityPanel > p { margin-top: 17px; color: var(--system-faint); font-size: 9px; line-height: 1.55; }
 
+.historyPanel {
+  margin-top: 11px;
+  min-height: 0;
+}
+
+.historyPanel h2 {
+  margin-top: 8px;
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 580;
+  letter-spacing: -0.025em;
+}
+
+.historyPanel > .ruleComposer { margin: 16px 0 10px; }
+.ruleList { max-height: 240px; border: 1px solid var(--system-line); }
+.ruleList > button { grid-template-columns: minmax(0, 1fr) auto; }
+.ruleList > button > b { font-size: 8px; }
+.ruleList > button:hover > b { color: var(--system-danger); }
+.ruleEmpty { display: block; border-top: 0; }
+
 @media (max-width: 980px) {
   .room { grid-template-columns: 190px minmax(0, 1fr); }
-  .overview, .inventoryPage, .dataPage, .workspacePage, .documentInspector { padding-right: 24px; padding-left: 24px; }
+  .overview, .inventoryPage, .dataPage, .workspacePage { padding-right: 24px; padding-left: 24px; }
   .signalGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .shapeDiagram { grid-template-columns: 100px 45px minmax(100px, 1fr) minmax(100px, 1fr); }
   .appNode { display: none; }
@@ -1104,7 +1305,8 @@
   .lowerGrid, .dataColumns, .workspaceColumns { grid-template-columns: 1fr; }
   .inventoryHeader, .inventoryRow { grid-template-columns: minmax(200px, 1.3fr) minmax(140px, 1fr) 90px; }
   .inventoryHeader > span:nth-child(3), .inventoryRow > div:nth-child(3) { display: none; }
-  .documentBody { grid-template-columns: 1fr; }
+  .fileActions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fileActions > span { display: none; }
 }
 
 @media (max-width: 700px) {
@@ -1120,6 +1322,10 @@
   .shapePanel { display: none; }
   .inventoryHeader, .inventoryRow { grid-template-columns: minmax(170px, 1fr) 75px; }
   .inventoryHeader > span:nth-child(2), .inventoryRow > div:nth-child(2) { display: none; }
+  .filesRootCard { grid-template-columns: 42px minmax(0, 1fr); padding: 12px; }
+  .pathComposer, .ruleComposer { grid-template-columns: auto minmax(0, 1fr); }
+  .pathComposer button, .ruleComposer button { grid-column: 1 / -1; border-width: 1px 0 0; }
+  .focusTools { align-items: flex-start; flex-direction: column; }
 }
 
 @media (prefers-reduced-motion: reduce) {

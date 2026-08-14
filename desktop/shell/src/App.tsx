@@ -3,7 +3,6 @@ import { AppLauncher } from "./components/AppLauncher";
 import { MarketplaceHandoffController } from "./components/MarketplaceHandoffController";
 import { SchemaApprovalModal } from "./components/SchemaApprovalModal";
 import { WorkspaceSetup } from "./components/WorkspaceSetup";
-import { WorkingTreeConflictModal } from "./components/WorkingTreeConflictModal";
 import { AppRuntimeView } from "./content/AppRuntimeView";
 import { UseWorkspace } from "./layout/UseWorkspace";
 import {
@@ -113,7 +112,6 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
   const [coreStatus, setCoreStatus] = useState<CoreStatus>("checking");
   const [coreError, setCoreError] = useState<string | null>(null);
   const [schemaRequest, setSchemaRequest] = useState<SchemaRequest | null>(null);
-  const [workingTreeConflictOpen, setWorkingTreeConflictOpen] = useState(false);
   const [marketplaceHandoffOpen, setMarketplaceHandoffOpen] = useState(false);
   const [lamarckSession, setLamarckSession] = useState<LamarckSessionView>({ status: "signed_out" });
   const [identityBusy, setIdentityBusy] = useState(false);
@@ -362,7 +360,7 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
     }
   }, []);
 
-  const viewerOccluded = Boolean(schemaRequest) || workingTreeConflictOpen || marketplaceHandoffOpen;
+  const viewerOccluded = Boolean(schemaRequest) || marketplaceHandoffOpen;
   const systemNeedsAttention = coreStatus === "offline" || viewerOccluded;
 
   return (
@@ -434,11 +432,6 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
           openApp(appId);
         }}
         onVisibilityChange={setMarketplaceHandoffOpen}
-      />
-      <WorkingTreeConflictModal
-        connected={coreStatus === "connected"}
-        paused={Boolean(schemaRequest)}
-        onVisibilityChange={setWorkingTreeConflictOpen}
       />
     </>
   );

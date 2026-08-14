@@ -5,17 +5,14 @@ import {
   type SQLOutputValue,
   type StatementSync,
 } from "node:sqlite";
-import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { D0_SCHEMA_VERSION } from "../schema";
 import { migrateDataDatabase } from "../data-migrations";
 import { DATA_DB_FILENAME } from "../data-schema";
-import { docIdsHavePortableMaterializationConflict, validateDocId } from "../doc-id";
 import { assertJsonValue, type JsonValue } from "../json";
 import { parseProducerRef } from "../producer-descriptor";
 import { foldSqliteIdentifier as normalizeName } from "../sqlite-identifiers";
-import { createUnifiedPatch } from "../utils/unified-diff";
 import { ulid } from "../utils/ulid";
 import type {
   GuardEventInput,
@@ -30,19 +27,16 @@ import type {
   GuardSqlParams,
   GuardStatement,
   GuardTransactionStatementResult,
-  GuardWorkingTreeDoc,
-  GuardWorkingTreeLockedDocHash,
 } from "./protocol";
 
 export { DATA_DB_FILENAME };
 
-const SYSTEM_TABLES = new Set(["events", "docs"]);
+const SYSTEM_TABLES = new Set(["events"]);
 const SYSTEM_TABLE_PREFIXES = ["sqlite_", "pragma_", "_lamarck_", "connector_", "auth_"];
 const SAFE_EPONYMOUS_READS = new Set(["json_each", "json_tree"]);
 const RESERVED_EVENT_TYPE_PREFIXES = [
   "connector.",
-  "d1.",
-  "d2.",
+  "workspace.",
   "ddl.",
   "app.created",
   "app.archived",
@@ -61,12 +55,6 @@ const DEFAULT_MAX_SQL_BYTES = 256 * 1024;
 // randomblob(1e9) fail with SQLITE_NOMEM instead of exhausting the host.
 const SQLITE_HARD_HEAP_LIMIT_BYTES = 256 * 1024 * 1024;
 const MAX_TRANSACTION_STATEMENTS = 100;
-const SHA256 = /^[0-9a-f]{64}$/;
-const UNCONDITIONAL_DOC_MUTATION = Symbol("unconditional-doc-mutation");
-type DocVersionExpectation = typeof UNCONDITIONAL_DOC_MUTATION | {
-  hash: string | null;
-  updatedAt: number | null;
-};
 
 type DmlOp = "insert" | "update" | "delete";
 
@@ -99,12 +87,6 @@ interface MutatePolicy {
   writes: PlannedWrite[];
 }
 
-interface D1Policy {
-  mode: "d1";
-  operation: "write" | "delete";
-  writes: PlannedWrite[];
-}
-
 interface SchemaPolicy {
   mode: "schema";
   kind: GuardSchemaKind;
@@ -121,13 +103,12 @@ interface DenyPolicy {
   mode: "deny";
 }
 
-type AuthorizerPolicy = QueryPolicy | D0Policy | MutatePolicy | D1Policy | SchemaPolicy | InternalPolicy | DenyPolicy;
+type AuthorizerPolicy = QueryPolicy | D0Policy | MutatePolicy | SchemaPolicy | InternalPolicy | DenyPolicy;
 
 interface NormalizedPrincipal {
   source: string;
   producerRef: string;
   tableGrants: "*" | Set<string>;
-  docGrants: "*" | string[];
   schemaGrant: boolean;
 }
 
@@ -188,6 +169,8 @@ export class GuardEngine {
   private policy: AuthorizerPolicy = { mode: "deny" };
   private closed = false;
   private readonly uncapturableTables = new Map<string, string>();
+  private readonly primaryKeyColumnsByTable = new Map<string, Set<string>>();
+  private deniedPrimaryKeyMutation: string | null = null;
   private readonly mainRelations = new Set<string>();
 
   constructor(opts: GuardEngineOptions) {
@@ -233,6 +216,7 @@ export class GuardEngine {
       this.db.setAuthorizer((action, arg1, arg2, dbName, triggerOrView) =>
         this.authorize(action, arg1, arg2, dbName, triggerOrView)
       );
+      this.assertD2PrimaryKeys();
       this.refreshCdcCapture();
     } catch (error) {
       try { this.db.close(); } catch {}
@@ -351,23 +335,29 @@ export class GuardEngine {
         this.clearCdcRows();
         const policy: MutatePolicy = { mode: "mutate", principal, writes: [] };
 
-        const prepared = this.withPolicy(policy, () => {
-          const statement = this.db.prepare(item.sql);
-          if (policy.writes.length > 0) {
-            this.assertWritesCapturable(policy.writes);
-          } else if (statement.columns().length === 0) {
-            throw new GuardServiceError(
-              "GUARD_QUERY_REQUIRED",
-              `Guard: transaction statement ${index} must be relational SQL or DML`,
-            );
-          }
-          const rows = executeRows(statement, item.params, {
-            maxRows: this.maxResultRows,
-            maxBytes: this.maxResultBytes,
-            mustComplete: policy.writes.length > 0,
+        this.deniedPrimaryKeyMutation = null;
+        let prepared: { rows: Array<Record<string, unknown>>; hasWrites: boolean };
+        try {
+          prepared = this.withPolicy(policy, () => {
+            const statement = this.db.prepare(item.sql);
+            if (policy.writes.length > 0) {
+              this.assertWritesCapturable(policy.writes);
+            } else if (statement.columns().length === 0) {
+              throw new GuardServiceError(
+                "GUARD_QUERY_REQUIRED",
+                `Guard: transaction statement ${index} must be relational SQL or DML`,
+              );
+            }
+            const rows = executeRows(statement, item.params, {
+              maxRows: this.maxResultRows,
+              maxBytes: this.maxResultBytes,
+              mustComplete: policy.writes.length > 0,
+            });
+            return { rows, hasWrites: policy.writes.length > 0 };
           });
-          return { rows, hasWrites: policy.writes.length > 0 };
-        });
+        } catch (error) {
+          this.rethrowPrimaryKeyMutation(error);
+        }
 
         if (!prepared.hasWrites) {
           appendResult({ kind: "query", rows: prepared.rows });
@@ -380,7 +370,6 @@ export class GuardEngine {
           principal,
           item.sql,
           item.params,
-          policy.writes,
           cdc,
           { transactionId, statementIndex: index, auditBudget },
         );
@@ -406,6 +395,23 @@ export class GuardEngine {
     validateEventInput(event);
     assertEventTypeAllowed(principal.source, event.type);
 
+    return this.appendEvent(principal, event);
+  }
+
+  writeWorkspaceEvent(principalInput: GuardPrincipal, event: GuardEventInput): string {
+    this.assertOpen();
+    const principal = normalizePrincipal(principalInput);
+    validateEventInput(event);
+    if (!event.type.startsWith("workspace.") || event.externalId !== undefined) {
+      throw new GuardServiceError(
+        "GUARD_EVENT_NAMESPACE",
+        "Guard: Host workspace events require workspace.* and external_id = null",
+      );
+    }
+    return this.appendEvent(principal, event);
+  }
+
+  private appendEvent(principal: NormalizedPrincipal, event: GuardEventInput): string {
     const id = ulid();
     let resolvedId = id;
     this.beginImmediate();
@@ -444,300 +450,6 @@ export class GuardEngine {
       this.rollback();
       throw error;
     }
-  }
-
-  writeDoc(
-    principalInput: GuardPrincipal,
-    id: string,
-    content: string,
-    metadata?: Record<string, unknown>,
-  ): { ok: true } {
-    this.assertOpen();
-    const principal = normalizePrincipal(principalInput);
-    validateDocId(id);
-    assertDocGrant(principal, id, "write");
-    if (typeof content !== "string") {
-      throw new GuardServiceError("GUARD_INVALID_DOC", "Guard: doc content must be a string");
-    }
-    if (metadata !== undefined) validateDocMetadata(metadata);
-
-    this.writeDocTransaction(principal, id, content, metadata, UNCONDITIONAL_DOC_MUTATION);
-    return { ok: true };
-  }
-
-  compareAndWriteDoc(
-    principalInput: GuardPrincipal,
-    id: string,
-    expectedHash: string | null,
-    expectedUpdatedAt: number | null,
-    content: string,
-    metadata?: Record<string, unknown>,
-  ): boolean {
-    this.assertOpen();
-    const principal = normalizePrincipal(principalInput);
-    validateDocId(id);
-    assertDocGrant(principal, id, "write");
-    if (expectedHash !== null && !isSha256(expectedHash)) {
-      throw new GuardServiceError(
-        "GUARD_INVALID_DOC",
-        "Guard: expected doc hash must be a lowercase SHA-256 hash or null",
-      );
-    }
-    validateExpectedDocVersion(expectedHash, expectedUpdatedAt);
-    if (typeof content !== "string") {
-      throw new GuardServiceError("GUARD_INVALID_DOC", "Guard: doc content must be a string");
-    }
-    if (metadata !== undefined) validateDocMetadata(metadata);
-
-    return this.writeDocTransaction(principal, id, content, metadata, {
-      hash: expectedHash,
-      updatedAt: expectedUpdatedAt,
-    });
-  }
-
-  readDocForWorkingTree(
-    principalInput: GuardPrincipal,
-    id: string,
-  ): GuardWorkingTreeDoc | null {
-    this.assertOpen();
-    const principal = normalizePrincipal(principalInput);
-    validateDocId(id);
-    if (!principal.source.startsWith("system:")) {
-      throw new GuardServiceError(
-        "GUARD_DOC_PERMISSION",
-        "Guard: Working Tree document reads require a system principal",
-      );
-    }
-    const row = this.withPolicy({ mode: "internal" }, () =>
-      this.db.prepare(
-        "SELECT id, content, metadata, updated_at FROM docs WHERE id = ?",
-      ).get(id)
-    ) as {
-      id: string;
-      content: string;
-      metadata: string | null;
-      updated_at: number;
-    } | undefined;
-    return row
-      ? { id: row.id, content: row.content, metadata: row.metadata, updatedAt: row.updated_at }
-      : null;
-  }
-
-  listLockedDocHashesForWorkingTree(
-    principalInput: GuardPrincipal,
-    afterId: string,
-    limit: number,
-  ): GuardWorkingTreeLockedDocHash[] {
-    this.assertOpen();
-    const principal = normalizePrincipal(principalInput);
-    if (!principal.source.startsWith("system:")) {
-      throw new GuardServiceError(
-        "GUARD_DOC_PERMISSION",
-        "Guard: Working Tree locked document hashes require a system principal",
-      );
-    }
-    if (typeof afterId !== "string") {
-      throw new GuardServiceError(
-        "GUARD_INVALID_DOC",
-        "Guard: Working Tree locked document cursor must be a string",
-      );
-    }
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 512) {
-      throw new GuardServiceError(
-        "GUARD_INVALID_DOC",
-        "Guard: Working Tree locked document hash limit must be an integer from 1 through 512",
-      );
-    }
-    const rows = this.withPolicy({ mode: "internal" }, () =>
-      this.db.prepare(
-        `SELECT id, content
-         FROM docs
-         WHERE id > ?
-           AND metadata IS NOT NULL
-           AND json_valid(metadata)
-           AND json_type(metadata, '$.locked') = 'true'
-         ORDER BY id
-         LIMIT ?`,
-      ).all(afterId, limit)
-    ) as unknown as Array<{ id: string; content: string }>;
-    return rows.map((row) => ({
-      id: row.id,
-      contentHash: hashDocContent(row.content),
-    }));
-  }
-
-  private writeDocTransaction(
-    principal: NormalizedPrincipal,
-    id: string,
-    content: string,
-    metadata: Record<string, unknown> | undefined,
-    expectation: DocVersionExpectation,
-  ): boolean {
-    this.beginImmediate();
-    try {
-      const existing = this.withPolicy({ mode: "internal" }, () =>
-        this.db.prepare("SELECT content, metadata, updated_at FROM docs WHERE id = ?").get(id)
-      ) as { content: string; metadata: string | null; updated_at: number } | undefined;
-      if (!docMatchesExpectation(existing, expectation)) {
-        this.commit();
-        return false;
-      }
-      if (!existing) {
-        const collision = this.withPolicy({ mode: "internal" }, () =>
-          (this.db.prepare("SELECT id FROM docs").all() as unknown as Array<{ id: string }>)
-            .find((row) => docIdsHavePortableMaterializationConflict(row.id, id))
-        );
-        if (collision) {
-          throw new GuardServiceError(
-            "GUARD_DOC_PATH_COLLISION",
-            `Guard: doc id ${JSON.stringify(id)} collides with portable Working Tree id ${JSON.stringify(collision.id)}`,
-          );
-        }
-      }
-      const storedMetadata = parseStoredDocMetadata(existing?.metadata ?? null);
-      let effectiveMetadata = resolveEffectiveDocMetadata(storedMetadata, metadata);
-      if (
-        principal.source === "working-tree:pages"
-        && this.hasLockedDocWithContentHash(hashDocContent(content))
-      ) {
-        effectiveMetadata = { ...(effectiveMetadata ?? {}), locked: true };
-      }
-      const suppressContentAudit = isLockedDocMetadata(storedMetadata)
-        || isLockedDocMetadata(effectiveMetadata);
-      const now = Math.max(Date.now(), (existing?.updated_at ?? -1) + 1);
-      this.clearCdcRows();
-      const policy: D1Policy = { mode: "d1", operation: "write", writes: [] };
-      this.withPolicy(policy, () => {
-        const statement = this.db.prepare(
-          `INSERT INTO docs (id, content, metadata, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-             content = excluded.content,
-             metadata = excluded.metadata,
-             updated_at = excluded.updated_at`,
-        );
-        this.assertWritesCapturable(policy.writes);
-        const result = statement.run(
-          id,
-          content,
-          effectiveMetadata === null ? null : JSON.stringify(effectiveMetadata),
-          now,
-          now,
-        );
-        assertSingleRowChange(result.changes, "D1 doc write");
-      });
-      this.assertNoD1SideEffects();
-
-      if (!suppressContentAudit) {
-        const before = existing?.content ?? "";
-        this.logD0(principal, "d1.write", {
-          doc_id: id,
-          patch: createUnifiedPatch(before, content, {
-            oldPath: existing ? `a/${id}` : "/dev/null",
-            newPath: `b/${id}`,
-          }),
-          bytes: Buffer.byteLength(content, "utf8"),
-        });
-      }
-      this.commit();
-      return true;
-    } catch (error) {
-      this.rollback();
-      throw error;
-    }
-  }
-
-  deleteDoc(principalInput: GuardPrincipal, id: string): boolean {
-    this.assertOpen();
-    const principal = normalizePrincipal(principalInput);
-    validateDocId(id);
-    assertDocGrant(principal, id, "delete");
-
-    return this.deleteDocTransaction(principal, id, UNCONDITIONAL_DOC_MUTATION);
-  }
-
-  compareAndDeleteDoc(
-    principalInput: GuardPrincipal,
-    id: string,
-    expectedHash: string,
-    expectedUpdatedAt: number,
-  ): boolean {
-    this.assertOpen();
-    const principal = normalizePrincipal(principalInput);
-    validateDocId(id);
-    assertDocGrant(principal, id, "delete");
-    if (!isSha256(expectedHash)) {
-      throw new GuardServiceError(
-        "GUARD_INVALID_DOC",
-        "Guard: expected doc hash must be a lowercase SHA-256 hash",
-      );
-    }
-    validateExpectedDocVersion(expectedHash, expectedUpdatedAt);
-
-    return this.deleteDocTransaction(principal, id, {
-      hash: expectedHash,
-      updatedAt: expectedUpdatedAt,
-    });
-  }
-
-  private deleteDocTransaction(
-    principal: NormalizedPrincipal,
-    id: string,
-    expectation: DocVersionExpectation,
-  ): boolean {
-    this.beginImmediate();
-    try {
-      const existing = this.withPolicy({ mode: "internal" }, () =>
-        this.db.prepare("SELECT content, metadata, updated_at FROM docs WHERE id = ?").get(id)
-      ) as { content: string; metadata: string | null; updated_at: number } | undefined;
-      if (!docMatchesExpectation(existing, expectation)) {
-        this.commit();
-        return false;
-      }
-      if (!existing) {
-        this.commit();
-        return false;
-      }
-      const storedMetadata = parseStoredDocMetadata(existing.metadata);
-
-      this.clearCdcRows();
-      const policy: D1Policy = { mode: "d1", operation: "delete", writes: [] };
-      this.withPolicy(policy, () => {
-        const statement = this.db.prepare("DELETE FROM docs WHERE id = ?");
-        this.assertWritesCapturable(policy.writes);
-        const result = statement.run(id);
-        assertSingleRowChange(result.changes, "D1 doc delete");
-      });
-      this.assertNoD1SideEffects();
-      if (!isLockedDocMetadata(storedMetadata)) {
-        this.logD0(principal, "d1.delete", {
-          doc_id: id,
-          content: existing.content,
-          metadata: storedMetadata,
-        });
-      }
-      this.commit();
-      return true;
-    } catch (error) {
-      this.rollback();
-      throw error;
-    }
-  }
-
-  private hasLockedDocWithContentHash(contentHash: string): boolean {
-    const rows = this.withPolicy({ mode: "internal" }, () =>
-      this.db.prepare(
-        `SELECT content
-         FROM docs
-         WHERE metadata IS NOT NULL
-           AND json_valid(metadata)
-           AND json_type(metadata, '$.locked') = 'true'`,
-      ).iterate()
-    ) as NodeJS.Iterator<{ content: string }>;
-    for (const row of rows) {
-      if (hashDocContent(row.content) === contentHash) return true;
-    }
-    return false;
   }
 
   schemaInspect(principalInput: GuardPrincipal): GuardSchemaSnapshot {
@@ -833,44 +545,10 @@ export class GuardEngine {
         );
       case "writeEvent":
         return this.writeEvent(params.principal as GuardPrincipal, params.event as GuardEventInput);
-      case "writeDoc":
-        return this.writeDoc(
+      case "writeWorkspaceEvent":
+        return this.writeWorkspaceEvent(
           params.principal as GuardPrincipal,
-          requireString(params.id, "params.id"),
-          requireString(params.content, "params.content"),
-          params.metadata as Record<string, unknown> | undefined,
-        );
-      case "readDocForWorkingTree":
-        return this.readDocForWorkingTree(
-          params.principal as GuardPrincipal,
-          requireString(params.id, "params.id"),
-        );
-      case "listLockedDocHashesForWorkingTree":
-        return this.listLockedDocHashesForWorkingTree(
-          params.principal as GuardPrincipal,
-          requireStringValue(params.afterId, "params.afterId"),
-          requireNumberValue(params.limit, "params.limit"),
-        );
-      case "compareAndWriteDoc":
-        return this.compareAndWriteDoc(
-          params.principal as GuardPrincipal,
-          requireString(params.id, "params.id"),
-          requireNullableStringValue(params.expectedHash, "params.expectedHash"),
-          requireNullableNumberValue(params.expectedUpdatedAt, "params.expectedUpdatedAt"),
-          requireStringValue(params.content, "params.content"),
-          params.metadata as Record<string, unknown> | undefined,
-        );
-      case "deleteDoc":
-        return this.deleteDoc(
-          params.principal as GuardPrincipal,
-          requireString(params.id, "params.id"),
-        );
-      case "compareAndDeleteDoc":
-        return this.compareAndDeleteDoc(
-          params.principal as GuardPrincipal,
-          requireString(params.id, "params.id"),
-          requireStringValue(params.expectedHash, "params.expectedHash"),
-          requireNumberValue(params.expectedUpdatedAt, "params.expectedUpdatedAt"),
+          params.event as GuardEventInput,
         );
       case "schema.inspect":
         return this.schemaInspect(params.principal as GuardPrincipal);
@@ -903,28 +581,33 @@ export class GuardEngine {
   ): GuardMutationResult {
     this.clearCdcRows();
     const policy: MutatePolicy = { mode: "mutate", principal, writes: [] };
-    const rows = this.withPolicy(policy, () => {
-      const statement = this.db.prepare(sql);
-      if (policy.writes.length === 0) {
-        throw new GuardServiceError(
-          "GUARD_MUTATION_REQUIRED",
-          "Guard: system.mutate requires one complete DML statement",
-        );
-      }
-      this.assertWritesCapturable(policy.writes);
-      return executeRows(statement, params, {
-        maxRows: this.maxResultRows,
-        maxBytes: this.maxResultBytes,
-        mustComplete: true,
+    this.deniedPrimaryKeyMutation = null;
+    let rows: Array<Record<string, unknown>>;
+    try {
+      rows = this.withPolicy(policy, () => {
+        const statement = this.db.prepare(sql);
+        if (policy.writes.length === 0) {
+          throw new GuardServiceError(
+            "GUARD_MUTATION_REQUIRED",
+            "Guard: system.mutate requires one complete DML statement",
+          );
+        }
+        this.assertWritesCapturable(policy.writes);
+        return executeRows(statement, params, {
+          maxRows: this.maxResultRows,
+          maxBytes: this.maxResultBytes,
+          mustComplete: true,
+        });
       });
-    });
+    } catch (error) {
+      this.rethrowPrimaryKeyMutation(error);
+    }
     const summary = this.readChangeSummary();
     const cdc = this.readCdcRows();
     const auditEventIds = this.writeMutationAudit(
       principal,
       sql,
       params,
-      policy.writes,
       cdc,
       context,
     );
@@ -935,15 +618,11 @@ export class GuardEngine {
     principal: NormalizedPrincipal,
     sql: string,
     params: NormalizedParams,
-    plannedWrites: PlannedWrite[],
     cdcRows: CdcRow[],
     context: MutationContext,
   ): string[] {
     const groups = groupCdcRows(cdcRows);
-    if (groups.length === 0) {
-      const direct = plannedWrites.find((write) => write.triggerOrView === null) ?? plannedWrites[0];
-      groups.push({ table: direct.table, op: direct.op, rows: [] });
-    }
+    if (groups.length === 0) return [];
 
     const eventIds: string[] = [];
     let statementAuditBytes = 0;
@@ -953,14 +632,18 @@ export class GuardEngine {
         .filter((column) => column.pk > 0)
         .sort((a, b) => a.pk - b.pk)
         .map((column) => column.name);
+      if (pkColumns.length === 0) {
+        throw new GuardServiceError(
+          "GUARD_D2_PRIMARY_KEY",
+          `Every App-owned D2 table needs an explicit non-null primary key: ${group.table}`,
+        );
+      }
       const beforeRows = group.rows.flatMap((row) => row.before ? [row.before] : []);
       const afterRows = group.rows.flatMap((row) => row.after ? [row.after] : []);
       const pkSource = group.op === "delete" ? beforeRows : afterRows;
-      const primaryKey = pkColumns.length === 0
-        ? null
-        : pkSource.map((row) =>
-            Object.fromEntries(pkColumns.map((column) => [column, row[column]]))
-          );
+      const primaryKey = pkSource.map((row) =>
+        Object.fromEntries(pkColumns.map((column) => [column, row[column]]))
+      );
       const payload: Record<string, unknown> = {
         op: group.op,
         table: group.table,
@@ -997,7 +680,11 @@ export class GuardEngine {
           );
         }
       }
-      eventIds.push(this.logD0(principal, `d2.${group.op}`, payload));
+      eventIds.push(this.logD0(
+        principal,
+        `workspace.table.rows.${group.op === "insert" ? "inserted" : group.op === "update" ? "updated" : "deleted"}`,
+        payload,
+      ));
     }
     return eventIds;
   }
@@ -1055,17 +742,6 @@ export class GuardEngine {
     });
   }
 
-  private assertNoD1SideEffects(): void {
-    const cdc = this.readCdcRows();
-    if (cdc.length > 0) {
-      const tables = [...new Set(cdc.map((row) => row.table))].join(", ");
-      throw new GuardServiceError(
-        "GUARD_D1_SIDE_EFFECT",
-        `Guard: D1 operation attempted a D2 side effect on ${tables}`,
-      );
-    }
-  }
-
   private assertWritesCapturable(writes: PlannedWrite[]): void {
     for (const write of writes) {
       const failure = this.uncapturableTables.get(normalizeName(write.table));
@@ -1076,6 +752,18 @@ export class GuardEngine {
         );
       }
     }
+  }
+
+  private rethrowPrimaryKeyMutation(error: unknown): never {
+    const target = this.deniedPrimaryKeyMutation;
+    this.deniedPrimaryKeyMutation = null;
+    if (target) {
+      throw new GuardServiceError(
+        "GUARD_D2_PRIMARY_KEY_MUTATION",
+        `Primary keys are immutable; delete and insert the row instead: ${target}`,
+      );
+    }
+    throw error;
   }
 
   private refreshCdcCapture(requiredTables?: Set<string>): void {
@@ -1099,6 +787,7 @@ export class GuardEngine {
       );
 
       this.uncapturableTables.clear();
+      this.primaryKeyColumnsByTable.clear();
       const tables = this.db.prepare(
         `SELECT name, sql FROM main.sqlite_schema
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
@@ -1124,6 +813,10 @@ export class GuardEngine {
           if (/^CREATE\s+VIRTUAL\s+TABLE\b/i.test(table.sql ?? "")) {
             throw new Error("virtual tables are not supported by row CDC");
           }
+          this.primaryKeyColumnsByTable.set(
+            normalizeName(table.name),
+            new Set(columns.filter((column) => column.pk > 0).map((column) => normalizeName(column.name))),
+          );
           const before = jsonObjectExpression("OLD", columns);
           const after = jsonObjectExpression("NEW", columns);
           const tableName = sqlString(table.name);
@@ -1200,20 +893,56 @@ export class GuardEngine {
     });
   }
 
+  private assertD2PrimaryKeys(onlyTables?: Set<string>): void {
+    this.withPolicy({ mode: "internal" }, () => {
+      const tables = this.db.prepare(
+        `SELECT name, sql FROM main.sqlite_schema
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name`,
+      ).all() as Array<{ name: string; sql: string | null }>;
+      for (const table of tables) {
+        const normalized = normalizeName(table.name);
+        if (isSystemTable(table.name) || (onlyTables && !onlyTables.has(normalized))) continue;
+        const columns = this.getTableColumnsInternal(table.name);
+        const primaryKey = columns.filter((column) => column.pk > 0);
+        if (primaryKey.length === 0) {
+          throw new GuardServiceError(
+            "GUARD_D2_PRIMARY_KEY",
+            `Every App-owned D2 table needs an explicit non-null primary key: ${table.name}`,
+          );
+        }
+        const sql = table.sql ?? "";
+        const tableProvidesNonNullPrimaryKey = /\bWITHOUT\s+ROWID\b/i.test(sql)
+          || /(?:\)|,)\s*STRICT(?:\s*,\s*WITHOUT\s+ROWID)?\s*$/i.test(sql);
+        const invalid = primaryKey.find((column) => {
+          const integerPrimaryKey = primaryKey.length === 1
+            && normalizeName(column.type.trim()) === "integer";
+          return column.notnull !== 1 && !integerPrimaryKey && !tableProvidesNonNullPrimaryKey;
+        });
+        if (invalid) {
+          throw new GuardServiceError(
+            "GUARD_D2_PRIMARY_KEY",
+            `Every primary-key column must be non-null: ${table.name}.${invalid.name}`,
+          );
+        }
+      }
+    });
+  }
+
   private snapshotSchema(includeSystemTables = false): GuardSchemaSnapshot {
     return this.withPolicy({ mode: "internal" }, () => {
       const tables = this.db.prepare(
         `SELECT name, sql FROM main.sqlite_schema
          WHERE type = 'table'
            AND name NOT LIKE 'sqlite_%'
-           ${includeSystemTables ? "" : "AND name NOT IN ('events', 'docs')"}
+           ${includeSystemTables ? "" : "AND name <> 'events'"}
          ORDER BY name`,
       ).all() as Array<{ name: string; sql: string }>;
       const indexes = this.db.prepare(
         `SELECT name, tbl_name AS table_name, sql FROM main.sqlite_schema
          WHERE type = 'index'
            AND name NOT LIKE 'sqlite_%'
-           ${includeSystemTables ? "" : "AND tbl_name NOT IN ('events', 'docs')"}
+           ${includeSystemTables ? "" : "AND tbl_name <> 'events'"}
          ORDER BY name`,
       ).all() as Array<{ name: string; table_name: string; sql: string | null }>;
       return {
@@ -1271,6 +1000,7 @@ export class GuardEngine {
         this.executeSchemaStatement(kind, statement, targets);
       }
       this.assertNoSystemForeignKeys(targets.tableObjects);
+      if (kind === "promote") this.assertD2PrimaryKeys(targets.tableObjects);
       this.rollback();
     } catch (error) {
       this.rollback();
@@ -1442,35 +1172,6 @@ export class GuardEngine {
         : constants.SQLITE_DENY;
     }
 
-    if (policy.mode === "d1") {
-      const op = dmlOpForAction(action);
-      if (!op || !arg1) return constants.SQLITE_DENY;
-      if (
-        dbName === "temp" &&
-        normalizeName(arg1) === CDC_TABLE &&
-        triggerOrView?.startsWith(CDC_TRIGGER_PREFIX)
-      ) {
-        return constants.SQLITE_OK;
-      }
-      if (dbName !== "main") return constants.SQLITE_DENY;
-      if (normalizeName(arg1) === "docs") {
-        // The helper owns the only direct docs statement. Recursive writes back
-        // into docs are never implicit grants.
-        if (triggerOrView !== null) return constants.SQLITE_DENY;
-        if (policy.operation === "delete") {
-          return op === "delete" ? constants.SQLITE_OK : constants.SQLITE_DENY;
-        }
-        return op === "insert" || op === "update" ? constants.SQLITE_OK : constants.SQLITE_DENY;
-      }
-      if (isSystemTable(arg1)) return constants.SQLITE_DENY;
-      // Legacy schemas may contain a trigger/FK edge from docs into D2. Let
-      // SQLite compile it so a no-op edge does not disable ordinary doc CRUD,
-      // but require CDC coverage and reject the transaction if it actually
-      // changes any D2 row.
-      policy.writes.push({ op, table: arg1, triggerOrView });
-      return constants.SQLITE_OK;
-    }
-
     if (policy.mode === "mutate") {
       const op = dmlOpForAction(action);
       if (!op || !arg1) return constants.SQLITE_DENY;
@@ -1484,6 +1185,14 @@ export class GuardEngine {
       if (dbName !== "main") return constants.SQLITE_DENY;
       if (isSystemTable(arg1)) return constants.SQLITE_DENY;
       if (!hasTableGrant(policy.principal, arg1)) return constants.SQLITE_DENY;
+      if (
+        op === "update"
+        && arg2
+        && this.primaryKeyColumnsByTable.get(normalizeName(arg1))?.has(normalizeName(arg2))
+      ) {
+        this.deniedPrimaryKeyMutation = `${arg1}.${arg2}`;
+        return constants.SQLITE_DENY;
+      }
       policy.writes.push({ op, table: arg1, triggerOrView });
       return constants.SQLITE_OK;
     }
@@ -1646,21 +1355,6 @@ function normalizePrincipal(input: GuardPrincipal): NormalizedPrincipal {
     throw new GuardServiceError("GUARD_INVALID_PRINCIPAL", "Guard: tableGrants are required");
   }
 
-  let docGrants: "*" | string[];
-  if (input.docGrants === "*") {
-    docGrants = "*";
-  } else if (Array.isArray(input.docGrants)) {
-    docGrants = input.docGrants.map((grant) => {
-      if (typeof grant !== "string" || !grant) {
-        throw new GuardServiceError("GUARD_INVALID_PRINCIPAL", "Guard: invalid D1 doc grant");
-      }
-      const body = grant.endsWith("/") ? grant.slice(0, -1) : grant;
-      validateDocId(body);
-      return grant;
-    });
-  } else {
-    throw new GuardServiceError("GUARD_INVALID_PRINCIPAL", "Guard: docGrants are required");
-  }
   const schemaGrant = input.schemaGrant === true;
   if (schemaGrant && !source.startsWith("system:")) {
     throw new GuardServiceError(
@@ -1668,20 +1362,7 @@ function normalizePrincipal(input: GuardPrincipal): NormalizedPrincipal {
       "Guard: schema capability requires a system source",
     );
   }
-  return { source, producerRef, tableGrants, docGrants, schemaGrant };
-}
-
-function assertDocGrant(principal: NormalizedPrincipal, id: string, op: "write" | "delete"): void {
-  if (principal.docGrants === "*") return;
-  const allowed = principal.docGrants.some((grant) =>
-    grant.endsWith("/") ? id.startsWith(grant) : id === grant
-  );
-  if (!allowed) {
-    throw new GuardServiceError(
-      "GUARD_DOC_DENIED",
-      `Guard: source ${principal.source} is not allowed to ${op} doc: ${id}`,
-    );
-  }
+  return { source, producerRef, tableGrants, schemaGrant };
 }
 
 function assertSchemaGrant(principal: NormalizedPrincipal): void {
@@ -2148,100 +1829,6 @@ function resolveRequiredWorkspacePath(value: string): string {
   return resolve(value);
 }
 
-function validateDocMetadata(metadata: unknown): asserts metadata is Record<string, unknown> {
-  assertJsonValue(metadata, "Guard doc metadata");
-  if (!isPlainObject(metadata)) {
-    throw new GuardServiceError("GUARD_INVALID_DOC", "Guard: doc metadata must be an object");
-  }
-  assertDocLockedValue(metadata as Record<string, unknown>);
-}
-
-function parseStoredDocMetadata(serialized: string | null): Record<string, unknown> | null {
-  if (serialized === null) return null;
-
-  let metadata: unknown;
-  try {
-    metadata = JSON.parse(serialized);
-  } catch {
-    throw new GuardServiceError("GUARD_INVALID_DOC", "Guard: stored doc metadata is not valid JSON");
-  }
-  if (!isPlainObject(metadata)) {
-    throw new GuardServiceError("GUARD_INVALID_DOC", "Guard: stored doc metadata must be an object");
-  }
-  assertDocLockedValue(metadata);
-  return metadata;
-}
-
-function resolveEffectiveDocMetadata(
-  stored: Record<string, unknown> | null,
-  incoming: Record<string, unknown> | undefined,
-): Record<string, unknown> | null {
-  if (incoming === undefined) return stored;
-
-  const effective = { ...incoming };
-  if (
-    stored !== null
-    && Object.hasOwn(stored, "locked")
-    && !Object.hasOwn(incoming, "locked")
-  ) {
-    effective.locked = stored.locked;
-  }
-  return effective;
-}
-
-function assertDocLockedValue(metadata: Record<string, unknown>): void {
-  if (Object.hasOwn(metadata, "locked") && typeof metadata.locked !== "boolean") {
-    throw new GuardServiceError(
-      "GUARD_INVALID_DOC",
-      "Guard: doc metadata.locked must be a boolean",
-    );
-  }
-}
-
-function isLockedDocMetadata(metadata: Record<string, unknown> | null): boolean {
-  return metadata?.locked === true;
-}
-
-function hashDocContent(content: string): string {
-  return createHash("sha256").update(content, "utf8").digest("hex");
-}
-
-function isSha256(value: string): boolean {
-  return SHA256.test(value);
-}
-
-function validateExpectedDocVersion(
-  expectedHash: string | null,
-  expectedUpdatedAt: number | null,
-): void {
-  if ((expectedHash === null) !== (expectedUpdatedAt === null)) {
-    throw new GuardServiceError(
-      "GUARD_INVALID_DOC",
-      "Guard: expected doc hash and updated_at must both be null or both identify an existing document",
-    );
-  }
-  if (
-    expectedUpdatedAt !== null
-    && (!Number.isSafeInteger(expectedUpdatedAt) || expectedUpdatedAt < 0)
-  ) {
-    throw new GuardServiceError(
-      "GUARD_INVALID_DOC",
-      "Guard: expected doc updated_at must be a nonnegative safe integer or null",
-    );
-  }
-}
-
-function docMatchesExpectation(
-  existing: { content: string; updated_at: number } | undefined,
-  expectation: DocVersionExpectation,
-): boolean {
-  if (expectation === UNCONDITIONAL_DOC_MUTATION) return true;
-  if (!existing) return expectation.hash === null && expectation.updatedAt === null;
-  return expectation.hash !== null
-    && hashDocContent(existing.content) === expectation.hash
-    && existing.updated_at === expectation.updatedAt;
-}
-
 function requireObject(value: unknown, label: string): Record<string, unknown> {
   if (!isPlainObject(value)) {
     throw new GuardServiceError("GUARD_INVALID_REQUEST", `Guard: ${label} must be an object`);
@@ -2254,30 +1841,6 @@ function requireString(value: unknown, label: string): string {
     throw new GuardServiceError("GUARD_INVALID_REQUEST", `Guard: ${label} must be a non-empty string`);
   }
   return value;
-}
-
-function requireStringValue(value: unknown, label: string): string {
-  if (typeof value !== "string") {
-    throw new GuardServiceError("GUARD_INVALID_REQUEST", `Guard: ${label} must be a string`);
-  }
-  return value;
-}
-
-function requireNullableStringValue(value: unknown, label: string): string | null {
-  if (value === null) return null;
-  return requireStringValue(value, label);
-}
-
-function requireNumberValue(value: unknown, label: string): number {
-  if (typeof value !== "number") {
-    throw new GuardServiceError("GUARD_INVALID_REQUEST", `Guard: ${label} must be a number`);
-  }
-  return value;
-}
-
-function requireNullableNumberValue(value: unknown, label: string): number | null {
-  if (value === null) return null;
-  return requireNumberValue(value, label);
 }
 
 function requireSchemaKind(value: unknown): GuardSchemaKind {

@@ -498,22 +498,16 @@ function mapCoreRequest(operation: string, input: unknown): CoreRequest {
       const body = { statements: expectJson(value.statements, "transaction.statements") };
       return { method: "POST", path: "/api/transaction", body, sizeValue: body };
     }
-    case "writeDoc": {
+    case "vfs.command": {
       const body: Record<string, JsonValue> = {
-        id: expectString(value.id, "writeDoc.id"),
-        content: expectString(value.content, "writeDoc.content"),
+        command: expectString(value.command, "vfs.command.command"),
       };
-      if (value.metadata !== undefined) body.metadata = expectJson(value.metadata, "writeDoc.metadata");
-      return { method: "POST", path: "/api/docs", body, sizeValue: body };
+      if (value.options !== undefined) body.options = expectJson(value.options, "vfs.command.options");
+      return { method: "POST", path: "/api/vfs/command", body, sizeValue: body };
     }
-    case "deleteDoc": {
-      const id = expectString(value.id, "deleteDoc.id");
-      const sizeValue = { id };
-      return {
-        method: "DELETE",
-        path: `/api/docs/${encodeURIComponent(id)}`,
-        sizeValue,
-      };
+    case "vfs.open": {
+      const body = { path: expectString(value.path, "vfs.open.path") };
+      return { method: "POST", path: "/api/vfs/open", body, sizeValue: body };
     }
     case "writeEvent": {
       const body: Record<string, JsonValue> = {

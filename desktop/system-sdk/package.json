@@ -47,6 +47,14 @@
     "./protocol": {
       "types": "./dist/protocol.d.ts",
       "default": "./dist/protocol.js"
+    },
+    "./internal/vfs": {
+      "node": {
+        "types": "./dist/vfs-internal.d.ts",
+        "default": "./dist/vfs-internal.js"
+      },
+      "types": "./dist/vfs-internal.d.ts",
+      "default": "./dist/vfs-internal.js"
     }
   },
   "scripts": {

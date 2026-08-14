@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,13 +18,11 @@ const TOKEN = "node-guard-test-token-0123456789";
 const DIRECT = process.env.LAMARCK_GUARD_TEST_DIRECT === "1";
 const require = createRequire(import.meta.url);
 const TEST_PRODUCER_REF = `producer:v1:sha256:${"1".repeat(64)}`;
-const OTHER_TEST_PRODUCER_REF = `producer:v1:sha256:${"2".repeat(64)}`;
 
 const host = {
   source: "system:test",
   producerRef: TEST_PRODUCER_REF,
   tableGrants: "*",
-  docGrants: "*",
   schemaGrant: true,
 };
 
@@ -462,13 +459,12 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     }, /exactly one/i);
   });
 
-  test("mutate enforces direct table grants and denies D0/D1/system writes", async () => {
+  test("mutate enforces direct table grants and denies D0/system writes", async () => {
     await assertRpcRejects("mutate", {
       principal: {
         source: "app:forged-wildcard",
         producerRef: TEST_PRODUCER_REF,
         tableGrants: "*",
-        docGrants: [],
         schemaGrant: false,
       },
       sql: "INSERT INTO parents (id, label) VALUES ('wildcard', 'denied')",
@@ -492,7 +488,10 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     });
     assert.deepEqual(upsert.rows, [{ id: "direct-ok", label: "updated" }]);
     const directAudit = await auditPayloads("app:direct");
-    assert.deepEqual(directAudit.map((event) => event.type), ["d2.insert", "d2.update"]);
+    assert.deepEqual(directAudit.map((event) => event.type), [
+      "workspace.table.rows.inserted",
+      "workspace.table.rows.updated",
+    ]);
     await rpc("mutate", {
       principal: app,
       sql: "INSERT INTO parents (id, label) VALUES ($id, $label)",
@@ -506,10 +505,6 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     await assertRpcRejects("mutate", {
       principal: host,
       sql: 'DELETE FROM "main"."events"',
-    }, /not authorized|authorization denied/i);
-    await assertRpcRejects("mutate", {
-      principal: host,
-      sql: "UPDATE main.docs SET content = 'forged'",
     }, /not authorized|authorization denied/i);
     await assertRpcRejects("mutate", {
       principal: host,
@@ -558,9 +553,9 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     ), [{ id: "replace-row", label: "after" }]);
     const audit = await auditPayloads(source);
     assert.deepEqual(audit.map((event) => event.type), [
-      "d2.insert",
-      "d2.delete",
-      "d2.insert",
+      "workspace.table.rows.inserted",
+      "workspace.table.rows.deleted",
+      "workspace.table.rows.inserted",
     ]);
   });
 
@@ -609,7 +604,7 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     ]);
     const audit = await auditPayloads("app:trigger-ok");
     assert.deepEqual(new Set(audit.map((event) => event.payload.table)), new Set(["trigger_source", "trigger_sink"]));
-    assert.ok(audit.every((event) => event.type === "d2.insert"));
+    assert.ok(audit.every((event) => event.type === "workspace.table.rows.inserted"));
     assert.ok(audit.every((event) => event.payload.affected_rows === 1));
   });
 
@@ -642,7 +637,7 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     assert.deepEqual(await queryRows("SELECT id FROM children WHERE id = 'cascade-child'"), []);
     const audit = await auditPayloads("app:cascade-ok");
     assert.deepEqual(new Set(audit.map((event) => event.payload.table)), new Set(["parents", "children"]));
-    assert.ok(audit.every((event) => event.type === "d2.delete"));
+    assert.ok(audit.every((event) => event.type === "workspace.table.rows.deleted"));
   });
 
   test("transaction owns BEGIN/COMMIT and rolls data plus audit back on any denial", async () => {
@@ -712,768 +707,87 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     assert.deepEqual(await auditPayloads(constraintSource), []);
   });
 
-  test("App D1 and D2 audit writes retain the initiating Producer ref", async () => {
-    const app = principal(
-      "app:producer-retention",
-      ["parents"],
-      ["apps/producer-retention/"],
-      OTHER_TEST_PRODUCER_REF,
-    );
-    await rpc("writeDoc", {
+  test("D2 mutation audit groups rows, skips zero-row writes, and keeps primary keys immutable", async () => {
+    const source = "app:d2-contract";
+    const app = principal(source, ["parents", "children"]);
+    const inserted = await rpc("mutate", {
       principal: app,
-      id: "apps/producer-retention/one",
-      content: "producer-bound",
+      sql: "INSERT INTO parents (id, label) VALUES ('group-a', 'A'), ('group-b', 'B')",
     });
+    assert.equal(inserted.auditEventIds.length, 1);
+    const [grouped] = await auditPayloads(source);
+    assert.equal(grouped.type, "workspace.table.rows.inserted");
+    assert.equal(grouped.payload.affected_rows, 2);
+    assert.deepEqual(grouped.payload.primary_key, [{ id: "group-a" }, { id: "group-b" }]);
+
+    const zero = await rpc("mutate", {
+      principal: app,
+      sql: "UPDATE parents SET label = 'never' WHERE id = 'missing-row'",
+    });
+    assert.deepEqual(zero.auditEventIds, []);
+    assert.equal((await auditPayloads(source)).length, 1);
+
     await rpc("mutate", {
       principal: app,
-      sql: "INSERT INTO parents (id, label) VALUES (?, ?)",
-      params: ["producer-retention", "producer-bound"],
+      sql: "INSERT INTO children (id, parent_id, value) VALUES ('group-child', 'group-a', 1)",
     });
-
-    assert.deepEqual(
-      (await d1Events("app:producer-retention")).map((event) => event.producerRef),
-      [OTHER_TEST_PRODUCER_REF],
-    );
-    assert.deepEqual(
-      (await auditPayloads("app:producer-retention")).map((event) => event.producerRef),
-      [OTHER_TEST_PRODUCER_REF],
-    );
-  });
-
-  test("D1 and D0 helpers preserve envelopes and enforce path/event namespaces", async () => {
-    const docs = principal("app:docs", [], ["apps/docs/", "shared/pinned"]);
-    assert.deepEqual(await rpc("writeDoc", {
-      principal: docs,
-      id: "apps/docs/today",
-      content: "hello",
-      metadata: { mood: "calm" },
-    }), { ok: true });
-    await assertRpcRejects("writeDoc", {
-      principal: docs,
-      id: "apps/other/no",
-      content: "denied",
-    }, /not allowed to write doc/i);
-    assert.equal(await rpc("deleteDoc", { principal: docs, id: "apps/docs/today" }), true);
-
-    const eventId = await rpc("writeEvent", {
-      principal: docs,
-      event: {
-        type: "focus.completed",
-        externalId: "focus-1",
-        startedAt: 1_700_000_000_000,
-        endedAt: 1_700_000_001_000,
-        payload: { minutes: 25 },
-      },
-    });
-    const event = (await queryRows(
-      "SELECT id, schema_version, source, producer_ref, type, external_id, payload FROM events WHERE id = ?",
-      [eventId],
-    ))[0];
-    assert.deepEqual(event, {
-      id: eventId,
-      schema_version: "0.1",
-      source: "app:docs",
-      producer_ref: TEST_PRODUCER_REF,
-      type: "focus.completed",
-      external_id: "focus-1",
-      payload: '{"minutes":25}',
-    });
-
-    const replayId = await rpc("writeEvent", {
-      principal: principal("app:docs", [], [], OTHER_TEST_PRODUCER_REF),
-      event: {
-        type: "focus.completed",
-        externalId: "focus-1",
-        startedAt: 1_800_000_000_000,
-        payload: { minutes: 99 },
-      },
-    });
-    assert.equal(replayId, eventId);
-    assert.deepEqual((await queryRows(
-      "SELECT producer_ref, started_at, payload FROM events WHERE id = ?",
-      [eventId],
-    ))[0], {
-      producer_ref: TEST_PRODUCER_REF,
-      started_at: 1_700_000_000_000,
-      payload: '{"minutes":25}',
-    });
-
-    const crossSourceId = await rpc("writeEvent", {
-      principal: principal("app:docs-other-source", [], [], OTHER_TEST_PRODUCER_REF),
-      event: {
-        type: "focus.completed",
-        externalId: "focus-1",
-        startedAt: 1_800_000_000_000,
-        payload: { minutes: 99 },
-      },
-    });
-    assert.notEqual(crossSourceId, eventId);
-    assert.deepEqual((await queryRows(
-      "SELECT source, producer_ref FROM events WHERE id = ?",
-      [crossSourceId],
-    ))[0], {
-      source: "app:docs-other-source",
-      producer_ref: OTHER_TEST_PRODUCER_REF,
-    });
-    await assertRpcRejects("writeEvent", {
-      principal: docs,
-      event: { type: "d2.insert", startedAt: Date.now(), payload: {} },
-    }, /system-reserved/i);
-
-    await assertRpcRejects("writeEvent", {
-      principal: { ...host, source: "system:suppressed" },
-      event: { type: "suppressed.test", startedAt: Date.now(), payload: {} },
-    }, /changed 0 rows instead of 1/i);
-    assert.deepEqual(await queryRows(
-      "SELECT id FROM events WHERE source = 'system:suppressed'",
-    ), []);
-
+    const auditCount = (await auditPayloads(source)).length;
     await assertRpcRejects("mutate", {
-      principal: { ...host, source: "system:suppressed" },
-      sql: "INSERT INTO parents (id, label) VALUES ('suppressed-audit', 'rollback')",
-    }, /changed 0 rows instead of 1/i);
+      principal: app,
+      sql: "UPDATE parents SET id = 'group-renamed' WHERE id = 'group-a'",
+    }, /GUARD_D2_PRIMARY_KEY_MUTATION|primary keys are immutable/i);
     assert.deepEqual(await queryRows(
-      "SELECT id FROM parents WHERE id = 'suppressed-audit'",
+      "SELECT id FROM parents WHERE id IN ('group-a', 'group-renamed') ORDER BY id",
+    ), [{ id: "group-a" }]);
+    assert.deepEqual(await queryRows(
+      "SELECT id, parent_id FROM children WHERE id = 'group-child'",
+    ), [{ id: "group-child", parent_id: "group-a" }]);
+    assert.equal((await auditPayloads(source)).length, auditCount);
+  });
+
+  test("D2 schema admission rejects nullable or missing primary keys and accepts SQLite-safe forms", async () => {
+    for (const ddl of [
+      "CREATE TABLE rejected_nullable_pk (id TEXT PRIMARY KEY, value TEXT)",
+      "CREATE TABLE rejected_missing_pk (id TEXT NOT NULL, value TEXT)",
+      "CREATE TABLE rejected_composite_pk (a TEXT NOT NULL, b TEXT, PRIMARY KEY (a, b))",
+    ]) {
+      await assertRpcRejects("schema.apply", {
+        principal: host,
+        kind: "promote",
+        ddl,
+        approved: true,
+      }, /GUARD_D2_PRIMARY_KEY|primary.?key/i);
+    }
+    assert.deepEqual(await queryRows(
+      "SELECT name FROM sqlite_master WHERE name LIKE 'rejected_%' ORDER BY name",
     ), []);
-  });
 
-  test("D1 ids cannot alias one portable Working Tree path", async () => {
-    const docs = { ...host, source: "system:portable-doc-ids" };
-    await rpc("writeDoc", {
-      principal: docs,
-      id: "Alias/CAFÉ",
-      content: "first",
-    });
-    await assertRpcRejects("writeDoc", {
-      principal: docs,
-      id: "alias/cafe\u0301",
-      content: "must not commit",
-    }, /collides with portable Working Tree id/i);
-    await assertRpcRejects("compareAndWriteDoc", {
-      principal: docs,
-      id: "ALIAS/café",
-      expectedHash: null,
-      expectedUpdatedAt: null,
-      content: "must not commit conditionally",
-    }, /collides with portable Working Tree id/i);
-
-    await rpc("writeDoc", {
-      principal: docs,
-      id: "portable-shared/Spelling/one",
-      content: "shared directory owner",
-    });
-    await assertRpcRejects("writeDoc", {
-      principal: docs,
-      id: "portable-shared/spelling/two",
-      content: "must not create a differently spelled shared directory",
-    }, /collides with portable Working Tree id/i);
-
-    await rpc("writeDoc", {
-      principal: docs,
-      id: "portable-file-dir/leaf",
-      content: "file owner",
-    });
-    await assertRpcRejects("compareAndWriteDoc", {
-      principal: docs,
-      id: "portable-file-dir/leaf.md/child",
-      expectedHash: null,
-      expectedUpdatedAt: null,
-      content: "must not turn the existing file path into a directory",
-    }, /collides with portable Working Tree id/i);
-    assert.deepEqual(await queryRows(
-      `SELECT id, content FROM docs
-       WHERE id IN (?, ?, ?, ?, ?, ?)
-       ORDER BY id`,
-      [
-        "Alias/CAFÉ",
-        "alias/cafe\u0301",
-        "portable-shared/Spelling/one",
-        "portable-shared/spelling/two",
-        "portable-file-dir/leaf",
-        "portable-file-dir/leaf.md/child",
-      ],
-    ), [
-      { id: "Alias/CAFÉ", content: "first" },
-      { id: "portable-file-dir/leaf", content: "file owner" },
-      { id: "portable-shared/Spelling/one", content: "shared directory owner" },
-    ]);
-  });
-
-  test("Host lifecycle writes retain the System Producer ref", async () => {
-    const eventId = await rpc("writeEvent", {
-      principal: host,
-      event: {
-        type: "app.created",
-        startedAt: 1_700_000_100_000,
-        payload: { app_id: "producer-test" },
-      },
-    });
-    assert.deepEqual((await queryRows(
-      "SELECT source, producer_ref, type FROM events WHERE id = ?",
-      [eventId],
-    ))[0], {
-      source: "system:test",
-      producer_ref: TEST_PRODUCER_REF,
-      type: "app.created",
-    });
-  });
-
-  test("only system principals can privately read complete Working Tree documents", async () => {
-    const source = "system:working-tree-private-read";
-    const docs = { ...host, source };
-    const docId = "journal/working-tree-large-private";
-    const content = `private-large-sentinel:${"x".repeat(8 * 1024 * 1024)}`;
-
-    await rpc("writeDoc", {
-      principal: docs,
-      id: docId,
-      content,
-      metadata: { locked: true, label: "private" },
-    });
-
-    const read = await rpc("readDocForWorkingTree", {
-      principal: principal("system:working-tree-reader", [], []),
-      id: docId,
-    });
-    assert.equal(read.id, docId);
-    assert.equal(read.content, content);
-    assert.equal(read.metadata, '{"locked":true,"label":"private"}');
-    assert.equal(typeof read.updatedAt, "number");
-    assert.deepEqual(await d1Events(source, docId), []);
-
-    await assertRpcRejects("readDocForWorkingTree", {
-      principal: principal("app:working-tree-reader", [], [docId]),
-      id: docId,
-    }, /require a system principal/i);
-  });
-
-  test("only system principals can page exact hashes of currently locked documents", async () => {
-    const docs = { ...host, source: "system:working-tree-locked-hashes" };
-    const ids = [
-      "zz-working-tree-locked-hashes/a",
-      "zz-working-tree-locked-hashes/b",
-      "zz-working-tree-locked-hashes/c",
-    ];
-    const contents = ["private-a", "private-b", "private-c"];
-    for (let index = 0; index < ids.length; index += 1) {
-      await rpc("writeDoc", {
-        principal: docs,
-        id: ids[index],
-        content: contents[index],
-        metadata: { locked: true },
+    for (const ddl of [
+      "CREATE TABLE accepted_integer_pk (id INTEGER PRIMARY KEY, value TEXT)",
+      "CREATE TABLE accepted_not_null_pk (id TEXT PRIMARY KEY NOT NULL, value TEXT)",
+      "CREATE TABLE accepted_strict_pk (id TEXT PRIMARY KEY, value TEXT) STRICT",
+      "CREATE TABLE accepted_without_rowid_pk (a TEXT, b TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID",
+    ]) {
+      await rpc("schema.apply", {
+        principal: host,
+        kind: "promote",
+        ddl,
+        approved: true,
       });
     }
-    await rpc("writeDoc", {
-      principal: docs,
-      id: "zz-working-tree-locked-hashes/unlocked",
-      content: "public",
-      metadata: { locked: false },
-    });
-
-    assert.deepEqual(await rpc("listLockedDocHashesForWorkingTree", {
-      principal: principal("system:working-tree-hash-reader", [], []),
-      afterId: "zz-working-tree-locked-hashes/",
-      limit: 2,
-    }), [
-      { id: ids[0], contentHash: sha256(contents[0]) },
-      { id: ids[1], contentHash: sha256(contents[1]) },
+    assert.deepEqual(await queryRows(
+      "SELECT name FROM sqlite_master WHERE name LIKE 'accepted_%' ORDER BY name",
+    ), [
+      { name: "accepted_integer_pk" },
+      { name: "accepted_not_null_pk" },
+      { name: "accepted_strict_pk" },
+      { name: "accepted_without_rowid_pk" },
     ]);
-    assert.deepEqual(await rpc("listLockedDocHashesForWorkingTree", {
-      principal: principal("system:working-tree-hash-reader", [], []),
-      afterId: ids[1],
-      limit: 2,
-    }), [
-      { id: ids[2], contentHash: sha256(contents[2]) },
-    ]);
-
-    await assertRpcRejects("listLockedDocHashesForWorkingTree", {
-      principal: principal("app:working-tree-hash-reader", [], ids),
-      afterId: "",
-      limit: 512,
-    }, /require a system principal/i);
-    await assertRpcRejects("listLockedDocHashesForWorkingTree", {
-      principal: principal("system:working-tree-hash-reader", [], []),
-      afterId: "",
-      limit: 0,
-    }, /limit must be an integer from 1 through 512/i);
-    await assertRpcRejects("listLockedDocHashesForWorkingTree", {
-      principal: principal("system:working-tree-hash-reader", [], []),
-      afterId: "",
-      limit: 513,
-    }, /limit must be an integer from 1 through 512/i);
-  });
-
-  test("locked D1 metadata is sticky and suppresses content-bearing history", async () => {
-    const source = "app:locked-docs";
-    const docs = principal(source, [], ["journal/"]);
-    const docId = "journal/private";
-
-    await rpc("writeDoc", {
-      principal: docs,
-      id: docId,
-      content: "private-create-sentinel",
-      metadata: { locked: true, label: "private" },
-    });
-    await rpc("writeDoc", {
-      principal: docs,
-      id: docId,
-      content: "private-omitted-metadata-sentinel",
-    });
-    let row = (await queryRows("SELECT content, metadata FROM docs WHERE id = ?", [docId]))[0];
-    assert.deepEqual(JSON.parse(row.metadata), { locked: true, label: "private" });
-    assert.deepEqual(await d1Events(source, docId), []);
-
-    await rpc("writeDoc", {
-      principal: docs,
-      id: docId,
-      content: "private-replaced-metadata-sentinel",
-      metadata: { category: "journal" },
-    });
-    row = (await queryRows("SELECT content, metadata FROM docs WHERE id = ?", [docId]))[0];
-    assert.deepEqual(JSON.parse(row.metadata), { category: "journal", locked: true });
-    assert.deepEqual(await d1Events(source, docId), []);
-
-    await rpc("writeDoc", {
-      principal: docs,
-      id: docId,
-      content: "private-unlock-transition-sentinel",
-      metadata: { category: "public", locked: false },
-    });
-    assert.deepEqual(await d1Events(source, docId), []);
-    await rpc("writeDoc", {
-      principal: docs,
-      id: docId,
-      content: "public-after-explicit-unlock",
-    });
-    assert.deepEqual((await d1Events(source, docId)).map((event) => event.type), ["d1.write"]);
-
-    const sealingSource = "app:locking-transition";
-    const sealingDocs = principal(sealingSource, [], ["journal/"]);
-    await rpc("writeDoc", {
-      principal: sealingDocs,
-      id: "journal/to-lock",
-      content: "public-before-lock",
-    });
-    await rpc("writeDoc", {
-      principal: sealingDocs,
-      id: "journal/to-lock",
-      content: "newly-locked-secret-sentinel",
-      metadata: { locked: true },
-    });
-    const sealingEvents = await d1Events(sealingSource, "journal/to-lock");
-    assert.equal(sealingEvents.length, 1);
-    assert.equal(JSON.stringify(sealingEvents).includes("newly-locked-secret-sentinel"), false);
-
-    const deleteSource = "app:locked-delete";
-    const deleteDocs = principal(deleteSource, [], ["journal/"]);
-    await rpc("writeDoc", {
-      principal: deleteDocs,
-      id: "journal/delete-private",
-      content: "locked-delete-secret-sentinel",
-      metadata: { locked: true },
-    });
-    assert.equal(await rpc("deleteDoc", {
-      principal: deleteDocs,
-      id: "journal/delete-private",
-    }), true);
-    assert.deepEqual(await queryRows(
-      "SELECT id FROM docs WHERE id = 'journal/delete-private'",
-    ), []);
-    assert.deepEqual(await d1Events(deleteSource, "journal/delete-private"), []);
-    assert.deepEqual(await queryRows(
-      "SELECT id FROM events WHERE payload LIKE ?",
-      ["%locked-delete-secret-sentinel%"],
-    ), []);
-
-    const ordinarySource = "app:ordinary-delete";
-    const ordinaryDocs = principal(ordinarySource, [], ["journal/"]);
-    await rpc("writeDoc", {
-      principal: ordinaryDocs,
-      id: "journal/delete-public",
-      content: "recoverable public content",
-      metadata: { category: "public" },
-    });
-    assert.equal(await rpc("deleteDoc", {
-      principal: ordinaryDocs,
-      id: "journal/delete-public",
-    }), true);
-    const ordinaryEvents = await d1Events(ordinarySource, "journal/delete-public");
-    assert.deepEqual(ordinaryEvents.map((event) => event.type), ["d1.write", "d1.delete"]);
-    assert.deepEqual(ordinaryEvents[1].payload, {
-      doc_id: "journal/delete-public",
-      content: "recoverable public content",
-      metadata: { category: "public" },
-    });
-    assert.equal(await rpc("deleteDoc", {
-      principal: ordinaryDocs,
-      id: "journal/missing",
-    }), false);
-
-    await assertRpcRejects("writeDoc", {
-      principal: docs,
-      id: "journal/invalid-lock",
-      content: "must not commit",
-      metadata: { locked: "yes" },
-    }, /metadata\.locked must be a boolean/i);
-    assert.deepEqual(await queryRows(
-      "SELECT id FROM docs WHERE id = 'journal/invalid-lock'",
-    ), []);
-  });
-
-  test("Working Tree cross-id copies of currently locked content inherit the lock atomically", async () => {
-    const secret = "cross-id-private-content-sentinel";
-    await rpc("writeDoc", {
-      principal: { ...host, source: "system:cross-id-private-source" },
-      id: "reconciliation/private-source",
-      content: secret,
-      metadata: { locked: true },
-    });
-
-    const workingTree = principal("working-tree:pages", [], ["reconciliation/"]);
-    assert.equal(await rpc("compareAndWriteDoc", {
-      principal: workingTree,
-      id: "reconciliation/private-copy",
-      expectedHash: null,
-      expectedUpdatedAt: null,
-      content: secret,
-      metadata: { locked: false, importedFrom: "file" },
-    }), true);
-
-    const copied = (await queryRows(
-      "SELECT content, metadata FROM docs WHERE id = ?",
-      ["reconciliation/private-copy"],
-    ))[0];
-    assert.equal(copied.content, secret);
-    assert.deepEqual(JSON.parse(copied.metadata), { locked: true, importedFrom: "file" });
-    assert.deepEqual(await d1Events("working-tree:pages", "reconciliation/private-copy"), []);
-
-    const overwriteId = "reconciliation/private-overwrite-target";
-    const publicBeforeOverwrite = "public-before-private-overwrite";
-    await rpc("writeDoc", {
-      principal: { ...host, source: "system:cross-id-public-target" },
-      id: overwriteId,
-      content: publicBeforeOverwrite,
-      metadata: { locked: false, label: "existing" },
-    });
-    const overwriteVersion = (await queryRows(
-      "SELECT updated_at FROM docs WHERE id = ?",
-      [overwriteId],
-    ))[0].updated_at;
-    assert.equal(await rpc("compareAndWriteDoc", {
-      principal: workingTree,
-      id: overwriteId,
-      expectedHash: sha256(publicBeforeOverwrite),
-      expectedUpdatedAt: overwriteVersion,
-      content: secret,
-    }), true);
-    const overwritten = (await queryRows(
-      "SELECT content, metadata FROM docs WHERE id = ?",
-      [overwriteId],
-    ))[0];
-    assert.equal(overwritten.content, secret);
-    assert.deepEqual(JSON.parse(overwritten.metadata), { locked: true, label: "existing" });
-    assert.deepEqual(await d1Events("working-tree:pages", overwriteId), []);
-
-    assert.deepEqual(await queryRows(
-      "SELECT id FROM events WHERE payload LIKE ?",
-      [`%${secret}%`],
-    ), []);
-  });
-
-  test("conditional D1 helpers compare and mutate atomically without stale audit", async () => {
-    const source = "system:conditional-docs";
-    const docs = { ...host, source };
-    const docId = "reconciliation/conditional";
-
-    await rpc("writeDoc", {
-      principal: docs,
-      id: docId,
-      content: "version-one",
-      metadata: { label: "preserved" },
-    });
-    const versionOneUpdatedAt = (await queryRows(
-      "SELECT updated_at FROM docs WHERE id = ?",
-      [docId],
-    ))[0].updated_at;
-    assert.equal(await rpc("compareAndWriteDoc", {
-      principal: docs,
-      id: docId,
-      expectedHash: sha256("stale"),
-      expectedUpdatedAt: versionOneUpdatedAt,
-      content: "must-not-commit",
-      metadata: { label: "must-not-commit" },
-    }), false);
-    assert.deepEqual((await queryRows(
-      "SELECT content, metadata FROM docs WHERE id = ?",
-      [docId],
-    ))[0], {
-      content: "version-one",
-      metadata: '{"label":"preserved"}',
-    });
-    assert.deepEqual((await d1Events(source, docId)).map((event) => event.type), ["d1.write"]);
-
-    assert.equal(await rpc("compareAndWriteDoc", {
-      principal: docs,
-      id: docId,
-      expectedHash: sha256("version-one"),
-      expectedUpdatedAt: versionOneUpdatedAt,
-      content: "version-two",
-    }), true);
-    assert.deepEqual((await queryRows(
-      "SELECT content, metadata FROM docs WHERE id = ?",
-      [docId],
-    ))[0], {
-      content: "version-two",
-      metadata: '{"label":"preserved"}',
-    });
-    assert.deepEqual((await d1Events(source, docId)).map((event) => event.type), [
-      "d1.write",
-      "d1.write",
-    ]);
-    const versionTwoUpdatedAt = (await queryRows(
-      "SELECT updated_at FROM docs WHERE id = ?",
-      [docId],
-    ))[0].updated_at;
-
-    assert.equal(await rpc("compareAndDeleteDoc", {
-      principal: docs,
-      id: docId,
-      expectedHash: sha256("version-one"),
-      expectedUpdatedAt: versionTwoUpdatedAt,
-    }), false);
-    assert.equal((await queryRows(
-      "SELECT count(*) AS count FROM docs WHERE id = ?",
-      [docId],
-    ))[0].count, 1);
-    assert.equal((await d1Events(source, docId)).length, 2);
-
-    assert.equal(await rpc("compareAndDeleteDoc", {
-      principal: docs,
-      id: docId,
-      expectedHash: sha256("version-two"),
-      expectedUpdatedAt: versionTwoUpdatedAt,
-    }), true);
-    assert.deepEqual((await d1Events(source, docId)).map((event) => event.type), [
-      "d1.write",
-      "d1.write",
-      "d1.delete",
-    ]);
-
-    assert.equal(await rpc("compareAndWriteDoc", {
-      principal: docs,
-      id: "reconciliation/empty",
-      expectedHash: null,
-      expectedUpdatedAt: null,
-      content: "",
-    }), true);
-    assert.equal(await rpc("compareAndWriteDoc", {
-      principal: docs,
-      id: "reconciliation/empty",
-      expectedHash: null,
-      expectedUpdatedAt: null,
-      content: "must-not-replace-existing",
-    }), false);
-    const emptyUpdatedAt = (await queryRows(
-      "SELECT updated_at FROM docs WHERE id = ?",
-      ["reconciliation/empty"],
-    ))[0].updated_at;
-    assert.equal(await rpc("compareAndWriteDoc", {
-      principal: docs,
-      id: "reconciliation/empty",
-      expectedHash: sha256(""),
-      expectedUpdatedAt: emptyUpdatedAt,
-      content: "now-present",
-    }), true);
-
-    const lockedId = "reconciliation/locked";
-    await rpc("writeDoc", {
-      principal: docs,
-      id: lockedId,
-      content: "locked-one",
-      metadata: { locked: true, label: "private" },
-    });
-    const lockedOneUpdatedAt = (await queryRows(
-      "SELECT updated_at FROM docs WHERE id = ?",
-      [lockedId],
-    ))[0].updated_at;
-    assert.equal(await rpc("compareAndWriteDoc", {
-      principal: docs,
-      id: lockedId,
-      expectedHash: sha256("locked-one"),
-      expectedUpdatedAt: lockedOneUpdatedAt,
-      content: "locked-two-secret-sentinel",
-      metadata: { category: "journal" },
-    }), true);
-    assert.deepEqual(JSON.parse((await queryRows(
-      "SELECT metadata FROM docs WHERE id = ?",
-      [lockedId],
-    ))[0].metadata), { category: "journal", locked: true });
-    const lockedTwoUpdatedAt = (await queryRows(
-      "SELECT updated_at FROM docs WHERE id = ?",
-      [lockedId],
-    ))[0].updated_at;
-    assert.equal(await rpc("compareAndDeleteDoc", {
-      principal: docs,
-      id: lockedId,
-      expectedHash: sha256("locked-two-secret-sentinel"),
-      expectedUpdatedAt: lockedTwoUpdatedAt,
-    }), true);
-    assert.deepEqual(await d1Events(source, lockedId), []);
-    assert.deepEqual(await queryRows(
-      "SELECT id FROM events WHERE payload LIKE ?",
-      ["%locked-two-secret-sentinel%"],
-    ), []);
-  });
-
-  test("conditional D1 versions reject same-content metadata races within one millisecond", async () => {
-    const docs = { ...host, source: "system:conditional-metadata-race" };
-    const id = "reconciliation/metadata-race";
-    const content = "same-content";
-    await rpc("writeDoc", {
-      principal: docs,
-      id,
-      content,
-      metadata: { revision: 1 },
-    });
-    const firstUpdatedAt = (await queryRows(
-      "SELECT updated_at FROM docs WHERE id = ?",
-      [id],
-    ))[0].updated_at;
-
-    await rpc("writeDoc", {
-      principal: docs,
-      id,
-      content,
-      metadata: { revision: 2 },
-    });
-    const secondUpdatedAt = (await queryRows(
-      "SELECT updated_at FROM docs WHERE id = ?",
-      [id],
-    ))[0].updated_at;
-    assert.ok(secondUpdatedAt > firstUpdatedAt);
-
-    assert.equal(await rpc("compareAndWriteDoc", {
-      principal: docs,
-      id,
-      expectedHash: sha256(content),
-      expectedUpdatedAt: firstUpdatedAt,
-      content: "must-not-commit",
-    }), false);
-    assert.deepEqual((await queryRows(
-      "SELECT content, metadata FROM docs WHERE id = ?",
-      [id],
-    ))[0], {
-      content,
-      metadata: '{"revision":2}',
-    });
-
-    assert.equal(await rpc("compareAndWriteDoc", {
-      principal: docs,
-      id,
-      expectedHash: sha256(content),
-      expectedUpdatedAt: secondUpdatedAt,
-      content: "version-three",
-    }), true);
-    const thirdUpdatedAt = (await queryRows(
-      "SELECT updated_at FROM docs WHERE id = ?",
-      [id],
-    ))[0].updated_at;
-    assert.ok(thirdUpdatedAt > secondUpdatedAt);
-
-    await assertRpcRejects("compareAndWriteDoc", {
-      principal: docs,
-      id: "reconciliation/invalid-null-version",
-      expectedHash: null,
-      expectedUpdatedAt: 0,
-      content: "must-not-commit",
-    }, /hash and updated_at must both be null or both identify/i);
-    await assertRpcRejects("compareAndWriteDoc", {
-      principal: docs,
-      id,
-      expectedHash: sha256("version-three"),
-      expectedUpdatedAt: null,
-      content: "must-not-commit",
-    }, /hash and updated_at must both be null or both identify/i);
-    await assertRpcRejects("compareAndDeleteDoc", {
-      principal: docs,
-      id,
-      expectedHash: sha256("version-three"),
-      expectedUpdatedAt: -1,
-    }, /updated_at must be a nonnegative safe integer/i);
-  });
-
-  test("locked D1 policy survives a Guard restart", () => {
-    const isolatedWorkspace = mkdtempSync(join(tmpdir(), "lamarck-locked-restart-"));
-    const { GuardEngine } = require(ENTRY);
-    const restartPrincipal = {
-      source: "system:locked-restart",
-      producerRef: TEST_PRODUCER_REF,
-      tableGrants: "*",
-      docGrants: "*",
-      schemaGrant: true,
-    };
-    let engine;
-    try {
-      engine = new GuardEngine({ workspacePath: isolatedWorkspace });
-      engine.writeDoc(
-        restartPrincipal,
-        "journal/restart-private",
-        "restart-private-create-sentinel",
-        { locked: true, persisted: true },
-      );
-      engine.close();
-      engine = new GuardEngine({ workspacePath: isolatedWorkspace });
-      engine.writeDoc(
-        restartPrincipal,
-        "journal/restart-private",
-        "restart-private-update-sentinel",
-      );
-      const rows = engine.query(
-        restartPrincipal,
-        "SELECT content, metadata FROM docs WHERE id = ?",
-        ["journal/restart-private"],
-      );
-      assert.equal(rows[0].content, "restart-private-update-sentinel");
-      assert.deepEqual(JSON.parse(rows[0].metadata), { locked: true, persisted: true });
-      assert.deepEqual(engine.query(
-        restartPrincipal,
-        "SELECT id FROM events WHERE source = ? AND type LIKE 'd1.%'",
-        [restartPrincipal.source],
-      ), []);
-    } finally {
-      try { engine?.close(); } catch {}
-      rmSync(isolatedWorkspace, { recursive: true, force: true });
-    }
-  });
-
-  test("D1 helpers reject trigger or foreign-key side effects into D2", async () => {
-    await rpc("writeDoc", {
-      principal: host,
-      id: "legacy/cascade-parent",
-      content: "must survive",
-    });
-    await rpc("mutate", {
-      principal: host,
-      sql: "INSERT INTO legacy_doc_children (id, doc_id) VALUES (?, ?)",
-      params: ["legacy-child", "legacy/cascade-parent"],
-    });
-
-    await assertRpcRejects("deleteDoc", {
-      principal: host,
-      id: "legacy/cascade-parent",
-    }, /D2 side effect|not authorized|authorization denied/i);
-    assert.equal((await queryRows(
-      "SELECT count(*) AS n FROM docs WHERE id = 'legacy/cascade-parent'",
-    ))[0].n, 1);
-    assert.equal((await queryRows(
-      "SELECT count(*) AS n FROM legacy_doc_children WHERE id = 'legacy-child'",
-    ))[0].n, 1);
   });
 
   test("schema methods are separately privileged and refresh CDC", async () => {
     const inspected = await rpc("schema.inspect", { principal: host });
     assert.ok(inspected.tables.some((table) => table.name === "events"));
-    assert.ok(inspected.tables.some((table) => table.name === "docs"));
     assert.ok(inspected.tables.some((table) => table.name === "parents"));
     await assertRpcRejects("schema.inspect", {
       principal: principal("app:no-inspect", []),
@@ -1484,16 +798,15 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
         source: "app:forged-schema",
         producerRef: TEST_PRODUCER_REF,
         tableGrants: [],
-        docGrants: [],
         schemaGrant: true,
       },
       kind: "promote",
-      ddl: "CREATE TABLE forged_schema (id TEXT PRIMARY KEY)",
+      ddl: "CREATE TABLE forged_schema (id TEXT PRIMARY KEY NOT NULL)",
     }, /requires a system source/i);
     await assertRpcRejects("schema.plan", {
       principal: principal("app:no-schema", []),
       kind: "promote",
-      ddl: "CREATE TABLE schema_denied (id TEXT PRIMARY KEY)",
+      ddl: "CREATE TABLE schema_denied (id TEXT PRIMARY KEY NOT NULL)",
     }, /schema lifecycle capability/i);
     await assertRpcRejects("schema.apply", {
       principal: host,
@@ -1513,23 +826,23 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     await assertRpcRejects("schema.plan", {
       principal: host,
       kind: "promote",
-      ddl: `CREATE TABLE forbidden_doc_fk (
-        id TEXT PRIMARY KEY,
-        doc_id TEXT REFERENCES docs(id) ON DELETE CASCADE
+      ddl: `CREATE TABLE forbidden_event_fk (
+        id TEXT PRIMARY KEY NOT NULL,
+        event_id TEXT REFERENCES events(id) ON DELETE CASCADE
       )`,
-    }, /cannot reference system table docs/i);
+    }, /cannot reference system table events/i);
 
     const plan = await rpc("schema.plan", {
       principal: host,
       kind: "promote",
-      ddl: "CREATE TABLE schema_created (id TEXT PRIMARY KEY, value TEXT)",
+      ddl: "CREATE TABLE schema_created (id TEXT PRIMARY KEY NOT NULL, value TEXT)",
     });
     assert.equal(plan.kind, "promote");
     assert.ok(Array.isArray(plan.beforeSchema.tables));
     await rpc("schema.apply", {
       principal: host,
       kind: "promote",
-      ddl: "CREATE TABLE schema_created (id TEXT PRIMARY KEY, value TEXT)",
+      ddl: "CREATE TABLE schema_created (id TEXT PRIMARY KEY NOT NULL, value TEXT)",
       approved: true,
       requestedBy: "node-test",
     });
@@ -1554,7 +867,7 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
       principal: host,
       kind: "promote",
       ddl: [
-        'CREATE TABLE "schema weird" (id TEXT PRIMARY KEY, value TEXT)',
+        'CREATE TABLE "schema weird" (id TEXT PRIMARY KEY NOT NULL, value TEXT)',
         'CREATE INDEX "schema weird idx" ON "schema weird" (value)',
       ],
       approved: true,
@@ -1796,14 +1109,6 @@ function seedDataDb(path) {
       BEGIN
         SELECT RAISE(ABORT, 'events are append-only');
       END;
-      CREATE TABLE docs (
-        id TEXT PRIMARY KEY,
-        content TEXT NOT NULL DEFAULT '',
-        metadata JSON,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE INDEX idx_docs_updated ON docs(updated_at DESC);
       CREATE TRIGGER suppress_test_event
       BEFORE INSERT ON events
       WHEN NEW.source = 'system:suppressed'
@@ -1811,20 +1116,20 @@ function seedDataDb(path) {
         SELECT RAISE(IGNORE);
       END;
       CREATE TABLE parents (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY NOT NULL,
         label TEXT NOT NULL
       );
       CREATE TABLE children (
-        id TEXT PRIMARY KEY,
-        parent_id TEXT NOT NULL REFERENCES parents(id) ON DELETE CASCADE,
+        id TEXT PRIMARY KEY NOT NULL,
+        parent_id TEXT NOT NULL REFERENCES parents(id) ON DELETE CASCADE ON UPDATE CASCADE,
         value INTEGER NOT NULL
       );
       CREATE TABLE trigger_source (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY NOT NULL,
         body TEXT NOT NULL
       );
       CREATE TABLE trigger_sink (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY NOT NULL,
         body TEXT NOT NULL
       );
       CREATE TRIGGER mirror_trigger_source
@@ -1833,11 +1138,11 @@ function seedDataDb(path) {
         INSERT INTO trigger_sink (id, body) VALUES (NEW.id, NEW.body);
       END;
       CREATE TABLE blob_rows (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY NOT NULL,
         value BLOB NOT NULL
       );
       CREATE TABLE numeric_rows (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY NOT NULL,
         integer_value INTEGER NOT NULL,
         real_value REAL NOT NULL
       );
@@ -1845,41 +1150,34 @@ function seedDataDb(path) {
         id INTEGER PRIMARY KEY,
         value TEXT NOT NULL
       );
-      CREATE TABLE "Ä" (id TEXT PRIMARY KEY);
-      CREATE TABLE "ä" (id TEXT PRIMARY KEY);
-      CREATE TABLE "weird table" (id TEXT PRIMARY KEY);
-      CREATE TABLE drop_trigger_table (id TEXT PRIMARY KEY);
+      CREATE TABLE "Ä" (id TEXT PRIMARY KEY NOT NULL);
+      CREATE TABLE "ä" (id TEXT PRIMARY KEY NOT NULL);
+      CREATE TABLE "weird table" (id TEXT PRIMARY KEY NOT NULL);
+      CREATE TABLE drop_trigger_table (id TEXT PRIMARY KEY NOT NULL);
       CREATE TRIGGER drop_trigger_table_audit
       AFTER INSERT ON drop_trigger_table
       BEGIN
         SELECT NEW.id;
       END;
-      CREATE TABLE demote_parent (id TEXT PRIMARY KEY);
+      CREATE TABLE demote_parent (id TEXT PRIMARY KEY NOT NULL);
       CREATE TABLE demote_child (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY NOT NULL,
         parent_id TEXT NOT NULL REFERENCES demote_parent(id) ON DELETE CASCADE
       );
       CREATE INDEX demote_child_parent_idx ON demote_child(parent_id);
-      CREATE TABLE legacy_doc_children (
-        id TEXT PRIMARY KEY,
-        doc_id TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE
-      );
       CREATE TABLE wide_table (
-        c0 TEXT PRIMARY KEY,
+        c0 TEXT PRIMARY KEY NOT NULL,
         ${Array.from({ length: 520 }, (_, index) => `c${index + 1} TEXT`).join(",\n")}
       );
+      PRAGMA user_version = 1;
     `);
   } finally {
     db.close();
   }
 }
 
-function principal(source, tableGrants, docGrants = [], producerRef = TEST_PRODUCER_REF) {
-  return { source, producerRef, tableGrants, docGrants, schemaGrant: false };
-}
-
-function sha256(content) {
-  return createHash("sha256").update(content, "utf8").digest("hex");
+function principal(source, tableGrants, producerRef = TEST_PRODUCER_REF) {
+  return { source, producerRef, tableGrants, schemaGrant: false };
 }
 
 async function rpc(method, params, options = {}) {
@@ -1936,7 +1234,7 @@ async function queryRows(sql, params) {
 
 async function auditPayloads(source) {
   const rows = await queryRows(
-    "SELECT type, producer_ref, payload FROM events WHERE source = ? AND type LIKE 'd2.%' ORDER BY created_at, rowid",
+    "SELECT type, producer_ref, payload FROM events WHERE source = ? AND type LIKE 'workspace.table.rows.%' ORDER BY created_at, rowid",
     [source],
   );
   return rows.map((row) => ({
@@ -1944,21 +1242,6 @@ async function auditPayloads(source) {
     producerRef: row.producer_ref,
     payload: JSON.parse(row.payload),
   }));
-}
-
-async function d1Events(source, docId) {
-  const rows = await queryRows(
-    "SELECT type, producer_ref, payload FROM events WHERE source = ? AND type LIKE 'd1.%' ORDER BY created_at, rowid",
-    [source],
-  );
-  const events = rows.map((row) => ({
-    type: row.type,
-    producerRef: row.producer_ref,
-    payload: JSON.parse(row.payload),
-  }));
-  return docId === undefined
-    ? events
-    : events.filter((event) => event.payload.doc_id === docId);
 }
 
 function expensiveRecursiveQuery() {

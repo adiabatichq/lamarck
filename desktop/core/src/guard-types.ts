@@ -9,5 +9,4 @@ export interface EventInput {
   payload: JsonValue;
 }
 
-export type DocOp = "write" | "delete";
 export type SchemaOp = "promote" | "demote";

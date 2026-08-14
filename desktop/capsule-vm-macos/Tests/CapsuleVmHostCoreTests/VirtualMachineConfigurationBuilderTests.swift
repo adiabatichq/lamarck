@@ -25,6 +25,7 @@ import Virtualization
 
     let configuration = try CapsuleVmConfigurationBuilder.makeUnvalidatedConfiguration(
         image: image,
+        workspaceFilesURL: stateDirectory,
         stateDiskLease: stateDiskLease,
         cpuCount: cpuCount,
         memorySize: memorySize,
@@ -74,7 +75,14 @@ import Virtualization
     #expect(configuration.serialPorts.first is VZVirtioConsoleDeviceSerialPortConfiguration)
 
     #expect(configuration.networkDevices.isEmpty)
-    #expect(configuration.directorySharingDevices.isEmpty)
+    #expect(configuration.directorySharingDevices.count == 1)
+    let filesShare = try #require(
+        configuration.directorySharingDevices.first as? VZVirtioFileSystemDeviceConfiguration
+    )
+    #expect(filesShare.tag == CapsuleVmConfigurationBuilder.workspaceFilesShareTag)
+    let sharedDirectory = try #require(filesShare.share as? VZSingleDirectoryShare)
+    #expect(sharedDirectory.directory.url == stateDirectory)
+    #expect(sharedDirectory.directory.isReadOnly)
     #expect(configuration.graphicsDevices.isEmpty)
     #expect(configuration.audioDevices.isEmpty)
     #expect(configuration.consoleDevices.isEmpty)
@@ -107,6 +115,7 @@ import Virtualization
     #expect(throws: CapsuleVmConfigurationError.self) {
         try CapsuleVmConfigurationBuilder.makeUnvalidatedConfiguration(
             image: image,
+            workspaceFilesURL: stateDirectory,
             stateDiskLease: stateDiskLease,
             cpuCount: VZVirtualMachineConfiguration.minimumAllowedCPUCount - 1,
             memorySize: memorySize,
@@ -116,6 +125,7 @@ import Virtualization
     #expect(throws: CapsuleVmConfigurationError.self) {
         try CapsuleVmConfigurationBuilder.makeUnvalidatedConfiguration(
             image: image,
+            workspaceFilesURL: stateDirectory,
             stateDiskLease: stateDiskLease,
             cpuCount: VZVirtualMachineConfiguration.minimumAllowedCPUCount,
             memorySize: VZVirtualMachineConfiguration.minimumAllowedMemorySize + 1,

@@ -173,10 +173,10 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
       const appAAudit = entries.filter((entry) => entry.source === "app:app-a:ui");
       const appBAudit = entries.filter((entry) => entry.source === "app:app-b:ui");
       expect(appAAudit.map(({ type }) => type)).toEqual([
-        "d2.insert",
+        "workspace.table.rows.inserted",
         "capsule.identity.probe",
       ]);
-      expect(appBAudit.map(({ type }) => type)).toEqual(["d2.insert"]);
+      expect(appBAudit.map(({ type }) => type)).toEqual(["workspace.table.rows.inserted"]);
       expect(JSON.parse(appAAudit[0]!.payload)).toMatchObject({
         table: "app_a_items",
         affected_rows: 1,
@@ -282,7 +282,7 @@ async function writeAppManifest(appId: string, tables: string[]): Promise<void> 
     runtime: {
       ui: { command: ["node", "server.mjs"], port: 3000 },
     },
-    permissions: { writes: { docs: [], tables } },
+    permissions: { writes: { files: [], tables } },
   }, null, 2)}\n`, "utf8");
   if (!existsSync(join(appDir, ".git"))) {
     runAppGit(appDir, "init", "--quiet");
@@ -313,13 +313,14 @@ function seedDataDatabase(): void {
     db.exec(DATA_SCHEMA);
     db.exec(`
       CREATE TABLE app_a_items (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY NOT NULL,
         value TEXT NOT NULL
       );
       CREATE TABLE app_b_items (
-        id TEXT PRIMARY KEY,
+        id TEXT PRIMARY KEY NOT NULL,
         value TEXT NOT NULL
       );
+      PRAGMA user_version = 1;
     `);
   } finally {
     db.close();

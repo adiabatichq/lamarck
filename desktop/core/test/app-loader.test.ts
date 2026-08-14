@@ -40,7 +40,7 @@ describe("App Loader", () => {
       name: id,
       description: `${id} description`,
       runtime: { ui: { command: ["npm", "run", "start"], port: 3000 } },
-      permissions: { writes: { docs: [], tables: [] } },
+      permissions: { writes: { files: [], tables: [] } },
     };
   }
 
@@ -80,7 +80,7 @@ describe("App Loader", () => {
     manifest.runtime.jobs = {
       "daily-etl": { command: ["npm", "run", "daily-etl", ""] },
     };
-    manifest.permissions.writes.docs = ["notes/"];
+    manifest.permissions.writes.files = ["notes/"];
     manifest.permissions.writes.tables = ["my_table"];
     writeApp("test-app", manifest);
 
@@ -91,6 +91,7 @@ describe("App Loader", () => {
     expect(app?.manifest).toEqual(manifest);
     expect(app?.manifestDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
     expect(registry.getTableGrants("test-app")).toEqual(["my_table"]);
+    expect(registry.getFileGrants("test-app")).toEqual(["apps/test-app/", "notes/"]);
     expect(registry.getTableGrants("unknown-app")).toEqual([]);
   });
 
@@ -164,7 +165,7 @@ describe("App Loader", () => {
     const first = (await loadApps(appsDir)).apps.get("authority")!;
 
     writeFileSync(join(appsDir, "authority", "manifest.json"), JSON.stringify({
-      permissions: { writes: { tables: ["reviews"], docs: [] } },
+      permissions: { writes: { tables: ["reviews"], files: [] } },
       runtime: { ui: { port: 3000, command: ["npm", "run", "start"] } },
       description: "authority description",
       name: "authority",
@@ -176,7 +177,7 @@ describe("App Loader", () => {
 
     writeFileSync(join(appsDir, "authority", "manifest.json"), JSON.stringify({
       ...manifest,
-      permissions: { writes: { docs: [], tables: [] } },
+      permissions: { writes: { files: [], tables: [] } },
     }));
     expect((await loadApps(appsDir)).apps.get("authority")?.manifestDigest)
       .not.toBe(first.manifestDigest);
@@ -225,21 +226,18 @@ describe("App Loader", () => {
     expect(services?.["constructor"].command).toEqual(["node", "service.mjs"]);
   });
 
-  test("canWriteDoc grants the implicit home prefix and declared grants", async () => {
+  test("file grants include the implicit home prefix and declared grants", async () => {
     const manifest = validManifest("focus");
-    manifest.permissions.writes.docs = ["notes/", "shared/pinned"];
+    manifest.permissions.writes.files = ["notes/", "shared/pinned.md"];
     writeApp("focus", manifest);
 
     const registry = await loadApps(appsDir);
-    expect(registry.canWriteDoc("focus", "apps/focus/brief", "write")).toBe(true);
-    expect(registry.canWriteDoc("focus", "apps/focus/deep/nested", "delete")).toBe(true);
-    expect(registry.canWriteDoc("focus", "notes/ideas", "write")).toBe(true);
-    expect(registry.canWriteDoc("focus", "shared/pinned", "write")).toBe(true);
-    expect(registry.canWriteDoc("focus", "notes", "write")).toBe(false);
-    expect(registry.canWriteDoc("focus", "shared/pinned-2", "write")).toBe(false);
-    expect(registry.canWriteDoc("focus", "apps/focus-2/brief", "write")).toBe(false);
-    expect(registry.canWriteDoc("focus", "apps/other/brief", "write")).toBe(false);
-    expect(registry.canWriteDoc("unknown-app", "apps/unknown-app/x", "write")).toBe(false);
+    expect(registry.getFileGrants("focus")).toEqual([
+      "apps/focus/",
+      "notes/",
+      "shared/pinned.md",
+    ]);
+    expect(registry.getFileGrants("unknown-app")).toEqual([]);
   });
 
   test("requires manifestVersion 1 and rejects unknown fields", async () => {
@@ -323,7 +321,7 @@ describe("App Loader", () => {
     expect(warnings.some((warning) => warning.includes('unknown runtime field "agents"'))).toBe(true);
   });
 
-  test("requires an explicit writes object with docs and tables arrays", async () => {
+  test("requires an explicit writes object with files and tables arrays", async () => {
     const missingPermissions = validManifest("missing-permissions") as unknown as Record<string, unknown>;
     delete missingPermissions.permissions;
     writeApp("missing-permissions", missingPermissions);
@@ -331,38 +329,38 @@ describe("App Loader", () => {
       ...validManifest("missing-writes"),
       permissions: {},
     });
-    writeApp("missing-docs", {
-      ...validManifest("missing-docs"),
+    writeApp("missing-files", {
+      ...validManifest("missing-files"),
       permissions: { writes: { tables: [] } },
     });
     writeApp("missing-tables", {
       ...validManifest("missing-tables"),
-      permissions: { writes: { docs: [] } },
+      permissions: { writes: { files: [] } },
     });
     const registry = await loadApps(appsDir);
     expect(registry.apps.size).toBe(0);
   });
 
   test("rejects invalid D1 and D2 grants", async () => {
-    writeApp("docs-not-array", {
-      ...validManifest("docs-not-array"),
-      permissions: { writes: { docs: "notes/", tables: [] } },
+    writeApp("files-not-array", {
+      ...validManifest("files-not-array"),
+      permissions: { writes: { files: "notes/", tables: [] } },
     });
-    writeApp("unsafe-doc", {
-      ...validManifest("unsafe-doc"),
-      permissions: { writes: { docs: ["../outside/"], tables: [] } },
+    writeApp("unsafe-file", {
+      ...validManifest("unsafe-file"),
+      permissions: { writes: { files: ["../outside/"], tables: [] } },
     });
     writeApp("tables-not-array", {
       ...validManifest("tables-not-array"),
-      permissions: { writes: { docs: [], tables: "focus_sessions" } },
+      permissions: { writes: { files: [], tables: "focus_sessions" } },
     });
     writeApp("wildcard-table", {
       ...validManifest("wildcard-table"),
-      permissions: { writes: { docs: [], tables: ["*"] } },
+      permissions: { writes: { files: [], tables: ["*"] } },
     });
     writeApp("padded-table", {
       ...validManifest("padded-table"),
-      permissions: { writes: { docs: [], tables: [" focus_sessions"] } },
+      permissions: { writes: { files: [], tables: [" focus_sessions"] } },
     });
 
     const registry = await loadApps(appsDir);

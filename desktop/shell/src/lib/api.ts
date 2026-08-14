@@ -1,7 +1,6 @@
 // HTTP client for core runtime. Electron provides the production URL; browser
 // dev keeps a default so `npm run dev` can still talk to a standalone core.
 
-import { normalizeDocMetadata } from "./doc-metadata";
 import type {
   ContentBlobRef,
   MutationResult,
@@ -97,58 +96,6 @@ export interface DataSchemaSnapshot {
   indexes: Array<{ name: string; table: string; sql: string | null }>;
 }
 
-export function subscribeDocEvents(
-  onEvent: (event: { id: string }) => void,
-  onError?: (error: unknown) => void,
-): () => void {
-  const controller = new AbortController();
-
-  void (async () => {
-    try {
-      const base = await getCoreBaseUrl();
-      const res = await fetch(`${base}/api/docs/events`, {
-        headers: await coreHeaders(),
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        const data = text ? JSON.parse(text) : {};
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-      if (!res.body) throw new Error("Doc event stream is unavailable");
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let boundary = buffer.indexOf("\n\n");
-        while (boundary !== -1) {
-          const rawEvent = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          const data = rawEvent
-            .split("\n")
-            .filter((line) => line.startsWith("data:"))
-            .map((line) => line.slice("data:".length).trim())
-            .join("\n");
-          if (data) onEvent(JSON.parse(data) as { id: string });
-          boundary = buffer.indexOf("\n\n");
-        }
-      }
-    } catch (err) {
-      if (!controller.signal.aborted) onError?.(err);
-    }
-  })();
-
-  return () => controller.abort();
-}
-
-// -- Docs --
-
 export interface WorkspaceInfo {
   path: string;
 }
@@ -194,113 +141,43 @@ export function logoutLamarckSession(): Promise<{ ok: true }> {
   });
 }
 
-export interface Doc {
-  id: string;
-  content: string;
-  metadata: Record<string, unknown> | null;
-  created_at: number;
-  updated_at: number;
+export interface VfsCommandResult {
+  success: boolean;
+  exitCode: number;
+  stdoutBase64: string;
+  stderrBase64: string;
 }
 
-export async function getDoc(id: string): Promise<Doc> {
-  const doc = await request<Omit<Doc, "metadata"> & { metadata: unknown }>(
-    `/api/docs/${encodeURIComponent(id)}`,
-  );
-  return { ...doc, metadata: normalizeDocMetadata(doc.metadata) };
-}
-
-export function saveDoc(
-  id: string,
-  content: string,
-  metadata?: Record<string, unknown>,
-): Promise<{ ok: true; id: string }> {
-  return request("/api/docs", {
+export function vfsCommand(
+  command: string,
+  options?: { stdin?: { encoding: "utf8" | "base64"; data: string }; stdout?: "capture" | "ignore"; author?: string },
+): Promise<VfsCommandResult> {
+  return request("/api/vfs/command", {
     method: "POST",
-    body: JSON.stringify({ id, content, metadata }),
+    body: JSON.stringify(options === undefined ? { command } : { command, options }),
   });
 }
 
-export function deleteDoc(id: string): Promise<{ ok: true }> {
-  return request(`/api/docs/${encodeURIComponent(id)}`, { method: "DELETE" });
+export interface D1HistoryExclusion {
+  path: string;
+  prefix: boolean;
 }
 
-export async function listDocs(): Promise<{ rows: Doc[] }> {
-  const result = await request<{
-    rows: Array<Omit<Doc, "metadata"> & { metadata: unknown }>;
-  }>("/api/query", {
+export function listD1HistoryExclusions(): Promise<{ exclusions: D1HistoryExclusion[] }> {
+  return request("/api/vfs/history-exclusions");
+}
+
+export function addD1HistoryExclusion(rule: string): Promise<{ exclusion: D1HistoryExclusion }> {
+  return request("/api/vfs/history-exclusions", {
     method: "POST",
-    body: JSON.stringify({
-      sql: "SELECT id, metadata, created_at, updated_at FROM docs ORDER BY updated_at DESC",
-    }),
+    body: JSON.stringify({ path: rule }),
   });
-  return {
-    rows: result.rows.map((doc) => ({
-      ...doc,
-      metadata: normalizeDocMetadata(doc.metadata),
-    })),
-  };
 }
 
-// -- Working Tree reconciliation --
-
-export interface WorkingTreeConflictSideSummary {
-  exists: boolean;
-  hash: string | null;
-  updatedAt?: number | null;
-  mtimeMs?: number | null;
-  error?: string;
-}
-
-export interface WorkingTreeConflictSide extends WorkingTreeConflictSideSummary {
-  content: string | null;
-}
-
-export interface WorkingTreeConflictSummary {
-  docId: string;
-  expectedVersion: string;
-  baseHash: string | null;
-  database: WorkingTreeConflictSideSummary;
-  file: WorkingTreeConflictSideSummary;
-  detectedAt: number;
-  error?: string;
-}
-
-export interface WorkingTreeConflict extends Omit<
-  WorkingTreeConflictSummary,
-  "database" | "file"
-> {
-  database: WorkingTreeConflictSide;
-  file: WorkingTreeConflictSide;
-}
-
-export type WorkingTreeConflictResolution =
-  | "use-database"
-  | "use-file"
-  | "keep-both";
-
-export function listWorkingTreeConflicts(): Promise<{
-  conflicts: WorkingTreeConflictSummary[];
-}> {
-  return request("/api/working-tree/conflicts");
-}
-
-export function getWorkingTreeConflict(docId: string): Promise<{
-  conflict: WorkingTreeConflict;
-}> {
-  return request(`/api/working-tree/conflicts/${encodeURIComponent(docId)}`);
-}
-
-export function resolveWorkingTreeConflict(
-  docId: string,
-  input: {
-    resolution: WorkingTreeConflictResolution;
-    expectedVersion: string;
-    newId?: string;
-  },
-): Promise<{ ok: true; newDocId?: string }> {
-  return request(`/api/working-tree/conflicts/${encodeURIComponent(docId)}/resolve`, {
-    method: "POST",
-    body: JSON.stringify(input),
+export function removeD1HistoryExclusion(rule: string): Promise<{ ok: true; removed: boolean }> {
+  return request("/api/vfs/history-exclusions", {
+    method: "DELETE",
+    body: JSON.stringify({ path: rule }),
   });
 }
 
@@ -325,7 +202,7 @@ export interface AppInfo {
   };
   permissions: {
     writes: {
-      docs: string[];
+      files: string[];
       tables: string[];
     };
   };

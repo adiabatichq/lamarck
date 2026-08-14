@@ -151,6 +151,8 @@ export interface MacOsCapsuleBackendOptions {
   cacheDirectory: string;
   /** Host-private sealed runtime artifact CAS and activation pointers. */
   artifactRoot: string;
+  /** The selected Workspace's canonical D1 root. */
+  workspaceFilesPath: () => string;
   /** Host terminator for the workload's ticket-bound System SDK stream. */
   systemStreamServer: SystemStreamServer;
   /** Narrow seams used by deterministic orchestration tests. */
@@ -1043,6 +1045,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       guestStartAttempted = true;
       const started = await helper.startGuest({
         ...release.vmImage,
+        workspaceFilesPath: this.#options.workspaceFilesPath(),
         stateDiskBytes,
         statePreparationId: statePreparation.preparationId,
       });

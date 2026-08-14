@@ -6,15 +6,17 @@ import { ConnectorsView } from "../content/ConnectorsView";
 import { TableView } from "../content/TableView";
 import { appWorkloads } from "../lib/app-visual";
 import {
-  getDoc,
+  addD1HistoryExclusion,
   inspectDataSchema,
   listConnectors,
-  listDocs,
+  listD1HistoryExclusions,
   query,
+  removeD1HistoryExclusion,
+  vfsCommand,
   type AppInfo,
   type ConnectorSourceView,
   type DataSchemaSnapshot,
-  type Doc,
+  type D1HistoryExclusion,
   type InstalledConnectorView,
   type LamarckSessionView,
 } from "../lib/api";
@@ -32,7 +34,6 @@ interface RecentEvent {
 interface SystemSnapshot {
   sources: ConnectorSourceView[];
   packages: InstalledConnectorView[];
-  docs: Doc[];
   tables: DataSchemaSnapshot["tables"];
   eventCount: number;
   recentEvents: RecentEvent[];
@@ -41,7 +42,6 @@ interface SystemSnapshot {
 const EMPTY_SNAPSHOT: SystemSnapshot = {
   sources: [],
   packages: [],
-  docs: [],
   tables: [],
   eventCount: 0,
   recentEvents: [],
@@ -79,7 +79,6 @@ export function SystemRoom({
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
-  const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -87,7 +86,6 @@ export function SystemRoom({
     setRefreshing(true);
     const results = await Promise.allSettled([
       listConnectors(),
-      listDocs(),
       inspectDataSchema(),
       query("SELECT COUNT(*) AS count FROM events"),
       query(
@@ -101,16 +99,14 @@ export function SystemRoom({
 
     setSnapshot((current) => {
       const connectors = results[0].status === "fulfilled" ? results[0].value : null;
-      const docs = results[1].status === "fulfilled" ? results[1].value.rows : current.docs;
-      const schema = results[2].status === "fulfilled" ? results[2].value : null;
-      const countResult = results[3].status === "fulfilled" ? results[3].value.rows[0] as { count?: number } : null;
-      const eventRows = results[4].status === "fulfilled" ? results[4].value.rows as RecentEvent[] : current.recentEvents;
+      const schema = results[1].status === "fulfilled" ? results[1].value : null;
+      const countResult = results[2].status === "fulfilled" ? results[2].value.rows[0] as { count?: number } : null;
+      const eventRows = results[3].status === "fulfilled" ? results[3].value.rows as RecentEvent[] : current.recentEvents;
       return {
         sources: connectors?.sources ?? current.sources,
         packages: connectors?.packages ?? current.packages,
-        docs,
         tables: schema
-          ? schema.tables.filter((table) => table.name !== "docs" && table.name !== "events")
+          ? schema.tables.filter((table) => table.name !== "events")
           : current.tables,
         eventCount: Number(countResult?.count ?? current.eventCount),
         recentEvents: eventRows,
@@ -129,7 +125,6 @@ export function SystemRoom({
 
   useEffect(() => {
     setSelectedTable(null);
-    setSelectedDocId(null);
     if (section !== "timeline") setSelectedEventId(null);
   }, [section]);
 
@@ -137,12 +132,6 @@ export function SystemRoom({
     const sourceAttention = snapshot.sources.filter(sourceNeedsAttention).length;
     return sourceAttention + (schemaRequestPending ? 1 : 0) + (coreStatus === "offline" ? 1 : 0);
   }, [coreStatus, schemaRequestPending, snapshot.sources]);
-
-  const openDocument = useCallback((docId: string) => {
-    setSection("data");
-    setSelectedTable(null);
-    setSelectedDocId(docId);
-  }, []);
 
   const inspectEvent = useCallback((eventId: string) => {
     setSelectedEventId(eventId);
@@ -239,27 +228,15 @@ export function SystemRoom({
         )}
         {section === "data" && (
           <SystemData
-            docs={snapshot.docs}
             tables={snapshot.tables}
             selectedTable={selectedTable}
-            selectedDocId={selectedDocId}
-            onSelectTable={(name) => {
-              setSelectedDocId(null);
-              setSelectedTable(name);
-            }}
-            onSelectDoc={(id) => {
-              setSelectedTable(null);
-              setSelectedDocId(id);
-            }}
-            onCloseInspector={() => {
-              setSelectedDocId(null);
-              setSelectedTable(null);
-            }}
+            onSelectTable={setSelectedTable}
+            onCloseInspector={() => setSelectedTable(null)}
           />
         )}
         {section === "timeline" && (
           <div className={styles.fullSurface}>
-            <ActivityView key={coreStatus} initialEventId={selectedEventId} onOpenDoc={openDocument} />
+            <ActivityView key={coreStatus} initialEventId={selectedEventId} />
           </div>
         )}
         {section === "workspace" && (
@@ -347,7 +324,7 @@ function SystemOverview({
       <section className={styles.signalGrid}>
         <Signal label="Sources" value={snapshot.sources.length} detail={`${sourceAttention.length} need attention`} tone={sourceAttention.length ? "amber" : "mint"} onClick={() => onNavigate("sources")} />
         <Signal label="Apps" value={apps.length} detail={`${uiApps} openable interfaces`} tone="cyan" onClick={() => onNavigate("apps")} />
-        <Signal label="Documents" value={snapshot.docs.length} detail="D1 durable objects" tone="neutral" onClick={() => onNavigate("data")} />
+        <Signal label="Files" value="Open" detail="D1 filesystem authority" tone="neutral" onClick={() => onNavigate("data")} />
         <Signal label="Tables" value={snapshot.tables.length} detail="D2 current models" tone="neutral" onClick={() => onNavigate("data")} />
       </section>
 
@@ -366,8 +343,8 @@ function SystemOverview({
             <span>D0 · Continuity</span><strong>Timeline</strong><i>{formatCompact(snapshot.eventCount)}</i>
           </button>
           <div className={styles.substrateBracket} aria-hidden="true"><span>data.db</span></div>
-          <button type="button" className={`${styles.shapeNode} ${styles.documentNode}`} onClick={() => onNavigate("data")}>
-            <span>D1 · Durable</span><strong>Documents</strong><i>{snapshot.docs.length}</i>
+          <button type="button" className={`${styles.shapeNode} ${styles.fileNode}`} onClick={() => onNavigate("data")}>
+            <span>D1 · Filesystem</span><strong>Files</strong><i>local</i>
           </button>
           <button type="button" className={`${styles.shapeNode} ${styles.tableNode}`} onClick={() => onNavigate("data")}>
             <span>D2 · Current</span><strong>Tables</strong><i>{snapshot.tables.length}</i>
@@ -430,7 +407,7 @@ function Signal({
   onClick,
 }: {
   label: string;
-  value: number;
+  value: number | string;
   detail: string;
   tone: "mint" | "cyan" | "amber" | "neutral";
   onClick: () => void;
@@ -438,7 +415,7 @@ function Signal({
   return (
     <button type="button" className={`${styles.signal} ${styles[`signal_${tone}`]}`} onClick={onClick}>
       <span>{label}</span>
-      <strong>{formatCompact(value)}</strong>
+      <strong>{typeof value === "number" ? formatCompact(value) : value}</strong>
       <i>{detail}</i>
       <b aria-hidden="true">↗</b>
     </button>
@@ -472,7 +449,7 @@ function SystemApps({ apps, onOpenApp }: { apps: AppInfo[]; onOpenApp: (appId: s
             </div>
             <div className={styles.badges}>{appWorkloads(app).map((workload) => <span key={workload}>{workload}</span>)}</div>
             <div className={styles.grants}>
-              <span><b>{app.permissions.writes.docs.length}</b> docs</span>
+              <span><b>{app.permissions.writes.files.length}</b> files</span>
               <span><b>{app.permissions.writes.tables.length}</b> tables</span>
             </div>
             <div>
@@ -488,20 +465,14 @@ function SystemApps({ apps, onOpenApp }: { apps: AppInfo[]; onOpenApp: (appId: s
 }
 
 function SystemData({
-  docs,
   tables,
   selectedTable,
-  selectedDocId,
   onSelectTable,
-  onSelectDoc,
   onCloseInspector,
 }: {
-  docs: Doc[];
   tables: DataSchemaSnapshot["tables"];
   selectedTable: string | null;
-  selectedDocId: string | null;
   onSelectTable: (name: string) => void;
-  onSelectDoc: (id: string) => void;
   onCloseInspector: () => void;
 }) {
   if (selectedTable) {
@@ -512,29 +483,19 @@ function SystemData({
       </div>
     );
   }
-  if (selectedDocId) {
-    return <DocumentInspector docId={selectedDocId} onBack={onCloseInspector} />;
-  }
-
   return (
     <div className={styles.dataPage}>
       <header className={styles.pageHeader}>
         <div>
           <span className={styles.overline}>Durable substrate</span>
           <h1>Data</h1>
-          <p>Raw inspection of Documents and promoted Tables. Daily discovery belongs to Apps.</p>
+          <p>Open filesystem-authoritative D1 files and inspect promoted D2 Tables.</p>
         </div>
       </header>
       <div className={styles.dataColumns}>
         <section className={styles.dataLedger}>
-          <div className={styles.panelHeading}><div><span>D1</span><strong>Documents</strong></div><b>{docs.length}</b></div>
-          <div className={styles.dataList}>
-            {docs.length === 0 ? <div className={styles.inventoryEmpty}>No Documents.</div> : docs.map((doc) => (
-              <button type="button" key={doc.id} onClick={() => onSelectDoc(doc.id)}>
-                <DocumentIcon /><span><strong>{doc.id}</strong><small>Updated {formatDate(doc.updated_at)}</small></span><b>→</b>
-              </button>
-            ))}
-          </div>
+          <div className={styles.panelHeading}><div><span>D1</span><strong>Files</strong></div><b>local</b></div>
+          <FilesPanel />
         </section>
         <section className={styles.dataLedger}>
           <div className={styles.panelHeading}><div><span>D2</span><strong>Tables</strong></div><b>{tables.length}</b></div>
@@ -551,30 +512,118 @@ function SystemData({
   );
 }
 
-function DocumentInspector({ docId, onBack }: { docId: string; onBack: () => void }) {
-  const [doc, setDoc] = useState<Doc | null>(null);
+function FilesPanel() {
+  const [path, setPath] = useState("");
+  const [content, setContent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    setDoc(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const readMarkdown = useCallback(async () => {
+    setBusy(true);
     setError(null);
-    void getDoc(docId).then((result) => {
-      if (!cancelled) setDoc(result);
-    }).catch((reason) => {
-      if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason));
-    });
-    return () => { cancelled = true; };
-  }, [docId]);
+    setNotice(null);
+    setContent(null);
+    try {
+      if (!path.toLowerCase().endsWith(".md")) throw new Error("Enter a real .md file path.");
+      const result = await vfsCommand(`cat -- ${quoteVfsWord(path)}`);
+      if (!result.success) throw new Error(decodeBase64Text(result.stderrBase64) || "Could not read file");
+      setContent(decodeBase64Text(result.stdoutBase64));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }, [path]);
+
+  const transfer = useCallback(async (kind: "import" | "export") => {
+    setError(null);
+    setNotice(null);
+    const chosen = await window.lamarckHost?.chooseVfsTransferPath(kind);
+    if (!chosen?.path) return;
+    const d1Path = window.prompt(
+      kind === "import" ? "D1 destination path" : "D1 source path",
+      path,
+    );
+    if (!d1Path) return;
+    const command = kind === "import"
+      ? `import -- ${quoteVfsWord(chosen.path)} ${quoteVfsWord(d1Path)}`
+      : `export -- ${quoteVfsWord(d1Path)} ${quoteVfsWord(chosen.path)}`;
+    const result = await vfsCommand(command);
+    if (!result.success) throw new Error(decodeBase64Text(result.stderrBase64) || `${kind} failed`);
+    setNotice(kind === "import" ? `Imported to ${d1Path}` : `Exported ${d1Path}`);
+  }, [path]);
+
+  const openFiles = useCallback(async (target: "finder" | "obsidian") => {
+    setError(null);
+    setNotice(null);
+    try {
+      await window.lamarckHost?.openWorkspaceFiles(target);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, []);
+
+  const excludeFocused = useCallback(async () => {
+    setError(null);
+    setNotice(null);
+    try {
+      await addD1HistoryExclusion(path);
+      setNotice(`${path} is excluded from future D0 history.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, [path]);
+
   return (
-    <div className={styles.documentInspector}>
-      <button type="button" className={styles.surfaceBack} onClick={onBack}><BackIcon /> Data</button>
-      <header><span>D1 / Document</span><h1>{docId}</h1>{doc && <p>Updated {formatDate(doc.updated_at)} · created {formatDate(doc.created_at)}</p>}</header>
-      {error ? <div className={styles.inspectorError}>{error}</div> : doc ? (
-        <div className={styles.documentBody}>
-          <section><span>Content</span><pre>{doc.content}</pre></section>
-          <section><span>Metadata</span><pre>{JSON.stringify(doc.metadata ?? {}, null, 2)}</pre></section>
+    <div className={styles.filesPanel}>
+      <section className={styles.filesRootCard}>
+        <div className={styles.filesRootRail} aria-hidden="true"><i /><span>files/</span></div>
+        <div>
+          <span className={styles.filesEyebrow}>Workspace authority</span>
+          <h2>Your files stay ordinary.</h2>
+          <p>Browse and edit them in Finder or Obsidian. Lamarck observes the resulting changes.</p>
         </div>
-      ) : <div className={styles.inspectorLoading}>Reading Document…</div>}
+        <div className={styles.fileActions}>
+          <button type="button" onClick={() => void openFiles("finder")}>Open in Finder</button>
+          <button type="button" onClick={() => void openFiles("obsidian")}>Open in Obsidian</button>
+          <span />
+          <button type="button" className={styles.quietAction} onClick={() => void transfer("import").catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))}>Import…</button>
+          <button type="button" className={styles.quietAction} onClick={() => void transfer("export").catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))}>Export…</button>
+        </div>
+      </section>
+      <section className={styles.markdownFocus}>
+        <div className={styles.focusHeading}>
+          <div><span>Focused Markdown</span><strong>Read a real D1 path</strong></div>
+          {content !== null && <small>{new TextEncoder().encode(content).byteLength.toLocaleString()} bytes</small>}
+        </div>
+        <div className={styles.pathComposer}>
+          <span>files/</span>
+          <input
+            aria-label="Markdown path"
+            value={path}
+            onChange={(event) => { setPath(event.target.value); setContent(null); setNotice(null); }}
+            placeholder="notes/today.md"
+            onKeyDown={(event) => { if (event.key === "Enter") void readMarkdown(); }}
+          />
+          <button type="button" disabled={busy || !path} onClick={() => void readMarkdown()}>{busy ? "Reading…" : "View file"}</button>
+        </div>
+        <div className={styles.focusTools}>
+          <button
+            type="button"
+            disabled={content === null}
+            onClick={() => void excludeFocused()}
+          >
+            Exclude from D0 history
+          </button>
+          <span>Stops future evidence for this exact path. It does not hide or lock the file.</span>
+        </div>
+        {error && <div className={styles.inspectorError}>{error}</div>}
+        {notice && <div className={styles.inspectorNotice}>{notice}</div>}
+        {content !== null
+          ? <pre className={styles.markdownPreview}>{content}</pre>
+          : <div className={styles.markdownEmpty}>Enter an explicit <code>.md</code> path to inspect its exact text.</div>}
+      </section>
     </div>
   );
 }
@@ -609,7 +658,57 @@ function SystemWorkspace({
           <p>Identity is separate from your local data and App permissions.</p>
         </section>
       </div>
+      <HistoryExclusionSettings />
     </div>
+  );
+}
+
+function HistoryExclusionSettings() {
+  const [rules, setRules] = useState<D1HistoryExclusion[]>([]);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const refresh = useCallback(async () => {
+    const result = await listD1HistoryExclusions();
+    setRules(result.exclusions);
+  }, []);
+  useEffect(() => {
+    void refresh().catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+  }, [refresh]);
+  const add = useCallback(async () => {
+    setError(null);
+    try {
+      await addD1HistoryExclusion(draft);
+      setDraft("");
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, [draft, refresh]);
+  const remove = useCallback(async (rule: D1HistoryExclusion) => {
+    await removeD1HistoryExclusion(`${rule.path}${rule.prefix ? "/" : ""}`);
+    await refresh();
+  }, [refresh]);
+
+  return (
+    <section className={`${styles.identityPanel} ${styles.historyPanel}`}>
+      <span className={styles.panelKicker}>D1 history policy</span>
+      <h2>Exclude from D0 history</h2>
+      <p>Enter an exact file path, or end a directory path with <code>/</code> to create a prefix rule.</p>
+      <div className={styles.ruleComposer}>
+        <span>files/</span>
+        <input aria-label="History exclusion path" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="private/" />
+        <button type="button" disabled={!draft} onClick={() => void add()}>Add rule</button>
+      </div>
+      {error && <div className={styles.inspectorError}>{error}</div>}
+      <div className={`${styles.dataList} ${styles.ruleList}`}>
+        {rules.length === 0 ? <span className={styles.ruleEmpty}>No paths are excluded.</span> : rules.map((rule) => (
+          <button type="button" key={`${rule.path}:${rule.prefix}`} onClick={() => void remove(rule)}>
+            <span><strong>{rule.path}{rule.prefix ? "/" : ""}</strong><small>{rule.prefix ? "Prefix" : "Exact path"}</small></span>
+            <b>Remove</b>
+          </button>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -644,8 +743,14 @@ function formatCompact(value: number): string {
   return new Intl.NumberFormat(undefined, { notation: value > 999 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
 }
 
-function formatDate(epoch: number): string {
-  return new Date(epoch).toLocaleString([], { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" });
+function quoteVfsWord(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function decodeBase64Text(value: string): string {
+  const binary = atob(value);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
 function relativeTime(epoch: number): string {
@@ -669,5 +774,4 @@ function AppsIcon() { return icon(<><rect x="4" y="4" width="6" height="6" rx="1
 function DataIcon() { return icon(<><ellipse cx="12" cy="6" rx="7" ry="3" /><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6" /></>); }
 function TimelineIcon() { return icon(<><path d="M5 4v16" /><circle cx="5" cy="8" r="2" /><circle cx="5" cy="16" r="2" /><path d="M9 8h10M9 16h7" /></>); }
 function WorkspaceIcon() { return icon(<><path d="M4 7.5h6l1.5-2H20v13H4v-11Z" /><path d="M4 9h16" /></>); }
-function DocumentIcon() { return icon(<><path d="M6 3h8l4 4v14H6V3Z" /><path d="M14 3v5h4M9 12h6M9 16h6" /></>); }
 function TableIcon() { return icon(<><rect x="3.5" y="4" width="17" height="16" rx="1" /><path d="M3.5 9h17M9 9v11M15 9v11" /></>); }

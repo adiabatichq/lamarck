@@ -9,6 +9,8 @@ interface WorkspacePreloadHost {
   chooseWorkspacePath(purpose: "create" | "open"): Promise<unknown>;
   createWorkspace(path: string): Promise<unknown>;
   openWorkspace(path: string, recoveryCode?: string): Promise<unknown>;
+  openWorkspaceFiles(application: "finder" | "obsidian"): Promise<unknown>;
+  chooseVfsTransferPath(purpose: "import" | "export"): Promise<unknown>;
 }
 
 function loadPreload(ipcInvoke: ReturnType<typeof vi.fn>): WorkspacePreloadHost {
@@ -49,6 +51,10 @@ describe("Shell Workspace preload contract", () => {
     await host.createWorkspace("/Users/person/New Lamarck");
     await host.openWorkspace("/Volumes/Data/Lamarck");
     await host.openWorkspace("/Volumes/Data/Lamarck", "recovery-code");
+    await host.openWorkspaceFiles("finder");
+    await host.openWorkspaceFiles("obsidian");
+    await host.chooseVfsTransferPath("import");
+    await host.chooseVfsTransferPath("export");
 
     expect(ipcInvoke.mock.calls).toEqual([
       ["workspace:getState"],
@@ -73,6 +79,10 @@ describe("Shell Workspace preload contract", () => {
           recoveryCode: "recovery-code",
         },
       ],
+      ["workspace:openFiles", "finder"],
+      ["workspace:openFiles", "obsidian"],
+      ["workspace:chooseVfsTransferPath", "import"],
+      ["workspace:chooseVfsTransferPath", "export"],
     ]);
   });
 });

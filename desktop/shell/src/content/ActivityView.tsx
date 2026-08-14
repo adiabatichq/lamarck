@@ -228,47 +228,27 @@ function PatchBlock({ patch }: { patch: string }) {
   );
 }
 
-function PayloadDetail({ type, payload, onOpenDoc }: { type: string; payload: JsonValue; onOpenDoc?: (docId: string) => void }) {
+function PayloadDetail({ type, payload }: { type: string; payload: JsonValue }) {
   if (!isJsonObject(payload)) {
     return <pre className={styles.sqlBlock}>{JSON.stringify(payload, null, 2)}</pre>;
   }
 
-  // d1.write — new events store a git-style patch.
-  if (type === "d1.write" && typeof payload.patch === "string") {
-    const docId = payload.doc_id as string;
+  if (type === "workspace.files.changed") {
+    const changes = Array.isArray(payload.changes) ? payload.changes.filter(isJsonObject) : [];
     return (
-      <div>
-        <div className={styles.detailMeta}>
-          <span
-            className={onOpenDoc ? styles.docLink : undefined}
-            onClick={onOpenDoc ? (e) => { e.stopPropagation(); onOpenDoc(docId); } : undefined}
-          >
-            {docId}
-          </span>
-          <span>{payload.bytes as number} bytes</span>
-        </div>
-        <PatchBlock patch={payload.patch} />
-      </div>
-    );
-  }
-
-  // d1.write / d1.delete — show diff
-  if ((type === "d1.write" || type === "d1.delete") && ("before" in payload || "after" in payload || "content" in payload)) {
-    const before = (payload.before ?? (type === "d1.delete" ? payload.content : null)) as string | null;
-    const after = (payload.after ?? (type === "d1.delete" ? "" : payload.content ?? "")) as string;
-    const docId = payload.doc_id as string;
-    return (
-      <div>
-        <div className={styles.detailMeta}>
-          <span
-            className={onOpenDoc ? styles.docLink : undefined}
-            onClick={onOpenDoc ? (e) => { e.stopPropagation(); onOpenDoc(docId); } : undefined}
-          >
-            {docId}
-          </span>
-          <span>{payload.bytes as number} bytes</span>
-        </div>
-        <DiffBlock before={before} after={after} />
+      <div className={styles.changesList}>
+        {changes.length === 0 ? (
+          <pre className={styles.sqlBlock}>{JSON.stringify(payload, null, 2)}</pre>
+        ) : changes.map((change, index) => (
+          <div key={`${String(change.path)}-${index}`}>
+            <div className={styles.detailMeta}>
+              <span>{String(change.kind)} · {String(change.path)}</span>
+              {typeof change.from === "string" && <span>from {change.from}</span>}
+            </div>
+            {typeof change.patch === "string" && <PatchBlock patch={change.patch} />}
+            {typeof change.patchPreview === "string" && <PatchBlock patch={change.patchPreview} />}
+          </div>
+        ))}
       </div>
     );
   }
@@ -310,11 +290,10 @@ function PayloadDetail({ type, payload, onOpenDoc }: { type: string; payload: Js
 }
 
 interface ActivityViewProps {
-  onOpenDoc?: (docId: string) => void;
   initialEventId?: string | null;
 }
 
-export function ActivityView({ onOpenDoc, initialEventId = null }: ActivityViewProps) {
+export function ActivityView({ initialEventId = null }: ActivityViewProps) {
   const [events, setEvents] = useState<EventRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -610,7 +589,7 @@ export function ActivityView({ onOpenDoc, initialEventId = null }: ActivityViewP
                         <span>{evt.id}</span>
                         <span>{formatTime(evt.started_at)}</span>
                       </div>
-                      <PayloadDetail type={evt.type} payload={payload} onOpenDoc={onOpenDoc} />
+                      <PayloadDetail type={evt.type} payload={payload} />
                       <details className={styles.rawEvent} onClick={(event) => event.stopPropagation()}>
                         <summary>Raw event</summary>
                         <pre>{formatRawEvent(evt)}</pre>

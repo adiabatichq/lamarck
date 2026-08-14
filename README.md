@@ -159,7 +159,7 @@ Sources and actions
         ↓
 D0 · append-only events
         ↓
-D1 · Markdown documents  +  D2 · SQLite tables
+D1 · Workspace files  +  D2 · SQLite tables
         ↓
 Apps · automations · AI workflows
 ```
@@ -167,11 +167,11 @@ Apps · automations · AI workflows
 | Layer | Role |
 |---|---|
 | **D0 · Events** | Append-only evidence of what happened, with stable provenance |
-| **D1 · Documents** | Human-editable narrative, materialized as Markdown |
+| **D1 · Files** | Filesystem-authoritative human-editable and portable data |
 | **D2 · Tables** | Structured current state and derived read models |
 | **Control plane** | Connector, credential, scheduler, and runtime state kept outside the personal substrate |
 
-Events stay. Documents, tables, apps, and interfaces can evolve around them.
+Events stay. Files, tables, apps, and interfaces can evolve around them.
 
 Three runtime boundaries keep that model honest:
 
@@ -255,8 +255,8 @@ GPT-5.6 is a big reason it got done.
 
 Also during Build Week, we shipped:
 
-- a more durable personal substrate, with transactional migrations and
-  reconciliation between D1 and its Markdown working tree
+- a more durable personal substrate, with transactional migrations and a
+  filesystem-authoritative D1 workspace
 - structured D0 ingestion for coding-agent transcripts, alongside a hardened
   Connector runtime
 - the runtime and starter workspace in the public repository, backed by

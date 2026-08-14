@@ -31,7 +31,6 @@ export type ContentBlobRef = {
   kind: "content-blob";
   version: 1;
   digest: string;
-  variant: "redacted-text";
   mediaType: "text/plain; charset=utf-8" | "application/json";
   encoding: "gzip";
 };
@@ -44,7 +43,6 @@ export type ResolveContentRefResult =
       bytes: number;
       digest: string;
       mediaType: string;
-      variant: string;
     }
   | { status: "missing"; digest: string }
   | { status: "digest_mismatch"; expected: string; actual: string }
@@ -57,6 +55,19 @@ export interface WriteEventInput {
   endedAt?: number;
   externalId?: string;
   payload: JsonValue;
+}
+
+export interface VfsCommandWireOptions {
+  stdin?: { encoding: "utf8" | "base64"; data: string };
+  stdout?: "capture" | "ignore";
+  author?: string;
+}
+
+export interface VfsCommandWireResult {
+  success: boolean;
+  exitCode: number;
+  stdoutBase64: string;
+  stderrBase64: string;
 }
 
 export interface SystemOperationMap {
@@ -76,13 +87,13 @@ export interface SystemOperationMap {
     input: { statements: SqlStatement[] };
     output: TransactionStatementResult[];
   };
-  writeDoc: {
-    input: { id: string; content: string; metadata?: Record<string, unknown> };
-    output: { ok: true; id: string };
+  "vfs.command": {
+    input: { command: string; options?: VfsCommandWireOptions };
+    output: VfsCommandWireResult;
   };
-  deleteDoc: {
-    input: { id: string };
-    output: { ok: true };
+  "vfs.open": {
+    input: { path: string };
+    output: { url: string };
   };
   writeEvent: {
     input: WriteEventInput;
@@ -95,8 +106,8 @@ export const SYSTEM_OPERATIONS = Object.freeze([
   "resolveContentRef",
   "mutate",
   "transaction",
-  "writeDoc",
-  "deleteDoc",
+  "vfs.command",
+  "vfs.open",
   "writeEvent",
 ] as const satisfies readonly (keyof SystemOperationMap)[]);
 

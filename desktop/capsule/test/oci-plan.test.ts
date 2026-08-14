@@ -36,6 +36,12 @@ describe("deterministic OCI bundle planning", () => {
       source: first.sdkBridgeRoot,
       options: ["rbind", "ro", "nosuid", "nodev", "noexec"],
     });
+    expect(first.config.mounts).toContainEqual({
+      destination: "/mnt/lamarck-files",
+      type: "bind",
+      source: "/mnt/lamarck-files",
+      options: ["rbind", "ro", "nosuid", "nodev", "noexec"],
+    });
     expect(first.config.linux.namespaces).toContainEqual({
       type: "network",
       path: first.networkNamespacePath,

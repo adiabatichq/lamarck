@@ -24,6 +24,22 @@ describe("read-only Guest boot contract", () => {
     expect(init).not.toMatch(/\bfstrim\b/);
   });
 
+  test("mounts the single Host D1 share read-only before workloads start", async () => {
+    const kernel = await readFile(resolve(board, "kernel.fragment"), "utf8");
+    const postBuild = await readFile(resolve(board, "post-build.sh"), "utf8");
+    const init = await readFile(
+      resolve(board, "rootfs-overlay/etc/init.d/S01lamarck-files"),
+      "utf8",
+    );
+    expect(kernel).toContain("CONFIG_FUSE_FS=y");
+    expect(kernel).toContain("CONFIG_VIRTIO_FS=y");
+    expect(postBuild).toContain('"$root/mnt/lamarck-files"');
+    expect(postBuild).toContain('mkdir -p "$target/mnt/lamarck-files"');
+    expect(init).toContain("mount -t virtiofs -o ro,nosuid,nodev,noexec");
+    expect(init).toContain("tag=lamarck-files");
+    expect(init).toContain("$3 == \"virtiofs\"");
+  });
+
   test("keeps the native toolchain Build-only and proves npm-ci node-gyp at boot", async () => {
     const defconfig = await readFile(
       resolve(guest, "buildroot/configs/lamarck_capsule_arm64_defconfig"),
@@ -69,6 +85,7 @@ describe("read-only Guest boot contract", () => {
     expect(postBuild).toContain(': > "$root/etc/resolv.conf"');
     expect(postBuild).toContain(': > "$root/etc/hosts"');
     expect(postBuild).toContain('"$root/run/app" "$root/run/lamarck"');
+    expect(postBuild).toContain('"$root/mnt/lamarck-files"');
     expect(postBuild.indexOf(': > "$root/etc/resolv.conf"')).toBeLessThan(
       postBuild.indexOf('runtime_root="$target/opt/lamarck/rootfs/node24"'),
     );

@@ -64,9 +64,9 @@ describe("isolated App System preload", () => {
     const ipcInvoke = vi.fn();
     const host = loadPreload(ipcInvoke);
 
-    await expect(host.invoke("writeDoc", {
-      id: "apps/malicious/oversized",
-      content: "x".repeat(MAX_SERIALIZED_BYTES),
+    await expect(host.invoke("vfs.command", {
+      command: "tee -- apps/malicious/oversized.bin",
+      options: { stdin: { encoding: "utf8", data: "x".repeat(MAX_SERIALIZED_BYTES) } },
     })).rejects.toMatchObject({ message: "System SDK request exceeds the size limit" });
     expect(ipcInvoke).not.toHaveBeenCalled();
   });

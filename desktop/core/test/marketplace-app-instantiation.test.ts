@@ -21,7 +21,7 @@ async function fixture() {
     name: "Notes",
     description: "Editable notes.",
     runtime: { ui: { command: ["npm", "run", "start"], port: 3000 } },
-    permissions: { writes: { docs: [], tables: [] } },
+    permissions: { writes: { files: [], tables: [] } },
   };
   await writeFile(join(source, "manifest.json"), `${JSON.stringify(manifest)}\n`);
   await writeFile(join(source, "src", "index.tsx"), "export default null;\n", { mode: 0o755 });

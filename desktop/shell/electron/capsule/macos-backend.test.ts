@@ -1174,6 +1174,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
         stateDirectory,
         cacheDirectory,
         artifactRoot,
+        workspaceFilesPath: () => join(root, "workspace", "files"),
         systemStreamServer: system as unknown as SystemStreamServer,
         dependencies: {
           hostPlatform: "darwin",
@@ -1293,14 +1294,14 @@ describe("MacOsCapsuleBackend orchestration", () => {
 
       const workspaceApp = join(workspace, "apps", "weather", "manifest.json");
       const d0d2Database = join(workspace, ".lamarck", "data.db");
-      const d1Document = join(workspace, "pages", "retirement-sentinel.md");
+      const d1Document = join(workspace, "files", "retirement-sentinel.md");
       await mkdir(join(workspace, "apps", "weather"), { recursive: true });
       await mkdir(join(workspace, ".lamarck"), { recursive: true });
-      await mkdir(join(workspace, "pages"), { recursive: true });
+      await mkdir(join(workspace, "files"), { recursive: true });
       const immutableSentinels = new Map<string, Buffer>([
         [workspaceApp, Buffer.from('{"manifestVersion":1,"id":"weather"}\n')],
         [d0d2Database, Buffer.from("D0 and D2 durable database sentinel")],
-        [d1Document, Buffer.from("# D1 working-tree sentinel\n")],
+        [d1Document, Buffer.from("# D1 filesystem sentinel\n")],
       ]);
       for (const [path, bytes] of immutableSentinels) await writeFile(path, bytes);
 
@@ -1316,6 +1317,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
         stateDirectory,
         cacheDirectory,
         artifactRoot,
+        workspaceFilesPath: () => join(workspace, "files"),
         systemStreamServer: system as unknown as SystemStreamServer,
         dependencies: {
           hostPlatform: "darwin",
@@ -1472,6 +1474,7 @@ function createHarness(overrides: { opaqueId?: () => string } = {}) {
     stateDirectory: "/private/state/capsule",
     cacheDirectory: "/private/cache/capsule",
     artifactRoot: "/private/artifacts/capsule",
+    workspaceFilesPath: () => "/workspace/files",
     systemStreamServer: system as unknown as SystemStreamServer,
     dependencies: {
       hostPlatform: "darwin",

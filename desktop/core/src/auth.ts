@@ -21,7 +21,7 @@ export type AppAuthorizationSnapshot = Readonly<{
   /** Host-resolved exact App activation commit; never accepted from App traffic. */
   appCommit: string;
   writeTables: readonly string[];
-  docGrants: readonly string[];
+  fileGrants: readonly string[];
 }>;
 
 export type AppAuthContext = Readonly<{
@@ -86,6 +86,10 @@ export class AppCapabilityRegistry {
 
   get size(): number {
     return this.#channelsByDigest.size;
+  }
+
+  isOpen(channelId: string): boolean {
+    return this.#channelsById.get(channelId)?.open === true;
   }
 
   issue(
@@ -300,8 +304,8 @@ function freezeAuthorizationSnapshot(
   if (
     !Array.isArray(authorization.writeTables)
     || authorization.writeTables.some((table) => typeof table !== "string")
-    || !Array.isArray(authorization.docGrants)
-    || authorization.docGrants.some((grant) => typeof grant !== "string")
+    || !Array.isArray(authorization.fileGrants)
+    || authorization.fileGrants.some((grant) => typeof grant !== "string")
   ) {
     throw new Error("App authorization grants must be string arrays");
   }
@@ -310,6 +314,6 @@ function freezeAuthorizationSnapshot(
     manifestDigest: authorization.manifestDigest,
     appCommit: validateFullGitCommit(authorization.appCommit, "App authorization commit"),
     writeTables: Object.freeze([...authorization.writeTables]),
-    docGrants: Object.freeze([...authorization.docGrants]),
+    fileGrants: Object.freeze([...authorization.fileGrants]),
   });
 }

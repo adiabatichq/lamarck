@@ -23,8 +23,6 @@ export interface GuardPrincipal {
   producerRef: string;
   /** D2 table names this request may mutate. `*` is reserved for host code. */
   tableGrants: "*" | string[];
-  /** D1 exact ids or slash-terminated prefixes this request may write/delete. */
-  docGrants: "*" | string[];
   /** Privileged schema lifecycle capability; ordinary apps must leave false. */
   schemaGrant?: boolean;
 }
@@ -76,18 +74,6 @@ export interface GuardSchemaPlan {
   beforeSchema: GuardSchemaSnapshot;
 }
 
-export interface GuardWorkingTreeDoc {
-  id: string;
-  content: string;
-  metadata: string | null;
-  updatedAt: number;
-}
-
-export interface GuardWorkingTreeLockedDocHash {
-  id: string;
-  contentHash: string;
-}
-
 export interface GuardRpcMethods {
   query: {
     params: GuardStatement & { principal: GuardPrincipal };
@@ -105,46 +91,9 @@ export interface GuardRpcMethods {
     params: { principal: GuardPrincipal; event: GuardEventInput };
     result: string;
   };
-  writeDoc: {
-    params: {
-      principal: GuardPrincipal;
-      id: string;
-      content: string;
-      metadata?: Record<string, unknown>;
-    };
-    result: { ok: true };
-  };
-  readDocForWorkingTree: {
-    params: { principal: GuardPrincipal; id: string };
-    result: GuardWorkingTreeDoc | null;
-  };
-  listLockedDocHashesForWorkingTree: {
-    params: { principal: GuardPrincipal; afterId: string; limit: number };
-    result: GuardWorkingTreeLockedDocHash[];
-  };
-  compareAndWriteDoc: {
-    params: {
-      principal: GuardPrincipal;
-      id: string;
-      expectedHash: string | null;
-      expectedUpdatedAt: number | null;
-      content: string;
-      metadata?: Record<string, unknown>;
-    };
-    result: boolean;
-  };
-  deleteDoc: {
-    params: { principal: GuardPrincipal; id: string };
-    result: boolean;
-  };
-  compareAndDeleteDoc: {
-    params: {
-      principal: GuardPrincipal;
-      id: string;
-      expectedHash: string;
-      expectedUpdatedAt: number;
-    };
-    result: boolean;
+  writeWorkspaceEvent: {
+    params: { principal: GuardPrincipal; event: GuardEventInput };
+    result: string;
   };
   "schema.inspect": {
     params: { principal: GuardPrincipal };
@@ -227,12 +176,7 @@ export const GUARD_RPC_DESCRIPTOR = Object.freeze({
     "mutate",
     "transaction",
     "writeEvent",
-    "writeDoc",
-    "readDocForWorkingTree",
-    "listLockedDocHashesForWorkingTree",
-    "compareAndWriteDoc",
-    "deleteDoc",
-    "compareAndDeleteDoc",
+    "writeWorkspaceEvent",
     "schema.inspect",
     "schema.plan",
     "schema.apply",

@@ -258,7 +258,7 @@ function appRelease(packageId: string): TestRelease {
       name: "Notes",
       description: "Editable notes.",
       runtime: { ui: { command: ["npm", "run", "start"], port: 3000 } },
-      permissions: { writes: { docs: [], tables: [] } },
+      permissions: { writes: { files: [], tables: [] } },
     })) },
   ].sort((left, right) => left.path.localeCompare(right.path));
   return releaseForEntries("app", packageId, entries);

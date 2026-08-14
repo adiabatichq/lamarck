@@ -34,6 +34,7 @@ public enum CapsuleVmConfigurationBuilder {
     public static let stateBlockDeviceIdentifier = "lamarck-state"
     public static let stateDevicePath = "/dev/vdb"
     public static let stateFilesystemLabel = "LAMARCK_STATE"
+    public static let workspaceFilesShareTag = "lamarck-files"
 
     public static func kernelCommandLine(for image: VerifiedGuestImage) -> String {
         [
@@ -49,6 +50,7 @@ public enum CapsuleVmConfigurationBuilder {
     /// can reach the Virtualization.framework configuration boundary.
     public static func build(
         image: VerifiedGuestImage,
+        workspaceFilesURL: URL,
         stateDiskLease: CapsuleVmStateDiskLease,
         cpuCount: Int,
         memorySize: UInt64,
@@ -56,6 +58,7 @@ public enum CapsuleVmConfigurationBuilder {
     ) throws -> VZVirtualMachineConfiguration {
         let configuration = try makeUnvalidatedConfiguration(
             image: image,
+            workspaceFilesURL: workspaceFilesURL,
             stateDiskLease: stateDiskLease,
             cpuCount: cpuCount,
             memorySize: memorySize,
@@ -75,6 +78,7 @@ public enum CapsuleVmConfigurationBuilder {
     /// the public builder above, which always invokes framework validation.
     static func makeUnvalidatedConfiguration(
         image: VerifiedGuestImage,
+        workspaceFilesURL: URL,
         stateDiskLease: CapsuleVmStateDiskLease,
         cpuCount: Int,
         memorySize: UInt64,
@@ -136,11 +140,18 @@ public enum CapsuleVmConfigurationBuilder {
         )
         configuration.serialPorts = [serialPort]
 
-        // These empty device sets are part of the security policy: the Guest has
-        // no raw network path and receives no Host directory, display, or USB
-        // surface. Host/Guest traffic is carried only by the virtio socket above.
+        let workspaceShare = VZVirtioFileSystemDeviceConfiguration(
+            tag: workspaceFilesShareTag
+        )
+        workspaceShare.share = VZSingleDirectoryShare(
+            directory: VZSharedDirectory(url: workspaceFilesURL, readOnly: true)
+        )
+
+        // The single directory surface is the selected Workspace's D1 root and
+        // Virtualization.framework enforces it read-only. All other Host/Guest
+        // traffic is carried only by the virtio socket above.
         configuration.networkDevices = []
-        configuration.directorySharingDevices = []
+        configuration.directorySharingDevices = [workspaceShare]
         configuration.graphicsDevices = []
         configuration.audioDevices = []
         configuration.consoleDevices = []

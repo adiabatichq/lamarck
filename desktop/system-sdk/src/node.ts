@@ -1,12 +1,13 @@
 import { createConnection } from "node:net";
-import { createSystem } from "./create-system.js";
 import { FramedRpcClient } from "./node-transport.js";
+import { createNodeSystem } from "./node-system.js";
 
 export * from "./create-system.js";
 export * from "./protocol.js";
 
 export const LAMARCK_SDK_SOCKET_ENV = "LAMARCK_SDK_SOCKET" as const;
 export const LAMARCK_SDK_SOCKET_PATH = "/run/lamarck/system.sock" as const;
+const LAMARCK_FILES_ROOT_PATH = "/mnt/lamarck-files";
 
 let client: FramedRpcClient | undefined;
 
@@ -26,4 +27,7 @@ function workloadClient(): FramedRpcClient {
   return client;
 }
 
-export const system = createSystem((operation, input) => workloadClient().invoke(operation, input));
+export const system = createNodeSystem(
+  (operation, input) => workloadClient().invoke(operation, input),
+  LAMARCK_FILES_ROOT_PATH,
+);

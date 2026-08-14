@@ -30,7 +30,8 @@ make_oci_root() {
 	rm -rf "$root"
 	mkdir -p "$root" "$root/etc" "$root/usr/bin" "$root/opt" "$root/app" \
 		"$root/home/app" "$root/home/build" "$root/run/app" "$root/run/lamarck" "$root/tmp" \
-		"$root/proc" "$root/dev" "$root/sys" "$root/dependencies" "$root/workspace"
+		"$root/proc" "$root/dev" "$root/sys" "$root/dependencies" "$root/workspace" \
+		"$root/mnt/lamarck-files"
 	for name in bin sbin lib lib64; do
 		[ ! -e "$target/$name" ] || cp -a "$target/$name" "$root/$name"
 	done
@@ -222,10 +223,12 @@ ln -sf /usr/bin/runc "$target/usr/sbin/runc"
 ln -sf /usr/bin/mkfs.erofs "$target/usr/sbin/mkfs.erofs"
 
 mkdir -p "$target/opt/lamarck/config"
+mkdir -p "$target/mnt/lamarck-files"
 : > "$target/opt/lamarck/config/empty-resolv.conf"
 printf '127.0.0.1 localhost\n::1 localhost\n' > "$target/opt/lamarck/config/loopback-hosts"
 
 chmod 0755 "$target/etc/init.d/S00lamarck-state" \
+	"$target/etc/init.d/S01lamarck-files" \
 	"$target/etc/init.d/S50lamarck-capsule" \
 	"$target/usr/libexec/lamarck-guest-service" \
 	"$target/usr/libexec/lamarck-supervisor.js" \

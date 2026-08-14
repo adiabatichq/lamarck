@@ -10,7 +10,7 @@ import { foldSqliteIdentifier } from "./sqlite-identifiers";
 const DATA_MIGRATIONS: readonly DatabaseMigration[] = [
   {
     version: 1,
-    name: "baseline D0 and D1 substrate",
+    name: "baseline D0 substrate",
     up(db) {
       db.exec(DATA_SCHEMA_V1);
     },
@@ -26,9 +26,6 @@ export function migrateDataDatabase(db: DatabaseSync): number {
   return runDatabaseMigrations(db, {
     database: DATA_DB_FILENAME,
     migrations: DATA_MIGRATIONS,
-    adoptVersionZero(unversionedDb) {
-      validateDataSchema(unversionedDb, DATA_SCHEMA_V1);
-    },
     validate(currentDb) {
       validateDataSchema(currentDb, DATA_SCHEMA);
     },

@@ -2,9 +2,10 @@ import { D0_SCHEMA_VERSION_V1 } from "./schema";
 
 export const DATA_DB_FILENAME = "data.db";
 
-// D0 events + D1 docs schema. Keep the event envelope stable: the Node Guard
-// is the sole production initializer/owner, while unit tests may initialize a
-// temporary database from the same runtime-neutral definition.
+// D0 schema. D1 is filesystem-authoritative under <Workspace>/files and has no
+// catalog or content copy in data.db. The Node Guard is the sole production
+// initializer/owner, while tests may initialize a temporary database from this
+// same runtime-neutral definition.
 export const DATA_SCHEMA_V1 = `
 CREATE TABLE IF NOT EXISTS events (
   id          TEXT PRIMARY KEY,
@@ -36,17 +37,7 @@ BEGIN
   SELECT RAISE(ABORT, 'events are append-only');
 END;
 
-CREATE TABLE IF NOT EXISTS docs (
-  id          TEXT PRIMARY KEY,
-  content     TEXT NOT NULL DEFAULT '',
-  metadata    JSON,
-  created_at  INTEGER NOT NULL,
-  updated_at  INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_docs_updated ON docs(updated_at DESC);
 `;
 
-// Latest schema for fresh fixtures and external compatibility harnesses. Once
-// v2 exists, keep DATA_SCHEMA_V1 frozen and point this alias at the new latest.
+// Greenfield V1 is rewritten directly until the first released schema exists.
 export const DATA_SCHEMA = DATA_SCHEMA_V1;

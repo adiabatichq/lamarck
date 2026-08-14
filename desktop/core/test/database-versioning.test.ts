@@ -1,15 +1,10 @@
-import { DatabaseSync } from "node:sqlite";
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
+import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import {
-  DATA_DATABASE_VERSION,
-  migrateDataDatabase,
-} from "../src/data-migrations";
+import { DATA_DATABASE_VERSION, migrateDataDatabase } from "../src/data-migrations";
 import { DATA_DB_FILENAME, DATA_SCHEMA_V1 } from "../src/data-schema";
 import {
   openSystemDatabase,
@@ -21,7 +16,7 @@ import { readDatabaseVersion } from "../src/database-migrations";
 import { GuardEngine } from "../src/guard-service/engine";
 import { TEST_PRODUCER_REF } from "./support/test-guard";
 
-describe("data.db and system.db schema versions", () => {
+describe("greenfield data.db and system.db V1 schemas", () => {
   let workspace: string;
   let lamarckDirectory: string;
 
@@ -37,33 +32,31 @@ describe("data.db and system.db schema versions", () => {
 
   test("fresh owners establish independent current baselines", () => {
     const guard = new GuardEngine({ workspacePath: workspace });
-    expect(guard.health()).toEqual({
-      ok: true,
-      schemaVersion: "0.1",
-      database: DATA_DB_FILENAME,
-    });
+    expect(guard.health()).toEqual({ ok: true, schemaVersion: "0.1", database: DATA_DB_FILENAME });
     guard.close();
 
     const systemDb = openSystemDatabase(workspace);
     expect(readDatabaseVersion(systemDb, SYSTEM_DB_FILENAME)).toBe(SYSTEM_DATABASE_VERSION);
-    expect(schemaObject(systemDb, "d1_working_tree_mirrors")).toBeTruthy();
-    expect(schemaObject(systemDb, "d1_working_tree_conflicts")).toBeTruthy();
-    expect(schemaObject(systemDb, "d1_working_tree_protected_hashes")).toBeTruthy();
+    expect(schemaObject(systemDb, "d1_observer_files")).toBeTruthy();
+    expect(schemaObject(systemDb, "d1_observer_cursor")).toBeTruthy();
+    expect(schemaObject(systemDb, "d1_history_exclusions")).toBeTruthy();
     expect(schemaObject(systemDb, "connector_official_release_hashes")).toBeTruthy();
     expect(schemaObject(systemDb, "connector_marketplace_approvals")).toBeUndefined();
     systemDb.close();
 
     const dataDb = new DatabaseSync(dataPath());
     expect(readDatabaseVersion(dataDb, DATA_DB_FILENAME)).toBe(DATA_DATABASE_VERSION);
+    expect(schemaObject(dataDb, "docs")).toBeUndefined();
     dataDb.close();
   });
 
-  test("pins the released migration inputs", () => {
+  test("pins the rewritten greenfield V1 inputs", () => {
+    expect(DATA_DATABASE_VERSION).toBe(1);
     expect(SYSTEM_DATABASE_VERSION).toBe(1);
     expect(sha256(DATA_SCHEMA_V1))
-      .toBe("c095c4c6e70ddbd10c9163e8c5438b4a43df1499b4f3e1f8fbb01a0d9432b66d");
+      .toBe("0dad836ef5969c2dc2eb71202881ca802281de079ec73866a62dfa19c5ed0979");
     expect(sha256(SYSTEM_SCHEMA_V1))
-      .toBe("90e13503ef7b23aa3aee486484a7a3f31cd9a66d79205d0bb2adde64c587a4f3");
+      .toBe("0668946eb090b7a0a3221d100d2030439405367931fde5803da93bb4cc170bed");
   });
 
   test("D2 promotion and demotion do not change the data database version", () => {
@@ -72,26 +65,19 @@ describe("data.db and system.db schema versions", () => {
       source: "system:database-version-test",
       producerRef: TEST_PRODUCER_REF,
       tableGrants: "*" as const,
-      docGrants: "*" as const,
       schemaGrant: true,
     };
     guard.schemaApply(
       host,
       "promote",
-      "CREATE TABLE version_invariant (id TEXT PRIMARY KEY)",
+      "CREATE TABLE version_invariant (id TEXT PRIMARY KEY NOT NULL)",
       true,
       "database-version-test",
     );
     const afterPromotion = new DatabaseSync(dataPath());
     expect(readDatabaseVersion(afterPromotion, DATA_DB_FILENAME)).toBe(DATA_DATABASE_VERSION);
     afterPromotion.close();
-    guard.schemaApply(
-      host,
-      "demote",
-      "DROP TABLE version_invariant",
-      true,
-      "database-version-test",
-    );
+    guard.schemaApply(host, "demote", "DROP TABLE version_invariant", true, "database-version-test");
     guard.close();
 
     const db = new DatabaseSync(dataPath());
@@ -100,279 +86,57 @@ describe("data.db and system.db schema versions", () => {
     db.close();
   });
 
-  test("system migration waits for a concurrent writer and then converges", async () => {
-    const childScript = `
-      const { DatabaseSync } = require("node:sqlite");
-      const db = new DatabaseSync(process.argv[1]);
-      db.exec("BEGIN IMMEDIATE");
-      process.stdout.write("locked\\n");
-      setTimeout(() => {
-        db.exec("COMMIT");
-        db.close();
-      }, 200);
-    `;
-    const child = spawn(process.execPath, ["-e", childScript, systemPath()], {
-      stdio: ["ignore", "pipe", "inherit"],
-    });
-    const childExit = once(child, "exit");
-    await waitForLine(child.stdout!, "locked");
+  test("rejects unversioned schemas instead of adopting or rewriting them", () => {
+    const data = new DatabaseSync(dataPath());
+    data.exec(DATA_SCHEMA_V1);
+    expect(() => migrateDataDatabase(data))
+      .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
+    expect(readDatabaseVersion(data, DATA_DB_FILENAME)).toBe(0);
+    data.close();
 
-    const systemDb = openSystemDatabase(workspace);
-    expect(readDatabaseVersion(systemDb, SYSTEM_DB_FILENAME)).toBe(SYSTEM_DATABASE_VERSION);
-    systemDb.close();
-    const [exitCode] = await childExit;
-    expect(exitCode).toBe(0);
+    const system = new DatabaseSync(systemPath());
+    system.exec(SYSTEM_SCHEMA_V1);
+    system.close();
+    expect(() => openSystemDatabase(workspace))
+      .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
+    const reopened = new DatabaseSync(systemPath());
+    expect(readDatabaseVersion(reopened, SYSTEM_DB_FILENAME)).toBe(0);
+    reopened.close();
   });
 
-  test("adopts a complete legacy data v0 without changing D2 objects or rows", () => {
-    const db = new DatabaseSync(dataPath());
-    db.exec(`
-      ${DATA_SCHEMA_V1}
-      CREATE TABLE project_items (
-        id TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-      CREATE INDEX project_items_value ON project_items(value);
-      CREATE TABLE project_audit (id TEXT PRIMARY KEY);
-      CREATE TRIGGER project_items_audit
-      AFTER INSERT ON project_items
-      BEGIN
-        INSERT INTO project_audit (id) VALUES (NEW.id);
-      END;
-      CREATE VIEW project_item_values AS SELECT id, value FROM project_items;
-      CREATE TABLE "_lamarcK_items" (id TEXT PRIMARY KEY, value TEXT NOT NULL);
-      INSERT INTO docs (id, content, metadata, created_at, updated_at)
-      VALUES ('notes/legacy.md', 'preserved', '{"locked":false}', 1, 2);
-      INSERT INTO project_items (id, value) VALUES ('item-1', 'preserved');
-      INSERT INTO "_lamarcK_items" (id, value) VALUES ('unicode-1', 'distinct');
-    `);
-    const names = [
-      "project_items",
-      "project_items_value",
-      "project_audit",
-      "project_items_audit",
-      "project_item_values",
-      "_lamarcK_items",
-    ];
-    const schemaBefore = schemaSnapshot(db, names);
-
-    expect(migrateDataDatabase(db)).toBe(DATA_DATABASE_VERSION);
-    expect(readDatabaseVersion(db, DATA_DB_FILENAME)).toBe(DATA_DATABASE_VERSION);
-    expect(schemaSnapshot(db, names)).toEqual(schemaBefore);
-    expect(db.prepare("SELECT content, metadata FROM docs WHERE id = ?")
-      .get("notes/legacy.md")).toEqual({
-        content: "preserved",
-        metadata: '{"locked":false}',
-      });
-    expect(db.prepare("SELECT id, value FROM project_items").all())
-      .toEqual([{ id: "item-1", value: "preserved" }]);
-    expect(db.prepare("SELECT id FROM project_audit").all()).toEqual([{ id: "item-1" }]);
-    expect(db.prepare('SELECT id, value FROM "_lamarcK_items"').all())
-      .toEqual([{ id: "unicode-1", value: "distinct" }]);
-    db.close();
-  });
-
-  test("adopts an exact unversioned system schema without changing control-plane rows", () => {
-    const legacy = new DatabaseSync(systemPath());
-    legacy.exec(SYSTEM_SCHEMA_V1);
-    legacy.prepare(
-      `INSERT INTO auth_accounts (id, label, subject, created_at)
-       VALUES (?, ?, ?, ?)`,
-    ).run("account-1", "Legacy", "subject-1", 123);
-    legacy.close();
-
-    const systemDb = openSystemDatabase(workspace);
-    expect(readDatabaseVersion(systemDb, SYSTEM_DB_FILENAME)).toBe(SYSTEM_DATABASE_VERSION);
-    expect(systemDb.prepare("SELECT id, label, subject, created_at FROM auth_accounts").all())
-      .toEqual([{
-        id: "account-1",
-        label: "Legacy",
-        subject: "subject-1",
-        created_at: 123,
-      }]);
-    expect(schemaObject(systemDb, "d1_working_tree_mirrors")).toBeTruthy();
-    expect(schemaObject(systemDb, "d1_working_tree_conflicts")).toBeTruthy();
-    expect(schemaObject(systemDb, "d1_working_tree_protected_hashes")).toBeTruthy();
-    systemDb.close();
-  });
-
-  test("refuses an incomplete declared system v1 without repairing it", () => {
+  test("refuses an incomplete declared V1 without repairing it", () => {
     const incomplete = new DatabaseSync(systemPath());
-    incomplete.exec(`
-      ${SYSTEM_SCHEMA_V1}
-      DROP TABLE d1_working_tree_mirrors;
-      DROP TABLE d1_working_tree_conflicts;
-      DROP TABLE d1_working_tree_protected_hashes;
-      PRAGMA user_version = 1;
-    `);
+    incomplete.exec(`${SYSTEM_SCHEMA_V1}\nDROP TABLE d1_observer_files;\nPRAGMA user_version = 1;`);
     incomplete.close();
 
     expect(() => openSystemDatabase(workspace))
       .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
     const reopened = new DatabaseSync(systemPath());
     expect(readDatabaseVersion(reopened, SYSTEM_DB_FILENAME)).toBe(1);
-    expect(schemaObject(reopened, "d1_working_tree_mirrors")).toBeUndefined();
-    expect(schemaObject(reopened, "d1_working_tree_conflicts")).toBeUndefined();
-    expect(schemaObject(reopened, "d1_working_tree_protected_hashes")).toBeUndefined();
-    expect(journalMode(reopened)).toBe("delete");
+    expect(schemaObject(reopened, "d1_observer_files")).toBeUndefined();
     reopened.close();
   });
 
-  test("refuses partial data v0 instead of silently repairing it", () => {
-    const partial = new DatabaseSync(dataPath());
-    partial.exec("CREATE TABLE events (id TEXT PRIMARY KEY)");
-
-    expect(() => migrateDataDatabase(partial))
-      .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
-    expect(readDatabaseVersion(partial, DATA_DB_FILENAME)).toBe(0);
-    expect(schemaObject(partial, "docs")).toBeUndefined();
-    partial.close();
-  });
-
-  test("refuses a complete-looking data v0 whose integrity trigger drifted", () => {
-    const incompatible = new DatabaseSync(dataPath());
-    incompatible.exec(`
-      ${DATA_SCHEMA_V1}
-      DROP TRIGGER prevent_events_delete;
-      CREATE TRIGGER prevent_events_delete
-      BEFORE DELETE ON events
-      BEGIN
-        SELECT 1;
-      END;
-    `);
-
-    expect(() => migrateDataDatabase(incompatible))
-      .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
-    expect(readDatabaseVersion(incompatible, DATA_DB_FILENAME)).toBe(0);
-    incompatible.close();
-  });
-
-  test("refuses a declared data v1 that predates required producer_ref", () => {
-    const incompatible = new DatabaseSync(dataPath());
-    const oldBaseline = DATA_SCHEMA_V1.replace("  producer_ref TEXT NOT NULL,\n", "");
-    incompatible.exec(`${oldBaseline}\nPRAGMA user_version = 1;`);
-    incompatible.close();
-
-    expect(() => new GuardEngine({ workspacePath: workspace }))
-      .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
-    const reopened = new DatabaseSync(dataPath());
-    expect(readDatabaseVersion(reopened, DATA_DB_FILENAME)).toBe(1);
-    expect((reopened.prepare("PRAGMA table_info(events)").all() as Array<{ name: string }>)
-      .some((column) => column.name === "producer_ref")).toBe(false);
-    reopened.close();
-  });
-
-  test("allows D2 extensions but rejects reserved control-plane objects in data v0", () => {
-    const polluted = new DatabaseSync(dataPath());
-    polluted.exec(`
-      ${DATA_SCHEMA_V1}
-      CREATE TABLE connector_legacy_state (id TEXT PRIMARY KEY);
-    `);
-
-    expect(() => migrateDataDatabase(polluted))
-      .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
-    expect(readDatabaseVersion(polluted, DATA_DB_FILENAME)).toBe(0);
-    expect(schemaObject(polluted, "connector_legacy_state")).toBeTruthy();
-    polluted.close();
-  });
-
-  test("refuses unknown objects in legacy system v0", () => {
-    const polluted = new DatabaseSync(systemPath());
-    polluted.exec(`
-      ${SYSTEM_SCHEMA_V1}
-      CREATE TABLE legacy_extra (id TEXT PRIMARY KEY);
-    `);
-    polluted.close();
-
-    expect(() => openSystemDatabase(workspace))
-      .toThrowError(expect.objectContaining({ code: "DB_SCHEMA_MISMATCH" }));
-    const reopened = new DatabaseSync(systemPath());
-    expect(readDatabaseVersion(reopened, SYSTEM_DB_FILENAME)).toBe(0);
-    expect(schemaObject(reopened, "legacy_extra")).toBeTruthy();
-    expect(journalMode(reopened)).toBe("delete");
-    reopened.close();
-  });
-
-  test("Guard refuses a future data version without enabling WAL or changing data", () => {
-    const future = new DatabaseSync(dataPath());
-    future.exec(`
-      ${DATA_SCHEMA_V1}
-      CREATE TABLE future_items (id TEXT PRIMARY KEY, value TEXT NOT NULL);
-      INSERT INTO future_items (id, value) VALUES ('future-1', 'preserved');
-      PRAGMA user_version = ${DATA_DATABASE_VERSION + 1};
-    `);
-    expect(journalMode(future)).toBe("delete");
-    future.close();
-
-    expect(() => new GuardEngine({ workspacePath: workspace }))
-      .toThrowError(expect.objectContaining({ code: "DB_VERSION_TOO_NEW" }));
-
-    const reopened = new DatabaseSync(dataPath());
-    expect(readDatabaseVersion(reopened, DATA_DB_FILENAME)).toBe(DATA_DATABASE_VERSION + 1);
-    expect(journalMode(reopened)).toBe("delete");
-    expect(reopened.prepare("SELECT id, value FROM future_items").all())
-      .toEqual([{ id: "future-1", value: "preserved" }]);
-    reopened.close();
-  });
-
-  test("Core refuses a future system version without enabling WAL or changing data", () => {
-    const future = new DatabaseSync(systemPath());
-    future.exec(`
-      ${SYSTEM_SCHEMA_V1}
-      PRAGMA user_version = ${SYSTEM_DATABASE_VERSION + 1};
-    `);
-    future.prepare(
-      `INSERT INTO auth_accounts (id, label, subject, created_at)
-       VALUES (?, ?, ?, ?)`,
-    ).run("future-account", "Future", "subject", 456);
-    expect(journalMode(future)).toBe("delete");
-    future.close();
-
-    expect(() => openSystemDatabase(workspace))
-      .toThrowError(expect.objectContaining({ code: "DB_VERSION_TOO_NEW" }));
-
-    const reopened = new DatabaseSync(systemPath());
-    expect(readDatabaseVersion(reopened, SYSTEM_DB_FILENAME)).toBe(SYSTEM_DATABASE_VERSION + 1);
-    expect(journalMode(reopened)).toBe("delete");
-    expect(reopened.prepare("SELECT id FROM auth_accounts").all())
-      .toEqual([{ id: "future-account" }]);
-    reopened.close();
-  });
-
-  test("each owner migrates only its own database stream", () => {
+  test("refuses future versions before changing journal mode or data", () => {
     const futureData = new DatabaseSync(dataPath());
-    futureData.exec(`
-      ${DATA_SCHEMA_V1}
-      PRAGMA user_version = ${DATA_DATABASE_VERSION + 1};
-    `);
+    futureData.exec(`${DATA_SCHEMA_V1}\nPRAGMA user_version = ${DATA_DATABASE_VERSION + 1};`);
     futureData.close();
+    expect(() => new GuardEngine({ workspacePath: workspace }))
+      .toThrowError(expect.objectContaining({ code: "DB_VERSION_TOO_NEW" }));
+    const data = new DatabaseSync(dataPath());
+    expect(readDatabaseVersion(data, DATA_DB_FILENAME)).toBe(DATA_DATABASE_VERSION + 1);
+    expect(journalMode(data)).toBe("delete");
+    data.close();
 
-    const systemDb = openSystemDatabase(workspace);
-    expect(readDatabaseVersion(systemDb, SYSTEM_DB_FILENAME)).toBe(SYSTEM_DATABASE_VERSION);
-    systemDb.close();
-
-    const untouchedData = new DatabaseSync(dataPath());
-    expect(readDatabaseVersion(untouchedData, DATA_DB_FILENAME)).toBe(DATA_DATABASE_VERSION + 1);
-    expect(journalMode(untouchedData)).toBe("delete");
-    untouchedData.close();
-
-    rmSync(dataPath(), { force: true });
     const futureSystem = new DatabaseSync(systemPath());
-    futureSystem.exec(`
-      ${SYSTEM_SCHEMA_V1}
-      PRAGMA user_version = ${SYSTEM_DATABASE_VERSION + 1};
-    `);
+    futureSystem.exec(`${SYSTEM_SCHEMA_V1}\nPRAGMA user_version = ${SYSTEM_DATABASE_VERSION + 1};`);
     futureSystem.close();
-
-    const guard = new GuardEngine({ workspacePath: workspace });
-    guard.close();
-    const migratedData = new DatabaseSync(dataPath());
-    expect(readDatabaseVersion(migratedData, DATA_DB_FILENAME)).toBe(DATA_DATABASE_VERSION);
-    migratedData.close();
-    const untouchedSystem = new DatabaseSync(systemPath());
-    expect(readDatabaseVersion(untouchedSystem, SYSTEM_DB_FILENAME))
-      .toBe(SYSTEM_DATABASE_VERSION + 1);
-    untouchedSystem.close();
+    expect(() => openSystemDatabase(workspace))
+      .toThrowError(expect.objectContaining({ code: "DB_VERSION_TOO_NEW" }));
+    const system = new DatabaseSync(systemPath());
+    expect(readDatabaseVersion(system, SYSTEM_DB_FILENAME)).toBe(SYSTEM_DATABASE_VERSION + 1);
+    expect(journalMode(system)).toBe("delete");
+    system.close();
   });
 
   function dataPath(): string {
@@ -384,18 +148,8 @@ describe("data.db and system.db schema versions", () => {
   }
 });
 
-function schemaSnapshot(db: DatabaseSync, names: string[]): unknown[] {
-  const placeholders = names.map(() => "?").join(", ");
-  return db.prepare(
-    `SELECT type, name, tbl_name, sql
-     FROM sqlite_schema
-     WHERE name IN (${placeholders})
-     ORDER BY type, name`,
-  ).all(...names);
-}
-
 function schemaObject(db: DatabaseSync, name: string): unknown {
-  return db.prepare("SELECT type, name, sql FROM sqlite_schema WHERE name = ?").get(name);
+  return db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name = ?").get(name);
 }
 
 function journalMode(db: DatabaseSync): string {
@@ -404,17 +158,4 @@ function journalMode(db: DatabaseSync): string {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-async function waitForLine(
-  stream: NodeJS.ReadableStream,
-  expected: string,
-): Promise<void> {
-  let output = "";
-  stream.setEncoding("utf8");
-  for await (const chunk of stream) {
-    output += chunk;
-    if (output.split(/\r?\n/).includes(expected)) return;
-  }
-  throw new Error(`Child exited before emitting ${expected}`);
 }

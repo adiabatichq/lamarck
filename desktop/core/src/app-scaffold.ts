@@ -76,7 +76,7 @@ export async function instantiateBlankApp(
       },
       permissions: {
         writes: {
-          docs: [],
+          files: [],
           tables: [],
         },
       },

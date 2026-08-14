@@ -28,6 +28,8 @@ contextBridge.exposeInMainWorld("lamarckHost", {
     path,
     ...(recoveryCode === undefined ? {} : { recoveryCode }),
   }),
+  openWorkspaceFiles: (application) => ipcRenderer.invoke("workspace:openFiles", application),
+  chooseVfsTransferPath: (purpose) => ipcRenderer.invoke("workspace:chooseVfsTransferPath", purpose),
   onOpenLauncher: (callback) => {
     const listener = () => callback();
     ipcRenderer.on("shell:open-launcher", listener);

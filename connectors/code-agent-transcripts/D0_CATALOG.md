@@ -98,7 +98,6 @@ A duration event for one completed, interrupted, or failed agent interaction. It
         "kind": "content-blob",
         "version": 1,
         "digest": "sha256:<digest>",
-        "variant": "redacted-text",
         "mediaType": "application/json",
         "encoding": "gzip"
       }

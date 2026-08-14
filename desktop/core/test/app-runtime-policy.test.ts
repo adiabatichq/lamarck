@@ -16,7 +16,7 @@ const manifest: AppManifest = {
     services: { indexer: { command: ["node", "indexer.mjs"] } },
     jobs: { "daily-etl": { command: ["node", "etl.mjs"] } },
   },
-  permissions: { writes: { docs: [], tables: [] } },
+  permissions: { writes: { files: [], tables: [] } },
 };
 
 describe("App runtime policy", () => {
@@ -55,9 +55,8 @@ describe("App runtime policy", () => {
       ["/api/mutate", "POST"],
       ["/api/transaction", "POST"],
       ["/api/events", "POST"],
-      ["/api/docs", "POST"],
-      ["/api/docs/apps%2Fapp-a%2Fstate", "DELETE"],
-      ["/api/docs/events", "DELETE"],
+      ["/api/vfs/command", "POST"],
+      ["/api/vfs/open", "POST"],
     ];
     for (const [path, method] of allowed) expect(isAppSystemRoute(path, method)).toBe(true);
   });
@@ -73,24 +72,12 @@ describe("App runtime policy", () => {
       ["/api/schema/requests/x/approve", "POST"],
       ["/api/connectors", "GET"],
       ["/api/terminal", "GET"],
-      ["/api/docs/events", "GET"],
-      ["/api/docs/apps%2Fapp-a%2Fstate", "GET"],
+      ["/api/vfs/open/token", "GET"],
       ["/api/query", "GET"],
       ["/api/mutate", "GET"],
-      ["/api/docs", "GET"],
+      ["/api/vfs/command", "GET"],
       ["/api/events", "GET"],
     ];
     for (const [path, method] of denied) expect(isAppSystemRoute(path, method)).toBe(false);
-
-    const workingTreeHostRoutes = [
-      "/api/working-tree/conflicts",
-      "/api/working-tree/conflicts/notes%2Fone",
-      "/api/working-tree/conflicts/notes%2Fone/resolve",
-    ];
-    for (const path of workingTreeHostRoutes) {
-      for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]) {
-        expect(isAppSystemRoute(path, method)).toBe(false);
-      }
-    }
   });
 });

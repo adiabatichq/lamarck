@@ -5,23 +5,16 @@ import { randomBytes } from "crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { openSystemDatabase } from "./db";
 import { ContentBlobStore } from "./blob-store";
-import { validateDocId } from "./doc-id";
 import type { SchemaOp } from "./guard-types";
 import {
   APP_GUARD_DEADLINE_MS,
   HOST_GUARD_DEADLINE_MS,
   RemoteGuard,
-  appDocGrants,
   type GuardStatement,
 } from "./remote-guard";
-import {
-  WorkingTree,
-  WorkingTreeConflictNotFoundError,
-  WorkingTreeConflictStaleError,
-  WorkingTreeResolutionError,
-  type WorkingTreeConflictResolution,
-} from "./working-tree";
-import { WorkingTreeStateStore } from "./working-tree-state";
+import { D1ObserverState } from "./d1-observer-state";
+import { D1Observer } from "./d1-observer";
+import { VfsService, type VfsCaller } from "./vfs";
 import {
   archiveApp,
   loadApps,
@@ -89,7 +82,6 @@ import { MarketplaceService } from "./marketplace/service";
 // All routes go through here. Guard is the only write path.
 
 const workspacePath = resolve(process.argv[2] || process.cwd());
-const pagesDir = join(workspacePath, "pages");
 const appsDir = join(workspacePath, "apps");
 const lamarckDir = join(workspacePath, ".lamarck");
 const appScaffoldDir = fileURLToPath(new URL("./scaffolds/app-v1/", import.meta.url));
@@ -216,13 +208,22 @@ const marketplaceService = await MarketplaceService.initialize({
     },
   },
 });
-const workingTree = new WorkingTree({
-  guard,
-  producer: systemProducer,
-  pagesDir,
-  stateStore: new WorkingTreeStateStore(systemDb),
+const d1ObserverState = new D1ObserverState(systemDb);
+const vfs = new VfsService(workspacePath, d1ObserverState, contentBlobStore);
+await vfs.initialize();
+const observerGuard = guard.withSource("system:vfs:observer", {
+  producerRef: systemProducer.producerRef,
+  prepareProducer: systemProducer.prepareProducer,
+  writeTables: [],
+  schemaGrant: false,
 });
-await workingTree.start();
+const d1Observer = new D1Observer(
+  vfs.filesRoot,
+  observerGuard,
+  d1ObserverState,
+  contentBlobStore,
+);
+await d1Observer.start();
 
 interface SchemaRequest {
   id: string;
@@ -237,15 +238,6 @@ interface SchemaRequest {
 
 const schemaRequests = new Map<string, SchemaRequest>();
 const schemaApprovals = new Map<string, Promise<SchemaRequest>>();
-
-// SSE: push doc change notifications to connected shell clients
-const sseClients = new Set<ReadableStreamDefaultController>();
-guard.docChangeSubscribers.push((id) => {
-  const msg = `data: ${JSON.stringify({ id })}\n\n`;
-  for (const c of sseClients) {
-    try { c.enqueue(new TextEncoder().encode(msg)); } catch { sseClients.delete(c); }
-  }
-});
 
 console.log(`[lamarck] Workspace: ${workspacePath}`);
 console.log(`[lamarck] Apps loaded: ${[...registry.apps.keys()].join(", ") || "(none)"}`);
@@ -316,11 +308,34 @@ function guardForRequest(auth: AuthContext, opts?: {
     // this channel. A later manifest edit can neither expand an in-flight
     // request nor revive this channel after its generation is invalidated.
     writeTables: [...auth.authorization.writeTables],
-    docGrants: [...auth.authorization.docGrants],
     schemaGrant: false,
     signal: opts?.signal,
     deadlineMs: APP_GUARD_DEADLINE_MS,
   });
+}
+
+function vfsCallerForRequest(auth: AuthContext, req: Request, signal: AbortSignal): VfsCaller {
+  if (auth.kind === "app") {
+    return {
+      guard: guardForRequest(auth, { signal }),
+      fileGrants: [...auth.authorization.fileGrants],
+      trustedHost: false,
+      workloadId: auth.channelId,
+    };
+  }
+  const client = req.headers.get("x-lamarck-vfs-client") === "cli" ? "cli" : "ui";
+  return {
+    guard: guard.withSource(`system:vfs:${client}`, {
+      producerRef: systemProducer.producerRef,
+      prepareProducer: systemProducer.prepareProducer,
+      writeTables: [],
+      schemaGrant: false,
+      signal,
+      deadlineMs: HOST_GUARD_DEADLINE_MS,
+    }),
+    fileGrants: null,
+    trustedHost: true,
+  };
 }
 
 async function reloadAppRegistry(): Promise<void> {
@@ -672,6 +687,23 @@ const server = await serve<{ cwd: string }>({
       );
     }
 
+    const openVfsMatch = path.match(/^\/api\/vfs\/open\/([A-Za-z0-9_-]{43})$/);
+    if (openVfsMatch && method === "GET") {
+      const content = await vfs.resolveOpen(
+        openVfsMatch[1],
+        (channelId) => appCapabilities.isOpen(channelId),
+      );
+      if (!content) return new Response("Not found", { status: 404, headers });
+      return new Response(new Uint8Array(content.bytes), {
+        status: 200,
+        headers: {
+          "Content-Type": content.mediaType,
+          "Cache-Control": "no-store",
+          ...headers,
+        },
+      });
+    }
+
     const admission = path.startsWith("/api/")
       ? admitRequest(req, authSecrets, appCapabilities)
       : null;
@@ -694,29 +726,6 @@ const server = await serve<{ cwd: string }>({
         return new Response("WebSocket upgrade failed", { status: 400, headers });
       }
       return undefined as unknown as Response;
-    }
-
-    // -- SSE: doc change stream --
-    if (path === "/api/docs/events" && method === "GET") {
-      let ctrl: ReadableStreamDefaultController;
-      const stream = new ReadableStream({
-        start(controller) {
-          ctrl = controller;
-          sseClients.add(controller);
-          controller.enqueue(new TextEncoder().encode(": connected\n\n"));
-        },
-        cancel() {
-          sseClients.delete(ctrl);
-        },
-      });
-      return new Response(stream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-          ...headers,
-        },
-      });
     }
 
     try {
@@ -742,92 +751,54 @@ const server = await serve<{ cwd: string }>({
         return json({ ok: true });
       }
 
-      // -- D1 Working Tree reconciliation --
-      if (path === "/api/working-tree/conflicts" && method === "GET") {
-        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        return json({ conflicts: await workingTree.listConflicts() });
-      }
-
-      const workingTreeResolveMatch = path.match(
-        /^\/api\/working-tree\/conflicts\/(.+)\/resolve$/,
-      );
-      if (workingTreeResolveMatch && method === "POST") {
-        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        let docId: string;
-        try {
-          docId = decodeURIComponent(workingTreeResolveMatch[1]);
-          validateDocId(docId);
-        } catch {
-          throw new HttpStatusError(400, "invalid Working Tree document id");
-        }
+      // -- D1 filesystem --
+      if (path === "/api/vfs/command" && method === "POST") {
         const body = await readBody<{
-          resolution?: unknown;
-          expectedVersion?: unknown;
-          newId?: unknown;
+          command: string;
+          options?: import("@lamarck/system/protocol").VfsCommandWireOptions;
         }>(req);
-        if (
-          body.resolution !== "use-database"
-          && body.resolution !== "use-file"
-          && body.resolution !== "keep-both"
-        ) {
-          throw new HttpStatusError(400, "invalid Working Tree conflict resolution");
-        }
-        if (typeof body.expectedVersion !== "string" || !/^[0-9a-f]{64}$/.test(body.expectedVersion)) {
-          throw new HttpStatusError(400, "invalid Working Tree conflict version");
-        }
-        if (body.newId !== undefined && typeof body.newId !== "string") {
-          throw new HttpStatusError(400, "invalid Working Tree Keep Both document id");
-        }
-        return json(await workingTree.resolveConflict(docId, {
-          resolution: body.resolution as WorkingTreeConflictResolution,
-          expectedVersion: body.expectedVersion,
-          newId: body.newId as string | undefined,
-        }));
+        if (typeof body.command !== "string") throw new HttpStatusError(400, "VFS command is required");
+        return json(await vfs.command(
+          vfsCallerForRequest(auth!, req, requestGuardSignal),
+          body.command,
+          body.options,
+        ));
       }
 
-      const workingTreeConflictMatch = path.match(
-        /^\/api\/working-tree\/conflicts\/(.+)$/,
-      );
-      if (workingTreeConflictMatch && method === "GET") {
+      if (path === "/api/vfs/open" && method === "POST") {
+        if (auth!.kind !== "app") return json({ error: "app workload required" }, 403);
+        const body = await readBody<{ path: string }>(req);
+        if (typeof body.path !== "string") throw new HttpStatusError(400, "VFS path is required");
+        return json({
+          url: await vfs.open(
+            vfsCallerForRequest(auth!, req, requestGuardSignal),
+            body.path,
+            url.origin,
+          ),
+        });
+      }
+
+      if (path === "/api/vfs/history-exclusions" && method === "GET") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        let docId: string;
-        try {
-          docId = decodeURIComponent(workingTreeConflictMatch[1]);
-          validateDocId(docId);
-        } catch {
-          throw new HttpStatusError(400, "invalid Working Tree document id");
-        }
-        const conflict = await workingTree.getConflict(docId);
-        if (!conflict) return json({ error: "Working Tree conflict not found" }, 404);
-        return json({ conflict });
+        return json({ exclusions: d1ObserverState.listExclusions() });
       }
 
-      // -- Docs --
-      if (path === "/api/docs" && method === "POST") {
-        const body = await readBody<{ id: string; content: string; metadata?: Record<string, unknown> }>(req);
-        await guardForRequest(auth!, { signal: requestGuardSignal }).writeDoc(
-          body.id,
-          body.content,
-          body.metadata,
-        );
-        return json({ ok: true, id: body.id });
+      if (path === "/api/vfs/history-exclusions" && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readBody<{ path: string }>(req);
+        if (typeof body.path !== "string") throw new HttpStatusError(400, "exclusion path is required");
+        const exclusion = d1ObserverState.addExclusion(body.path);
+        d1Observer.schedule();
+        return json({ ok: true, exclusion });
       }
 
-      if (path.startsWith("/api/docs/") && method === "GET") {
-        const docId = decodeURIComponent(path.slice("/api/docs/".length));
-        const doc = await guardForRequest(auth!, { signal: requestGuardSignal }).queryOne(
-          "SELECT * FROM docs WHERE id = ?",
-          [docId],
-        );
-        if (!doc) return json({ error: "not found" }, 404);
-        return json(doc);
-      }
-
-      if (path.startsWith("/api/docs/") && method === "DELETE") {
-        const docId = decodeURIComponent(path.slice("/api/docs/".length));
-        const deleted = await guardForRequest(auth!, { signal: requestGuardSignal }).deleteDoc(docId);
-        if (!deleted) return json({ error: "not found" }, 404);
-        return json({ ok: true });
+      if (path === "/api/vfs/history-exclusions" && method === "DELETE") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readBody<{ path: string }>(req);
+        if (typeof body.path !== "string") throw new HttpStatusError(400, "exclusion path is required");
+        const removed = d1ObserverState.removeExclusion(body.path);
+        d1Observer.schedule();
+        return json({ ok: true, removed });
       }
 
       // -- Events --
@@ -1253,7 +1224,7 @@ const server = await serve<{ cwd: string }>({
           manifestDigest: app.manifestDigest,
           appCommit,
           writeTables: registry.getTableGrants(body.appId),
-          docGrants: appDocGrants(body.appId, app.manifest.permissions.writes.docs),
+          fileGrants: registry.getFileGrants(body.appId),
         }));
       }
 
@@ -1429,12 +1400,6 @@ const server = await serve<{ cwd: string }>({
       console.error(`[lamarck] Error: ${message}`);
       const status = err instanceof HttpStatusError
         ? err.status
-        : err instanceof WorkingTreeConflictNotFoundError
-          ? 404
-          : err instanceof WorkingTreeConflictStaleError
-            ? 409
-            : err instanceof WorkingTreeResolutionError
-              ? 400
         : err instanceof ConnectorLifecycleConflictError
           ? 409
           : 500;
@@ -1561,7 +1526,7 @@ async function shutdown(): Promise<void> {
   }
   terminalProcs.clear();
   await serverStopped;
-  await workingTree.stop();
+  await d1Observer.stop();
   systemDb.close();
   process.exit(0);
 }

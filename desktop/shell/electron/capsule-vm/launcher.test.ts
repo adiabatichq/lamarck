@@ -924,6 +924,7 @@ function guestDescriptor() {
   return {
     imageBundlePath: "/Applications/Lamarck.app/Contents/Resources/capsule-guest",
     stateDirectory: "/Users/test/Library/Application Support/Lamarck/capsule-vm",
+    workspaceFilesPath: "/Users/test/Documents/Lamarck/files",
     expectedManifestDigest: IMAGE_DIGEST,
     manifestPublicKey: Buffer.alloc(32, 7).toString("base64"),
     cpuCount: 2,

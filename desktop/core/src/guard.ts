@@ -8,8 +8,6 @@ export {
   GuardRpcClient,
   RemoteGuard,
   RemoteGuard as Guard,
-  appDocGrants,
-  canWriteDocFromGrants,
 } from "./remote-guard";
 
 export type {
@@ -19,4 +17,4 @@ export type {
   SchemaPlan,
   SchemaSnapshot,
 } from "./remote-guard";
-export type { DocOp, EventInput, SchemaOp } from "./guard-types";
+export type { EventInput, SchemaOp } from "./guard-types";

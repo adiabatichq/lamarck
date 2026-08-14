@@ -40,7 +40,57 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "vfs") {
+    await runVfs(args);
+    return;
+  }
+
   die(`unknown command: ${command}`);
+}
+
+async function runVfs(rawArgs: string[]): Promise<void> {
+  let author: string | undefined;
+  const args = [...rawArgs];
+  if (args[0] === "--author") {
+    author = args[1];
+    if (author === undefined) die("vfs --author requires a value");
+    args.splice(0, 2);
+  }
+  if (args.length === 0) die("vfs requires a command");
+  const nativeCommand = args[0];
+  const stdin = nativeCommand === "tee" ? await readStdin() : undefined;
+  let response: {
+    success: boolean;
+    exitCode: number;
+    stdoutBase64: string;
+    stderrBase64: string;
+  };
+  try {
+    response = await post("/api/vfs/command", {
+      command: args.map(quoteVfsWord).join(" "),
+      options: {
+        ...(author === undefined ? {} : { author }),
+        ...(stdin === undefined ? {} : { stdin: { encoding: "base64", data: stdin.toString("base64") } }),
+      },
+    }, { "x-lamarck-vfs-client": "cli" });
+  } catch (error) {
+    die(`Lamarck Core must be running for vfs commands: ${errorMessage(error)}`);
+  }
+  const stdout = Buffer.from(response.stdoutBase64, "base64");
+  const stderr = Buffer.from(response.stderrBase64, "base64");
+  if (stdout.length > 0) process.stdout.write(stdout);
+  if (stderr.length > 0) process.stderr.write(stderr);
+  if (!response.success) process.exit(response.exitCode);
+}
+
+async function readStdin(): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+function quoteVfsWord(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 async function readDdlArg(args: string[]): Promise<string> {
@@ -68,10 +118,10 @@ async function waitForSchemaRequest(id: string): Promise<void> {
   }
 }
 
-async function post<T>(path: string, body: unknown): Promise<T> {
+async function post<T>(path: string, body: unknown, extraHeaders: Record<string, string> = {}): Promise<T> {
   const res = await fetch(`${baseUrl}${path}`, {
     method: "POST",
-    headers: authHeaders(),
+    headers: { ...authHeaders(), ...extraHeaders },
     body: JSON.stringify(body),
   });
   return readResponse<T>(res);
@@ -107,7 +157,11 @@ function usage(): void {
   lamarck promote "<ddl>"
   lamarck promote --file schema.sql
   lamarck demote "<ddl>"
-  lamarck demote --file cleanup.sql`);
+  lamarck demote --file cleanup.sql
+  lamarck vfs [--author name] ls -R notes/
+  lamarck vfs [--author name] tee -- notes/result.md
+  lamarck vfs import <host-source> <d1-destination>
+  lamarck vfs export <d1-source> <host-destination>`);
 }
 
 function die(message: string): never {
@@ -116,3 +170,7 @@ function die(message: string): never {
 }
 
 main().catch((err) => die(err instanceof Error ? err.message : String(err)));
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

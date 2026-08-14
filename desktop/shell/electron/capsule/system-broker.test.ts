@@ -50,8 +50,8 @@ describe("SystemBroker", () => {
       "resolveContentRef",
       "mutate",
       "transaction",
-      "writeDoc",
-      "deleteDoc",
+      "vfs.command",
+      "vfs.open",
       "writeEvent",
     ]);
     const fetchImpl = vi.fn<typeof fetch>();
@@ -105,15 +105,14 @@ describe("SystemBroker", () => {
     broker.bindSender(1, { channelId: "channel", capability: "capability" });
 
     await broker.invoke(1, "query", { sql: "SELECT 1", params: undefined });
-    await broker.invoke(1, "writeDoc", {
-      id: "apps/a/doc",
-      content: "hello",
-      metadata: undefined,
+    await broker.invoke(1, "vfs.command", {
+      command: "ls",
+      options: undefined,
     });
 
     expect(bodies).toEqual([
       { sql: "SELECT 1" },
-      { id: "apps/a/doc", content: "hello" },
+      { command: "ls" },
     ]);
   });
 
@@ -160,18 +159,18 @@ describe("SystemBroker", () => {
       body: { statements: [{ sql: "SELECT 1" }] },
     },
     {
-      operation: "writeDoc",
-      input: { id: "apps/a/doc", content: "text", metadata: { pinned: true } },
+      operation: "vfs.command",
+      input: { command: "tee -- apps/a/result.md", options: { stdin: { encoding: "utf8", data: "text" } } },
       method: "POST",
-      path: "/api/docs",
-      body: { id: "apps/a/doc", content: "text", metadata: { pinned: true } },
+      path: "/api/vfs/command",
+      body: { command: "tee -- apps/a/result.md", options: { stdin: { encoding: "utf8", data: "text" } } },
     },
     {
-      operation: "deleteDoc",
-      input: { id: "apps/a/a doc" },
-      method: "DELETE",
-      path: "/api/docs/apps%2Fa%2Fa%20doc",
-      body: undefined,
+      operation: "vfs.open",
+      input: { path: "apps/a/a file.png" },
+      method: "POST",
+      path: "/api/vfs/open",
+      body: { path: "apps/a/a file.png" },
     },
     {
       operation: "writeEvent",
@@ -245,9 +244,9 @@ describe("SystemBroker", () => {
     const { broker } = createBroker(fetchImpl, { maxRequestBytes: 64 });
     broker.bindSender(1, { channelId: "channel", capability: "capability" });
 
-    await expect(broker.invoke(1, "writeDoc", {
-      id: "apps/a/doc",
-      content: "x".repeat(100),
+    await expect(broker.invoke(1, "vfs.command", {
+      command: "tee -- apps/a/result.md",
+      options: { stdin: { encoding: "utf8", data: "x".repeat(100) } },
     })).rejects.toMatchObject({ code: "request_too_large" });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
@@ -325,8 +324,12 @@ describe("SystemBroker", () => {
 
   test("enforces aggregate request bytes per sender and globally", async () => {
     const content = "x".repeat(100);
-    const serialized = browserRequest("writeDoc", { id: "apps/a/doc", content });
-    const coreBody = JSON.stringify({ id: "apps/a/doc", content });
+    const vfsInput = {
+      command: "tee -- apps/a/result.md",
+      options: { stdin: { encoding: "utf8", data: content } },
+    };
+    const serialized = browserRequest("vfs.command", vfsInput);
+    const coreBody = JSON.stringify(vfsInput);
     const leaseBytes = Buffer.byteLength(serialized) + Buffer.byteLength(coreBody);
     const pendingFetch = vi.fn<typeof fetch>(() => new Promise<Response>(() => {}));
     const { broker: senderBroker } = createBroker(pendingFetch, {

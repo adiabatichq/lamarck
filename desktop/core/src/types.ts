@@ -16,7 +16,6 @@ export type {
 } from "@lamarck/system";
 export type { RemoteGuard as Guard } from "./remote-guard";
 export type { EventInput } from "./guard-types";
-export type { WorkingTree, WorkingTreeOptions } from "./working-tree";
 export type { AppManifest, LoadedApp, AppRegistry } from "./app-loader";
 export type {
   BoundConnectorGuard,

@@ -15,7 +15,6 @@ export type {
 
 export interface WriteTextBlobInput {
   text: string;
-  variant?: "redacted-text";
   mediaType?: "text/plain; charset=utf-8" | "application/json";
 }
 
@@ -55,7 +54,6 @@ export class ContentBlobStore {
         kind: "content-blob",
         version: 1,
         digest,
-        variant: input.variant ?? "redacted-text",
         mediaType: input.mediaType ?? "text/plain; charset=utf-8",
         encoding: "gzip",
       },
@@ -116,7 +114,6 @@ export class ContentBlobStore {
       bytes: bytes.byteLength,
       digest: parsed.ref.digest,
       mediaType: parsed.ref.mediaType,
-      variant: parsed.ref.variant,
     };
   }
 
@@ -130,7 +127,6 @@ function parseContentBlobRef(value: unknown): { ok: true; ref: ContentBlobRef; d
   if (!isPlainObject(value)) return { ok: false, reason: "contentRef must be an object" };
   if (value.kind !== "content-blob") return { ok: false, reason: "unsupported contentRef kind" };
   if (value.version !== 1) return { ok: false, reason: "unsupported contentRef version" };
-  if (value.variant !== "redacted-text") return { ok: false, reason: "unsupported contentRef variant" };
   if (value.mediaType !== "text/plain; charset=utf-8"
     && value.mediaType !== "application/json") {
     return { ok: false, reason: "unsupported contentRef mediaType" };

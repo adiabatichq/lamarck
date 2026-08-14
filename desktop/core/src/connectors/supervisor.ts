@@ -2304,15 +2304,14 @@ function normalizeConfigPatch(value: unknown): ConnectorConfigPatch {
 
 function normalizeTextBlobInput(value: unknown): {
   text: string;
-  variant?: "redacted-text";
   mediaType?: "text/plain; charset=utf-8" | "application/json";
 } {
   const input = normalizeJsonObject(value, "Connector text blob");
   if (typeof input.text !== "string") {
     throw new Error("Connector text blob requires a text string");
   }
-  if (input.variant !== undefined && input.variant !== "redacted-text") {
-    throw new Error("Connector text blob variant must be redacted-text");
+  if (input.variant !== undefined) {
+    throw new Error("Connector text blob variant is not supported");
   }
   if (input.mediaType !== undefined
     && input.mediaType !== "text/plain; charset=utf-8"
@@ -2321,7 +2320,6 @@ function normalizeTextBlobInput(value: unknown): {
   }
   return {
     text: input.text,
-    variant: input.variant === undefined ? undefined : "redacted-text",
     mediaType: input.mediaType,
   };
 }

@@ -2542,7 +2542,6 @@ async function externalizeLargeContents(aggregate, guard) {
     if (!pending) {
       pending = guard.writeTextBlob({
         text,
-        variant: "redacted-text",
         mediaType: "text/plain; charset=utf-8",
       });
       writes.set(text, pending);

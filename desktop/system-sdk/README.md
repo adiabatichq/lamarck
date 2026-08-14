@@ -12,6 +12,8 @@ The package supplies the client and protocol contract. At runtime, Lamarck binds
 
 `@lamarck/system` follows System protocol V1 and declares that compatibility in its package metadata. Apps should declare an explicit compatible version in `package.json` and commit the generated npm lockfile.
 
+The D1 surface is `system.vfs.command(command, options?)`, using explicit real paths under the Workspace `files/` authority, plus `system.vfs.open(path)` for brokered browser display. There are no document IDs, implicit `.md` suffixes, or legacy document compatibility methods. D2 mutations require an existing granted table with an explicit non-null primary key; primary-key values are immutable.
+
 ## Release
 
 Publishing a GitHub Release whose tag is `system-sdk-v<version>` publishes the exact tarball produced by `scripts/pack-system-sdk.mjs`. The release gate verifies the SDK, reproducible tarball contents, clean consumer installation, and registry bytes without depending on Core, Shell, or first-party App lockfiles. It accepts an existing immutable version only when the registry integrity and tarball URL match the locally verified artifact.

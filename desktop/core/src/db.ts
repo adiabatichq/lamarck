@@ -12,8 +12,7 @@ export {
 } from "./data-schema";
 export const SYSTEM_DB_FILENAME = "system.db";
 
-// Released schema constants are immutable migration inputs. This greenfield V1
-// includes both the control plane and D1 working-tree reconciliation state.
+// Greenfield V1 includes the control plane and rebuildable D1 observer state.
 export const SYSTEM_SCHEMA_V1 = `
 CREATE TABLE IF NOT EXISTS connector_sources (
   id            TEXT PRIMARY KEY,
@@ -111,41 +110,24 @@ CREATE INDEX IF NOT EXISTS idx_auth_credentials_owner
 CREATE INDEX IF NOT EXISTS idx_auth_credentials_status
   ON auth_credentials(status);
 
-CREATE TABLE IF NOT EXISTS d1_working_tree_mirrors (
-  doc_id              TEXT PRIMARY KEY,
-  content_hash        TEXT NOT NULL
-                      CHECK (length(content_hash) = 64 AND content_hash NOT GLOB '*[^0-9a-f]*'),
-  baseline_locked     INTEGER NOT NULL CHECK (baseline_locked IN (0, 1)),
-  database_updated_at INTEGER NOT NULL CHECK (database_updated_at >= 0),
-  verified_at         INTEGER NOT NULL CHECK (verified_at >= 0)
+CREATE TABLE IF NOT EXISTS d1_observer_files (
+  path              TEXT PRIMARY KEY,
+  digest            TEXT NOT NULL
+                    CHECK (substr(digest, 1, 7) = 'sha256:'
+                      AND length(digest) = 71
+                      AND substr(digest, 8) NOT GLOB '*[^0-9a-f]*'),
+  byte_length       INTEGER NOT NULL CHECK (byte_length >= 0),
+  markdown_baseline BLOB
 );
 
-CREATE TABLE IF NOT EXISTS d1_working_tree_conflicts (
-  doc_id                       TEXT PRIMARY KEY,
-  baseline_hash                TEXT
-                               CHECK (baseline_hash IS NULL OR
-                                 (length(baseline_hash) = 64 AND baseline_hash NOT GLOB '*[^0-9a-f]*')),
-  baseline_locked              INTEGER CHECK (baseline_locked IS NULL OR baseline_locked IN (0, 1)),
-  baseline_database_updated_at INTEGER
-                               CHECK (baseline_database_updated_at IS NULL OR baseline_database_updated_at >= 0),
-  database_hash                TEXT
-                               CHECK (database_hash IS NULL OR
-                                 (length(database_hash) = 64 AND database_hash NOT GLOB '*[^0-9a-f]*')),
-  file_hash                    TEXT
-                               CHECK (file_hash IS NULL OR
-                                 (length(file_hash) = 64 AND file_hash NOT GLOB '*[^0-9a-f]*')),
-  detected_at                  INTEGER NOT NULL CHECK (detected_at >= 0),
-  updated_at                   INTEGER NOT NULL CHECK (updated_at >= detected_at),
-  CHECK (
-    (baseline_hash IS NULL) = (baseline_locked IS NULL)
-    AND (baseline_hash IS NULL) = (baseline_database_updated_at IS NULL)
-  )
+CREATE TABLE IF NOT EXISTS d1_observer_cursor (
+  singleton     INTEGER PRIMARY KEY CHECK (singleton = 1),
+  last_event_id TEXT
 );
 
-CREATE TABLE IF NOT EXISTS d1_working_tree_protected_hashes (
-  content_hash TEXT PRIMARY KEY NOT NULL
-               CHECK (length(content_hash) = 64 AND content_hash NOT GLOB '*[^0-9a-f]*'),
-  protected_at INTEGER NOT NULL CHECK (protected_at >= 0)
+CREATE TABLE IF NOT EXISTS d1_history_exclusions (
+  path      TEXT PRIMARY KEY,
+  is_prefix INTEGER NOT NULL CHECK (is_prefix IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS connector_official_release_hashes (
@@ -162,7 +144,7 @@ export const SYSTEM_DATABASE_VERSION = 1;
 const SYSTEM_MIGRATIONS: readonly DatabaseMigration[] = [
   {
     version: 1,
-    name: "baseline control-plane and D1 reconciliation schema",
+    name: "baseline control-plane and D1 observer schema",
     up(db) {
       db.exec(SYSTEM_SCHEMA_V1);
     },
@@ -178,11 +160,6 @@ export function migrateSystemDatabase(db: DatabaseSync): number {
   return runDatabaseMigrations(db, {
     database: SYSTEM_DB_FILENAME,
     migrations: SYSTEM_MIGRATIONS,
-    adoptVersionZero(unversionedDb) {
-      assertSchemaCompatible(unversionedDb, SYSTEM_SCHEMA_V1, SYSTEM_DB_FILENAME, {
-        allowUnknownObjects: false,
-      });
-    },
     validate(currentDb) {
       assertSchemaCompatible(currentDb, SYSTEM_SCHEMA, SYSTEM_DB_FILENAME, {
         allowUnknownObjects: false,

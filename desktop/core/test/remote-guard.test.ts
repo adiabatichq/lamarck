@@ -13,12 +13,8 @@ import {
 } from "../src/remote-guard";
 import { TEST_PRODUCER_REF } from "./support/test-guard";
 
-const STALE_HASH = "0".repeat(64);
-const MATCH_HASH = "1".repeat(64);
 const CONNECTOR_PRODUCER_REF = `producer:v1:sha256:${"2".repeat(64)}`;
 const APP_PRODUCER_REF = `producer:v1:sha256:${"3".repeat(64)}`;
-const STALE_UPDATED_AT = 100;
-const MATCH_UPDATED_AT = 101;
 
 class FakeRpc {
   calls: Array<{ method: string; params: Record<string, unknown> }> = [];
@@ -32,17 +28,7 @@ class FakeRpc {
     this.calls.push({ method, params });
     this.executionOptions.push(options);
     if (method === "query") return [{ id: "first" }] as T;
-    if (method === "writeEvent") return "event-id" as T;
-    if (method === "writeDoc") return { ok: true } as T;
-    if (method === "listLockedDocHashesForWorkingTree") {
-      return [{ id: "private/one", contentHash: MATCH_HASH }] as T;
-    }
-    if (method === "compareAndWriteDoc" || method === "compareAndDeleteDoc") {
-      return (
-        params.expectedHash === MATCH_HASH
-        && params.expectedUpdatedAt === MATCH_UPDATED_AT
-      ) as T;
-    }
+    if (method === "writeEvent" || method === "writeWorkspaceEvent") return "event-id" as T;
     throw new Error(`Unexpected method: ${method}`);
   }
 
@@ -54,7 +40,6 @@ function createGuard(rpc: FakeRpc, binding?: Partial<GuardBinding>): RemoteGuard
     source: "system:server",
     producerRef: TEST_PRODUCER_REF,
     writeTables: null,
-    docGrants: null,
     schemaGrant: true,
     ...binding,
   });
@@ -89,7 +74,7 @@ describe("RemoteGuard capability binding", () => {
         manifestDigest: `sha256:${"a".repeat(64)}`,
         appCommit: "a".repeat(40),
         writeTables: [],
-        docGrants: [],
+        fileGrants: [],
       });
       const admission = admitRequest(new Request("http://localhost/api/query", {
         headers: { [APP_CAPABILITY_HEADER]: issued.capability },
@@ -121,7 +106,7 @@ describe("RemoteGuard capability binding", () => {
     }
   });
 
-  test("source rebinding drops schema authority and serializes the principal", async () => {
+  test("source rebinding drops schema authority and serializes only D2 grants", async () => {
     const rpc = new FakeRpc();
     const connector = createGuard(rpc).withSource("connector:calendar", {
       producerRef: CONNECTOR_PRODUCER_REF,
@@ -141,7 +126,6 @@ describe("RemoteGuard capability binding", () => {
           source: "connector:calendar",
           producerRef: CONNECTOR_PRODUCER_REF,
           tableGrants: [],
-          docGrants: "*",
           schemaGrant: false,
         },
         event: {
@@ -154,7 +138,7 @@ describe("RemoteGuard capability binding", () => {
     });
   });
 
-  test("publishes the bound descriptor before a D0-producing call but not a query", async () => {
+  test("publishes the bound descriptor before D0-producing calls but not queries", async () => {
     const rpc = new FakeRpc();
     const callsObservedDuringPrepare: number[] = [];
     const guard = createGuard(rpc, {
@@ -165,39 +149,30 @@ describe("RemoteGuard capability binding", () => {
 
     await guard.query("SELECT 1");
     expect(callsObservedDuringPrepare).toEqual([]);
-    await guard.writeEvent({
-      type: "test.observation",
+    await guard.writeWorkspaceEvent({
+      type: "workspace.files.changed",
       startedAt: 1,
-      payload: {},
+      payload: { changes: [] },
     });
 
     expect(callsObservedDuringPrepare).toEqual([1]);
-    expect(rpc.calls.map((call) => call.method)).toEqual(["query", "writeEvent"]);
+    expect(rpc.calls.map((call) => call.method)).toEqual(["query", "writeWorkspaceEvent"]);
   });
 
-  test("app grants are concrete arrays and queryOne stays a client helper", async () => {
+  test("App grants are concrete arrays and queryOne stays a client helper", async () => {
     const rpc = new FakeRpc();
     const app = createGuard(rpc).withSource("app:focus", {
       producerRef: APP_PRODUCER_REF,
       writeTables: ["focus_sessions"],
-      docGrants: ["apps/focus/"],
       schemaGrant: false,
     });
 
     expect(await app.queryOne("SELECT id FROM focus_sessions LIMIT 1")).toEqual({ id: "first" });
-    expect(rpc.calls[0]).toEqual({
-      method: "query",
-      params: {
-        principal: {
-          source: "app:focus",
-          producerRef: APP_PRODUCER_REF,
-          tableGrants: ["focus_sessions"],
-          docGrants: ["apps/focus/"],
-          schemaGrant: false,
-        },
-        sql: "SELECT id FROM focus_sessions LIMIT 1",
-        params: undefined,
-      },
+    expect(rpc.calls[0].params.principal).toEqual({
+      source: "app:focus",
+      producerRef: APP_PRODUCER_REF,
+      tableGrants: ["focus_sessions"],
+      schemaGrant: false,
     });
   });
 
@@ -207,162 +182,11 @@ describe("RemoteGuard capability binding", () => {
     const app = createGuard(rpc).withSource("app:focus", {
       producerRef: APP_PRODUCER_REF,
       writeTables: ["focus_sessions"],
-      docGrants: [],
       signal: controller.signal,
       deadlineMs: 1234,
     });
 
     await app.query("SELECT 1");
-    expect(rpc.executionOptions[0]).toEqual({
-      signal: controller.signal,
-      deadlineMs: 1234,
-    });
-  });
-
-  test("doc materialization failures do not turn a committed RPC into failure", async () => {
-    const rpc = new FakeRpc();
-    const guard = createGuard(rpc);
-    guard.onDocChange = async () => {
-      throw new Error("filesystem unavailable");
-    };
-
-    const originalError = console.error;
-    console.error = () => {};
-    try {
-      await expect(guard.writeDoc("notes/one", "saved")).resolves.toBeUndefined();
-      await delay(0);
-    } finally {
-      console.error = originalError;
-    }
-    expect(rpc.calls[0].method).toBe("writeDoc");
-  });
-
-  test("conditional doc helpers forward expectations and notify only after success", async () => {
-    const rpc = new FakeRpc();
-    const guard = createGuard(rpc);
-    const materialized: Array<[string, string | null]> = [];
-    const notified: string[] = [];
-    guard.onDocChange = (id, content) => { materialized.push([id, content]); };
-    guard.docChangeSubscribers.push((id) => notified.push(id));
-
-    await expect(guard.compareAndWriteDoc(
-      "notes/one",
-      STALE_HASH,
-      STALE_UPDATED_AT,
-      "must-not-notify",
-      { label: "draft" },
-    )).resolves.toBe(false);
-    await expect(guard.compareAndWriteDoc(
-      "notes/one",
-      MATCH_HASH,
-      MATCH_UPDATED_AT,
-      "saved",
-      { label: "draft" },
-    )).resolves.toBe(true);
-    await expect(guard.compareAndDeleteDoc(
-      "notes/one",
-      STALE_HASH,
-      STALE_UPDATED_AT,
-    )).resolves.toBe(false);
-    await expect(guard.compareAndDeleteDoc(
-      "notes/one",
-      MATCH_HASH,
-      MATCH_UPDATED_AT,
-    )).resolves.toBe(true);
-
-    expect(rpc.calls).toEqual([
-      {
-        method: "compareAndWriteDoc",
-        params: {
-          principal: {
-            source: "system:server",
-            producerRef: TEST_PRODUCER_REF,
-            tableGrants: "*",
-            docGrants: "*",
-            schemaGrant: true,
-          },
-          id: "notes/one",
-          expectedHash: STALE_HASH,
-          expectedUpdatedAt: STALE_UPDATED_AT,
-          content: "must-not-notify",
-          metadata: { label: "draft" },
-        },
-      },
-      {
-        method: "compareAndWriteDoc",
-        params: {
-          principal: {
-            source: "system:server",
-            producerRef: TEST_PRODUCER_REF,
-            tableGrants: "*",
-            docGrants: "*",
-            schemaGrant: true,
-          },
-          id: "notes/one",
-          expectedHash: MATCH_HASH,
-          expectedUpdatedAt: MATCH_UPDATED_AT,
-          content: "saved",
-          metadata: { label: "draft" },
-        },
-      },
-      {
-        method: "compareAndDeleteDoc",
-        params: {
-          principal: {
-            source: "system:server",
-            producerRef: TEST_PRODUCER_REF,
-            tableGrants: "*",
-            docGrants: "*",
-            schemaGrant: true,
-          },
-          id: "notes/one",
-          expectedHash: STALE_HASH,
-          expectedUpdatedAt: STALE_UPDATED_AT,
-        },
-      },
-      {
-        method: "compareAndDeleteDoc",
-        params: {
-          principal: {
-            source: "system:server",
-            producerRef: TEST_PRODUCER_REF,
-            tableGrants: "*",
-            docGrants: "*",
-            schemaGrant: true,
-          },
-          id: "notes/one",
-          expectedHash: MATCH_HASH,
-          expectedUpdatedAt: MATCH_UPDATED_AT,
-        },
-      },
-    ]);
-    expect(materialized).toEqual([
-      ["notes/one", "saved"],
-      ["notes/one", null],
-    ]);
-    expect(notified).toEqual(["notes/one", "notes/one"]);
-  });
-
-  test("forwards the private paged locked-document hash request", async () => {
-    const rpc = new FakeRpc();
-    const guard = createGuard(rpc);
-
-    await expect(guard.listLockedDocHashesForWorkingTree("private/zero", 128)).resolves.toEqual([
-      { id: "private/one", contentHash: MATCH_HASH },
-    ]);
-    expect(rpc.calls).toEqual([{
-      method: "listLockedDocHashesForWorkingTree",
-      params: {
-        principal: {
-          source: "system:server",
-          producerRef: TEST_PRODUCER_REF,
-          tableGrants: "*",
-          docGrants: "*",
-          schemaGrant: true,
-        },
-        afterId: "private/zero",
-        limit: 128,
-      },
-    }]);
+    expect(rpc.executionOptions[0]).toEqual({ signal: controller.signal, deadlineMs: 1234 });
   });
 });

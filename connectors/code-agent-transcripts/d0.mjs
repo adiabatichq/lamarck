@@ -130,7 +130,6 @@ async function materializeBlobs(guard, events) {
       if (!pending) {
         pending = guard.writeTextBlob({
           text,
-          variant: "redacted-text",
           mediaType,
         });
         pendingByContent.set(contentKey, pending);

@@ -17,7 +17,7 @@ function app(id: string, name: string): AppInfo {
     },
     permissions: {
       writes: {
-        docs: [],
+        files: [],
         tables: [],
       },
     },

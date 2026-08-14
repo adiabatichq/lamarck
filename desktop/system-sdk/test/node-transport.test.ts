@@ -149,9 +149,9 @@ describe("Node framed System SDK transport", () => {
       maxFrameBytes: 64,
       requestTimeoutMs: 1_000,
     });
-    await expect(bounded.request("writeDoc", {
-      id: "apps/a/doc",
-      content: "x".repeat(100),
+    await expect(bounded.request("vfs.command", {
+      command: "tee -- apps/a/result.md",
+      options: { stdin: { encoding: "utf8", data: "x".repeat(100) } },
     })).rejects.toThrow("frame limit");
     bounded.close();
 

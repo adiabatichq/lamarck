@@ -104,6 +104,8 @@ export interface CapsuleVmGuestImageBase {
 
 /** Complete trusted start descriptor. Capacity is selected by Host admission. */
 export interface CapsuleVmGuestImage extends CapsuleVmGuestImageBase {
+  /** The selected Workspace D1 authority, shared into the VM read-only. */
+  workspaceFilesPath: string;
   stateDiskBytes: number;
   statePreparationId: string;
 }
@@ -1097,6 +1099,7 @@ function isStopResult(value: unknown): value is CapsuleVmStopResult {
 function hasCompleteGuestImage(image: CapsuleVmGuestImage): boolean {
   return isAbsolute(image.imageBundlePath)
     && isAbsolute(image.stateDirectory)
+    && isAbsolute(image.workspaceFilesPath)
     && /^sha256:[0-9a-f]{64}$/.test(image.expectedManifestDigest)
     && /^[A-Za-z0-9+/]{43}=$/.test(image.manifestPublicKey)
     && Number.isSafeInteger(image.cpuCount)

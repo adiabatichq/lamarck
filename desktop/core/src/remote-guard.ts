@@ -1,5 +1,5 @@
 import type { JsonValue } from "./json";
-import type { DocOp, EventInput, SchemaOp } from "./guard-types";
+import type { EventInput, SchemaOp } from "./guard-types";
 import type {
   GuardMutationResult,
   GuardPrincipal,
@@ -7,8 +7,6 @@ import type {
   GuardSqlParams,
   GuardStatement as RpcGuardStatement,
   GuardTransactionStatementResult,
-  GuardWorkingTreeDoc,
-  GuardWorkingTreeLockedDocHash,
 } from "./guard-service/protocol";
 
 export interface GuardBinding {
@@ -19,8 +17,6 @@ export interface GuardBinding {
   prepareProducer?: () => void | Promise<void>;
   /** null means trusted host access; an array is an exact D2 table allowlist. */
   writeTables: string[] | null;
-  /** null means trusted host access; grants are exact doc ids or prefixes ending in '/'. */
-  docGrants: string[] | null;
   /** Only the authenticated host schema approval path receives this grant. */
   schemaGrant: boolean;
 }
@@ -146,9 +142,6 @@ export class GuardRpcClient {
  * SQLite handle: production data access can only cross this RPC boundary.
  */
 export class RemoteGuard {
-  public onDocChange?: (id: string, content: string | null) => void | Promise<void>;
-  public docChangeSubscribers: Array<(id: string) => void> = [];
-
   constructor(
     private readonly rpc: GuardRpcClient,
     private readonly binding: GuardBinding,
@@ -174,7 +167,6 @@ export class RemoteGuard {
         producerRef,
         prepareProducer,
         writeTables: null,
-        docGrants: null,
         schemaGrant: true,
       },
     );
@@ -188,9 +180,7 @@ export class RemoteGuard {
     producerRef: string;
     prepareProducer?: () => void | Promise<void>;
     writeTables?: string[] | null;
-    docGrants?: string[] | null;
     schemaGrant?: boolean;
-    copyDocHook?: boolean;
     signal?: AbortSignal;
     deadlineMs?: number;
   }): RemoteGuard {
@@ -205,16 +195,13 @@ export class RemoteGuard {
           ? []
           : this.binding.writeTables
         : opts.writeTables,
-      docGrants: opts?.docGrants === undefined ? this.binding.docGrants : opts.docGrants,
       // Source rebinding is a privilege drop. Schema authority is never
-      // inherited implicitly by app, connector, or working-tree facades.
+      // inherited implicitly by app or connector facades.
       schemaGrant: opts?.schemaGrant ?? false,
     }, {
       signal: opts?.signal ?? this.execution.signal,
       deadlineMs: opts?.deadlineMs ?? this.execution.deadlineMs,
     });
-    guard.docChangeSubscribers = this.docChangeSubscribers;
-    if (opts?.copyDocHook !== false) guard.onDocChange = this.onDocChange;
     return guard;
   }
 
@@ -223,8 +210,6 @@ export class RemoteGuard {
       signal: opts.signal,
       deadlineMs: positiveDeadline(opts.deadlineMs),
     });
-    guard.docChangeSubscribers = this.docChangeSubscribers;
-    guard.onDocChange = this.onDocChange;
     return guard;
   }
 
@@ -259,79 +244,9 @@ export class RemoteGuard {
     return this.call<string>("writeEvent", { principal: this.principal(), event });
   }
 
-  async writeDoc(id: string, content: string, metadata?: Record<string, unknown>): Promise<void> {
+  async writeWorkspaceEvent(event: EventInput): Promise<string> {
     await this.prepareProducer();
-    await this.call("writeDoc", {
-      principal: this.principal(),
-      id,
-      content,
-      metadata,
-    });
-    this.notifyDocChange(id, content);
-  }
-
-  async readDocForWorkingTree(id: string): Promise<GuardWorkingTreeDoc | null> {
-    return this.call<GuardWorkingTreeDoc | null>("readDocForWorkingTree", {
-      principal: this.principal(),
-      id,
-    });
-  }
-
-  async listLockedDocHashesForWorkingTree(
-    afterId: string,
-    limit: number,
-  ): Promise<GuardWorkingTreeLockedDocHash[]> {
-    return this.call<GuardWorkingTreeLockedDocHash[]>("listLockedDocHashesForWorkingTree", {
-      principal: this.principal(),
-      afterId,
-      limit,
-    });
-  }
-
-  async compareAndWriteDoc(
-    id: string,
-    expectedHash: string | null,
-    expectedUpdatedAt: number | null,
-    content: string,
-    metadata?: Record<string, unknown>,
-  ): Promise<boolean> {
-    await this.prepareProducer();
-    const applied = await this.call<boolean>("compareAndWriteDoc", {
-      principal: this.principal(),
-      id,
-      expectedHash,
-      expectedUpdatedAt,
-      content,
-      metadata,
-    });
-    if (applied) this.notifyDocChange(id, content);
-    return applied;
-  }
-
-  async deleteDoc(id: string): Promise<boolean> {
-    await this.prepareProducer();
-    const deleted = await this.call<boolean>("deleteDoc", {
-      principal: this.principal(),
-      id,
-    });
-    if (deleted) this.notifyDocChange(id, null);
-    return deleted;
-  }
-
-  async compareAndDeleteDoc(
-    id: string,
-    expectedHash: string,
-    expectedUpdatedAt: number,
-  ): Promise<boolean> {
-    await this.prepareProducer();
-    const deleted = await this.call<boolean>("compareAndDeleteDoc", {
-      principal: this.principal(),
-      id,
-      expectedHash,
-      expectedUpdatedAt,
-    });
-    if (deleted) this.notifyDocChange(id, null);
-    return deleted;
+    return this.call<string>("writeWorkspaceEvent", { principal: this.principal(), event });
   }
 
   async schemaPlan(kind: SchemaOp, ddl: string | string[]): Promise<SchemaPlan> {
@@ -376,7 +291,6 @@ export class RemoteGuard {
       source: this.binding.source,
       producerRef: this.binding.producerRef,
       tableGrants: this.binding.writeTables ?? "*",
-      docGrants: this.binding.docGrants ?? "*",
       schemaGrant: this.binding.schemaGrant,
     };
   }
@@ -389,18 +303,6 @@ export class RemoteGuard {
     await this.binding.prepareProducer?.();
   }
 
-  private notifyDocChange(id: string, content: string | null): void {
-    try {
-      Promise.resolve(this.onDocChange?.(id, content)).catch((err) => {
-        console.error(`[guard] Doc materialization failed for ${id}:`, err);
-      });
-    } catch (err) {
-      console.error(`[guard] Doc materialization failed for ${id}:`, err);
-    }
-    for (const subscriber of this.docChangeSubscribers) {
-      try { subscriber(id); } catch {}
-    }
-  }
 }
 
 function positiveDeadline(value: number): number {
@@ -408,14 +310,6 @@ function positiveDeadline(value: number): number {
     throw new Error("Guard execution deadline must be a positive safe integer");
   }
   return value;
-}
-
-export function appDocGrants(appId: string, declared: string[]): string[] {
-  return [`apps/${appId}/`, ...declared];
-}
-
-export function canWriteDocFromGrants(grants: string[], id: string, _op: DocOp): boolean {
-  return grants.some((grant) => grant.endsWith("/") ? id.startsWith(grant) : id === grant);
 }
 
 export type { EventInput, SchemaOp, JsonValue };

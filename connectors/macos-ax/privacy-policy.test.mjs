@@ -1307,7 +1307,6 @@ test("desktop context connector writes large visible text through content blobs"
 
   assert.equal(blobWrites.length, 1);
   assert.equal(blobWrites[0].text, largeText);
-  assert.equal(blobWrites[0].variant, "redacted-text");
   const contextEvent = writes.find((event) => event.type === "desktop.context");
   assert.ok(contextEvent);
   assert.equal(contextEvent.payload.contents.c1.text, undefined);

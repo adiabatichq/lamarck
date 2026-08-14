@@ -27,14 +27,14 @@ function appRequest(capability: string, extraHeaders: Record<string, string> = {
 function authorization(
   manifestGeneration = 1,
   writeTables: string[] = [],
-  docGrants: string[] = [],
+  fileGrants: string[] = [],
 ): AppAuthorizationSnapshot {
   return {
     manifestGeneration,
     manifestDigest: MANIFEST_DIGEST,
     appCommit: APP_COMMIT,
     writeTables,
-    docGrants,
+    fileGrants,
   };
 }
 
@@ -78,7 +78,7 @@ describe("auth", () => {
         manifestDigest: MANIFEST_DIGEST,
         appCommit: APP_COMMIT,
         writeTables: ["notes"],
-        docGrants: ["apps/app-a/"],
+        fileGrants: ["apps/app-a/"],
       },
     });
     expect(Object.isFrozen(admission?.context)).toBe(true);
@@ -159,10 +159,10 @@ describe("auth", () => {
   test("returns immutable identity and never serializes the raw capability in registry state", () => {
     const registry = new AppCapabilityRegistry();
     const tables = ["notes"];
-    const docs = ["apps/app-a/"];
-    const issued = registry.issue("app-a", "ui", authorization(1, tables, docs));
+    const files = ["apps/app-a/"];
+    const issued = registry.issue("app-a", "ui", authorization(1, tables, files));
     tables.push("secrets");
-    docs.push("private/");
+    files.push("private/");
     const admission = admitRequest(appRequest(issued.capability), secrets, registry);
     const auth = admission?.context;
     if (!auth || auth.kind !== "app") throw new Error("Expected App auth");
@@ -172,9 +172,10 @@ describe("auth", () => {
     expect(Reflect.set(auth, "appId", "app-b")).toBe(false);
     expect(auth.appId).toBe("app-a");
     expect(auth.authorization.writeTables).toEqual(["notes"]);
-    expect(auth.authorization.docGrants).toEqual(["apps/app-a/"]);
+    expect(auth.authorization.fileGrants).toEqual(["apps/app-a/"]);
     expect(Object.isFrozen(auth.authorization)).toBe(true);
     expect(Object.isFrozen(auth.authorization.writeTables)).toBe(true);
+    expect(Object.isFrozen(auth.authorization.fileGrants)).toBe(true);
     expect(JSON.stringify(registry)).not.toContain(issued.capability);
     admission.release();
   });
