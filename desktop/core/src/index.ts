@@ -14,6 +14,7 @@ import {
 } from "./remote-guard";
 import { D1ObserverState } from "./d1-observer-state";
 import { D1Observer } from "./d1-observer";
+import { D1Sequencer } from "./d1-sequencer";
 import { VfsService, type VfsCaller } from "./vfs";
 import {
   archiveApp,
@@ -209,7 +210,8 @@ const marketplaceService = await MarketplaceService.initialize({
   },
 });
 const d1ObserverState = new D1ObserverState(systemDb);
-const vfs = new VfsService(workspacePath, d1ObserverState, contentBlobStore);
+const d1Sequencer = new D1Sequencer();
+const vfs = new VfsService(workspacePath, d1ObserverState, contentBlobStore, d1Sequencer);
 await vfs.initialize();
 const observerGuard = guard.withSource("system:vfs:observer", {
   producerRef: systemProducer.producerRef,
@@ -222,6 +224,7 @@ const d1Observer = new D1Observer(
   observerGuard,
   d1ObserverState,
   contentBlobStore,
+  d1Sequencer,
 );
 await d1Observer.start();
 

@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import type { ContentBlobRef } from "@lamarck/system/protocol";
 import { ContentBlobStore } from "./blob-store";
 import { D1ObserverState, type D1RecordedChange } from "./d1-observer-state";
+import { D1Sequencer } from "./d1-sequencer";
 import {
   compareFileSnapshots,
   digestBytes,
@@ -35,13 +36,16 @@ export class D1Observer {
     private readonly guard: RemoteGuard,
     private readonly state: D1ObserverState,
     private readonly blobStore: ContentBlobStore,
+    private readonly sequencer: D1Sequencer,
   ) {}
 
   async start(): Promise<void> {
     if (!this.stopped) return;
     this.stopped = false;
-    await this.catchUpFromD0();
-    await this.observe();
+    await this.sequencer.run(async () => {
+      await this.catchUpFromD0();
+      await this.observeExclusive();
+    });
     try {
       this.watcher = watch(this.filesRoot, { recursive: true }, () => this.schedule());
       this.watcher.on("error", (error) => {
@@ -78,6 +82,10 @@ export class D1Observer {
   }
 
   async observe(): Promise<void> {
+    await this.sequencer.run(() => this.observeExclusive());
+  }
+
+  private async observeExclusive(): Promise<void> {
     const before = observerFilesToSnapshots(this.state.listFiles());
     const deferred = new Set<string>();
     const after = await scanD1Files(this.filesRoot, {

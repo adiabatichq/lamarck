@@ -25,6 +25,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { VfsCommandWireOptions, VfsCommandWireResult } from "@lamarck/system/protocol";
 import { ContentBlobStore } from "./blob-store";
 import { D1ObserverState } from "./d1-observer-state";
+import { D1Sequencer } from "./d1-sequencer";
 import {
   compareFileSnapshots,
   externalizeFileChanges,
@@ -56,13 +57,13 @@ export interface VfsOpenContent {
 
 export class VfsService {
   readonly filesRoot: string;
-  private mutationTail: Promise<void> = Promise.resolve();
   private readonly openHandles = new Map<string, OpenHandle>();
 
   constructor(
     workspacePath: string,
     private readonly state: D1ObserverState,
     private readonly blobStore: ContentBlobStore,
+    private readonly sequencer: D1Sequencer,
   ) {
     this.filesRoot = join(workspacePath, "files");
   }
@@ -91,7 +92,7 @@ export class VfsService {
     }
 
     if (isMutating(parsed.name)) {
-      return this.serializeMutation(() => this.executeMutation(caller, parsed, options));
+      return this.sequencer.run(() => this.executeMutation(caller, parsed, options));
     }
     try {
       const output = await this.executeRead(parsed);
@@ -133,12 +134,6 @@ export class VfsService {
       this.openHandles.delete(token);
       return null;
     }
-  }
-
-  private serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
-    const resultPromise = this.mutationTail.then(operation);
-    this.mutationTail = resultPromise.then(() => undefined, () => undefined);
-    return resultPromise;
   }
 
   private async executeMutation(

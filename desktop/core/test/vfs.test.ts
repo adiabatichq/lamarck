@@ -16,6 +16,7 @@ import { d1PathsConflict, parseVfsCommand, validateD1Path } from "@lamarck/syste
 import { ContentBlobStore } from "../src/blob-store";
 import { D1Observer } from "../src/d1-observer";
 import { D1ObserverState } from "../src/d1-observer-state";
+import { D1Sequencer } from "../src/d1-sequencer";
 import {
   compareFileSnapshots,
   externalizeFileChanges,
@@ -36,8 +37,26 @@ const { applyPatch } = require("diff") as { applyPatch(source: string, patch: st
 class EventGuard {
   readonly events: Array<EventInput & { id: string }> = [];
   failNextWrite = false;
+  writeAttempts = 0;
+  private blockedWrite: { entered: () => void; released: Promise<void> } | null = null;
+
+  blockNextWrite(): { entered: Promise<void>; release: () => void } {
+    let markEntered!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    this.blockedWrite = { entered: markEntered, released };
+    return { entered, release };
+  }
 
   async writeWorkspaceEvent(event: EventInput): Promise<string> {
+    this.writeAttempts += 1;
+    const blockedWrite = this.blockedWrite;
+    this.blockedWrite = null;
+    if (blockedWrite) {
+      blockedWrite.entered();
+      await blockedWrite.released;
+    }
     if (this.failNextWrite) {
       this.failNextWrite = false;
       throw new Error("injected D0 failure");
@@ -62,6 +81,7 @@ describe("D1 VFS", () => {
   let blobs: ContentBlobStore;
   let guard: EventGuard;
   let vfs: VfsService;
+  let sequencer: D1Sequencer;
   let closeDb: () => void;
 
   beforeEach(async () => {
@@ -72,7 +92,8 @@ describe("D1 VFS", () => {
     state = new D1ObserverState(db);
     blobs = new ContentBlobStore(workspace);
     guard = new EventGuard();
-    vfs = new VfsService(workspace, state, blobs);
+    sequencer = new D1Sequencer();
+    vfs = new VfsService(workspace, state, blobs, sequencer);
     await vfs.initialize();
     filesRoot = join(workspace, "files");
   });
@@ -135,6 +156,91 @@ describe("D1 VFS", () => {
     expect((guard.events[0]!.payload as Record<string, JsonValue>).author).toBe("codex");
   });
 
+  test("does not let the observer scan between a VFS filesystem effect and its checkpoint", async () => {
+    mkdirSync(join(filesRoot, "notes"));
+    const observer = new D1Observer(
+      filesRoot,
+      guard as unknown as RemoteGuard,
+      state,
+      blobs,
+      sequencer,
+    );
+    const originalListFiles = state.listFiles.bind(state);
+    let observerStateReads = 0;
+    state.listFiles = (() => {
+      observerStateReads += 1;
+      return originalListFiles();
+    }) as typeof state.listFiles;
+
+    const gate = guard.blockNextWrite();
+    const mutation = vfs.command(hostCaller(guard), "tee -- notes/result.md", {
+      stdin: { encoding: "utf8", data: "complete" },
+      author: "codex",
+    });
+    let observation: Promise<void> | undefined;
+    try {
+      await gate.entered;
+      expect(readFileSync(join(filesRoot, "notes/result.md"), "utf8")).toBe("complete");
+
+      observation = observer.observe();
+      await Promise.resolve();
+      expect(observerStateReads).toBe(0);
+      expect(guard.writeAttempts).toBe(1);
+    } finally {
+      gate.release();
+    }
+
+    expect((await mutation).success).toBe(true);
+    await observation;
+    expect(guard.writeAttempts).toBe(1);
+    expect(guard.events).toHaveLength(1);
+    expect(guard.events[0]!.payload).toMatchObject({
+      argv: ["tee", "--", "notes/result.md"],
+      author: "codex",
+      changes: [expect.objectContaining({ kind: "added", path: "notes/result.md" })],
+    });
+    expect(originalListFiles()).toEqual([
+      expect.objectContaining({ path: "notes/result.md" }),
+    ]);
+  });
+
+  test("does not let a VFS mutation enter an observer scan sequence", async () => {
+    writeFileSync(join(filesRoot, "external.md"), "external");
+    const observer = new D1Observer(
+      filesRoot,
+      guard as unknown as RemoteGuard,
+      state,
+      blobs,
+      sequencer,
+    );
+    const gate = guard.blockNextWrite();
+    const observation = observer.observe();
+    let mutation: Promise<Awaited<ReturnType<VfsService["command"]>>> | undefined;
+    try {
+      await gate.entered;
+      mutation = vfs.command(hostCaller(guard), "tee -- managed.md", {
+        stdin: { encoding: "utf8", data: "managed" },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(readFileMaybe(join(filesRoot, "managed.md"))).toBeNull();
+      expect(guard.writeAttempts).toBe(1);
+    } finally {
+      gate.release();
+    }
+
+    await observation;
+    expect((await mutation)?.success).toBe(true);
+    expect(guard.writeAttempts).toBe(2);
+    expect(guard.events).toHaveLength(2);
+    expect(guard.events[0]!.payload).toEqual({
+      changes: [expect.objectContaining({ kind: "added", path: "external.md" })],
+    });
+    expect(guard.events[1]!.payload).toMatchObject({
+      argv: ["tee", "--", "managed.md"],
+      changes: [expect.objectContaining({ kind: "added", path: "managed.md" })],
+    });
+  });
+
   test("preflights every operand and rejects unsupported filesystem entries", async () => {
     mkdirSync(join(filesRoot, "ok"));
     mkdirSync(join(filesRoot, "blocked"));
@@ -161,7 +267,7 @@ describe("D1 VFS", () => {
     mkdirSync(join(filesRoot, "from/sub"), { recursive: true });
     writeFileSync(join(filesRoot, "from/a.md"), "a");
     writeFileSync(join(filesRoot, "from/sub/b.bin"), Buffer.from([0, 1, 2]));
-    const observer = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs);
+    const observer = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs, sequencer);
     await observer.observe();
     guard.events.length = 0;
 
@@ -215,7 +321,7 @@ describe("D1 VFS", () => {
     expect(state.listFiles().map((file) => file.path)).toEqual(["public/a.md"]);
 
     state.removeExclusion("private/");
-    const observer = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs);
+    const observer = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs, sequencer);
     await observer.observe();
     expect((guard.events.at(-1)!.payload as { changes: unknown[] }).changes).toEqual([
       expect.objectContaining({ kind: "added", path: "private/a.md" }),
@@ -303,7 +409,7 @@ describe("D1 VFS", () => {
 
   test("records external renames as delete plus add and ignores no-op mutations", async () => {
     writeFileSync(join(filesRoot, "before.md"), "same bytes");
-    const observer = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs);
+    const observer = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs, sequencer);
     await observer.observe();
     guard.events.length = 0;
     renameSync(join(filesRoot, "before.md"), join(filesRoot, "after.md"));
@@ -322,7 +428,7 @@ describe("D1 VFS", () => {
 
   test("records first scan, offline edits, and a coalesced atomic-save result", async () => {
     writeFileSync(join(filesRoot, "journal.md"), "first");
-    const first = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs);
+    const first = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs, sequencer);
     await first.start();
     await first.stop();
     expect((guard.events[0]!.payload as { changes: unknown[] }).changes).toEqual([
@@ -330,7 +436,7 @@ describe("D1 VFS", () => {
     ]);
 
     writeFileSync(join(filesRoot, "journal.md"), "offline");
-    const live = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs);
+    const live = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs, sequencer);
     await live.start();
     expect((guard.events[1]!.payload as { changes: unknown[] }).changes).toEqual([
       expect.objectContaining({ kind: "modified", path: "journal.md" }),
@@ -369,7 +475,7 @@ describe("D1 VFS", () => {
     expect(readFileSync(join(filesRoot, "recovery/d0-failed.md"), "utf8")).toBe("physical effect");
     expect(state.cursor()).toBeNull();
 
-    const firstObserver = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs);
+    const firstObserver = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs, sequencer);
     await firstObserver.start();
     await firstObserver.stop();
     expect(guard.events).toHaveLength(1);
@@ -393,7 +499,7 @@ describe("D1 VFS", () => {
     expect(state.listFiles().map((file) => file.path)).toEqual(["recovery/d0-failed.md"]);
     writeFileSync(join(filesRoot, "recovery/checkpoint-failed.md"), "offline edit after durable D0");
 
-    const secondObserver = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs);
+    const secondObserver = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs, sequencer);
     await secondObserver.start();
     await secondObserver.stop();
     expect(guard.events).toHaveLength(3);
