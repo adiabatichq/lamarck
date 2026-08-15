@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
 import {
   assertSafeD1Parents,
   d1PathsConflict,
@@ -15,6 +16,7 @@ import {
   cp,
   lstat,
   mkdir,
+  readFile,
   readdir,
   rename,
   rm,
@@ -22,6 +24,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { pipeline } from "node:stream/promises";
 import type { VfsCommandWireOptions, VfsCommandWireResult } from "@lamarck/system/protocol";
 import { ContentBlobStore } from "./blob-store";
 import { D1ObserverState } from "./d1-observer-state";
@@ -37,6 +40,7 @@ import {
   type D1FileSnapshot,
 } from "./filesystem-changes";
 import type { RemoteGuard } from "./remote-guard";
+import { VfsUploadStore, type ConsumedVfsUpload } from "./vfs-uploads";
 
 export interface VfsCaller {
   guard: RemoteGuard;
@@ -57,6 +61,7 @@ interface MutationPlan {
 }
 
 export const MAX_VFS_OPEN_HANDLES_PER_WORKLOAD = 256;
+const MAX_CAPTURED_UPLOADED_STDIN_BYTES = 15 * 1024 * 1024 - 1024;
 
 export interface VfsOpenContent {
   bytes: Buffer;
@@ -67,6 +72,7 @@ export class VfsService {
   readonly filesRoot: string;
   private readonly openHandles = new Map<string, OpenHandle>();
   private readonly openHandleTokensByWorkload = new Map<string, Set<string>>();
+  private readonly uploads: VfsUploadStore;
 
   constructor(
     workspacePath: string,
@@ -75,10 +81,12 @@ export class VfsService {
     private readonly sequencer: D1Sequencer,
   ) {
     this.filesRoot = join(workspacePath, "files");
+    this.uploads = new VfsUploadStore(workspacePath);
   }
 
   async initialize(): Promise<void> {
     await mkdir(this.filesRoot, { recursive: true });
+    await this.uploads.initialize();
   }
 
   async command(
@@ -87,28 +95,81 @@ export class VfsService {
     options: VfsCommandWireOptions = {},
   ): Promise<VfsCommandWireResult> {
     let parsed: ParsedVfsCommand;
+    let uploadedStdin: ConsumedVfsUpload | null = null;
     try {
-      parsed = parseVfsCommand(commandText);
       validateOptions(options);
+      uploadedStdin = this.consumeUploadedStdin(caller, options.stdin);
+      parsed = parseVfsCommand(commandText);
     } catch (error) {
+      if (uploadedStdin) this.uploads.cleanupConsumed(uploadedStdin);
       return result(1, Buffer.alloc(0), Buffer.from(`${errorMessage(error)}\n`));
     }
 
-    if (parsed.name === "import" || parsed.name === "export") {
-      if (!caller.trustedHost) {
-        return result(1, Buffer.alloc(0), Buffer.from(`${parsed.name} is available only to trusted Host tools\n`));
-      }
-    }
-
-    if (isMutating(parsed.name)) {
-      return this.sequencer.run(() => this.executeMutation(caller, parsed, options));
-    }
     try {
-      const output = await this.executeRead(parsed);
-      return result(0, options.stdout === "ignore" ? Buffer.alloc(0) : output, Buffer.alloc(0));
-    } catch (error) {
-      return result(1, Buffer.alloc(0), Buffer.from(`${errorMessage(error)}\n`));
+      if (
+        uploadedStdin
+        && parsed.name === "tee"
+        && options.stdout !== "ignore"
+        && uploadedStdin.byteLength > MAX_CAPTURED_UPLOADED_STDIN_BYTES
+      ) {
+        return result(1, Buffer.alloc(0), Buffer.from(
+          "Streamed tee stdin exceeds the captured-response limit; set stdout to ignore\n",
+        ));
+      }
+
+      if (parsed.name === "import" || parsed.name === "export") {
+        if (!caller.trustedHost) {
+          return result(1, Buffer.alloc(0), Buffer.from(`${parsed.name} is available only to trusted Host tools\n`));
+        }
+      }
+
+      if (isMutating(parsed.name)) {
+        return await this.sequencer.run(() => this.executeMutation(
+          caller,
+          parsed,
+          options,
+          uploadedStdin,
+        ));
+      }
+      try {
+        const output = await this.executeRead(parsed);
+        return result(0, options.stdout === "ignore" ? Buffer.alloc(0) : output, Buffer.alloc(0));
+      } catch (error) {
+        return result(1, Buffer.alloc(0), Buffer.from(`${errorMessage(error)}\n`));
+      }
+    } finally {
+      if (uploadedStdin) this.uploads.cleanupConsumed(uploadedStdin);
     }
+  }
+
+  async beginUpload(caller: VfsCaller): Promise<string> {
+    return this.uploads.begin(requireWorkload(caller, "system.vfs upload"));
+  }
+
+  async appendUpload(
+    caller: VfsCaller,
+    token: string,
+    index: number,
+    dataBase64: string,
+  ): Promise<void> {
+    await this.uploads.append(
+      requireWorkload(caller, "system.vfs upload"),
+      token,
+      index,
+      dataBase64,
+    );
+  }
+
+  completeUpload(caller: VfsCaller, token: string): void {
+    this.uploads.complete(requireWorkload(caller, "system.vfs upload"), token);
+  }
+
+  abortUpload(caller: VfsCaller, token: string): void {
+    this.uploads.abort(requireWorkload(caller, "system.vfs upload"), token);
+  }
+
+  cleanupExpiredUploads(now = Date.now()): number {
+    return this.uploads.expire(now);
   }
 
   async open(caller: VfsCaller, path: string, origin: string): Promise<string> {
@@ -131,10 +192,10 @@ export class VfsService {
 
   closeWorkload(workloadId: string): number {
     const tokens = this.openHandleTokensByWorkload.get(workloadId);
-    if (!tokens) return 0;
-    for (const token of tokens) this.openHandles.delete(token);
-    this.openHandleTokensByWorkload.delete(workloadId);
-    return tokens.size;
+    for (const token of tokens ?? []) this.openHandles.delete(token);
+    if (tokens) this.openHandleTokensByWorkload.delete(workloadId);
+    this.uploads.closeWorkload(workloadId);
+    return tokens?.size ?? 0;
   }
 
   async resolveOpen(token: string, workloadIsOpen: (id: string) => boolean): Promise<VfsOpenContent | null> {
@@ -167,10 +228,22 @@ export class VfsService {
     if (workloadTokens?.size === 0) this.openHandleTokensByWorkload.delete(handle.workloadId);
   }
 
+  private consumeUploadedStdin(
+    caller: VfsCaller,
+    stdin: VfsCommandWireOptions["stdin"],
+  ): ConsumedVfsUpload | null {
+    if (!stdin || !("uploadToken" in stdin)) return null;
+    return this.uploads.consume(
+      requireWorkload(caller, "system.vfs upload"),
+      stdin.uploadToken,
+    );
+  }
+
   private async executeMutation(
     caller: VfsCaller,
     parsed: ParsedVfsCommand,
     options: VfsCommandWireOptions,
+    uploadedStdin: ConsumedVfsUpload | null,
   ): Promise<VfsCommandWireResult> {
     let stdout: Buffer = Buffer.alloc(0);
     let stderr: Buffer = Buffer.alloc(0);
@@ -183,8 +256,13 @@ export class VfsService {
       plan = await this.preflight(caller, parsed);
       before = await this.scanRecordedFiles(plan.snapshotRoots, new Map());
       snapshotTaken = true;
-      const stdin = decodeStdin(options.stdin);
-      const execution = await this.performMutation(parsed, stdin, plan.mappings);
+      const stdin = uploadedStdin ?? decodeInlineStdin(options.stdin);
+      const execution = await this.performMutation(
+        parsed,
+        stdin,
+        plan.mappings,
+        options.stdout !== "ignore",
+      );
       stdout = execution.stdout;
     } catch (error) {
       exitCode = 1;
@@ -355,17 +433,32 @@ export class VfsService {
 
   private async performMutation(
     parsed: ParsedVfsCommand,
-    stdin: Buffer,
+    stdin: Buffer | ConsumedVfsUpload,
     mappings: readonly { from: string; path: string }[],
+    captureStdout: boolean,
   ): Promise<{ stdout: Buffer; moves: Array<{ from: string; path: string }> }> {
     const force = parsed.flags.has("f");
     if (parsed.name === "tee") {
-      for (const path of parsed.operands) {
-        await writeFile(resolveD1Path(this.filesRoot, path), stdin, {
-          flag: parsed.flags.has("a") ? "a" : "w",
-        });
+      if (Buffer.isBuffer(stdin)) {
+        for (const path of parsed.operands) {
+          await writeFile(resolveD1Path(this.filesRoot, path), stdin, {
+            flag: parsed.flags.has("a") ? "a" : "w",
+          });
+        }
+        return { stdout: stdin, moves: [] };
       }
-      return { stdout: stdin, moves: [] };
+      for (const path of parsed.operands) {
+        await pipeline(
+          createReadStream(stdin.path),
+          createWriteStream(resolveD1Path(this.filesRoot, path), {
+            flags: parsed.flags.has("a") ? "a" : "w",
+          }),
+        );
+      }
+      return {
+        stdout: captureStdout ? await readFile(stdin.path) : Buffer.alloc(0),
+        moves: [],
+      };
     }
     if (parsed.name === "mkdir") {
       for (const path of parsed.operands) {
@@ -438,16 +531,27 @@ function isMutating(name: ParsedVfsCommand["name"]): boolean {
 
 function validateOptions(options: VfsCommandWireOptions): void {
   validateVfsMetadata(options);
-  if (options.stdin !== undefined && (
-    !options.stdin
-    || typeof options.stdin !== "object"
-    || (options.stdin.encoding !== "utf8" && options.stdin.encoding !== "base64")
+  if (options.stdin === undefined) return;
+  if (!options.stdin || typeof options.stdin !== "object") {
+    throw new Error("VFS stdin encoding is invalid");
+  }
+  if ("uploadToken" in options.stdin) {
+    if (
+      typeof options.stdin.uploadToken !== "string"
+      || options.stdin.uploadToken.length < 16
+      || options.stdin.uploadToken.length > 200
+    ) throw new Error("VFS upload token is invalid");
+    return;
+  }
+  if (
+    (options.stdin.encoding !== "utf8" && options.stdin.encoding !== "base64")
     || typeof options.stdin.data !== "string"
-  )) throw new Error("VFS stdin encoding is invalid");
+  ) throw new Error("VFS stdin encoding is invalid");
 }
 
-function decodeStdin(stdin: VfsCommandWireOptions["stdin"]): Buffer {
+function decodeInlineStdin(stdin: VfsCommandWireOptions["stdin"]): Buffer {
   if (!stdin) return Buffer.alloc(0);
+  if ("uploadToken" in stdin) throw new Error("VFS upload stdin was not consumed");
   if (stdin.encoding === "utf8") return Buffer.from(stdin.data, "utf8");
   if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(stdin.data)) {
     throw new Error("VFS stdin is not canonical base64");
@@ -455,6 +559,11 @@ function decodeStdin(stdin: VfsCommandWireOptions["stdin"]): Buffer {
   const bytes = Buffer.from(stdin.data, "base64");
   if (bytes.toString("base64") !== stdin.data) throw new Error("VFS stdin is not canonical base64");
   return bytes;
+}
+
+function requireWorkload(caller: VfsCaller, operation: string): string {
+  if (!caller.workloadId) throw new Error(`${operation} requires a bound workload`);
+  return caller.workloadId;
 }
 
 function result(exitCode: number, stdout: Buffer, stderr: Buffer): VfsCommandWireResult {

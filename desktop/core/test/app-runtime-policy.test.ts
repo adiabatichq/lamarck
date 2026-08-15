@@ -55,6 +55,10 @@ describe("App runtime policy", () => {
       ["/api/mutate", "POST"],
       ["/api/transaction", "POST"],
       ["/api/events", "POST"],
+      ["/api/vfs/upload/begin", "POST"],
+      ["/api/vfs/upload/chunk", "POST"],
+      ["/api/vfs/upload/complete", "POST"],
+      ["/api/vfs/upload/abort", "POST"],
       ["/api/vfs/command", "POST"],
       ["/api/vfs/open", "POST"],
     ];

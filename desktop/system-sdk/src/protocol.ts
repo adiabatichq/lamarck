@@ -58,7 +58,7 @@ export interface WriteEventInput {
 }
 
 export interface VfsCommandWireOptions {
-  stdin?: { encoding: "utf8" | "base64"; data: string };
+  stdin?: { encoding: "utf8" | "base64"; data: string } | { uploadToken: string };
   stdout?: "capture" | "ignore";
   author?: string;
 }
@@ -91,6 +91,22 @@ export interface SystemOperationMap {
     input: { command: string; options?: VfsCommandWireOptions };
     output: VfsCommandWireResult;
   };
+  "vfs.upload.begin": {
+    input: Record<string, never>;
+    output: { token: string };
+  };
+  "vfs.upload.chunk": {
+    input: { token: string; index: number; dataBase64: string };
+    output: { ok: true };
+  };
+  "vfs.upload.complete": {
+    input: { token: string };
+    output: { ok: true };
+  };
+  "vfs.upload.abort": {
+    input: { token: string };
+    output: { ok: true };
+  };
   "vfs.open": {
     input: { path: string };
     output: { url: string };
@@ -109,6 +125,10 @@ export const SYSTEM_OPERATIONS = Object.freeze([
   "vfs.command",
   "vfs.open",
   "writeEvent",
+  "vfs.upload.begin",
+  "vfs.upload.chunk",
+  "vfs.upload.complete",
+  "vfs.upload.abort",
 ] as const satisfies readonly (keyof SystemOperationMap)[]);
 
 export type SystemOperation = (typeof SYSTEM_OPERATIONS)[number];

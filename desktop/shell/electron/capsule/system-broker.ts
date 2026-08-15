@@ -498,6 +498,29 @@ function mapCoreRequest(operation: string, input: unknown): CoreRequest {
       const body = { statements: expectJson(value.statements, "transaction.statements") };
       return { method: "POST", path: "/api/transaction", body, sizeValue: body };
     }
+    case "vfs.upload.begin": {
+      return { method: "POST", path: "/api/vfs/upload/begin", body: {}, sizeValue: {} };
+    }
+    case "vfs.upload.chunk": {
+      const body = {
+        token: expectString(value.token, "vfs.upload.chunk.token"),
+        index: expectNonNegativeInteger(value.index, "vfs.upload.chunk.index"),
+        dataBase64: expectString(value.dataBase64, "vfs.upload.chunk.dataBase64"),
+      };
+      return { method: "POST", path: "/api/vfs/upload/chunk", body, sizeValue: body };
+    }
+    case "vfs.upload.complete":
+    case "vfs.upload.abort": {
+      const body = { token: expectString(value.token, `${operation}.token`) };
+      return {
+        method: "POST",
+        path: operation === "vfs.upload.complete"
+          ? "/api/vfs/upload/complete"
+          : "/api/vfs/upload/abort",
+        body,
+        sizeValue: body,
+      };
+    }
     case "vfs.command": {
       const body: Record<string, JsonValue> = {
         command: expectString(value.command, "vfs.command.command"),
@@ -530,6 +553,13 @@ function mapCoreRequest(operation: string, input: unknown): CoreRequest {
 
 function expectRecord(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) invalid("System SDK operation input must be an object");
+  return value;
+}
+
+function expectNonNegativeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    invalid(`${label} must be a non-negative integer`);
+  }
   return value;
 }
 

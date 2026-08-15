@@ -37,6 +37,9 @@ export interface System {
   writeEvent(event: WriteEventInput): Promise<{ ok: true; id: string }>;
 }
 
+const VFS_INLINE_STDIN_BYTES = 4 * 1024 * 1024;
+const VFS_UPLOAD_CHUNK_BYTES = 512 * 1024;
+
 export function createSystem(invoke: SystemInvoke): System {
   return Object.freeze({
     query: (sql: string, params?: SqlParams) => invoke(
@@ -51,11 +54,10 @@ export function createSystem(invoke: SystemInvoke): System {
     transaction: (statements: SqlStatement[]) => invoke("transaction", { statements }),
     vfs: Object.freeze({
       command: async (command: string, options?: VfsCommandOptions) => {
-        const wireOptions = await encodeVfsOptions(options);
-        const result = await invoke(
-          "vfs.command",
-          wireOptions === undefined ? { command } : { command, options: wireOptions },
-        );
+        const result = options?.stdin !== undefined
+          && vfsStdinByteLength(options.stdin) > VFS_INLINE_STDIN_BYTES
+          ? await invokeUploadedVfsCommand(invoke, command, options, options.stdin)
+          : await invokeInlineVfsCommand(invoke, command, options);
         return {
           success: result.success,
           exitCode: result.exitCode,
@@ -67,6 +69,48 @@ export function createSystem(invoke: SystemInvoke): System {
     }),
     writeEvent: (event: WriteEventInput) => invoke("writeEvent", event),
   });
+}
+
+async function invokeInlineVfsCommand(
+  invoke: SystemInvoke,
+  command: string,
+  options: VfsCommandOptions | undefined,
+) {
+  const wireOptions = await encodeVfsOptions(options);
+  return invoke(
+    "vfs.command",
+    wireOptions === undefined ? { command } : { command, options: wireOptions },
+  );
+}
+
+async function invokeUploadedVfsCommand(
+  invoke: SystemInvoke,
+  command: string,
+  options: VfsCommandOptions,
+  stdin: VfsStdin,
+) {
+  const { token } = await invoke("vfs.upload.begin", {});
+  let abortRequired = true;
+  try {
+    let index = 0;
+    for await (const chunk of vfsStdinChunks(stdin)) {
+      await invoke("vfs.upload.chunk", {
+        token,
+        index,
+        dataBase64: encodeBase64(chunk),
+      });
+      index += 1;
+    }
+    await invoke("vfs.upload.complete", { token });
+    const wireOptions: VfsCommandWireOptions = { stdin: { uploadToken: token } };
+    if (options.stdout !== undefined) wireOptions.stdout = options.stdout;
+    if (options.author !== undefined) wireOptions.author = options.author;
+    const result = await invoke("vfs.command", { command, options: wireOptions });
+    abortRequired = false;
+    return result;
+  } finally {
+    if (abortRequired) await invoke("vfs.upload.abort", { token }).catch(() => {});
+  }
 }
 
 async function encodeVfsOptions(options: VfsCommandOptions | undefined): Promise<VfsCommandWireOptions | undefined> {
@@ -104,6 +148,53 @@ async function readBlobStream(blob: Blob): Promise<Uint8Array> {
   for (const chunk of chunks) {
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function vfsStdinByteLength(stdin: VfsStdin): number {
+  if (typeof stdin === "string") return utf8ByteLength(stdin);
+  if (stdin instanceof Blob) return stdin.size;
+  return stdin.byteLength;
+}
+
+async function* vfsStdinChunks(stdin: VfsStdin): AsyncGenerator<Uint8Array> {
+  if (typeof stdin === "string" || stdin instanceof Blob) {
+    const blob = typeof stdin === "string" ? new Blob([stdin]) : stdin;
+    const reader = blob.stream().getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        for (let offset = 0; offset < value.byteLength; offset += VFS_UPLOAD_CHUNK_BYTES) {
+          yield value.subarray(offset, offset + VFS_UPLOAD_CHUNK_BYTES);
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  const bytes = stdin instanceof Uint8Array ? stdin : new Uint8Array(stdin);
+  for (let offset = 0; offset < bytes.byteLength; offset += VFS_UPLOAD_CHUNK_BYTES) {
+    yield bytes.subarray(offset, offset + VFS_UPLOAD_CHUNK_BYTES);
+  }
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 3;
+      }
+    } else bytes += 3;
   }
   return bytes;
 }

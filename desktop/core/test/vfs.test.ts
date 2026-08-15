@@ -3,16 +3,18 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
   symlinkSync,
+  statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { d1PathsConflict, parseVfsCommand, validateD1Path } from "@lamarck/system/internal/vfs";
 import { ContentBlobStore } from "../src/blob-store";
 import { D1Observer } from "../src/d1-observer";
@@ -163,6 +165,202 @@ describe("D1 VFS", () => {
     ]);
     expect((guard.events[0]!.payload as Record<string, JsonValue>).author).toBe("codex");
   });
+
+  test("streams stdin beyond the request limit and records only the consumed VFS effect", async () => {
+    const caller = workloadCaller(guard, "channel-large", ["large.bin"]);
+    const payload = Buffer.alloc(20 * 1024 * 1024 + 123, 0x5a);
+    const token = await uploadBytes(vfs, caller, payload);
+
+    expect(guard.events).toHaveLength(0);
+    expect(readdirSync(uploadRoot(workspace))).toHaveLength(1);
+
+    const written = await vfs.command(caller, "tee -- large.bin", {
+      stdin: { uploadToken: token },
+      stdout: "ignore",
+      author: "codex",
+    });
+
+    expect(written).toMatchObject({ success: true, stdoutBase64: "" });
+    expect(statSync(join(filesRoot, "large.bin")).size).toBe(payload.byteLength);
+    expect(readFileSync(join(filesRoot, "large.bin")).equals(payload)).toBe(true);
+    expect(guard.events).toHaveLength(1);
+    expect(guard.events[0]!.payload).toMatchObject({
+      argv: ["tee", "--", "large.bin"],
+      author: "codex",
+      changes: [expect.objectContaining({ kind: "added", path: "large.bin" })],
+    });
+    expect(readdirSync(uploadRoot(workspace))).toEqual([]);
+  }, 20_000);
+
+  test("gives uploaded stdin the same VFS and D0 semantics as inline stdin", async () => {
+    const caller = workloadCaller(
+      guard,
+      "channel-semantics",
+      ["inline.bin", "uploaded.bin", "reused.bin"],
+    );
+    const bytes = Buffer.from([0, 1, 2, 255]);
+    const inline = await vfs.command(caller, "tee -- inline.bin", {
+      stdin: { encoding: "base64", data: bytes.toString("base64") },
+    });
+    const token = await uploadBytes(vfs, caller, bytes);
+    expect(guard.events).toHaveLength(1);
+
+    const uploaded = await vfs.command(caller, "tee -- uploaded.bin", {
+      stdin: { uploadToken: token },
+    });
+
+    expect(uploaded).toEqual(inline);
+    const inlineChange = (guard.events[0]!.payload as {
+      changes: Array<{ kind: string; digest: string }>;
+    }).changes[0]!;
+    const uploadedChange = (guard.events[1]!.payload as {
+      changes: Array<{ kind: string; digest: string }>;
+    }).changes[0]!;
+    expect(uploadedChange).toMatchObject({
+      kind: inlineChange.kind,
+      digest: inlineChange.digest,
+    });
+    const reused = await vfs.command(caller, "tee -- reused.bin", {
+      stdin: { uploadToken: token },
+      stdout: "ignore",
+    });
+    expect(reused.success).toBe(false);
+    expect(readFileMaybe(join(filesRoot, "reused.bin"))).toBeNull();
+    expect(guard.events).toHaveLength(2);
+    expect(readFileSync(join(filesRoot, "uploaded.bin"))).toEqual(bytes);
+    expect(readdirSync(uploadRoot(workspace))).toEqual([]);
+  });
+
+  test("binds upload tokens to workloads and cleans every upload lifecycle", async () => {
+    const callerA = workloadCaller(guard, "channel-a", []);
+    const callerB = workloadCaller(guard, "channel-b", []);
+
+    const crossWorkload = await uploadBytes(vfs, callerA, Buffer.from("owned"));
+    const rejected = await vfs.command(callerB, "tee -- stolen.bin", {
+      stdin: { uploadToken: crossWorkload },
+      stdout: "ignore",
+    });
+    expect(rejected.success).toBe(false);
+    expect(Buffer.from(rejected.stderrBase64, "base64").toString()).toContain("not available");
+    vfs.abortUpload(callerA, crossWorkload);
+
+    const aborted = await vfs.beginUpload(callerA);
+    await vfs.appendUpload(callerA, aborted, 0, Buffer.from("abort").toString("base64"));
+    vfs.abortUpload(callerA, aborted);
+
+    const failed = await vfs.beginUpload(callerA);
+    await expect(vfs.appendUpload(callerA, failed, 0, "not base64"))
+      .rejects.toThrow("canonical base64");
+
+    const expired = await uploadBytes(vfs, callerA, Buffer.from("expire"));
+    expect(expired).toBeTruthy();
+    expect(vfs.cleanupExpiredUploads(Number.MAX_SAFE_INTEGER)).toBe(1);
+
+    const denied = await uploadBytes(vfs, callerA, Buffer.from("denied"));
+    const deniedResult = await vfs.command(callerA, "tee -- denied.bin", {
+      stdin: { uploadToken: denied },
+      stdout: "ignore",
+    });
+    expect(deniedResult.success).toBe(false);
+    expect(readFileMaybe(join(filesRoot, "denied.bin"))).toBeNull();
+
+    for (let index = 0; index < 4; index += 1) await vfs.beginUpload(callerA);
+    await expect(vfs.beginUpload(callerA)).rejects.toThrow("Too many concurrent");
+    expect(vfs.closeWorkload("channel-a")).toBe(0);
+    expect(readdirSync(uploadRoot(workspace))).toEqual([]);
+    expect(guard.events).toHaveLength(0);
+  });
+
+  test("transfers a consumed upload exclusively to the running command", async () => {
+    const caller = workloadCaller(guard, "channel-transfer", ["owned.bin"]);
+    const bytes = Buffer.from("command-owned upload");
+    const token = await uploadBytes(vfs, caller, bytes);
+    const temporaryPath = join(uploadRoot(workspace), token);
+    const gate = guard.blockNextWrite();
+    const command = vfs.command(caller, "tee -- owned.bin", {
+      stdin: { uploadToken: token },
+      stdout: "ignore",
+    });
+
+    try {
+      await gate.entered;
+      expect(readFileSync(temporaryPath)).toEqual(bytes);
+      expect(() => vfs.abortUpload(caller, token)).toThrow("not available");
+      expect(vfs.cleanupExpiredUploads(Number.MAX_SAFE_INTEGER)).toBe(0);
+      expect(vfs.closeWorkload("channel-transfer")).toBe(0);
+      expect(readFileSync(temporaryPath)).toEqual(bytes);
+    } finally {
+      gate.release();
+    }
+
+    expect(await command).toMatchObject({ success: true, stdoutBase64: "" });
+    expect(readFileMaybe(temporaryPath)).toBeNull();
+    expect(readFileSync(join(filesRoot, "owned.bin"))).toEqual(bytes);
+    expect(guard.events).toHaveLength(1);
+    expect(guard.events[0]!.payload).toMatchObject({
+      argv: ["tee", "--", "owned.bin"],
+      changes: [expect.objectContaining({ kind: "added", path: "owned.bin" })],
+    });
+  });
+
+  test("does not replace a successful command when final upload cleanup fails", async () => {
+    const caller = workloadCaller(guard, "channel-cleanup", ["cleanup.bin"]);
+    const bytes = Buffer.from("durable command result");
+    const token = await uploadBytes(vfs, caller, bytes);
+    const temporaryPath = join(uploadRoot(workspace), token);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const gate = guard.blockNextWrite();
+    const command = vfs.command(caller, "tee -- cleanup.bin", {
+      stdin: { uploadToken: token },
+      stdout: "ignore",
+      author: "codex",
+    });
+
+    try {
+      await gate.entered;
+      rmSync(temporaryPath);
+      mkdirSync(temporaryPath);
+    } finally {
+      gate.release();
+    }
+
+    try {
+      expect(await command).toMatchObject({ success: true, stdoutBase64: "" });
+      expect(readFileSync(join(filesRoot, "cleanup.bin"))).toEqual(bytes);
+      expect(guard.events).toHaveLength(1);
+      expect(guard.events[0]!.payload).toMatchObject({
+        argv: ["tee", "--", "cleanup.bin"],
+        author: "codex",
+        changes: [expect.objectContaining({ kind: "added", path: "cleanup.bin" })],
+      });
+      expect(statSync(temporaryPath).isDirectory()).toBe(true);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(String(warning.mock.calls[0]![0])).toContain("consumed upload cleanup failed");
+      expect(String(warning.mock.calls[0]![0]).length).toBeLessThan(600);
+    } finally {
+      warning.mockRestore();
+    }
+
+    await vfs.initialize();
+    expect(readdirSync(uploadRoot(workspace))).toEqual([]);
+  });
+
+  test("rejects oversized captured tee stdout before filesystem mutation", async () => {
+    const caller = workloadCaller(guard, "channel-capture", ["captured.bin"]);
+    const token = await uploadBytes(vfs, caller, Buffer.alloc(16 * 1024 * 1024, 0x31));
+
+    const rejected = await vfs.command(caller, "tee -- captured.bin", {
+      stdin: { uploadToken: token },
+    });
+
+    expect(rejected.success).toBe(false);
+    expect(Buffer.from(rejected.stderrBase64, "base64").toString()).toContain(
+      "set stdout to ignore",
+    );
+    expect(readFileMaybe(join(filesRoot, "captured.bin"))).toBeNull();
+    expect(guard.events).toHaveLength(0);
+    expect(readdirSync(uploadRoot(workspace))).toEqual([]);
+  }, 20_000);
 
   test("keeps unrelated external edits out of authored VFS evidence", async () => {
     mkdirSync(join(filesRoot, "notes"));
@@ -695,6 +893,38 @@ function hostCaller(guard: EventGuard): VfsCaller {
 
 function appCaller(guard: EventGuard, fileGrants: string[]): VfsCaller {
   return { guard: guard as unknown as RemoteGuard, fileGrants, trustedHost: false };
+}
+
+function workloadCaller(
+  guard: EventGuard,
+  workloadId: string,
+  fileGrants: string[],
+): VfsCaller {
+  return { ...appCaller(guard, fileGrants), workloadId };
+}
+
+async function uploadBytes(
+  vfs: VfsService,
+  caller: VfsCaller,
+  bytes: Uint8Array,
+): Promise<string> {
+  const token = await vfs.beginUpload(caller);
+  let index = 0;
+  for (let offset = 0; offset < bytes.byteLength; offset += 512 * 1024) {
+    await vfs.appendUpload(
+      caller,
+      token,
+      index,
+      Buffer.from(bytes.subarray(offset, offset + 512 * 1024)).toString("base64"),
+    );
+    index += 1;
+  }
+  vfs.completeUpload(caller, token);
+  return token;
+}
+
+function uploadRoot(workspace: string): string {
+  return join(workspace, ".lamarck", "tmp", "vfs-uploads");
 }
 
 function readFileMaybe(path: string): Buffer | null {

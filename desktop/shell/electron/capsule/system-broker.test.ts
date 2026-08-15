@@ -53,6 +53,10 @@ describe("SystemBroker", () => {
       "vfs.command",
       "vfs.open",
       "writeEvent",
+      "vfs.upload.begin",
+      "vfs.upload.chunk",
+      "vfs.upload.complete",
+      "vfs.upload.abort",
     ]);
     const fetchImpl = vi.fn<typeof fetch>();
     const { broker } = createBroker(fetchImpl);
@@ -114,6 +118,80 @@ describe("SystemBroker", () => {
       { sql: "SELECT 1" },
       { command: "ls" },
     ]);
+  });
+
+  test("routes only private VFS upload operations without changing other request limits", async () => {
+    const requests: Array<{ path: string; bytes: number }> = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      requests.push({
+        path: new URL(String(input)).pathname,
+        bytes: Buffer.byteLength(String(init?.body ?? ""), "utf8"),
+      });
+      if (String(input).endsWith("/api/vfs/upload/begin")) {
+        return jsonResponse({ token: "opaque-upload-token" });
+      }
+      if (String(input).endsWith("/api/vfs/command")) {
+        return jsonResponse({ success: true, exitCode: 0, stdoutBase64: "", stderrBase64: "" });
+      }
+      if (String(input).endsWith("/api/vfs/open")) return jsonResponse({ url: "http://core/open" });
+      if (String(input).endsWith("/api/content-ref/resolve")) {
+        return jsonResponse({ status: "missing", digest: "sha256:x" });
+      }
+      if (String(input).endsWith("/api/query")) return jsonResponse({ rows: [] });
+      if (String(input).endsWith("/api/mutate")) {
+        return jsonResponse({ rows: [], changes: 0, lastInsertRowid: 0, auditEventIds: [] });
+      }
+      if (String(input).endsWith("/api/transaction")) return jsonResponse([]);
+      return jsonResponse({ ok: true, id: "event-1" });
+    });
+    const { broker } = createBroker(fetchImpl, { maxRequestBytes: 1024 });
+    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+
+    const begun = await broker.invoke(1, "vfs.upload.begin", {});
+    await broker.invoke(1, "vfs.upload.chunk", {
+      token: begun.token,
+      index: 0,
+      dataBase64: Buffer.alloc(256, 1).toString("base64"),
+    });
+    await broker.invoke(1, "vfs.upload.complete", { token: begun.token });
+    await broker.invoke(1, "vfs.command", {
+      command: "tee -- result.bin",
+      options: { stdin: { uploadToken: begun.token }, stdout: "ignore" },
+    });
+    await broker.invoke(1, "vfs.upload.abort", { token: begun.token });
+    await broker.invoke(1, "query", { sql: "SELECT 1" });
+    await broker.invoke(1, "mutate", { sql: "DELETE FROM x" });
+    await broker.invoke(1, "transaction", { statements: [{ sql: "SELECT 1" }] });
+    await broker.invoke(1, "resolveContentRef", {
+      ref: {
+        kind: "content-blob",
+        version: 1,
+        digest: "sha256:x",
+        mediaType: "application/json",
+        encoding: "gzip",
+      },
+    });
+    await broker.invoke(1, "vfs.open", { path: "result.bin" });
+    await broker.invoke(1, "writeEvent", { type: "test", startedAt: 1, payload: {} });
+
+    expect(requests.map((request) => request.path)).toEqual([
+      "/api/vfs/upload/begin",
+      "/api/vfs/upload/chunk",
+      "/api/vfs/upload/complete",
+      "/api/vfs/command",
+      "/api/vfs/upload/abort",
+      "/api/query",
+      "/api/mutate",
+      "/api/transaction",
+      "/api/content-ref/resolve",
+      "/api/vfs/open",
+      "/api/events",
+    ]);
+    expect(Math.max(...requests.map((request) => request.bytes))).toBeLessThan(1024);
+
+    await expect(broker.invoke(1, "query", { sql: "x".repeat(2_000) }))
+      .rejects.toMatchObject({ code: "request_too_large" });
+    expect(fetchImpl).toHaveBeenCalledTimes(requests.length);
   });
 
   test("does not expose a bound raw capability through its API or serialization", () => {

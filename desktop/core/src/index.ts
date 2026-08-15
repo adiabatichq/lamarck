@@ -758,6 +758,39 @@ const server = await serve<{ cwd: string }>({
       }
 
       // -- D1 filesystem --
+      if (path === "/api/vfs/upload/begin" && method === "POST") {
+        if (auth!.kind !== "app") return json({ error: "app workload required" }, 403);
+        return json({
+          token: await vfs.beginUpload(vfsCallerForRequest(auth!, req, requestGuardSignal)),
+        });
+      }
+
+      if (path === "/api/vfs/upload/chunk" && method === "POST") {
+        if (auth!.kind !== "app") return json({ error: "app workload required" }, 403);
+        const body = await readBody<{ token: string; index: number; dataBase64: string }>(req);
+        await vfs.appendUpload(
+          vfsCallerForRequest(auth!, req, requestGuardSignal),
+          body.token,
+          body.index,
+          body.dataBase64,
+        );
+        return json({ ok: true });
+      }
+
+      if (path === "/api/vfs/upload/complete" && method === "POST") {
+        if (auth!.kind !== "app") return json({ error: "app workload required" }, 403);
+        const body = await readBody<{ token: string }>(req);
+        vfs.completeUpload(vfsCallerForRequest(auth!, req, requestGuardSignal), body.token);
+        return json({ ok: true });
+      }
+
+      if (path === "/api/vfs/upload/abort" && method === "POST") {
+        if (auth!.kind !== "app") return json({ error: "app workload required" }, 403);
+        const body = await readBody<{ token: string }>(req);
+        vfs.abortUpload(vfsCallerForRequest(auth!, req, requestGuardSignal), body.token);
+        return json({ ok: true });
+      }
+
       if (path === "/api/vfs/command" && method === "POST") {
         const body = await readBody<{
           command: string;
