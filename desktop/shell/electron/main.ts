@@ -1970,6 +1970,7 @@ async function prepareAppViewerSurface(
     options.assertHostCurrent();
     gateway = await createViewerGateway({
       instanceId: binding.instanceId,
+      coreOrigin: coreBaseUrl(),
       originHost: appOriginHost(appId, binding.channelId),
       transport: {
         openUiStream: (instanceId) => {
@@ -2055,7 +2056,9 @@ async function prepareAppViewerSurface(
     authorityAbortMonitoring = true;
     preparedAuthoritySenderId = view.webContents.id;
     preparedAppViewerSenderIds.add(preparedAuthoritySenderId);
-    systemBroker.bindSender(view.webContents.id, binding);
+    systemBroker.bindSender(view.webContents.id, binding, {
+      registerVfsResource: (coreUrl) => gateway!.registerVfsResource(coreUrl),
+    });
     binding.assertCurrent();
     options.assertHostCurrent();
     stopResponseMonitor = await loadAppViewerDocument(

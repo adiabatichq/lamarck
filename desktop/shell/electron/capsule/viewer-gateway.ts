@@ -7,6 +7,8 @@ import { CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE } from "./backend";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const MAX_HEADER_COUNT = 128;
+const VIEWER_VFS_PATH_PREFIX = "/.lamarck/vfs/";
+const OPAQUE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
 export interface CapsuleUiStreamTransport {
   openUiStream(instanceId: string): Promise<Duplex>;
@@ -15,6 +17,7 @@ export interface CapsuleUiStreamTransport {
 export interface ViewerGatewayBinding {
   readonly viewerUrl: string;
   readonly proxyUrl: string;
+  registerVfsResource(coreUrl: string): string;
   close(): Promise<void>;
 }
 
@@ -27,11 +30,14 @@ export interface ViewerGatewayBinding {
 export async function createViewerGateway(options: {
   transport: CapsuleUiStreamTransport;
   instanceId: string;
+  coreOrigin: string;
   originHost?: string;
 }): Promise<ViewerGatewayBinding> {
   const originHost = options.originHost ?? `${randomBytes(18).toString("hex")}.localhost`;
   assertOriginHost(originHost);
+  const coreOrigin = normalizeCoreOrigin(options.coreOrigin);
   const viewerUrl = `http://${originHost}/`;
+  const vfsResources = new Map<string, string>();
   const sockets = new Set<Duplex>();
 
   const bridge = createNetServer({ pauseOnConnect: true }, (socket) => {
@@ -63,6 +69,10 @@ export async function createViewerGateway(options: {
     if (!target || !isBoundTarget(target, originHost)) {
       sendDenied(outgoing);
       incoming.resume();
+      return;
+    }
+    if (isReservedVfsPath(target.pathname)) {
+      serveViewerVfsResource(incoming, outgoing, target, vfsResources);
       return;
     }
 
@@ -109,6 +119,10 @@ export async function createViewerGateway(options: {
       browserSocket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
       return;
     }
+    if (isReservedVfsPath(target.pathname)) {
+      browserSocket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      return;
+    }
 
     const upstream = netConnect({ host: LOOPBACK_HOST, port: bridgeAddress.port });
     sockets.add(upstream);
@@ -148,9 +162,19 @@ export async function createViewerGateway(options: {
   return Object.freeze({
     viewerUrl,
     proxyUrl: `http://${LOOPBACK_HOST}:${proxyAddress.port}`,
+    registerVfsResource(coreUrl: string) {
+      if (closed) throw new Error("Viewer gateway is closed");
+      const validatedCoreUrl = validateCoreVfsResourceUrl(coreUrl, coreOrigin);
+      let token: string;
+      do token = randomBytes(32).toString("base64url");
+      while (vfsResources.has(token));
+      vfsResources.set(token, validatedCoreUrl);
+      return new URL(`${VIEWER_VFS_PATH_PREFIX}${token}`, viewerUrl).toString();
+    },
     async close() {
       if (closed) return;
       closed = true;
+      vfsResources.clear();
       await Promise.all([
         closeServer(proxy, sockets),
         closeServer(bridge, sockets),
@@ -193,6 +217,165 @@ function parseProxyTarget(rawUrl: string | undefined, host: string | undefined):
 
 function isBoundTarget(target: URL, originHost: string): boolean {
   return (target.protocol === "http:" || target.protocol === "ws:") && target.host === originHost;
+}
+
+function isReservedVfsPath(pathname: string): boolean {
+  return pathname === VIEWER_VFS_PATH_PREFIX.slice(0, -1)
+    || pathname.startsWith(VIEWER_VFS_PATH_PREFIX);
+}
+
+function serveViewerVfsResource(
+  incoming: import("node:http").IncomingMessage,
+  outgoing: import("node:http").ServerResponse,
+  target: URL,
+  resources: Map<string, string>,
+): void {
+  const method = incoming.method ?? "GET";
+  if (method !== "GET" && method !== "HEAD") {
+    incoming.resume();
+    sendVfsFailure(outgoing, 405, "VFS resource method is not allowed", method === "HEAD", {
+      allow: "GET, HEAD",
+    });
+    return;
+  }
+  const token = target.pathname.slice(VIEWER_VFS_PATH_PREFIX.length);
+  if (target.search || !OPAQUE_TOKEN_PATTERN.test(token)) {
+    incoming.resume();
+    sendVfsFailure(outgoing, 404, "VFS resource not found", method === "HEAD");
+    return;
+  }
+  const coreUrl = resources.get(token);
+  if (!coreUrl) {
+    incoming.resume();
+    sendVfsFailure(outgoing, 404, "VFS resource not found", method === "HEAD");
+    return;
+  }
+
+  incoming.resume();
+  let viewerResponseTerminated = false;
+  const terminateViewerResponse = () => {
+    if (viewerResponseTerminated) return;
+    viewerResponseTerminated = true;
+    if (!outgoing.writableEnded && !outgoing.destroyed) outgoing.destroy();
+  };
+  outgoing.once("finish", () => { viewerResponseTerminated = true; });
+  const upstream = httpRequest(coreUrl, {
+    method,
+    headers: { accept: incoming.headers.accept ?? "*/*" },
+    agent: false,
+  }, (response) => {
+    response.once("aborted", terminateViewerResponse);
+    response.once("error", terminateViewerResponse);
+    const status = response.statusCode ?? 502;
+    if (status < 200 || status > 299) {
+      if (status === 404) resources.delete(token);
+      response.resume();
+      sendVfsFailure(
+        outgoing,
+        status === 404 ? 404 : 502,
+        "VFS resource unavailable",
+        method === "HEAD",
+      );
+      return;
+    }
+    outgoing.writeHead(
+      status,
+      response.statusMessage,
+      hardenViewerResponseHeaders(viewerVfsResponseHeaders(response.headers)),
+    );
+    if (method === "HEAD") {
+      response.resume();
+      outgoing.end();
+    } else {
+      response.pipe(outgoing);
+    }
+  });
+  upstream.once("error", () => {
+    if (!outgoing.headersSent) {
+      sendVfsFailure(outgoing, 502, "VFS resource unavailable", method === "HEAD");
+    } else {
+      terminateViewerResponse();
+    }
+  });
+  outgoing.once("close", () => {
+    if (!outgoing.writableEnded) {
+      viewerResponseTerminated = true;
+      upstream.destroy();
+    }
+  });
+  upstream.end();
+}
+
+function viewerVfsResponseHeaders(
+  headers: import("node:http").IncomingHttpHeaders,
+): Record<string, string | string[] | undefined> {
+  return {
+    "accept-ranges": headers["accept-ranges"],
+    "content-disposition": headers["content-disposition"],
+    "content-length": headers["content-length"],
+    "content-range": headers["content-range"],
+    "content-type": headers["content-type"] ?? "application/octet-stream",
+  };
+}
+
+function sendVfsFailure(
+  response: import("node:http").ServerResponse,
+  status: number,
+  message: string,
+  head: boolean,
+  headers: Record<string, string> = {},
+): void {
+  const body = Buffer.from(message);
+  response.writeHead(status, hardenViewerResponseHeaders({
+    "content-type": "text/plain; charset=utf-8",
+    "content-length": String(body.byteLength),
+    ...headers,
+  }));
+  response.end(head ? undefined : body);
+}
+
+function normalizeCoreOrigin(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("Viewer Core origin is invalid");
+  }
+  if (
+    url.protocol !== "http:"
+    || !new Set(["localhost", "127.0.0.1"]).has(url.hostname)
+    || !url.port
+    || url.username
+    || url.password
+    || url.pathname !== "/"
+    || url.search
+    || url.hash
+  ) {
+    throw new Error("Viewer Core origin is invalid");
+  }
+  return url.origin;
+}
+
+function validateCoreVfsResourceUrl(raw: string, coreOrigin: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("Core VFS resource URL is invalid");
+  }
+  const token = url.pathname.slice("/api/vfs/open/".length);
+  if (
+    url.origin !== coreOrigin
+    || !url.pathname.startsWith("/api/vfs/open/")
+    || !OPAQUE_TOKEN_PATTERN.test(token)
+    || url.search
+    || url.hash
+    || url.username
+    || url.password
+  ) {
+    throw new Error("Core VFS resource URL is invalid");
+  }
+  return url.toString();
 }
 
 function sanitizeRequestHeaders(

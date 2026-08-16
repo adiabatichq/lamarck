@@ -14,6 +14,39 @@ afterEach(() => {
 });
 
 describe("browser System SDK", () => {
+  test("rejects known stdin above 1 GiB before upload and allows the exact boundary", async () => {
+    const operations: SystemOperation[] = [];
+    const invoke = vi.fn(async (operation: SystemOperation) => {
+      operations.push(operation);
+      if (operation === "vfs.upload.begin") return { token: "upload-token-boundary-123" };
+      if (operation === "vfs.upload.complete") return { ok: true };
+      if (operation === "vfs.command") {
+        return { success: true, exitCode: 0, stdoutBase64: "", stderrBase64: "" };
+      }
+      throw new Error(`Unexpected operation: ${operation}`);
+    });
+    browserGlobal.__LAMARCK_SYSTEM_HOST__ = {
+      invoke: invoke as unknown as BrowserSystemHost["invoke"],
+    };
+
+    await expect(system.vfs.command("tee -- exact.bin", {
+      stdin: new KnownSizeBlob(1024 * 1024 * 1024),
+      stdout: "ignore",
+    })).resolves.toMatchObject({ success: true });
+    expect(operations).toEqual([
+      "vfs.upload.begin",
+      "vfs.upload.complete",
+      "vfs.command",
+    ]);
+
+    operations.length = 0;
+    await expect(system.vfs.command("tee -- overflow.bin", {
+      stdin: new KnownSizeBlob(1024 * 1024 * 1024 + 1),
+      stdout: "ignore",
+    })).rejects.toThrow("1 GiB upload limit");
+    expect(operations).toEqual([]);
+  });
+
   test("keeps every supported small stdin type on the inline command path", async () => {
     const calls: Array<{ operation: SystemOperation; input: unknown }> = [];
     const invoke = vi.fn(async (operation: SystemOperation, input: unknown) => {
@@ -133,7 +166,9 @@ describe("browser System SDK", () => {
       if (operation === "vfs.command") {
         return { success: true, exitCode: 0, stdoutBase64: "b2s=", stderrBase64: "" };
       }
-      if (operation === "vfs.open") return { url: "http://core.test/api/vfs/open/token" };
+      if (operation === "vfs.open") {
+        return { url: `http://0123456789abcdef.localhost/.lamarck/vfs/${"v".repeat(43)}` };
+      }
       if (operation === "resolveContentRef") return { status: "missing", digest: "sha256:x" };
       return { ok: true, id: "result" };
     });
@@ -148,7 +183,7 @@ describe("browser System SDK", () => {
       author: "codex",
     })).resolves.toMatchObject({ success: true, stdout: new Uint8Array([111, 107]) });
     await expect(system.vfs.open("apps/a/result.bin"))
-      .resolves.toBe("http://core.test/api/vfs/open/token");
+      .resolves.toBe(`http://0123456789abcdef.localhost/.lamarck/vfs/${"v".repeat(43)}`);
     await system.writeEvent({ type: "test", startedAt: 1, payload: {} });
     await system.resolveContentRef({
       kind: "content-blob",
@@ -205,3 +240,13 @@ describe("browser System SDK", () => {
     });
   });
 });
+
+class KnownSizeBlob extends Blob {
+  constructor(private readonly knownSize: number) {
+    super([]);
+  }
+
+  override get size(): number {
+    return this.knownSize;
+  }
+}

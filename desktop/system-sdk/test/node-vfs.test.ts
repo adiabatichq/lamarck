@@ -39,4 +39,26 @@ describe("Node VFS read mount", () => {
       options: { stdin: { encoding: "utf8", data: "changed" }, author: "codex" },
     });
   });
+
+  test("rejects known stdin above 1 GiB before beginning a Node upload", async () => {
+    root = await mkdtemp(join(tmpdir(), "lamarck-node-vfs-"));
+    const invoke = vi.fn();
+    const system = createNodeSystem(invoke as never, root);
+
+    await expect(system.vfs.command("tee -- overflow.bin", {
+      stdin: new KnownSizeBlob(1024 * 1024 * 1024 + 1),
+      stdout: "ignore",
+    })).rejects.toThrow("1 GiB upload limit");
+    expect(invoke).not.toHaveBeenCalled();
+  });
 });
+
+class KnownSizeBlob extends Blob {
+  constructor(private readonly knownSize: number) {
+    super([]);
+  }
+
+  override get size(): number {
+    return this.knownSize;
+  }
+}

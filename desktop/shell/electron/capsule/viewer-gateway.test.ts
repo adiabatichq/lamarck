@@ -1,4 +1,8 @@
-import { createServer as createHttpServer, get as httpGet } from "node:http";
+import {
+  createServer as createHttpServer,
+  get as httpGet,
+  request as httpRequest,
+} from "node:http";
 import { connect as netConnect } from "node:net";
 import { Duplex } from "node:stream";
 import { afterEach, describe, expect, test } from "vitest";
@@ -54,6 +58,169 @@ describe("App viewer gateway", () => {
     expect(tunneled).toContain("403 Forbidden");
   });
 
+  test("streams Host-owned VFS resources without forwarding the reserved path to Guest", async () => {
+    let guestRequests = 0;
+    const guest = createHttpServer((_request, response) => {
+      guestRequests += 1;
+      response.end("Guest must not serve this path");
+    });
+    const guestPort = await listen(guest);
+    closers.push(() => closeServer(guest));
+
+    const coreToken = "c".repeat(43);
+    const coreRequests: string[] = [];
+    const core = createHttpServer((request, response) => {
+      coreRequests.push(`${request.method} ${request.url}`);
+      if (request.url !== `/api/vfs/open/${coreToken}`) {
+        response.writeHead(404).end("Not found");
+        return;
+      }
+      response.writeHead(200, {
+        "content-type": "image/png",
+        "content-length": "11",
+        "cache-control": "public, max-age=31536000",
+      });
+      if (request.method === "HEAD") {
+        response.end();
+        return;
+      }
+      response.write("image-");
+      setTimeout(() => response.end("bytes"), 5);
+    });
+    const corePort = await listen(core);
+    closers.push(() => closeServer(core));
+
+    const gateway = await createViewerGateway({
+      instanceId: "instance-vfs",
+      originHost: "0123456789abcdef.localhost",
+      coreOrigin: `http://127.0.0.1:${corePort}`,
+      transport: {
+        openUiStream: async () => netConnect(guestPort, "127.0.0.1"),
+      },
+    });
+    closers.push(() => gateway.close());
+    const viewerResource = gateway.registerVfsResource(
+      `http://127.0.0.1:${corePort}/api/vfs/open/${coreToken}`,
+    );
+
+    expect(new URL(viewerResource).origin).toBe(new URL(gateway.viewerUrl).origin);
+    expect(viewerResource).not.toContain(coreToken);
+    expect(viewerResource).not.toContain(`127.0.0.1:${corePort}`);
+    const streamed = await proxyRequest(gateway, new URL(viewerResource).pathname, "GET");
+    expect(streamed).toMatchObject({
+      status: 200,
+      body: "image-bytes",
+      headers: expect.objectContaining({
+        "content-type": "image/png",
+        "cache-control": "no-store, max-age=0",
+      }),
+    });
+    const head = await proxyRequest(gateway, new URL(viewerResource).pathname, "HEAD");
+    expect(head).toMatchObject({ status: 200, body: "" });
+    expect(head.headers["content-type"]).toBe("image/png");
+    expect(coreRequests).toEqual([
+      `GET /api/vfs/open/${coreToken}`,
+      `HEAD /api/vfs/open/${coreToken}`,
+    ]);
+    expect(guestRequests).toBe(0);
+  });
+
+  test("terminates the Viewer response when Core aborts after sending headers", async () => {
+    let guestRequests = 0;
+    const guest = createHttpServer((_request, response) => {
+      guestRequests += 1;
+      response.end("Guest must not serve this path");
+    });
+    const guestPort = await listen(guest);
+    closers.push(() => closeServer(guest));
+    const coreToken = "a".repeat(43);
+    const core = createHttpServer((_request, response) => {
+      response.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": "1024",
+      });
+      response.write("partial");
+      setImmediate(() => response.socket?.destroy());
+    });
+    const corePort = await listen(core);
+    closers.push(() => closeServer(core));
+    const gateway = await createViewerGateway({
+      instanceId: "instance-aborted-vfs",
+      originHost: "0123456789abcdef.localhost",
+      coreOrigin: `http://127.0.0.1:${corePort}`,
+      transport: { openUiStream: async () => netConnect(guestPort, "127.0.0.1") },
+    });
+    closers.push(() => gateway.close());
+    const viewerResource = gateway.registerVfsResource(
+      `http://127.0.0.1:${corePort}/api/vfs/open/${coreToken}`,
+    );
+
+    const terminated = await withTimeout(
+      observeProxyTermination(gateway, new URL(viewerResource).pathname),
+      1_000,
+    );
+    expect(terminated.status).toBe(200);
+    expect(["aborted", "error"]).toContain(terminated.outcome);
+    expect(guestRequests).toBe(0);
+  });
+
+  test("fails malformed, expired, and cross-Viewer VFS handles closed and bounded", async () => {
+    let guestRequests = 0;
+    const guest = createHttpServer((_request, response) => {
+      guestRequests += 1;
+      response.end("Guest must not serve this path");
+    });
+    const guestPort = await listen(guest);
+    closers.push(() => closeServer(guest));
+    const core = createHttpServer((_request, response) => {
+      response.writeHead(404, { "content-type": "text/plain" });
+      response.end("expired Core handle");
+    });
+    const corePort = await listen(core);
+    closers.push(() => closeServer(core));
+    const coreOrigin = `http://127.0.0.1:${corePort}`;
+    const first = await createViewerGateway({
+      instanceId: "instance-first",
+      originHost: "0123456789abcdef.localhost",
+      coreOrigin,
+      transport: { openUiStream: async () => netConnect(guestPort, "127.0.0.1") },
+    });
+    const second = await createViewerGateway({
+      instanceId: "instance-second",
+      originHost: "fedcba9876543210.localhost",
+      coreOrigin,
+      transport: { openUiStream: async () => netConnect(guestPort, "127.0.0.1") },
+    });
+    closers.push(() => first.close(), () => second.close());
+    const viewerResource = first.registerVfsResource(
+      `${coreOrigin}/api/vfs/open/${"e".repeat(43)}`,
+    );
+    const viewerPath = new URL(viewerResource).pathname;
+
+    const malformed = await proxyGet(first, "/.lamarck/vfs/not-a-token");
+    const unsupportedMethod = await proxyRequest(first, viewerPath, "POST");
+    const expired = await proxyGet(first, viewerPath);
+    const crossViewer = await proxyGet(second, viewerPath);
+    for (const failure of [malformed, expired, crossViewer]) {
+      expect(failure.status).toBe(404);
+      expect(Buffer.byteLength(failure.body)).toBeLessThan(128);
+    }
+    expect(unsupportedMethod.status).toBe(405);
+    expect(unsupportedMethod.headers.allow).toBe("GET, HEAD");
+    expect(guestRequests).toBe(0);
+    expect(() => first.registerVfsResource(`${coreOrigin}/api/query`)).toThrow(
+      "Core VFS resource URL is invalid",
+    );
+    expect(() => first.registerVfsResource(
+      `http://127.0.0.1:${corePort + 1}/api/vfs/open/${"x".repeat(43)}`,
+    )).toThrow("Core VFS resource URL is invalid");
+
+    const directCore = await rawProxyRequest(first.proxyUrl,
+      `GET ${coreOrigin}/api/vfs/open/${"x".repeat(43)} HTTP/1.1\r\n`
+      + `Host: 127.0.0.1:${corePort}\r\nConnection: close\r\n\r\n`);
+    expect(directCore).toContain("403 Forbidden");
+  });
+
   test("carries a WebSocket-style upgrade as raw bidirectional bytes", async () => {
     const upstream = createHttpServer();
     const upstreamSockets = new Set<import("node:stream").Duplex>();
@@ -91,6 +258,7 @@ describe("App viewer gateway", () => {
     const gateway = await createViewerGateway({
       instanceId: "instance-1",
       originHost: "0123456789abcdef.localhost",
+      coreOrigin: "http://127.0.0.1:32100",
       transport: {
         openUiStream: async () => {
           guest = new RecordingGuestStream(true);
@@ -165,6 +333,7 @@ async function createGateway(upstreamPort: number): Promise<ViewerGatewayBinding
   const gateway = await createViewerGateway({
     instanceId: "instance-1",
     originHost: "0123456789abcdef.localhost",
+    coreOrigin: `http://127.0.0.1:${upstreamPort}`,
     transport: {
       openUiStream: async () => netConnect(upstreamPort, "127.0.0.1"),
     },
@@ -204,6 +373,70 @@ function beginProxyGet(
     path: target,
     headers: { host: new URL(gateway.viewerUrl).host },
   });
+}
+
+function proxyRequest(
+  gateway: ViewerGatewayBinding,
+  path: string,
+  method: "GET" | "HEAD" | "POST",
+): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string }> {
+  const proxy = new URL(gateway.proxyUrl);
+  const target = new URL(path, gateway.viewerUrl).toString();
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({
+      host: proxy.hostname,
+      port: Number(proxy.port),
+      path: target,
+      method,
+      headers: { host: new URL(gateway.viewerUrl).host },
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on("end", () => resolve({
+        status: response.statusCode ?? 0,
+        headers: response.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }));
+    });
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+function observeProxyTermination(
+  gateway: ViewerGatewayBinding,
+  path: string,
+): Promise<{ status: number; outcome: "ended" | "aborted" | "error" }> {
+  const request = beginProxyGet(gateway, path);
+  return new Promise((resolve) => {
+    request.once("error", () => resolve({ status: 0, outcome: "error" }));
+    request.once("response", (response) => {
+      let settled = false;
+      const finish = (outcome: "ended" | "aborted" | "error") => {
+        if (settled) return;
+        settled = true;
+        resolve({ status: response.statusCode ?? 0, outcome });
+      };
+      response.once("end", () => finish("ended"));
+      response.once("aborted", () => finish("aborted"));
+      response.once("error", () => finish("error"));
+      response.resume();
+    });
+  });
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Timed out waiting for Viewer response termination")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 function rawProxyRequest(proxyUrl: string, request: string): Promise<string> {

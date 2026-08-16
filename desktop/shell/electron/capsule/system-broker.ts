@@ -24,6 +24,10 @@ export interface SystemSenderBinding {
   capability: string;
 }
 
+export interface SystemViewerResourceBinding {
+  registerVfsResource(coreUrl: string): string;
+}
+
 export interface SystemBrokerOptions {
   coreBaseUrl: string | (() => string | Promise<string>);
   fetch?: typeof fetch;
@@ -65,6 +69,7 @@ export class SystemBrokerError extends Error {
 interface PrivateBinding {
   readonly channelId: string;
   readonly capability: string;
+  readonly viewerResources?: SystemViewerResourceBinding;
 }
 
 interface CoreRequest {
@@ -138,7 +143,11 @@ export class SystemBroker {
     return this.#bindingsBySender.size;
   }
 
-  bindSender(senderId: SenderId, binding: SystemSenderBinding): void {
+  bindSender(
+    senderId: SenderId,
+    binding: SystemSenderBinding,
+    viewerResources?: SystemViewerResourceBinding,
+  ): void {
     validateSenderId(senderId);
     if (!binding || typeof binding.channelId !== "string" || !binding.channelId) {
       throw new Error("System sender binding requires channelId");
@@ -158,6 +167,7 @@ export class SystemBroker {
     const stored: PrivateBinding = Object.freeze({
       channelId: binding.channelId,
       capability: binding.capability,
+      ...(viewerResources ? { viewerResources } : {}),
     });
     this.#bindingsBySender.set(senderId, stored);
     this.#senderByChannel.set(stored.channelId, senderId);
@@ -277,6 +287,12 @@ export class SystemBroker {
     if (!SYSTEM_OPERATION_SET.has(operation)) {
       throw new SystemBrokerError("operation_denied", "System SDK operation is not allowed");
     }
+    if (operation === "vfs.open" && !binding.viewerResources) {
+      throw new SystemBrokerError(
+        "operation_denied",
+        "system.vfs.open requires a bound App Viewer",
+      );
+    }
 
     const coreRequest = mapCoreRequest(operation, input);
     const serializedForSize = serializeJson(coreRequest.sizeValue);
@@ -345,7 +361,10 @@ export class SystemBroker {
           : `Core returned HTTP ${response.status}`;
         throw new SystemBrokerError("core_error", message);
       }
-      return finish({ data }, lease);
+      const boundData = operation === "vfs.open"
+        ? viewerVfsOpenResult(data, binding.viewerResources!)
+        : data;
+      return finish({ data: boundData }, lease);
     } finally {
       clearTimeout(timeout);
       this.#releaseLease(lease);
@@ -430,6 +449,20 @@ export class SystemBroker {
     else this.#aggregateBytesBySender.set(lease.senderId, remainingSenderBytes);
     this.#inFlightGlobal = Math.max(0, this.#inFlightGlobal - 1);
     this.#aggregateBytesGlobal = Math.max(0, this.#aggregateBytesGlobal - lease.bytes);
+  }
+}
+
+function viewerVfsOpenResult(
+  data: unknown,
+  resources: SystemViewerResourceBinding,
+): { url: string } {
+  if (!isRecord(data) || typeof data.url !== "string") {
+    throw new SystemBrokerError("invalid_response", "Core returned an invalid VFS resource");
+  }
+  try {
+    return { url: resources.registerVfsResource(data.url) };
+  } catch {
+    throw new SystemBrokerError("invalid_response", "Core returned an invalid VFS resource");
   }
 }
 

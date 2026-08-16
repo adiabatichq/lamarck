@@ -7,6 +7,7 @@ const UPLOAD_TTL_MS = 5 * 60_000;
 const MAX_UPLOADS_PER_WORKLOAD = 4;
 const MAX_UPLOADS_GLOBAL = 32;
 const MAX_CHUNK_BYTES = 1024 * 1024;
+export const MAX_VFS_UPLOAD_BYTES = 1024 * 1024 * 1024;
 
 interface UploadSession {
   token: string;
@@ -30,7 +31,13 @@ export class VfsUploadStore {
   private readonly sessions = new Map<string, UploadSession>();
   private expiryTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(workspacePath: string) {
+  constructor(
+    workspacePath: string,
+    private readonly maxUploadBytes = MAX_VFS_UPLOAD_BYTES,
+  ) {
+    if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes < 0) {
+      throw new Error("VFS upload byte limit is invalid");
+    }
     this.root = join(workspacePath, ".lamarck", "tmp", "vfs-uploads");
   }
 
@@ -90,6 +97,10 @@ export class VfsUploadStore {
     if (bytes.byteLength > MAX_CHUNK_BYTES) {
       this.deleteSession(session);
       throw new Error("VFS upload chunk exceeds the size limit");
+    }
+    if (session.byteLength > this.maxUploadBytes - bytes.byteLength) {
+      this.deleteSession(session);
+      throw new Error("VFS upload exceeds the 1 GiB size limit");
     }
 
     session.busy = true;

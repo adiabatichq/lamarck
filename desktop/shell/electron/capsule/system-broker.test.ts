@@ -145,7 +145,11 @@ describe("SystemBroker", () => {
       return jsonResponse({ ok: true, id: "event-1" });
     });
     const { broker } = createBroker(fetchImpl, { maxRequestBytes: 1024 });
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(
+      1,
+      { channelId: "channel", capability: "capability" },
+      { registerVfsResource: () => "http://0123456789abcdef.localhost/.lamarck/vfs/token" },
+    );
 
     const begun = await broker.invoke(1, "vfs.upload.begin", {});
     await broker.invoke(1, "vfs.upload.chunk", {
@@ -192,6 +196,41 @@ describe("SystemBroker", () => {
     await expect(broker.invoke(1, "query", { sql: "x".repeat(2_000) }))
       .rejects.toMatchObject({ code: "request_too_large" });
     expect(fetchImpl).toHaveBeenCalledTimes(requests.length);
+  });
+
+  test("returns a Viewer-owned VFS URL without exposing the Core resource", async () => {
+    const coreUrl = `http://127.0.0.1:32100/api/vfs/open/${"c".repeat(43)}`;
+    const viewerUrl = `http://0123456789abcdef.localhost/.lamarck/vfs/${"v".repeat(43)}`;
+    const registerVfsResource = vi.fn(() => viewerUrl);
+    const fetchImpl = vi.fn<typeof fetch>(async () => jsonResponse({ url: coreUrl }));
+    const { broker } = createBroker(fetchImpl);
+    broker.bindSender(
+      1,
+      { channelId: "channel", capability: "capability" },
+      { registerVfsResource },
+    );
+
+    const response = browserEnvelope(await broker.invokeSerialized(
+      1,
+      browserRequest("vfs.open", { path: "image.png" }),
+    ));
+
+    expect(response).toEqual({ ok: true, result: { url: viewerUrl } });
+    expect(JSON.stringify(response)).not.toContain("127.0.0.1");
+    expect(JSON.stringify(response)).not.toContain("/api/vfs/open/");
+    expect(registerVfsResource).toHaveBeenCalledWith(coreUrl);
+  });
+
+  test("rejects VFS open before Core when no Viewer resource binding exists", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const { broker } = createBroker(fetchImpl);
+    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+
+    await expect(broker.invoke(1, "vfs.open", { path: "image.png" })).rejects.toMatchObject({
+      code: "operation_denied",
+      message: "system.vfs.open requires a bound App Viewer",
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   test("does not expose a bound raw capability through its API or serialization", () => {
@@ -263,10 +302,16 @@ describe("SystemBroker", () => {
     const fetchImpl = vi.fn<typeof fetch>(async (url, init) => {
       seenUrl = String(url);
       seenInit = init;
-      return jsonResponse({ mapped: operation });
+      return jsonResponse(operation === "vfs.open"
+        ? { url: "http://core.test/api/vfs/open/token" }
+        : { mapped: operation });
     });
     const { broker } = createBroker(fetchImpl);
-    broker.bindSender(7, { channelId: "channel", capability: "capability" });
+    broker.bindSender(
+      7,
+      { channelId: "channel", capability: "capability" },
+      { registerVfsResource: () => "http://0123456789abcdef.localhost/.lamarck/vfs/token" },
+    );
 
     await broker.invoke(7, operation as never, input as never);
 

@@ -39,6 +39,7 @@ export interface System {
 
 const VFS_INLINE_STDIN_BYTES = 4 * 1024 * 1024;
 const VFS_UPLOAD_CHUNK_BYTES = 512 * 1024;
+const VFS_UPLOAD_MAX_BYTES = 1024 * 1024 * 1024;
 
 export function createSystem(invoke: SystemInvoke): System {
   return Object.freeze({
@@ -54,8 +55,15 @@ export function createSystem(invoke: SystemInvoke): System {
     transaction: (statements: SqlStatement[]) => invoke("transaction", { statements }),
     vfs: Object.freeze({
       command: async (command: string, options?: VfsCommandOptions) => {
+        const stdinBytes = options?.stdin === undefined
+          ? undefined
+          : vfsStdinByteLength(options.stdin);
+        if (stdinBytes !== undefined && stdinBytes > VFS_UPLOAD_MAX_BYTES) {
+          throw new Error("VFS stdin exceeds the 1 GiB upload limit");
+        }
         const result = options?.stdin !== undefined
-          && vfsStdinByteLength(options.stdin) > VFS_INLINE_STDIN_BYTES
+          && stdinBytes !== undefined
+          && stdinBytes > VFS_INLINE_STDIN_BYTES
           ? await invokeUploadedVfsCommand(invoke, command, options, options.stdin)
           : await invokeInlineVfsCommand(invoke, command, options);
         return {

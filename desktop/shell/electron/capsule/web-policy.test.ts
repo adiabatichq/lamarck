@@ -13,6 +13,10 @@ describe("Electron App/Shell web policy", () => {
   test("allows only the Host-bound App origin plus data and same-origin blob URLs", () => {
     const binding = { protocol: "http:", host: "0123456789abcdef.localhost" };
     expect(isAllowedAppViewerUrl("http://0123456789abcdef.localhost/assets/app.js", binding)).toBe(true);
+    expect(isAllowedAppViewerUrl(
+      `http://0123456789abcdef.localhost/.lamarck/vfs/${"v".repeat(43)}`,
+      binding,
+    )).toBe(true);
     expect(isAllowedAppViewerUrl("data:text/plain,ok", binding)).toBe(true);
     expect(isAllowedAppViewerUrl("blob:http://0123456789abcdef.localhost/id", binding)).toBe(true);
     expect(isAllowedAppViewerUrl("blob:http://caller-selected.localhost/id", binding)).toBe(false);

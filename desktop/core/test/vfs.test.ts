@@ -1,5 +1,7 @@
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import {
+  existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
@@ -108,7 +110,8 @@ describe("D1 VFS", () => {
     filesRoot = join(workspace, "files");
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await vfs?.close();
     closeDb?.();
     rmSync(workspace, { recursive: true, force: true });
   });
@@ -681,17 +684,111 @@ describe("D1 VFS", () => {
     ]);
   });
 
-  test("open URLs are workload-bound and invalidate on digest change", async () => {
-    writeFileSync(join(filesRoot, "image.png"), Buffer.from([1, 2, 3]));
+  test("open URLs directly stream bounded exact bytes and support bodyless HEAD", async () => {
+    const expected = Buffer.alloc(3 * 64 * 1024 + 17);
+    for (let index = 0; index < expected.byteLength; index += 1) expected[index] = index % 251;
+    writeFileSync(join(filesRoot, "image.png"), expected);
     const caller = { ...appCaller(guard, []), workloadId: "channel-1" };
     const url = await vfs.open(caller, "image.png", "http://core.test");
     const token = new URL(url).pathname.split("/").at(-1)!;
-    expect(await vfs.resolveOpen(token, (id) => id === "channel-1")).toEqual({
-      bytes: Buffer.from([1, 2, 3]),
-      mediaType: "image/png",
-    });
+    const openTempRoot = join(workspace, ".lamarck", "tmp", "vfs-open");
+    const recordedDigest = (vfs as unknown as {
+      openHandles: Map<string, { digest: string }>;
+    }).openHandles.get(token)!.digest;
+
+    const head = await vfs.resolveOpen(token, (id) => id === "channel-1", false);
+    expect(head).toMatchObject({ body: null, byteLength: expected.byteLength, mediaType: "image/png" });
+    expect(existsSync(openTempRoot)).toBe(false);
+
+    const resource = await vfs.resolveOpen(token, (id) => id === "channel-1");
+    expect(resource).not.toBeNull();
+    expect(resource).not.toHaveProperty("bytes");
+    expect(resource).toMatchObject({ byteLength: expected.byteLength, mediaType: "image/png" });
+    const chunks: Buffer[] = [];
+    const reader = resource!.body!.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(Buffer.from(value));
+    }
+    expect(Math.max(...chunks.map((chunk) => chunk.byteLength))).toBeLessThanOrEqual(64 * 1024);
+    const completed = Buffer.concat(chunks);
+    expect(completed).toEqual(expected);
+    expect(`sha256:${createHash("sha256").update(completed).digest("hex")}`).toBe(recordedDigest);
+    expect(existsSync(openTempRoot)).toBe(false);
+  });
+
+  test("rejects a digest mismatch before creating an open response", async () => {
+    writeFileSync(join(filesRoot, "image.png"), Buffer.from([1, 2, 3]));
+    const caller = { ...appCaller(guard, []), workloadId: "channel-mismatch" };
+    const url = await vfs.open(caller, "image.png", "http://core.test");
+    const token = new URL(url).pathname.split("/").at(-1)!;
     writeFileSync(join(filesRoot, "image.png"), Buffer.from([4, 5, 6]));
     expect(await vfs.resolveOpen(token, () => true)).toBeNull();
+    expect(existsSync(join(workspace, ".lamarck", "tmp", "vfs-open"))).toBe(false);
+  });
+
+  test("aborts and invalidates an open response when its source mutates during streaming", async () => {
+    const original = Buffer.alloc(8 * 64 * 1024, 0x5a);
+    const filePath = join(filesRoot, "changing.bin");
+    writeFileSync(filePath, original);
+    const caller = { ...appCaller(guard, []), workloadId: "channel-changing" };
+    const url = await vfs.open(caller, "changing.bin", "http://core.test");
+    const token = new URL(url).pathname.split("/").at(-1)!;
+    const resource = await vfs.resolveOpen(token, () => true);
+    const reader = resource!.body!.getReader();
+    const first = await reader.read();
+    expect(first).toMatchObject({ done: false });
+    let emittedBytes = first.value!.byteLength;
+
+    writeFileSync(filePath, Buffer.alloc(original.byteLength, 0xa5));
+    await expect(drainReader(reader, (chunk) => { emittedBytes += chunk.byteLength; }))
+      .rejects.toThrow("changed while streaming");
+    expect(emittedBytes).toBeLessThan(resource!.byteLength);
+    expect(await vfs.resolveOpen(token, () => true)).toBeNull();
+  });
+
+  test("closes direct open file handles on cancellation, workload closure, and service shutdown", async () => {
+    const filePath = join(filesRoot, "active.bin");
+    writeFileSync(filePath, Buffer.alloc(128 * 1024, 0x5a));
+    const cancelledUrl = await vfs.open(
+      { ...appCaller(guard, []), workloadId: "channel-cancelled" },
+      "active.bin",
+      "http://core.test",
+    );
+    const workloadUrl = await vfs.open(
+      { ...appCaller(guard, []), workloadId: "channel-active" },
+      "active.bin",
+      "http://core.test",
+    );
+    const shutdownUrl = await vfs.open(
+      { ...appCaller(guard, []), workloadId: "channel-shutdown" },
+      "active.bin",
+      "http://core.test",
+    );
+    const cancelledToken = tokenFromUrl(cancelledUrl);
+    const cancelled = await vfs.resolveOpen(cancelledToken, () => true);
+    const cancelledHandle = activeOpenFileHandle(vfs, cancelledToken);
+    await cancelled!.body!.cancel();
+    expect(cancelledHandle.fd).toBe(-1);
+
+    const workloadToken = tokenFromUrl(workloadUrl);
+    const active = await vfs.resolveOpen(workloadToken, () => true);
+    const activeHandle = activeOpenFileHandle(vfs, workloadToken);
+    const activeReader = active!.body!.getReader();
+    expect(vfs.closeWorkload("channel-active")).toBe(1);
+    await expect(activeReader.read()).rejects.toThrow("closed");
+    expect(activeHandle.fd).toBe(-1);
+    expect(await vfs.resolveOpen(workloadToken, () => true)).toBeNull();
+
+    const shutdownToken = tokenFromUrl(shutdownUrl);
+    const shutdown = await vfs.resolveOpen(shutdownToken, () => true);
+    const shutdownHandle = activeOpenFileHandle(vfs, shutdownToken);
+    const shutdownReader = shutdown!.body!.getReader();
+    await vfs.close();
+    await expect(shutdownReader.read()).rejects.toThrow("closed");
+    expect(shutdownHandle.fd).toBe(-1);
+    expect(await vfs.resolveOpen(shutdownToken, () => true)).toBeNull();
   });
 
   test("bounds open handles per workload and releases them when the workload closes", async () => {
@@ -958,6 +1055,30 @@ function cacheUpdatePaths(db: ReturnType<typeof openSystemDatabase>): string[] {
 function sqliteTotalChanges(db: ReturnType<typeof openSystemDatabase>): number {
   const row = db.prepare("SELECT total_changes() AS value").get() as { value: number };
   return row.value;
+}
+
+async function drainReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  onChunk?: (chunk: Uint8Array) => void,
+): Promise<void> {
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return;
+    onChunk?.(value);
+  }
+}
+
+function tokenFromUrl(url: string): string {
+  return new URL(url).pathname.split("/").at(-1)!;
+}
+
+function activeOpenFileHandle(vfs: VfsService, token: string): { readonly fd: number } {
+  const leases = (vfs as unknown as {
+    openResourceLeasesByToken: Map<string, Set<{ fileHandle?: { readonly fd: number } }>>;
+  }).openResourceLeasesByToken.get(token);
+  const fileHandle = leases && [...leases][0]?.fileHandle;
+  if (!fileHandle) throw new Error("Active VFS open file handle was not found");
+  return fileHandle;
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {

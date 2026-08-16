@@ -694,20 +694,27 @@ const server = await serve<{ cwd: string }>({
     }
 
     const openVfsMatch = path.match(/^\/api\/vfs\/open\/([A-Za-z0-9_-]{43})$/);
-    if (openVfsMatch && method === "GET") {
+    if (openVfsMatch && (method === "GET" || method === "HEAD")) {
       const content = await vfs.resolveOpen(
         openVfsMatch[1],
         (channelId) => appCapabilities.isOpen(channelId),
+        method === "GET",
       );
       if (!content) return new Response("Not found", { status: 404, headers });
-      return new Response(new Uint8Array(content.bytes), {
-        status: 200,
-        headers: {
-          "Content-Type": content.mediaType,
-          "Cache-Control": "no-store",
-          ...headers,
-        },
-      });
+      try {
+        return new Response(content.body, {
+          status: 200,
+          headers: {
+            "Content-Type": content.mediaType,
+            "Content-Length": String(content.byteLength),
+            "Cache-Control": "no-store",
+            ...headers,
+          },
+        });
+      } catch (error) {
+        await content.dispose();
+        throw error;
+      }
     }
 
     const admission = path.startsWith("/api/")
@@ -813,6 +820,7 @@ const server = await serve<{ cwd: string }>({
             vfsCallerForRequest(auth!, req, requestGuardSignal),
             body.path,
             url.origin,
+            (channelId) => appCapabilities.isOpen(channelId),
           ),
         });
       }
@@ -1558,13 +1566,14 @@ async function shutdown(): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log("\n[lamarck] Shutting down...");
+  const vfsClosed = vfs.close();
   const serverStopped = server.stop().catch(() => {});
   await connectorScheduler.stop();
   for (const proc of terminalProcs) {
     try { proc.kill(); } catch {}
   }
   terminalProcs.clear();
-  await serverStopped;
+  await Promise.all([serverStopped, vfsClosed]);
   await d1Observer.stop();
   systemDb.close();
   process.exit(0);

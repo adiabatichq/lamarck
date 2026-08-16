@@ -1,5 +1,5 @@
-import { randomBytes } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { constants, createReadStream, createWriteStream } from "node:fs";
 import {
   assertSafeD1Parents,
   d1PathsConflict,
@@ -16,6 +16,7 @@ import {
   cp,
   lstat,
   mkdir,
+  open as openFile,
   readFile,
   readdir,
   rename,
@@ -33,7 +34,6 @@ import {
   compareFileSnapshots,
   externalizeFileChanges,
   metadataOnlyFileSnapshots,
-  readStableD1File,
   recordedChanges,
   scanD1Files,
   type D1FileChange,
@@ -55,6 +55,13 @@ interface OpenHandle {
   workloadId: string;
 }
 
+interface OpenResourceLease {
+  readonly controller: AbortController;
+  readonly released: Promise<void>;
+  fileHandle?: Awaited<ReturnType<typeof openFile>>;
+  release(): void;
+}
+
 interface MutationPlan {
   snapshotRoots: string[];
   mappings: Array<{ from: string; path: string }>;
@@ -62,16 +69,20 @@ interface MutationPlan {
 
 export const MAX_VFS_OPEN_HANDLES_PER_WORKLOAD = 256;
 const MAX_CAPTURED_UPLOADED_STDIN_BYTES = 15 * 1024 * 1024 - 1024;
+const VFS_OPEN_IO_CHUNK_BYTES = 64 * 1024;
 
 export interface VfsOpenContent {
-  bytes: Buffer;
+  body: ReadableStream<Uint8Array> | null;
+  byteLength: number;
   mediaType: string;
+  dispose(): Promise<void>;
 }
 
 export class VfsService {
   readonly filesRoot: string;
   private readonly openHandles = new Map<string, OpenHandle>();
   private readonly openHandleTokensByWorkload = new Map<string, Set<string>>();
+  private readonly openResourceLeasesByToken = new Map<string, Set<OpenResourceLease>>();
   private readonly uploads: VfsUploadStore;
 
   constructor(
@@ -172,17 +183,26 @@ export class VfsService {
     return this.uploads.expire(now);
   }
 
-  async open(caller: VfsCaller, path: string, origin: string): Promise<string> {
+  async open(
+    caller: VfsCaller,
+    path: string,
+    origin: string,
+    workloadIsOpen?: (id: string) => boolean,
+  ): Promise<string> {
     if (!caller.workloadId) throw new Error("system.vfs.open requires a bound workload");
     const workloadTokens = this.openHandleTokensByWorkload.get(caller.workloadId) ?? new Set<string>();
     if (workloadTokens.size >= MAX_VFS_OPEN_HANDLES_PER_WORKLOAD) {
       throw new Error("system.vfs.open handle limit exceeded for this workload");
     }
-    const snapshot = await readStableD1File(this.filesRoot, path);
+    const observed = await readStableOpenMetadata(this.filesRoot, path);
+    if (!observed) throw new Error("VFS open resource is unavailable");
+    if (workloadIsOpen && !workloadIsOpen(caller.workloadId)) {
+      throw new Error("system.vfs.open workload is closed");
+    }
     const token = randomBytes(32).toString("base64url");
     this.openHandles.set(token, {
-      path: snapshot.path,
-      digest: snapshot.digest,
+      path: observed.path,
+      digest: observed.digest,
       workloadId: caller.workloadId,
     });
     workloadTokens.add(token);
@@ -191,41 +211,263 @@ export class VfsService {
   }
 
   closeWorkload(workloadId: string): number {
-    const tokens = this.openHandleTokensByWorkload.get(workloadId);
-    for (const token of tokens ?? []) this.openHandles.delete(token);
-    if (tokens) this.openHandleTokensByWorkload.delete(workloadId);
+    const tokens = [...(this.openHandleTokensByWorkload.get(workloadId) ?? [])];
+    for (const token of tokens) this.deleteOpenHandle(token);
     this.uploads.closeWorkload(workloadId);
-    return tokens?.size ?? 0;
+    return tokens.length;
   }
 
-  async resolveOpen(token: string, workloadIsOpen: (id: string) => boolean): Promise<VfsOpenContent | null> {
+  async close(): Promise<void> {
+    const leases = [...this.openResourceLeasesByToken.values()].flatMap((values) => [...values]);
+    for (const [token, handle] of [...this.openHandles]) this.deleteOpenHandle(token, handle);
+    await Promise.all(leases.map((lease) => lease.released));
+  }
+
+  async resolveOpen(
+    token: string,
+    workloadIsOpen: (id: string) => boolean,
+    includeBody = true,
+  ): Promise<VfsOpenContent | null> {
     const handle = this.openHandles.get(token);
     if (!handle || !workloadIsOpen(handle.workloadId)) {
       this.deleteOpenHandle(token, handle);
       return null;
     }
+    const lease = this.beginOpenResourceLease(token);
+    let transferred = false;
+    let validated: ValidatedOpenFile | null = null;
     try {
-      const snapshot = await readStableD1File(this.filesRoot, handle.path);
-      if (snapshot.digest !== handle.digest) {
+      validated = await openValidatedOpenFile(
+        this.filesRoot,
+        handle.path,
+        handle.digest,
+        lease.controller.signal,
+      );
+      if (
+        !validated
+        || this.openHandles.get(token) !== handle
+        || !workloadIsOpen(handle.workloadId)
+      ) {
+        const fileHandle = validated?.fileHandle;
+        validated = null;
+        await fileHandle?.close();
         this.deleteOpenHandle(token, handle);
         return null;
       }
+      if (!includeBody) {
+        const fileHandle = validated.fileHandle;
+        const byteLength = validated.byteLength;
+        validated = null;
+        await fileHandle.close();
+        return {
+          body: null,
+          byteLength,
+          mediaType: mediaTypeForPath(handle.path),
+          dispose: async () => {},
+        };
+      }
+      const resource = this.createOpenResponseBody(token, lease, handle, validated);
+      validated = null;
+      if (
+        lease.controller.signal.aborted
+        || this.openHandles.get(token) !== handle
+        || !workloadIsOpen(handle.workloadId)
+      ) {
+        await resource.dispose();
+        this.deleteOpenHandle(token, handle);
+        return null;
+      }
+      transferred = true;
       return {
-        bytes: snapshot.bytes,
+        body: resource.body,
+        byteLength: resource.byteLength,
         mediaType: mediaTypeForPath(handle.path),
+        dispose: resource.dispose,
       };
     } catch {
+      await validated?.fileHandle.close().catch(() => {});
       this.deleteOpenHandle(token, handle);
       return null;
+    } finally {
+      if (!transferred) this.releaseOpenResourceLease(token, lease);
     }
   }
 
   private deleteOpenHandle(token: string, handle = this.openHandles.get(token)): void {
     this.openHandles.delete(token);
+    this.terminateOpenResourceLeases(token);
     if (!handle) return;
     const workloadTokens = this.openHandleTokensByWorkload.get(handle.workloadId);
     workloadTokens?.delete(token);
     if (workloadTokens?.size === 0) this.openHandleTokensByWorkload.delete(handle.workloadId);
+  }
+
+  private beginOpenResourceLease(token: string): OpenResourceLease {
+    let resolveReleased!: () => void;
+    let released = false;
+    const lease: OpenResourceLease = {
+      controller: new AbortController(),
+      released: new Promise<void>((resolve) => { resolveReleased = resolve; }),
+      release() {
+        if (released) return;
+        released = true;
+        resolveReleased();
+      },
+    };
+    const leases = this.openResourceLeasesByToken.get(token) ?? new Set<OpenResourceLease>();
+    leases.add(lease);
+    this.openResourceLeasesByToken.set(token, leases);
+    return lease;
+  }
+
+  private releaseOpenResourceLease(token: string, lease: OpenResourceLease): void {
+    const leases = this.openResourceLeasesByToken.get(token);
+    leases?.delete(lease);
+    if (leases?.size === 0) this.openResourceLeasesByToken.delete(token);
+    lease.release();
+  }
+
+  private terminateOpenResourceLeases(token: string): void {
+    const leases = this.openResourceLeasesByToken.get(token);
+    this.openResourceLeasesByToken.delete(token);
+    for (const lease of leases ?? []) lease.controller.abort();
+  }
+
+  private createOpenResponseBody(
+    token: string,
+    lease: OpenResourceLease,
+    openHandle: OpenHandle,
+    validated: ValidatedOpenFile,
+  ): { body: ReadableStream<Uint8Array>; byteLength: number; dispose(): Promise<void> } {
+    lease.fileHandle = validated.fileHandle;
+    let position = 0;
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let finishing = false;
+    let cleanupPromise: Promise<void> | undefined;
+    const streamedHash = createHash("sha256");
+    const finish = (options: {
+      error?: Error;
+      invalidate?: boolean;
+      closeBody?: boolean;
+      finalChunk?: Uint8Array;
+    } = {}): Promise<void> => {
+      if (cleanupPromise) return cleanupPromise;
+      finishing = true;
+      cleanupPromise = (async () => {
+        lease.controller.signal.removeEventListener("abort", onAbort);
+        let error = options.error;
+        const fileHandle = lease.fileHandle;
+        lease.fileHandle = undefined;
+        try {
+          await fileHandle?.close();
+        } catch (closeError) {
+          error ??= closeError instanceof Error ? closeError : new Error(String(closeError));
+        }
+        this.releaseOpenResourceLease(token, lease);
+        if (error && options.invalidate) this.deleteOpenHandle(token, openHandle);
+        if (error) {
+          try { controller?.error(error); } catch {}
+        } else if (options.closeBody) {
+          try {
+            if (options.finalChunk) controller?.enqueue(options.finalChunk);
+            controller?.close();
+          } catch {}
+        }
+      })();
+      return cleanupPromise;
+    };
+    const onAbort = () => {
+      void finish({ error: new Error("VFS open resource was closed") });
+    };
+    lease.controller.signal.addEventListener("abort", onAbort, { once: true });
+
+    const completedStreamMatches = async (): Promise<boolean> => {
+      const extra = new Uint8Array(1);
+      const { bytesRead: extraBytesRead } = await validated.fileHandle.read(
+        extra,
+        0,
+        extra.byteLength,
+        position,
+      );
+      throwIfAborted(lease.controller.signal);
+      const after = await validated.fileHandle.stat({ bigint: true });
+      const pathStillMatches = await openPathMatchesIdentity(
+        validated.filesRoot,
+        validated.path,
+        validated.filePath,
+        validated.identity,
+      );
+      const digest = `sha256:${streamedHash.digest("hex")}`;
+      return extraBytesRead === 0
+        && BigInt(position) === validated.identity.size
+        && sameOpenFileIdentity(validated.identity, after)
+        && pathStillMatches
+        && digest === openHandle.digest;
+    };
+
+    const body = new ReadableStream<Uint8Array>({
+      start(value) {
+        controller = value;
+        if (lease.controller.signal.aborted) onAbort();
+      },
+      async pull(value) {
+        if (finishing) return;
+        try {
+          if (position === validated.byteLength) {
+            if (!await completedStreamMatches()) {
+              await finish({
+                error: new Error("VFS open resource changed while streaming"),
+                invalidate: true,
+              });
+              return;
+            }
+            await finish({ closeBody: true, invalidate: true });
+            return;
+          }
+          const chunk = new Uint8Array(Math.min(
+            VFS_OPEN_IO_CHUNK_BYTES,
+            validated.byteLength - position,
+          ));
+          const { bytesRead } = await validated.fileHandle.read(chunk, 0, chunk.byteLength, position);
+          if (finishing) return;
+          if (bytesRead === 0) {
+            await finish({
+              error: new Error("VFS open resource changed while streaming"),
+              invalidate: true,
+            });
+            return;
+          }
+          position += bytesRead;
+          const bytes = chunk.subarray(0, bytesRead);
+          streamedHash.update(bytes);
+          if (position === validated.byteLength) {
+            if (!await completedStreamMatches()) {
+              await finish({
+                error: new Error("VFS open resource changed while streaming"),
+                invalidate: true,
+              });
+              return;
+            }
+            await finish({ closeBody: true, finalChunk: bytes, invalidate: true });
+            return;
+          }
+          value.enqueue(bytes);
+        } catch (error) {
+          await finish({
+            error: error instanceof Error ? error : new Error(String(error)),
+            invalidate: true,
+          });
+        }
+      },
+      cancel() {
+        return finish();
+      },
+    });
+    return {
+      body,
+      byteLength: validated.byteLength,
+      dispose: () => finish({ error: new Error("VFS open resource was closed") }),
+    };
   }
 
   private consumeUploadedStdin(
@@ -781,6 +1023,147 @@ async function pathExists(path: string): Promise<boolean> {
 
 function isNodeError(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === code;
+}
+
+interface StableOpenFile {
+  path: string;
+  digest: string;
+  byteLength: number;
+}
+
+interface OpenFileIdentity {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  nlink: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+interface ValidatedOpenFile extends StableOpenFile {
+  fileHandle: Awaited<ReturnType<typeof openFile>>;
+  filePath: string;
+  filesRoot: string;
+  identity: OpenFileIdentity;
+}
+
+async function readStableOpenMetadata(
+  filesRoot: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<StableOpenFile | null> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const validated = await openValidatedOpenFile(filesRoot, path, undefined, signal);
+    if (!validated) continue;
+    try {
+      return {
+        path: validated.path,
+        digest: validated.digest,
+        byteLength: validated.byteLength,
+      };
+    } finally {
+      await validated.fileHandle.close();
+    }
+  }
+  throw new Error("file changed while it was being read");
+}
+
+async function openValidatedOpenFile(
+  filesRoot: string,
+  path: string,
+  expectedDigest?: string,
+  signal?: AbortSignal,
+): Promise<ValidatedOpenFile | null> {
+  const validatedPath = validateD1Path(path);
+  const filePath = resolveD1Path(filesRoot, validatedPath);
+  throwIfAborted(signal);
+  await assertSafeD1Parents(filesRoot, validatedPath);
+  const fileHandle = await openFile(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let retained = false;
+  try {
+    const before = await fileHandle.stat({ bigint: true });
+    if (!before.isFile() || before.nlink !== 1n) {
+      throw new Error("D1 admits only regular, non-hard-linked files");
+    }
+    const identity = openFileIdentity(before);
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(VFS_OPEN_IO_CHUNK_BYTES);
+    let position = 0;
+    for (;;) {
+      throwIfAborted(signal);
+      const { bytesRead } = await fileHandle.read(chunk, 0, chunk.byteLength, position);
+      if (bytesRead === 0) break;
+      hash.update(chunk.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    throwIfAborted(signal);
+    const after = await fileHandle.stat({ bigint: true });
+    if (
+      BigInt(position) !== identity.size
+      || !sameOpenFileIdentity(identity, after)
+      || !await openPathMatchesIdentity(filesRoot, validatedPath, filePath, identity)
+    ) {
+      return null;
+    }
+    const digest = `sha256:${hash.digest("hex")}`;
+    if (expectedDigest && digest !== expectedDigest) return null;
+    retained = true;
+    return {
+      path: validatedPath,
+      digest,
+      byteLength: position,
+      fileHandle,
+      filePath,
+      filesRoot,
+      identity,
+    };
+  } finally {
+    if (!retained) await fileHandle.close();
+  }
+}
+
+function openFileIdentity(value: OpenFileIdentity): OpenFileIdentity {
+  return {
+    dev: value.dev,
+    ino: value.ino,
+    size: value.size,
+    nlink: value.nlink,
+    mtimeNs: value.mtimeNs,
+    ctimeNs: value.ctimeNs,
+  };
+}
+
+function sameOpenFileIdentity(
+  expected: OpenFileIdentity,
+  actual: OpenFileIdentity,
+): boolean {
+  return expected.dev === actual.dev
+    && expected.ino === actual.ino
+    && expected.size === actual.size
+    && expected.nlink === actual.nlink
+    && expected.mtimeNs === actual.mtimeNs
+    && expected.ctimeNs === actual.ctimeNs;
+}
+
+async function openPathMatchesIdentity(
+  filesRoot: string,
+  path: string,
+  filePath: string,
+  expected: OpenFileIdentity,
+): Promise<boolean> {
+  await assertSafeD1Parents(filesRoot, path);
+  const actual = await lstat(filePath, { bigint: true });
+  return actual.isFile()
+    && !actual.isSymbolicLink()
+    && actual.nlink === 1n
+    && sameOpenFileIdentity(expected, actual);
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new Error("VFS open resource was closed");
 }
 
 function errorMessage(error: unknown): string {
