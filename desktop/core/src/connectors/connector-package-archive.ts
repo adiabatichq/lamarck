@@ -13,6 +13,8 @@ import {
 
 const TAR_BLOCK_SIZE = 512;
 const TAR_END_SIZE = TAR_BLOCK_SIZE * 2;
+const GZIP_OS_BYTE_OFFSET = 9;
+const GZIP_OS_DARWIN = 19;
 const PACKAGE_DIGEST_PATTERN = /^sha256:([a-f0-9]{64})$/;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
@@ -76,6 +78,9 @@ export class ConnectorPackageArchiveStore {
     }
 
     const archiveBytes = gzipSync(encodeTar(entries), { level: 9 });
+    // RFC 1952's OS byte varies by runner. Pin the historical archive value
+    // so the immutable representation is identical on macOS and Linux.
+    archiveBytes[GZIP_OS_BYTE_OFFSET] = GZIP_OS_DARWIN;
     const path = this.archivePath(logicalDigest);
     const archiveDir = dirname(path);
     await mkdir(archiveDir, { recursive: true });

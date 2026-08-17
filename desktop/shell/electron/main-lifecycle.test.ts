@@ -569,7 +569,7 @@ describe("Shell Host configuration", () => {
       `binding.signal.addEventListener("abort", onAuthorityAborted`,
     );
     const bindSender = lifecycle.indexOf(
-      "systemBroker.bindSender(view.webContents.id, binding)",
+      "systemBroker.bindSender(view.webContents.id, binding,",
     );
     expect(lifecycle).toMatch(
       /const onAuthorityAborted = \(\) => \{[\s\S]*?systemBroker\.unbindSender\(view\.webContents\.id\);[\s\S]*?\n  \};/,
