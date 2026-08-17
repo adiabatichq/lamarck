@@ -48,12 +48,16 @@ const expectedFiles = [
   "dist/browser.js",
   "dist/create-system.d.ts",
   "dist/create-system.js",
+  "dist/node-system.d.ts",
+  "dist/node-system.js",
   "dist/node-transport.d.ts",
   "dist/node-transport.js",
   "dist/node.d.ts",
   "dist/node.js",
   "dist/protocol.d.ts",
   "dist/protocol.js",
+  "dist/vfs-internal.d.ts",
+  "dist/vfs-internal.js",
   "package.json",
 ];
 const actualFiles = first.files?.map((entry) => entry.path);
