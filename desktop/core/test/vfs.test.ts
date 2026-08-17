@@ -11,13 +11,20 @@ import {
   rmSync,
   symlinkSync,
   statSync,
+  truncateSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { d1PathsConflict, parseVfsCommand, validateD1Path } from "@lamarck/system/internal/vfs";
+import {
+  d1PathsConflict,
+  executeReadVfsCommand,
+  parseVfsCommand,
+  validateD1Path,
+} from "@lamarck/system/internal/vfs";
 import { ContentBlobStore } from "../src/blob-store";
 import { D1Observer } from "../src/d1-observer";
 import { D1ObserverState } from "../src/d1-observer-state";
@@ -139,6 +146,48 @@ describe("D1 VFS", () => {
     for (const path of ["/absolute.md", "../escape.md", "a\\b.md", "a//b.md", "CON.txt", "x. ", ".obsidian/x", "a/.DS_Store"]) {
       expect(() => validateD1Path(path)).toThrow();
     }
+  });
+
+  test("streams opaque digests without retaining bytes and preserves Markdown baselines", async () => {
+    const probe = await open(join(filesRoot, "read-method-probe"), "w+");
+    const readFile = vi.spyOn(Object.getPrototypeOf(probe) as { readFile: () => Promise<Buffer> }, "readFile");
+    await probe.close();
+
+    const opaqueBytes = Buffer.alloc(3 * 64 * 1024 + 17, 0xa5);
+    writeFileSync(join(filesRoot, "archive.bin"), opaqueBytes);
+    const opaque = await readStableD1File(filesRoot, "archive.bin");
+    expect(opaque).toMatchObject({
+      byteLength: opaqueBytes.byteLength,
+      markdown: false,
+      markdownBaseline: null,
+    });
+    expect(opaque.bytes).toHaveLength(0);
+    expect(opaque.digest).toBe(`sha256:${createHash("sha256").update(opaqueBytes).digest("hex")}`);
+    expect(readFile).not.toHaveBeenCalled();
+
+    const markdownBytes = Buffer.from("first\r\nsecond\n", "utf8");
+    writeFileSync(join(filesRoot, "notes.MD"), markdownBytes);
+    const markdown = await readStableD1File(filesRoot, "notes.MD");
+    expect(markdown.markdown).toBe(true);
+    expect(markdown.bytes).toEqual(markdownBytes);
+    expect(markdown.markdownBaseline).toEqual(markdownBytes);
+    expect(readFile).toHaveBeenCalledTimes(1);
+    readFile.mockRestore();
+  });
+
+  test("rejects oversized captured cat output before reading it into memory", async () => {
+    writeFileSync(join(filesRoot, "small.bin"), "12345");
+    await expect(executeReadVfsCommand(filesRoot, parseVfsCommand("cat -- small.bin"), {
+      maxCapturedBytes: 4,
+    })).rejects.toThrow("captured output exceeds the size limit");
+
+    const oversizedPath = join(filesRoot, "oversized.bin");
+    writeFileSync(oversizedPath, "");
+    truncateSync(oversizedPath, 20 * 1024 * 1024);
+    const result = await vfs.command(hostCaller(guard), "cat -- oversized.bin");
+    expect(result.success).toBe(false);
+    expect(Buffer.from(result.stderrBase64, "base64").toString())
+      .toContain("captured output exceeds the size limit");
   });
 
   test("writes bytes through one command and records exact Markdown evidence", async () => {
@@ -617,6 +666,21 @@ describe("D1 VFS", () => {
 
     symlinkSync(join(filesRoot, "ok"), join(filesRoot, "alias"));
     expect((await vfs.command(hostCaller(guard), "cat -- alias/one.md")).success).toBe(false);
+  });
+
+  test("rejects forced self-copy and self-move without removing the source", async () => {
+    writeFileSync(join(filesRoot, "copy.md"), "copy source");
+    const copied = await vfs.command(hostCaller(guard), "cp -f -- copy.md copy.md");
+    expect(copied.success).toBe(false);
+    expect(Buffer.from(copied.stderrBase64, "base64").toString()).toContain("same filesystem entry");
+    expect(readFileSync(join(filesRoot, "copy.md"), "utf8")).toBe("copy source");
+
+    writeFileSync(join(filesRoot, "move.md"), "move source");
+    const moved = await vfs.command(hostCaller(guard), "mv -f -- move.md move.md");
+    expect(moved.success).toBe(false);
+    expect(Buffer.from(moved.stderrBase64, "base64").toString()).toContain("same filesystem entry");
+    expect(readFileSync(join(filesRoot, "move.md"), "utf8")).toBe("move source");
+    expect(guard.events).toHaveLength(0);
   });
 
   test("classifies explicit directory moves without guessing observer moves", async () => {

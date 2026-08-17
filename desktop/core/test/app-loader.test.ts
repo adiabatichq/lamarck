@@ -13,6 +13,7 @@ import {
   mkdtempSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "fs";
 import { open } from "fs/promises";
@@ -238,6 +239,27 @@ describe("App Loader", () => {
       "shared/pinned.md",
     ]);
     expect(registry.getFileGrants("unknown-app")).toEqual([]);
+  });
+
+  test("provisions validated App D1 homes on load without granting the parent", async () => {
+    const manifest = validManifest("focus");
+    manifest.permissions.writes.files = ["notes/"];
+    writeApp("focus", manifest);
+
+    const firstRegistry = await loadApps(appsDir);
+    const home = join(workspace, "files", "apps", "focus");
+    expect(statSync(home).isDirectory()).toBe(true);
+    expect(firstRegistry.getFileGrants("focus")).toEqual(["apps/focus/", "notes/"]);
+    expect(firstRegistry.getFileGrants("focus")).not.toContain("apps/");
+
+    rmSync(home, { recursive: true });
+    const refreshedRegistry = await loadApps(appsDir);
+    expect(refreshedRegistry.apps.has("focus")).toBe(true);
+    expect(statSync(home).isDirectory()).toBe(true);
+
+    await archiveApp(appsDir, join(workspace, "app-archive"), "focus");
+    expect((await loadApps(appsDir)).apps.has("focus")).toBe(false);
+    expect(statSync(home).isDirectory()).toBe(true);
   });
 
   test("requires manifestVersion 1 and rejects unknown fields", async () => {

@@ -5,6 +5,7 @@ import {
   realpathSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -15,6 +16,7 @@ import {
   initializeWorkspaceDirectory,
   inspectWorkspaceForOpen,
   normalizeWorkspacePath,
+  validateWorkspaceFilesMountPath,
 } from "./workspace-files";
 import { createWorkspaceVaultVerifier } from "./workspace-vault-crypto";
 
@@ -203,5 +205,28 @@ describe("Workspace filesystem lifecycle", () => {
       () => inspectWorkspaceForOpen(workspace),
       "WORKSPACE_VAULT_VERIFIER_INVALID",
     );
+  });
+
+  test("accepts only the canonical physical Workspace files directory for VM mounting", () => {
+    const root = temporaryRoot();
+    const workspace = join(root, "workspace");
+    const files = join(workspace, "files");
+    mkdirSync(files, { recursive: true });
+
+    expect(validateWorkspaceFilesMountPath(workspace)).toBe(realpathSync(files));
+
+    const workspaceAlias = join(root, "workspace-alias");
+    symlinkSync(workspace, workspaceAlias);
+    expect(validateWorkspaceFilesMountPath(workspaceAlias)).toBe(realpathSync(files));
+
+    rmSync(files, { recursive: true });
+    const external = join(root, "external-files");
+    mkdirSync(external);
+    symlinkSync(external, files);
+    expect(() => validateWorkspaceFilesMountPath(workspace)).toThrow("physical directory");
+
+    rmSync(files);
+    writeFileSync(files, "not a directory");
+    expect(() => validateWorkspaceFilesMountPath(workspace)).toThrow("physical directory");
   });
 });

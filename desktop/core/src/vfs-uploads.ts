@@ -58,24 +58,35 @@ export class VfsUploadStore {
     do token = randomBytes(32).toString("base64url");
     while (this.sessions.has(token));
     const path = join(this.root, token);
-    try {
-      await writeFile(path, Buffer.alloc(0), { flag: "wx", mode: 0o600 });
-    } catch (error) {
-      unlinkFile(path);
-      throw error;
-    }
-    this.sessions.set(token, {
+    const session: UploadSession = {
       token,
       workloadId,
       path,
       nextChunkIndex: 0,
       byteLength: 0,
       completed: false,
-      busy: false,
+      busy: true,
       expiresAt: Date.now() + UPLOAD_TTL_MS,
-    });
+    };
+    // Reserve quota before filesystem creation yields so concurrent begins
+    // observe this session in both workload and global counts.
+    this.sessions.set(token, session);
     this.scheduleExpiry();
-    return token;
+    try {
+      await writeFile(path, Buffer.alloc(0), { flag: "wx", mode: 0o600 });
+      if (this.sessions.get(token) !== session) {
+        unlinkFile(path);
+        throw new Error("VFS upload is no longer active");
+      }
+      session.busy = false;
+      session.expiresAt = Date.now() + UPLOAD_TTL_MS;
+      this.scheduleExpiry();
+      return token;
+    } catch (error) {
+      this.removeSession(session);
+      unlinkFile(path);
+      throw error;
+    }
   }
 
   async append(workloadId: string, token: string, index: number, dataBase64: string): Promise<void> {

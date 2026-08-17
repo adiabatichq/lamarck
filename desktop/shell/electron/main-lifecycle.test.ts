@@ -4,6 +4,11 @@ import { describe, expect, test } from "vitest";
 const mainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
 
 describe("Shell window lifecycle", () => {
+  test("validates the selected Workspace files directory at the VM mount boundary", () => {
+    expect(mainSource).toContain("workspaceFilesPath: () => validateWorkspaceFilesMountPath(workspace)");
+    expect(mainSource).not.toContain('workspaceFilesPath: () => join(workspace, "files")');
+  });
+
   test("does not dereference a destroyed BrowserWindow from its closed handler", () => {
     const match = mainSource.match(/win\.on\("closed", \(\) => \{([\s\S]*?)\n  \}\);/);
     if (!match) throw new Error("Shell BrowserWindow closed handler is missing");

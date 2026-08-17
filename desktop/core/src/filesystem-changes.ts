@@ -29,6 +29,7 @@ const { createTwoFilesPatch } = require("diff") as {
 export const INLINE_PATCH_BYTES = 8 * 1024;
 export const PATCH_PREVIEW_BYTES = 4 * 1024;
 export const INLINE_CHANGES_BYTES = 256 * 1024;
+const D1_HASH_CHUNK_BYTES = 64 * 1024;
 
 export interface D1FileSnapshot extends D1ObserverFile {
   bytes: Buffer;
@@ -167,7 +168,25 @@ export async function readStableD1File(filesRoot: string, path: string): Promise
       if (!before.isFile() || before.nlink !== 1n) {
         throw new Error("D1 admits only regular, non-hard-linked files");
       }
-      const bytes = await handle.readFile();
+      const markdownPath = isMarkdownPath(path);
+      let bytes = Buffer.alloc(0);
+      let byteLength = 0;
+      let digest: string;
+      if (markdownPath) {
+        bytes = Buffer.from(await handle.readFile());
+        byteLength = bytes.byteLength;
+        digest = digestBytes(bytes);
+      } else {
+        const hash = createHash("sha256");
+        const chunk = Buffer.allocUnsafe(D1_HASH_CHUNK_BYTES);
+        for (;;) {
+          const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, byteLength);
+          if (bytesRead === 0) break;
+          hash.update(chunk.subarray(0, bytesRead));
+          byteLength += bytesRead;
+        }
+        digest = `sha256:${hash.digest("hex")}`;
+      }
       const after = await handle.stat({ bigint: true });
       if (
         before.dev === after.dev
@@ -175,17 +194,16 @@ export async function readStableD1File(filesRoot: string, path: string): Promise
         && before.size === after.size
         && before.mtimeNs === after.mtimeNs
         && before.ctimeNs === after.ctimeNs
-        && BigInt(bytes.byteLength) === after.size
+        && BigInt(byteLength) === after.size
       ) {
-        const digest = digestBytes(bytes);
-        const markdown = isMarkdownPath(path) && decodeUtf8(bytes) !== null;
+        const markdown = markdownPath && decodeUtf8(bytes) !== null;
         return {
           path,
           digest,
-          byteLength: bytes.byteLength,
+          byteLength,
           markdownBaseline: markdown ? Buffer.from(bytes) : null,
           statFingerprint: statFingerprint(after),
-          bytes: Buffer.from(bytes),
+          bytes: markdownPath ? Buffer.from(bytes) : Buffer.alloc(0),
           markdown,
         };
       }

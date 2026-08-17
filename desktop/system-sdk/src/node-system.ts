@@ -40,7 +40,9 @@ async function nodeVfsCommand(
   if (!isReadVfsCommand(parsed)) return brokered.vfs.command(command, options);
   try {
     if (options !== undefined) validateVfsMetadata(options);
-    const stdout = await executeReadVfsCommand(filesRoot, parsed);
+    const stdout = await executeReadVfsCommand(filesRoot, parsed, {
+      captureOutput: options?.stdout !== "ignore",
+    });
     return {
       success: true,
       exitCode: 0,

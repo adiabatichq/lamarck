@@ -69,6 +69,11 @@ interface MutationPlan {
 
 export const MAX_VFS_OPEN_HANDLES_PER_WORKLOAD = 256;
 const MAX_CAPTURED_UPLOADED_STDIN_BYTES = 15 * 1024 * 1024 - 1024;
+// Largest stdout whose Base64 form and fixed successful VFS/Browser JSON
+// envelopes fit the existing 20 MiB response budget.
+const MAX_CAPTURED_VFS_STDOUT_BYTES = Math.floor(
+  (20 * 1024 * 1024 - 86) / 4,
+) * 3;
 const VFS_OPEN_IO_CHUNK_BYTES = 64 * 1024;
 
 export interface VfsOpenContent {
@@ -143,7 +148,7 @@ export class VfsService {
         ));
       }
       try {
-        const output = await this.executeRead(parsed);
+        const output = await this.executeRead(parsed, options.stdout !== "ignore");
         return result(0, options.stdout === "ignore" ? Buffer.alloc(0) : output, Buffer.alloc(0));
       } catch (error) {
         return result(1, Buffer.alloc(0), Buffer.from(`${errorMessage(error)}\n`));
@@ -721,7 +726,12 @@ export class VfsService {
       for (const mapping of mappings) {
         const source = resolveD1Path(this.filesRoot, mapping.from);
         const destination = resolveD1Path(this.filesRoot, mapping.path);
-        if (force) await rm(destination, { recursive: true, force: true });
+        if (force) {
+          if (await pathsReferenceSameFilesystemEntry(source, destination)) {
+            throw new Error(`${parsed.name}: source and destination are the same filesystem entry`);
+          }
+          await rm(destination, { recursive: true, force: true });
+        }
         if (parsed.name === "cp") {
           await cp(source, destination, { recursive: true, errorOnExist: true, force: false, dereference: false });
         } else {
@@ -746,9 +756,12 @@ export class VfsService {
     throw new Error(`Unsupported mutating command: ${parsed.name}`);
   }
 
-  private async executeRead(parsed: ParsedVfsCommand): Promise<Buffer> {
+  private async executeRead(parsed: ParsedVfsCommand, captureOutput: boolean): Promise<Buffer> {
     if (parsed.name === "cat" || parsed.name === "stat" || parsed.name === "ls") {
-      return executeReadVfsCommand(this.filesRoot, parsed);
+      return executeReadVfsCommand(this.filesRoot, parsed, {
+        captureOutput,
+        maxCapturedBytes: MAX_CAPTURED_VFS_STDOUT_BYTES,
+      });
     }
     if (parsed.name === "export") {
       await collectEntryPaths(this.filesRoot, parsed.operands[0]!);
@@ -1019,6 +1032,18 @@ async function pathExists(path: string): Promise<boolean> {
     if (isNodeError(error, "ENOENT")) return false;
     throw error;
   }
+}
+
+async function pathsReferenceSameFilesystemEntry(left: string, right: string): Promise<boolean> {
+  const leftInfo = await lstat(left, { bigint: true });
+  let rightInfo;
+  try {
+    rightInfo = await lstat(right, { bigint: true });
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return false;
+    throw error;
+  }
+  return leftInfo.dev === rightInfo.dev && leftInfo.ino === rightInfo.ino;
 }
 
 function isNodeError(error: unknown, code: string): boolean {

@@ -1,5 +1,6 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -71,6 +72,20 @@ export function normalizeWorkspacePath(input: string): string {
     );
   }
   return resolve(normalized);
+}
+
+export function validateWorkspaceFilesMountPath(selectedWorkspacePath: string): string {
+  const canonicalWorkspace = realpathSync(resolve(selectedWorkspacePath));
+  const expectedFilesPath = join(canonicalWorkspace, "files");
+  const info = lstatSync(expectedFilesPath);
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error("Workspace files mount path must be a physical directory");
+  }
+  const canonicalFilesPath = realpathSync(expectedFilesPath);
+  if (canonicalFilesPath !== expectedFilesPath) {
+    throw new Error("Workspace files mount path must be the canonical Workspace files directory");
+  }
+  return canonicalFilesPath;
 }
 
 export function inspectWorkspaceForOpen(input: string): WorkspaceDescriptor {

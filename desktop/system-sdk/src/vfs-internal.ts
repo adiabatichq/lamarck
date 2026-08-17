@@ -52,6 +52,7 @@ const PORTABLE_PATH_CHARS = /[<>:"|?*]/;
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 const MAX_PATH_BYTES = 768;
 const MAX_SEGMENT_BYTES = 240;
+const VFS_READ_CHUNK_BYTES = 64 * 1024;
 
 export function parseVfsCommand(command: string): ParsedVfsCommand {
   if (typeof command !== "string" || command.length === 0 || command.includes("\0")) {
@@ -129,11 +130,33 @@ export function validateVfsMetadata(options: unknown): void {
 export async function executeReadVfsCommand(
   filesRoot: string,
   parsed: ParsedVfsCommand,
+  options: {
+    captureOutput?: boolean;
+    maxCapturedBytes?: number;
+  } = {},
 ): Promise<Buffer> {
   if (parsed.name === "cat") {
+    const captureOutput = options.captureOutput !== false;
+    const maxCapturedBytes = options.maxCapturedBytes ?? Number.MAX_SAFE_INTEGER;
+    if (!Number.isSafeInteger(maxCapturedBytes) || maxCapturedBytes < 0) {
+      throw new Error("cat captured-output limit is invalid");
+    }
+    if (captureOutput) {
+      await assertCatCaptureWithinLimit(filesRoot, parsed.operands, maxCapturedBytes);
+    }
     const chunks: Buffer[] = [];
-    for (const path of parsed.operands) chunks.push(await readStableFile(filesRoot, path));
-    return Buffer.concat(chunks);
+    let remainingBytes = maxCapturedBytes;
+    for (const path of parsed.operands) {
+      const bytes = await readStableFile(filesRoot, path, {
+        retainBytes: captureOutput,
+        maxBytes: remainingBytes,
+      });
+      if (captureOutput) {
+        chunks.push(bytes);
+        remainingBytes -= bytes.byteLength;
+      }
+    }
+    return captureOutput ? Buffer.concat(chunks) : Buffer.alloc(0);
   }
   if (parsed.name === "stat") {
     const lines: string[] = [];
@@ -259,7 +282,30 @@ export function hasD1Grant(grants: readonly string[] | null, path: string): bool
     : path === grant);
 }
 
-async function readStableFile(filesRoot: string, path: string): Promise<Buffer> {
+async function assertCatCaptureWithinLimit(
+  filesRoot: string,
+  paths: readonly string[],
+  maxBytes: number,
+): Promise<void> {
+  let total = 0n;
+  const limit = BigInt(maxBytes);
+  for (const path of paths) {
+    validateD1Path(path);
+    await assertSafeD1Parents(filesRoot, path);
+    const info = await lstat(resolveD1Path(filesRoot, path), { bigint: true });
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1n) {
+      throw new Error(`cat: ${path}: unsupported filesystem entry`);
+    }
+    total += info.size;
+    if (total > limit) throw new Error("cat: captured output exceeds the size limit");
+  }
+}
+
+async function readStableFile(
+  filesRoot: string,
+  path: string,
+  options: { retainBytes: boolean; maxBytes: number },
+): Promise<Buffer> {
   validateD1Path(path);
   await assertSafeD1Parents(filesRoot, path);
   const filePath = join(filesRoot, ...path.split("/"));
@@ -270,7 +316,31 @@ async function readStableFile(filesRoot: string, path: string): Promise<Buffer> 
       if (!before.isFile() || before.nlink !== 1n) {
         throw new Error("D1 admits only regular, non-hard-linked files");
       }
-      const bytes = await handle.readFile();
+      if (options.retainBytes && before.size > BigInt(options.maxBytes)) {
+        throw new Error("cat: captured output exceeds the size limit");
+      }
+      const bytes = options.retainBytes
+        ? Buffer.allocUnsafe(Number(before.size))
+        : Buffer.alloc(0);
+      const chunk = options.retainBytes ? bytes : Buffer.allocUnsafe(VFS_READ_CHUNK_BYTES);
+      let position = 0;
+      let reachedEof = false;
+      for (;;) {
+        if (options.retainBytes && position === bytes.byteLength) {
+          const extra = Buffer.allocUnsafe(1);
+          reachedEof = (await handle.read(extra, 0, extra.byteLength, position)).bytesRead === 0;
+          break;
+        }
+        const length = options.retainBytes
+          ? bytes.byteLength - position
+          : chunk.byteLength;
+        const { bytesRead } = await handle.read(chunk, 0, length, position);
+        if (bytesRead === 0) {
+          reachedEof = true;
+          break;
+        }
+        position += bytesRead;
+      }
       const after = await handle.stat({ bigint: true });
       if (
         before.dev === after.dev
@@ -278,8 +348,9 @@ async function readStableFile(filesRoot: string, path: string): Promise<Buffer> 
         && before.size === after.size
         && before.mtimeNs === after.mtimeNs
         && before.ctimeNs === after.ctimeNs
-        && BigInt(bytes.byteLength) === after.size
-      ) return Buffer.from(bytes);
+        && BigInt(position) === after.size
+        && reachedEof
+      ) return options.retainBytes ? bytes : Buffer.alloc(0);
     } finally {
       await handle.close();
     }

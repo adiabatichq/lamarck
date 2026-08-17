@@ -80,6 +80,7 @@ import {
   initializeWorkspaceDirectory,
   inspectWorkspaceForCreate,
   inspectWorkspaceForOpen,
+  validateWorkspaceFilesMountPath,
   type WorkspaceDescriptor,
 } from "./workspace-files";
 import {
@@ -305,7 +306,7 @@ const capsuleBackend = new MacOsCapsuleBackend({
   stateDirectory: join(capsuleCacheRoot, "vm"),
   cacheDirectory: join(capsuleCacheRoot, "cache"),
   artifactRoot: join(capsuleCacheRoot, "artifacts"),
-  workspaceFilesPath: () => join(workspace, "files"),
+  workspaceFilesPath: () => validateWorkspaceFilesMountPath(workspace),
   systemStreamServer,
 });
 const capsuleManager = new CapsuleManager({

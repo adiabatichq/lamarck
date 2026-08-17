@@ -42,4 +42,40 @@ describe("VFS upload size boundary", () => {
     expect(() => store.abort("workload", overflow)).toThrow("not available");
     expect(existsSync(join(workspace, "files"))).toBe(false);
   });
+
+  test("reserves workload and global upload slots before concurrent file creation yields", async () => {
+    workspace = await mkdtemp(join(tmpdir(), "lamarck-vfs-upload-quota-"));
+    const store = new VfsUploadStore(workspace);
+    await store.initialize();
+
+    const workloadBegins = await Promise.allSettled(
+      Array.from({ length: 5 }, () => store.begin("same-workload")),
+    );
+    expect(workloadBegins.filter((result) => result.status === "fulfilled")).toHaveLength(4);
+    expect(workloadBegins.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(store.closeWorkload("same-workload")).toBe(4);
+    expect(await readdir(store.root)).toEqual([]);
+
+    const globalBegins = await Promise.allSettled(
+      Array.from({ length: 33 }, (_, index) => store.begin(`workload-${index}`)),
+    );
+    expect(globalBegins.filter((result) => result.status === "fulfilled")).toHaveLength(32);
+    expect(globalBegins.filter((result) => result.status === "rejected")).toHaveLength(1);
+    for (let index = 0; index < 33; index += 1) store.closeWorkload(`workload-${index}`);
+    expect(await readdir(store.root)).toEqual([]);
+  });
+
+  test("rolls back a reserved slot when temporary file creation fails", async () => {
+    workspace = await mkdtemp(join(tmpdir(), "lamarck-vfs-upload-rollback-"));
+    const store = new VfsUploadStore(workspace);
+
+    await expect(store.begin("workload")).rejects.toThrow();
+    await store.initialize();
+    const tokens = await Promise.all(
+      Array.from({ length: 4 }, () => store.begin("workload")),
+    );
+    expect(tokens).toHaveLength(4);
+    expect(store.closeWorkload("workload")).toBe(4);
+    expect(await readdir(store.root)).toEqual([]);
+  });
 });

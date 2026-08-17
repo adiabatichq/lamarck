@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
-import { mkdir, open, readdir, rename, stat } from "fs/promises";
-import { join } from "path";
+import { lstat, mkdir, open, readdir, rename, stat } from "fs/promises";
+import { dirname, join } from "path";
 import { validateD1Grant } from "@lamarck/system/internal/vfs";
 import {
   APP_MANIFEST_MAX_BYTES,
@@ -127,6 +127,7 @@ export async function loadApps(appsDir: string): Promise<AppRegistry> {
       continue;
     }
 
+    await provisionAppD1Home(dirname(appsDir), validation.manifest.id);
     apps.set(validation.manifest.id, {
       manifest: validation.manifest,
       manifestDigest: digestNormalizedAppManifest(validation.manifest),
@@ -135,6 +136,26 @@ export async function loadApps(appsDir: string): Promise<AppRegistry> {
   }
 
   return createRegistry(apps);
+}
+
+async function provisionAppD1Home(workspacePath: string, appId: string): Promise<void> {
+  const filesRoot = join(workspacePath, "files");
+  const appHomesRoot = join(filesRoot, "apps");
+  await ensurePhysicalDirectory(filesRoot, "D1 root");
+  await ensurePhysicalDirectory(appHomesRoot, "D1 App homes root");
+  await ensurePhysicalDirectory(join(appHomesRoot, appId), `D1 home for App ${appId}`);
+}
+
+async function ensurePhysicalDirectory(path: string, label: string): Promise<void> {
+  try {
+    await mkdir(path);
+  } catch (error) {
+    if (!isNodeError(error, "EEXIST")) throw error;
+  }
+  const info = await lstat(path);
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error(`${label} must be a physical directory`);
+  }
 }
 
 /**
