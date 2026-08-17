@@ -1,5 +1,5 @@
 import { watch, type FSWatcher } from "node:fs";
-import { createRequire } from "node:module";
+import { applyPatch } from "diff";
 import type { ContentBlobRef } from "@lamarck/system/protocol";
 import { ContentBlobStore } from "./blob-store";
 import { D1ObserverState, type D1RecordedChange } from "./d1-observer-state";
@@ -20,10 +20,6 @@ import type { JsonValue } from "./json";
 
 const COALESCE_MS = 120;
 const POLL_MS = 2_000;
-const require = createRequire(import.meta.url);
-const { applyPatch } = require("diff") as {
-  applyPatch(source: string, patch: string): string | false;
-};
 
 export class D1Observer {
   private watcher: FSWatcher | null = null;

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, readdir } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { join } from "node:path";
+import { createTwoFilesPatch } from "diff";
 import type { ContentBlobRef } from "@lamarck/system/protocol";
 import { ContentBlobStore } from "./blob-store";
 import {
@@ -12,19 +12,6 @@ import {
   validateD1Path,
 } from "@lamarck/system/internal/vfs";
 import type { D1ObserverFile, D1RecordedChange } from "./d1-observer-state";
-
-const require = createRequire(import.meta.url);
-const { createTwoFilesPatch } = require("diff") as {
-  createTwoFilesPatch(
-    oldPath: string,
-    newPath: string,
-    before: string,
-    after: string,
-    oldHeader?: string,
-    newHeader?: string,
-    options?: { context?: number },
-  ): string;
-};
 
 export const INLINE_PATCH_BYTES = 8 * 1024;
 export const PATCH_PREVIEW_BYTES = 4 * 1024;
