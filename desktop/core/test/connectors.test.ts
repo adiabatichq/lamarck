@@ -9390,7 +9390,7 @@ auth:
     ).rejects.toThrow("browser auth");
   });
 
-  test("holds connector identity ownership through pending browser auth and releases it on terminal status", async () => {
+  test("recovers connector identity ownership from abandoned browser auth", async () => {
     supervisor = new TestConnectorSupervisor({
       systemDb,
       guard: new Guard({ db: dataDb, source: "system:test" }),
@@ -9443,15 +9443,40 @@ auth:
       .rejects.toThrow("identity mutation in progress");
 
     const firstState = new URL(first.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.retrySourceIdentity(sourceRecord.id)).resolves.toMatchObject({
+      identityStatus: "unresolved",
+      setupStatus: "setup",
+    });
     await expect(supervisor.completeOAuthCallback(new URLSearchParams({
       state: firstState,
       error: "access_denied",
-    }))).resolves.toMatchObject({ status: "failed", error: "access_denied" });
+    }))).resolves.toEqual({
+      status: "failed",
+      error: "OAuth state is invalid or already used",
+    });
 
     const second = await supervisor.startOAuthSource(sourceRecord.id, {
       redirectUri: "http://localhost:32123/oauth/callback",
     });
-    const secondState = new URL(second.authorizationUrl).searchParams.get("state")!;
+    expect(supervisor.cancelAuthAttempt(sourceRecord.id, second.attemptId)).toBe(true);
+    expect(supervisor.cancelAuthAttempt(sourceRecord.id, second.attemptId)).toBe(false);
+
+    const replaced = await supervisor.startOAuthSource(sourceRecord.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+    });
+    const replacement = await supervisor.startOAuthSource(sourceRecord.id, {
+      redirectUri: "http://localhost:32123/oauth/callback",
+      replacePending: true,
+    });
+    const replacedState = new URL(replaced.authorizationUrl).searchParams.get("state")!;
+    await expect(supervisor.completeOAuthCallback(new URLSearchParams({
+      state: replacedState,
+      code: "stale-code",
+    }))).resolves.toEqual({
+      status: "failed",
+      error: "OAuth state is invalid or already used",
+    });
+    const secondState = new URL(replacement.authorizationUrl).searchParams.get("state")!;
     await expect(supervisor.completeOAuthCallback(new URLSearchParams({
       state: secondState,
       code: "code-1",

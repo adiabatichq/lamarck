@@ -92,6 +92,27 @@ describe("Connector surface responsibilities", () => {
     expect(markup).toContain("Rename…");
   });
 
+  test("waits for account connection before enabling identity retry", () => {
+    mocks.useConnectors.mockReturnValue({
+      sources: [{
+        ...identitySource,
+        identityStatus: "unresolved" as const,
+        conflictSourceId: undefined,
+        authReady: false,
+        setupPending: ["auth", "identity"],
+      }],
+      packages: [installedConnector],
+      loading: false,
+      error: null,
+      refresh: vi.fn(),
+    });
+
+    const markup = renderToStaticMarkup(<ConnectorsView />);
+
+    expect(markup).toContain("Connect an account before resolving identity");
+    expect(markup).toContain("Connect Account");
+  });
+
   test("presents another-device ownership without local run controls", () => {
     mocks.useConnectors.mockReturnValue({
       sources: [{

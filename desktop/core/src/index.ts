@@ -1153,10 +1153,16 @@ const server = await serve<{ cwd: string }>({
         ?? path.match(/^\/api\/connectors\/sources\/([^/]+)\/oauth\/start$/);
       if (authStartMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readBody<Record<string, unknown>>(req);
+        assertAllowedRequestFields(body, ["replacePending"]);
+        if (body.replacePending !== undefined && typeof body.replacePending !== "boolean") {
+          return json({ error: "replacePending must be a boolean" }, 400);
+        }
         const result = await connectorSupervisor.startAuthSource(
           decodeURIComponent(authStartMatch[1]),
           {
             redirectUri: oauthRedirectUri,
+            replacePending: body.replacePending === true,
           },
         );
         return json(result);
@@ -1174,6 +1180,14 @@ const server = await serve<{ cwd: string }>({
           decodeURIComponent(authAttemptMatch[2]),
         );
         return json(result);
+      }
+      if (authAttemptMatch && method === "DELETE") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const cancelled = connectorSupervisor.cancelAuthAttempt(
+          decodeURIComponent(authAttemptMatch[1]),
+          decodeURIComponent(authAttemptMatch[2]),
+        );
+        return json({ ok: true, cancelled });
       }
 
       const retryIdentityMatch = path.match(

@@ -138,6 +138,7 @@ interface ActiveRunIntent {
 
 interface IdentityMutationClaim {
   sourceId: string;
+  authAttemptId?: string;
   expiresAt?: number;
 }
 
@@ -604,7 +605,7 @@ export class ConnectorSupervisor {
 
   async startOAuthSource(
     instanceId: string,
-    input: { redirectUri: string },
+    input: { redirectUri: string; replacePending?: boolean },
   ): Promise<OAuthStartResult> {
     const existing = this.store.get(instanceId);
     if (!existing) {
@@ -618,12 +619,16 @@ export class ConnectorSupervisor {
     if (!isPlatformSupported(registration.manifest, this.platform)) {
       throw new Error(`Connector ${existing.connectorId} is not supported on ${this.platform}`);
     }
-    return this.startBrowserAuth(existing, () => this.authManager.startOAuth(existing, auth, input));
+    return this.startBrowserAuth(
+      existing,
+      () => this.authManager.startOAuth(existing, auth, input),
+      input.replacePending,
+    );
   }
 
   async startAuthSource(
     instanceId: string,
-    input: { redirectUri: string },
+    input: { redirectUri: string; replacePending?: boolean },
   ): Promise<OAuthStartResult> {
     const existing = this.store.get(instanceId);
     if (!existing) {
@@ -638,6 +643,7 @@ export class ConnectorSupervisor {
       return this.startBrowserAuth(
         existing,
         () => this.authManager.startOAuth(existing, auth, input),
+        input.replacePending,
       );
     }
     if (isManagedProviderAuthSpec(auth)) {
@@ -646,6 +652,7 @@ export class ConnectorSupervisor {
         () => this.authManager.startManagedProvider(existing, auth, {
           appOrigin: this.managedProviderAppOrigin,
         }),
+        input.replacePending,
       );
     }
     throw new Error(`Connector ${existing.connectorId} does not use browser auth`);
@@ -655,6 +662,25 @@ export class ConnectorSupervisor {
     const result = await this.authManager.getOAuthAttempt(instanceId, attemptId);
     await this.finalizeConnectedAuthAttempt(result);
     return result;
+  }
+
+  cancelAuthAttempt(instanceId: string, attemptId: string): boolean {
+    const sourceRecord = this.store.get(instanceId);
+    if (!sourceRecord) {
+      throw new Error(`Connector Source not found: ${instanceId}`);
+    }
+    this.requireRegistration(sourceRecord.connectorId);
+    const cancelled = this.authManager.cancelPendingAuthAttempt(instanceId, attemptId);
+    const identityClaim = this.identityMutations.get(sourceRecord.connectorId);
+    if (
+      cancelled
+      && identityClaim?.sourceId === instanceId
+      && identityClaim.authAttemptId === attemptId
+      && identityClaim.expiresAt !== undefined
+    ) {
+      this.releaseIdentityMutation(sourceRecord.connectorId, identityClaim);
+    }
+    return cancelled;
   }
 
   async completeOAuthCallback(params: URLSearchParams): Promise<OAuthAttemptView> {
@@ -1231,10 +1257,18 @@ export class ConnectorSupervisor {
   private async startBrowserAuth(
     sourceRecord: ConnectorSource,
     start: () => Promise<OAuthStartResult> | OAuthStartResult,
+    replacePending = false,
   ): Promise<OAuthStartResult> {
     const registration = this.requireRegistration(sourceRecord.connectorId);
     if (registration.manifest.source.identity !== "connector") {
+      if (replacePending) {
+        this.authManager.cancelPendingAuthAttemptsForSource(sourceRecord.id);
+      }
       return await start();
+    }
+
+    if (replacePending) {
+      this.cancelPendingBrowserIdentityMutation(sourceRecord);
     }
 
     const claim = this.claimIdentityMutation(sourceRecord.connectorId, sourceRecord.id);
@@ -1242,6 +1276,7 @@ export class ConnectorSupervisor {
       this.store.beginIdentityResolution(sourceRecord.id);
       await this.drainExecutionAttemptForIdentity(sourceRecord.id);
       const result = await start();
+      claim.authAttemptId = result.attemptId;
       claim.expiresAt = result.expiresAt;
       return result;
     } catch (error) {
@@ -1252,6 +1287,25 @@ export class ConnectorSupervisor {
       this.releaseIdentityMutation(sourceRecord.connectorId, claim);
       throw error;
     }
+  }
+
+  private cancelPendingBrowserIdentityMutation(sourceRecord: ConnectorSource): boolean {
+    const claim = this.identityMutations.get(sourceRecord.connectorId);
+    if (
+      !claim
+      || claim.sourceId !== sourceRecord.id
+      || claim.expiresAt === undefined
+    ) {
+      return false;
+    }
+    const cancelled = claim.authAttemptId
+      ? this.authManager.cancelPendingAuthAttempt(sourceRecord.id, claim.authAttemptId)
+      : this.authManager.cancelPendingAuthAttemptsForSource(sourceRecord.id);
+    if (!cancelled) {
+      return false;
+    }
+    this.releaseIdentityMutation(sourceRecord.connectorId, claim);
+    return true;
   }
 
   private async resolveSourceIdentityInClaim(
@@ -1509,6 +1563,10 @@ export class ConnectorSupervisor {
     if (existing.identityStatus === "resolved") {
       throw new Error(`Connector Source identity is already resolved: ${instanceId}`);
     }
+    // Retry is also the recovery action for a browser connection that the user
+    // abandoned. Cancel that same-Source attempt before taking a fresh fence;
+    // generation invalidation prevents a late callback from committing.
+    this.cancelPendingBrowserIdentityMutation(existing);
     const resolved = await this.withIdentityMutation<TConfig, TState>(instanceId);
     if (resolved.setupStatus === "ready") {
       this.requestRuntimeReconcile(instanceId, "readiness_changed");

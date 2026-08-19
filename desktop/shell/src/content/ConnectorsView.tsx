@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useConnectors } from "../hooks/useConnectors";
 import {
   approveConnector,
+  cancelConnectorAuthAttempt,
   checkConnectorRequirements,
   connectConnectorSource,
   createConnectorSource,
@@ -48,7 +49,7 @@ import styles from "./ConnectorsView.module.css";
 type Act = (key: string, label: string, fn: () => Promise<unknown>) => Promise<void>;
 type AuthPendingAttempt = { attemptId: string };
 type TrackAuthAttempt = (sourceId: string, attemptId: string) => void;
-type DismissAuthAttempt = (sourceId: string) => void;
+type DismissAuthAttempt = (sourceId: string, attemptId?: string) => Promise<void>;
 type ConfigPanelModalState = {
   sessionId: string;
   url: string;
@@ -94,9 +95,14 @@ export function ConnectorsView() {
     setAuthPending((prev) => ({ ...prev, [sourceId]: { attemptId } }));
   }, []);
 
-  const dismissAuthAttempt = useCallback<DismissAuthAttempt>((sourceId) => {
-    setAuthPending((prev) => clearAuthPendingAttempt(prev, sourceId));
-  }, []);
+  const dismissAuthAttempt = useCallback<DismissAuthAttempt>(async (sourceId, attemptId) => {
+    const pendingAttemptId = attemptId ?? authPending[sourceId]?.attemptId;
+    if (!pendingAttemptId) return;
+    await act(sourceId, "auth-cancel", async () => {
+      await cancelConnectorAuthAttempt(sourceId, pendingAttemptId);
+      setAuthPending((prev) => clearAuthPendingAttempt(prev, sourceId, pendingAttemptId));
+    });
+  }, [act, authPending]);
 
   const openConfigPanel = useCallback(
     async (connector: ConnectorSourceView, panelId: string, label: string) => {
@@ -857,7 +863,19 @@ function SourceRow({
       <SourceIdentityState
         sourceRecord={c}
         cardBusy={cardBusy}
-        retryEnabled={trusted && interactive}
+        retryEnabled={
+          trusted
+          && interactive
+          && !pendingAuthAttempt
+          && !c.setupPending.includes("auth")
+        }
+        retryDisabledReason={
+          pendingAuthAttempt
+            ? "Finish or cancel the account connection first"
+            : c.setupPending.includes("auth")
+              ? "Connect an account before resolving identity"
+              : undefined
+        }
         busyLabel={busy[c.id]}
         onAct={onAct}
       />
@@ -919,9 +937,9 @@ function SourceRow({
             onSubmit={(event) => {
               event.preventDefault();
               onAct(c.id, "auth", async () => {
-                const started = await startConnectorAuth(c.id);
-                await openAuthorizationUrl(started.authorizationUrl);
+                const started = await startConnectorAuth(c.id, { replacePending: true });
                 onTrackAuthAttempt(c.id, started.attemptId);
+                await openAuthorizationUrl(started.authorizationUrl);
               });
             }}
           >
@@ -945,9 +963,9 @@ function SourceRow({
                 type="button"
                 className={styles.ghostBtn}
                 disabled={cardBusy}
-                onClick={() => onDismissAuthAttempt(c.id)}
+                onClick={() => void onDismissAuthAttempt(c.id, pendingAuthAttempt.attemptId)}
               >
-                Dismiss
+                {busy[c.id] === "auth-cancel" ? "cancelling…" : "Cancel"}
               </button>
             )}
           </form>
@@ -1039,12 +1057,14 @@ function SourceIdentityState({
   sourceRecord,
   cardBusy,
   retryEnabled,
+  retryDisabledReason,
   busyLabel,
   onAct,
 }: {
   sourceRecord: ConnectorSourceView;
   cardBusy: boolean;
   retryEnabled: boolean;
+  retryDisabledReason?: string;
   busyLabel?: string;
   onAct: Act;
 }) {
@@ -1092,7 +1112,9 @@ function SourceIdentityState({
               type="button"
               className={styles.ghostBtn}
               disabled={cardBusy || !retryEnabled}
-              title={retryEnabled ? "Resolve this Source identity again" : "Connector must be available first"}
+              title={retryEnabled
+                ? "Resolve this Source identity again"
+                : retryDisabledReason ?? "Connector must be available first"}
               onClick={() => onAct(
                 sourceRecord.id,
                 "identity",

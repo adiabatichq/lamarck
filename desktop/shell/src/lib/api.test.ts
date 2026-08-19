@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
+  cancelConnectorAuthAttempt,
   clearCoreBaseUrlCache,
   createConnectorSource,
   getCoreBaseUrl,
   retryConnectorSourceIdentity,
+  startConnectorAuth,
   updateConnectorSource,
 } from "./api";
 
@@ -98,6 +100,37 @@ describe("Core endpoint resolution", () => {
         method: "POST",
         body: JSON.stringify({}),
       }),
+    );
+  });
+
+  test("replaces and explicitly cancels pending browser auth attempts", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({}),
+    });
+    vi.stubGlobal("window", {
+      lamarckHost: {
+        getCoreBaseUrl: vi.fn().mockResolvedValue("http://localhost:32100"),
+        getCoreToken: vi.fn().mockResolvedValue("test-token"),
+      },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startConnectorAuth("source/1", { replacePending: true });
+    await cancelConnectorAuthAttempt("source/1", "attempt/1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://localhost:32100/api/connectors/sources/source%2F1/auth/start",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ replacePending: true }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://localhost:32100/api/connectors/sources/source%2F1/auth/attempts/attempt%2F1",
+      expect.objectContaining({ method: "DELETE" }),
     );
   });
 });

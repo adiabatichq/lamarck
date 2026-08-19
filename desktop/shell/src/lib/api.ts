@@ -646,9 +646,13 @@ export interface OAuthAttemptResult {
   error?: string;
 }
 
-export function startConnectorAuth(sourceId: string): Promise<OAuthStartResult> {
+export function startConnectorAuth(
+  sourceId: string,
+  opts: { replacePending?: boolean } = {},
+): Promise<OAuthStartResult> {
   return request(`/api/connectors/sources/${encodeURIComponent(sourceId)}/auth/start`, {
     method: "POST",
+    body: JSON.stringify({ replacePending: opts.replacePending === true }),
   });
 }
 
@@ -658,6 +662,16 @@ export function getConnectorAuthAttempt(
 ): Promise<OAuthAttemptResult> {
   return request(
     `/api/connectors/sources/${encodeURIComponent(sourceId)}/auth/attempts/${encodeURIComponent(attemptId)}`,
+  );
+}
+
+export function cancelConnectorAuthAttempt(
+  sourceId: string,
+  attemptId: string,
+): Promise<{ ok: true; cancelled: boolean }> {
+  return request(
+    `/api/connectors/sources/${encodeURIComponent(sourceId)}/auth/attempts/${encodeURIComponent(attemptId)}`,
+    { method: "DELETE" },
   );
 }
 

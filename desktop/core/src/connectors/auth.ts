@@ -217,6 +217,27 @@ export class ConnectorAuthManager {
     return this.authGenerationBySource.get(sourceId) ?? 0;
   }
 
+  cancelPendingAuthAttempt(sourceId: string, attemptId: string): boolean {
+    const attempt = this.authAttemptById(attemptId);
+    if (
+      !attempt
+      || attempt.sourceId !== sourceId
+      || attempt.status !== "pending"
+    ) {
+      return false;
+    }
+    this.cancelAttemptsForSource(sourceId);
+    return true;
+  }
+
+  cancelPendingAuthAttemptsForSource(sourceId: string): boolean {
+    const pending = [...this.attemptsById.values(), ...this.managedAttemptsById.values()]
+      .some((attempt) => attempt.sourceId === sourceId && attempt.status === "pending");
+    if (!pending) return false;
+    this.cancelAttemptsForSource(sourceId);
+    return true;
+  }
+
   cancelAttemptsForSource(sourceId: string, opts?: { removed?: boolean }): void {
     this.authGenerationBySource.set(
       sourceId,
