@@ -742,6 +742,14 @@ const server = await serve<{ cwd: string }>({
     }
 
     try {
+      // Host lifecycle probes must not depend on App registry scans, Connector
+      // state, or any other feature domain. A healthy Core can report those
+      // domains independently without being torn down as a startup failure.
+      if (path === "/api/health" && method === "GET") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        return json({ ok: true });
+      }
+
       // -- Workspace --
       if (path === "/api/workspace" && method === "GET") {
         return json({ path: workspacePath });

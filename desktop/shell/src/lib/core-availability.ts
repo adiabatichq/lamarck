@@ -7,7 +7,7 @@ export interface CoreFailureState {
 
 export interface HostCoreRuntimeState {
   generation: number;
-  phase: "starting" | "ready" | "failed";
+  phase: "starting" | "ready" | "restarting" | "failed";
   error: string | null;
 }
 
@@ -37,7 +37,7 @@ export async function resolveCoreRequestFailure(
   if (getRuntimeState) {
     try {
       const runtime = await getRuntimeState();
-      if (runtime.phase === "starting") {
+      if (runtime.phase === "starting" || runtime.phase === "restarting") {
         return { status: "checking", error: null };
       }
       if (runtime.phase === "failed" && runtime.error?.trim()) {

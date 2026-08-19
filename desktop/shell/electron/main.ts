@@ -8,6 +8,7 @@ import {
   BrowserWindow,
   dialog,
   ipcMain,
+  powerMonitor,
   safeStorage,
   shell,
   utilityProcess,
@@ -61,9 +62,10 @@ import {
   type AppViewerOriginBinding,
 } from "./capsule/web-policy";
 import {
-  CoreRuntimeStateController,
-  type CoreRuntimeState,
-} from "./core-runtime-state";
+  DesktopRuntimeSupervisor,
+  type RuntimeState,
+} from "./runtime-supervisor";
+import { GuardHeartbeatMonitor } from "./guard-heartbeat";
 import {
   isWorkspaceVaultId,
   WorkspaceVaultStateController,
@@ -108,42 +110,43 @@ const PROCESS_STOP_TIMEOUT_MS = 1_500;
 const CORE_READY_TIMEOUT_MS = 10_000;
 const CORE_READY_REQUEST_TIMEOUT_MS = 750;
 const CORE_READY_RETRY_DELAY_MS = 200;
+const RUNTIME_RELAUNCH_ARG = "--lamarck-runtime-relaunch";
 const PRIVATE_RUNTIME_ENV = [
   "LAMARCK_GUARD_ORIGIN",
   "LAMARCK_GUARD_TOKEN",
   "LAMARCK_CORE_TOKEN",
   "LAMARCK_VAULT_KEY",
 ] as const;
-let core: ChildProcess | null = null;
-let guard: UtilityProcess | null = null;
-let guardOrigin = "";
 let workspace = "";
 let corePort = 0;
-let coreStartError: string | null = null;
 let activeWorkspace: WorkspaceDescriptor | null = null;
 let rememberedWorkspace: RememberedWorkspace | null = null;
 let workspaceSetupReason: WorkspaceSetupReason = "first-run";
 let workspaceSetupDetail: string | null = null;
 let workspaceSelectionNeedsPersistence = false;
-const coreRuntime = new CoreRuntimeStateController(notifyCoreRuntimeState);
+const runtimeSupervisor = new DesktopRuntimeSupervisor<ChildProcess, UtilityProcess>(
+  notifyRuntimeState,
+);
 const workspaceVault = new WorkspaceVaultStateController();
 let nextTerminalId = 1;
 let isQuitting = false;
 let shutdownComplete = false;
 let runtimeQueue: Promise<void> = Promise.resolve();
-let controlPlaneTeardownBarrier: Promise<void> = Promise.resolve();
-let guardHeartbeatTimer: NodeJS.Timeout | null = null;
-let guardHeartbeatChild: UtilityProcess | null = null;
-let guardPongListener: ((message: unknown) => void) | null = null;
-let guardLastPongAt = 0;
-let guardPingNonce = 0;
+let runtimeRelaunchRequested = false;
+const startedFromRuntimeRelaunch = process.argv.includes(RUNTIME_RELAUNCH_ARG);
 const expectedCoreStops = new WeakSet<ChildProcess>();
 const expectedGuardStops = new WeakSet<UtilityProcess>();
 const exitedCores = new WeakSet<ChildProcess>();
 const exitedGuards = new WeakSet<UtilityProcess>();
 const unspawnedCoreFailures = new WeakSet<ChildProcess>();
-const handledCoreLosses = new WeakSet<ChildProcess>();
-const handledGuardLosses = new WeakSet<UtilityProcess>();
+const guardHeartbeat = new GuardHeartbeatMonitor<UtilityProcess>({
+  intervalMs: GUARD_HEARTBEAT_INTERVAL_MS,
+  timeoutMs: GUARD_HEARTBEAT_TIMEOUT_MS,
+  isCurrent: (child) => runtimeSupervisor.guard === child,
+  isExpectedStop: (child) => expectedGuardStops.has(child),
+  isQuitting: () => isQuitting,
+  onFailure: beginUnexpectedGuardTeardown,
+});
 const terminalSessions = new Map<string, { proc: ChildProcess; ownerWebContentsId: number }>();
 const MARKETPLACE_HANDOFF_QUEUE_LIMIT = 32;
 const marketplaceHandoffs: MarketplaceDeepLink[] = [];
@@ -201,7 +204,7 @@ function queueMarketplaceHandoff(handoff: MarketplaceDeepLink, focus = true): bo
 }
 
 function flushMarketplaceHandoffs(): void {
-  if (coreRuntime.snapshot().phase !== "ready" || marketplaceHandoffs.length === 0) return;
+  if (runtimeSupervisor.snapshot().phase !== "ready" || marketplaceHandoffs.length === 0) return;
   const window = mainWindow;
   if (!window || window.isDestroyed()) return;
   const contents = window.webContents;
@@ -318,7 +321,7 @@ const capsuleManager = new CapsuleManager({
   unbindSystemSender: (senderId) => { systemBroker.unbindSender(senderId); },
   onBackendBoundaryLost(error) {
     console.error(`[electron] App Capsule boundary lost: ${errorMessage(error)}`);
-    detachAllAppWebContents();
+    scheduleRuntimeRestart(`App Capsule boundary lost: ${errorMessage(error)}`);
   },
   onUiLost(event) {
     console.error(
@@ -341,11 +344,6 @@ const capsuleManager = new CapsuleManager({
 interface GuardReadyMessage {
   type: "ready";
   port: number;
-}
-
-interface GuardPongMessage {
-  type: "pong";
-  nonce: number;
 }
 
 interface RememberedWorkspace {
@@ -841,7 +839,7 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function notifyCoreRuntimeState(state: CoreRuntimeState): void {
+function notifyRuntimeState(state: RuntimeState): void {
   for (const window of BrowserWindow.getAllWindows()) {
     const contents = window.webContents;
     if (
@@ -852,28 +850,25 @@ function notifyCoreRuntimeState(state: CoreRuntimeState): void {
   if (state.phase === "ready") flushMarketplaceHandoffs();
 }
 
-function markCoreStarting(): number {
-  coreStartError = null;
-  return coreRuntime.begin();
+function beginRuntimeGeneration(): number {
+  return runtimeSupervisor.begin();
 }
 
-function markCoreReady(generation: number): boolean {
-  const published = coreRuntime.ready(generation);
-  if (published) coreStartError = null;
-  return published;
+function markRuntimeReady(generation: number): boolean {
+  return runtimeSupervisor.ready(generation);
 }
 
-function markCoreFailed(
+function markRuntimeFailed(
   error: unknown,
-  generation = coreRuntime.snapshot().generation,
+  generation = runtimeSupervisor.snapshot().generation,
 ): string {
   const message = errorMessage(error);
-  if (coreRuntime.fail(generation, message)) coreStartError = message;
+  runtimeSupervisor.fail(generation, message);
   return message;
 }
 
-function coreRuntimeState(): CoreRuntimeState {
-  return coreRuntime.snapshot();
+function runtimeState(): RuntimeState {
+  return runtimeSupervisor.snapshot();
 }
 
 function unprivilegedEnvironment(
@@ -893,63 +888,65 @@ function enqueueRuntime<T>(operation: () => Promise<T>): Promise<T> {
   return result;
 }
 
-function extendControlPlaneTeardownBarrier(teardown: Promise<void>): Promise<void> {
-  const barrier = Promise.all([controlPlaneTeardownBarrier, teardown]).then(() => {});
-  controlPlaneTeardownBarrier = barrier;
-  // Observe rejection immediately even if another runtime operation keeps the
-  // queue busy. The original rejected barrier remains intact for startRuntime.
-  void barrier.catch(() => {});
-  return barrier;
+function relaunchDesktopAfterFailedCleanup(error: unknown): void {
+  if (isQuitting || runtimeRelaunchRequested || startedFromRuntimeRelaunch) return;
+  runtimeRelaunchRequested = true;
+  isQuitting = true;
+  disposeAllTerminals();
+  console.error(
+    `[electron] Runtime cleanup was incomplete; relaunching Lamarck: ${errorMessage(error)}`,
+  );
+  app.relaunch({
+    args: [
+      ...process.argv.slice(1).filter((argument) => argument !== RUNTIME_RELAUNCH_ARG),
+      RUNTIME_RELAUNCH_ARG,
+    ],
+  });
+  shutdownComplete = true;
+  app.exit(1);
 }
 
-function latchControlPlaneRestartRequired(error: Error): void {
-  extendControlPlaneTeardownBarrier(Promise.reject(error));
-}
-
-function beginUnexpectedControlPlaneTeardown(
+function scheduleRuntimeRestart(
   reason: string,
-  generation: number,
-  coreChild: ChildProcess | null,
-  guardChild: UtilityProcess | null,
+  controlPlaneLost = false,
 ): void {
-  const failure = markCoreFailed(reason, generation);
-  console.error(`[electron] ${failure}`);
+  if (isQuitting) return;
+  const current = runtimeSupervisor.snapshot();
+  if (current.phase !== "ready") return;
+  const generation = current.generation;
+  if (!runtimeSupervisor.prepareRestart(reason)) return;
+  console.error(`[electron] ${reason}`);
 
-  // Remove every local App authority before any asynchronous process or VM
-  // cleanup. Core channels belong to the failed process generation, so loss
-  // mode must not depend on reaching that process to revoke them remotely.
+  // Collapse all App authority immediately. The serialized restart below then
+  // replaces Core, Guard, and Capsule as one reconstructable runtime.
   systemBroker.unbindAll();
   detachAllAppWebContents();
-  let capsuleStop: Promise<void>;
-  try {
-    capsuleStop = capsuleManager.stopAll({ controlPlaneLost: true });
-  } catch (error) {
-    capsuleStop = Promise.reject(error);
-  }
-
-  // Guard owns data.db. Once either member of the pair becomes untrustworthy,
-  // stop the exact Core generation immediately, then finish Guard teardown.
-  // These calls start before the queue reservation so Retry cannot overtake
-  // cleanup even when a renderer request was already waiting in the queue.
-  if (guardChild) {
-    expectedGuardStops.add(guardChild);
-    stopGuardHeartbeat(guardChild);
-  }
-  const processStop = stopControlPlaneProcesses(coreChild, guardChild);
-  const teardown = Promise.allSettled([capsuleStop, processStop]).then((results) => {
-    const failures = results
-      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-      .map((result) => result.reason);
-    if (failures.length > 0) {
-      throw new AggregateError(failures, "Control-plane loss teardown was incomplete");
-    }
-  });
-  const barrier = extendControlPlaneTeardownBarrier(teardown);
   void enqueueRuntime(async () => {
+    const state = runtimeSupervisor.snapshot();
+    if (
+      isQuitting
+      || state.generation !== generation
+      || state.phase !== "restarting"
+    ) return;
+    if (!activeWorkspace) {
+      markRuntimeFailed("Runtime restart has no active Workspace", generation);
+      return;
+    }
+
+    console.log("[electron] Restarting the Desktop runtime after an unexpected failure");
     try {
-      await barrier;
+      await stopRuntimeAfterFailure(controlPlaneLost);
     } catch (error) {
-      console.error(`[electron] ${errorMessage(error)}`);
+      const cleanupFailure = markRuntimeFailed(error);
+      console.error(`[electron] Runtime cleanup failed: ${cleanupFailure}`);
+      relaunchDesktopAfterFailedCleanup(error);
+      return;
+    }
+    try {
+      await startRuntime({ expectedVaultId: activeWorkspace.vaultId });
+    } catch (error) {
+      const restartFailure = markRuntimeFailed(error);
+      console.error(`[electron] Automatic runtime restart failed: ${restartFailure}`);
     }
   });
 }
@@ -960,17 +957,18 @@ function beginUnexpectedGuardTeardown(
   reason: string,
 ): void {
   if (
-    handledGuardLosses.has(child)
-    || expectedGuardStops.has(child)
+    expectedGuardStops.has(child)
     || isQuitting
-    || guard !== child
   ) {
     return;
   }
-  handledGuardLosses.add(child);
-  guard = null;
-  guardOrigin = "";
-  beginUnexpectedControlPlaneTeardown(reason, generation, core, child);
+  const state = runtimeSupervisor.snapshot();
+  if (state.generation !== generation || runtimeSupervisor.guard !== child) return;
+  if (state.phase === "ready") {
+    scheduleRuntimeRestart(reason, true);
+  } else if (state.phase === "starting") {
+    markRuntimeFailed(reason, generation);
+  }
 }
 
 function beginUnexpectedCoreTeardown(
@@ -979,16 +977,18 @@ function beginUnexpectedCoreTeardown(
   reason: string,
 ): void {
   if (
-    handledCoreLosses.has(child)
-    || expectedCoreStops.has(child)
+    expectedCoreStops.has(child)
     || isQuitting
-    || core !== child
   ) {
     return;
   }
-  handledCoreLosses.add(child);
-  core = null;
-  beginUnexpectedControlPlaneTeardown(reason, generation, child, guard);
+  const state = runtimeSupervisor.snapshot();
+  if (state.generation !== generation || runtimeSupervisor.core !== child) return;
+  if (state.phase === "ready") {
+    scheduleRuntimeRestart(reason, true);
+  } else if (state.phase === "starting") {
+    markRuntimeFailed(reason, generation);
+  }
 }
 
 function isGuardReadyMessage(message: unknown): message is GuardReadyMessage {
@@ -1082,59 +1082,8 @@ function waitForCoreExit(child: ChildProcess, timeoutMs: number): Promise<boolea
   });
 }
 
-function stopGuardHeartbeat(child?: UtilityProcess): void {
-  if (child && guardHeartbeatChild !== child) return;
-  if (guardHeartbeatTimer) clearInterval(guardHeartbeatTimer);
-  if (guardHeartbeatChild && guardPongListener) {
-    guardHeartbeatChild.off("message", guardPongListener);
-  }
-  guardHeartbeatTimer = null;
-  guardHeartbeatChild = null;
-  guardPongListener = null;
-}
-
-function startGuardHeartbeat(child: UtilityProcess, generation: number): void {
-  stopGuardHeartbeat();
-  guardHeartbeatChild = child;
-  guardLastPongAt = Date.now();
-  guardPongListener = (message: unknown) => {
-    const candidate = message as Partial<GuardPongMessage> | null;
-    if (candidate?.type === "pong" && Number.isSafeInteger(candidate.nonce)) {
-      guardLastPongAt = Date.now();
-    }
-  };
-  child.on("message", guardPongListener);
-
-  const ping = () => {
-    if (guard !== child || expectedGuardStops.has(child) || isQuitting) {
-      stopGuardHeartbeat(child);
-      return;
-    }
-    if (Date.now() - guardLastPongAt > GUARD_HEARTBEAT_TIMEOUT_MS) {
-      beginUnexpectedGuardTeardown(
-        child,
-        generation,
-        "Guard utility became unresponsive and was terminated",
-      );
-      stopGuardHeartbeat(child);
-      return;
-    }
-    try {
-      child.postMessage({ type: "ping", nonce: ++guardPingNonce });
-    } catch (error) {
-      beginUnexpectedGuardTeardown(
-        child,
-        generation,
-        `Guard utility heartbeat failed: ${errorMessage(error)}`,
-      );
-    }
-  };
-  ping();
-  guardHeartbeatTimer = setInterval(ping, GUARD_HEARTBEAT_INTERVAL_MS);
-}
-
 async function startGuard(generation: number): Promise<void> {
-  if (guard) throw new Error("Guard utility is already running");
+  if (runtimeSupervisor.guard) throw new Error("Guard utility is already running");
 
   console.log("[electron] Starting Node Guard utility...");
   const child = utilityProcess.fork(GUARD_ENTRY, [workspace], {
@@ -1145,8 +1094,7 @@ async function startGuard(generation: number): Promise<void> {
     serviceName: "Lamarck Guard",
     stdio: "inherit",
   });
-  guard = child;
-  guardOrigin = "";
+  runtimeSupervisor.attachGuard(generation, child);
 
   child.on("error", (type, location, report) => {
     console.error(`[electron] Guard utility ${type} at ${location}\n${report}`);
@@ -1157,7 +1105,7 @@ async function startGuard(generation: number): Promise<void> {
     );
   });
   child.on("exit", (code) => {
-    stopGuardHeartbeat(child);
+    guardHeartbeat.stop(child);
     exitedGuards.add(child);
     const expected = expectedGuardStops.has(child);
     console.log(`[electron] Guard utility exited with code ${code}`);
@@ -1167,25 +1115,28 @@ async function startGuard(generation: number): Promise<void> {
         generation,
         `Guard utility exited unexpectedly (code ${code})`,
       );
-    } else if (guard === child) {
-      guard = null;
-      guardOrigin = "";
+    } else {
+      runtimeSupervisor.detachGuard(child);
     }
   });
 
   try {
     const port = await waitForGuardReady(child);
-    if (guard !== child) throw new Error("Guard utility stopped during startup");
-    guardOrigin = `http://127.0.0.1:${port}`;
-    startGuardHeartbeat(child, generation);
+    const guardOrigin = `http://127.0.0.1:${port}`;
+    if (!runtimeSupervisor.publishGuardOrigin(generation, child, guardOrigin)) {
+      throw new Error("Guard utility stopped during startup");
+    }
+    guardHeartbeat.start(child, generation);
     console.log(`[electron] Guard utility ready on ${guardOrigin}`);
   } catch (error) {
-    if (guard === child) await stopGuard();
+    if (runtimeSupervisor.guard === child) await stopGuard(child);
     throw error;
   }
 }
 
 function startCore(generation: number): void {
+  const guard = runtimeSupervisor.guard;
+  const guardOrigin = runtimeSupervisor.guardOrigin;
   if (!guard || !guardOrigin) {
     throw new Error("Cannot start core before the Guard utility is ready");
   }
@@ -1203,7 +1154,7 @@ function startCore(generation: number): void {
       LAMARCK_GUARD_TOKEN: GUARD_TOKEN,
     },
   });
-  core = child;
+  runtimeSupervisor.attachCore(generation, child);
   child.on("error", (error) => {
     if (child.pid === undefined) unspawnedCoreFailures.add(child);
     beginUnexpectedCoreTeardown(
@@ -1222,44 +1173,53 @@ function startCore(generation: number): void {
         generation,
         `Node Core exited unexpectedly${code === null ? "" : ` (code ${code})`}`,
       );
-    } else if (core === child) {
-      core = null;
+    } else {
+      runtimeSupervisor.detachCore(child);
     }
   });
 }
 
-async function stopCore(child: ChildProcess | null = core): Promise<void> {
+async function stopCore(
+  child: ChildProcess | null = runtimeSupervisor.core,
+): Promise<void> {
   if (!child) return;
-  if (core === child) core = null;
   expectedCoreStops.add(child);
-  if (coreExitConfirmed(child)) return;
+  if (coreExitConfirmed(child)) {
+    runtimeSupervisor.detachCore(child);
+    return;
+  }
   const gracefulExit = waitForCoreExit(child, PROCESS_STOP_TIMEOUT_MS);
   try {
     child.kill();
   } catch {}
-  if (await gracefulExit) return;
+  if (await gracefulExit) {
+    runtimeSupervisor.detachCore(child);
+    return;
+  }
 
   console.warn("[electron] Node Core did not shut down in time; terminating it");
   try {
     child.kill("SIGKILL");
   } catch {}
-  if (await waitForCoreExit(child, 500)) return;
-  const failure = new Error(
+  if (await waitForCoreExit(child, 500)) {
+    runtimeSupervisor.detachCore(child);
+    return;
+  }
+  throw new Error(
     "Node Core termination was not confirmed; restart Lamarck before retrying",
   );
-  latchControlPlaneRestartRequired(failure);
-  throw failure;
 }
 
-async function stopGuard(child: UtilityProcess | null = guard): Promise<void> {
+async function stopGuard(
+  child: UtilityProcess | null = runtimeSupervisor.guard,
+): Promise<void> {
   if (!child) return;
-  stopGuardHeartbeat(child);
-  if (guard === child) {
-    guard = null;
-    guardOrigin = "";
-  }
+  guardHeartbeat.stop(child);
   expectedGuardStops.add(child);
-  if (exitedGuards.has(child)) return;
+  if (exitedGuards.has(child)) {
+    runtimeSupervisor.detachGuard(child);
+    return;
+  }
 
   const gracefulExit = waitForGuardExit(child, PROCESS_STOP_TIMEOUT_MS);
   try {
@@ -1269,23 +1229,27 @@ async function stopGuard(child: UtilityProcess | null = guard): Promise<void> {
       child.kill();
     } catch {}
   }
-  if (await gracefulExit) return;
+  if (await gracefulExit) {
+    runtimeSupervisor.detachGuard(child);
+    return;
+  }
 
   console.warn("[electron] Guard utility did not shut down in time; terminating it");
   try {
     child.kill();
   } catch {}
-  if (await waitForGuardExit(child, 500)) return;
-  const failure = new Error(
+  if (await waitForGuardExit(child, 500)) {
+    runtimeSupervisor.detachGuard(child);
+    return;
+  }
+  throw new Error(
     "Guard utility termination was not confirmed; restart Lamarck before retrying",
   );
-  latchControlPlaneRestartRequired(failure);
-  throw failure;
 }
 
 async function stopControlPlaneProcesses(
-  coreChild: ChildProcess | null = core,
-  guardChild: UtilityProcess | null = guard,
+  coreChild: ChildProcess | null = runtimeSupervisor.core,
+  guardChild: UtilityProcess | null = runtimeSupervisor.guard,
 ): Promise<void> {
   const failures: unknown[] = [];
   try {
@@ -1304,9 +1268,6 @@ async function stopControlPlaneProcesses(
   const failure = failures.length === 1
     ? failures[0]
     : new AggregateError(failures, "Control-plane process teardown was incomplete");
-  latchControlPlaneRestartRequired(
-    failure instanceof Error ? failure : new Error(errorMessage(failure)),
-  );
   throw failure;
 }
 
@@ -1314,19 +1275,17 @@ async function startRuntime(opts?: {
   expectedVaultId?: string;
   rotatePort?: boolean;
 }): Promise<number> {
-  // A Retry may already be queued when process loss is observed. Join the
-  // exact old-generation teardown here so no new Core or Guard can overlap it.
-  await controlPlaneTeardownBarrier;
-  const generation = markCoreStarting();
+  const generation = beginRuntimeGeneration();
   try {
     await ensureWorkspaceRuntimeSettings(opts);
     if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
     await startGuard(generation);
     if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
     startCore(generation);
+    await waitForCore(generation);
     return generation;
   } catch (error) {
-    markCoreFailed(error, generation);
+    markRuntimeFailed(error, generation);
     try {
       await stopControlPlaneProcesses();
     } catch (cleanupError) {
@@ -1340,30 +1299,45 @@ async function startRuntime(opts?: {
 }
 
 async function stopRuntime(): Promise<void> {
-  // Revoke every App launch channel while Core is still alive, then tear down
-  // the VM/backend before releasing Core and Guard authority.
-  let capsuleFailure: unknown;
-  try {
-    await stopAllAppViewers();
-  } catch (error) {
-    capsuleFailure = error;
-    console.error(`[electron] App Capsule shutdown failed: ${errorMessage(error)}`);
+  runtimeSupervisor.prepareRestart();
+  // Intentional replacement keeps Core alive while Capsule revokes its issued
+  // channels, then releases Core before Guard's exclusive data.db ownership.
+  await stopAllAppViewers();
+  await stopControlPlaneProcesses();
+}
+
+async function stopRuntimeAfterFailure(controlPlaneLost: boolean): Promise<void> {
+  const failures: unknown[] = [];
+  if (controlPlaneLost) {
+    // Core can no longer revoke remote channels, so local authority collapse
+    // above is final. Stop Capsule and the exact Core/Guard pair concurrently.
+    let capsuleStop: Promise<void>;
+    try {
+      capsuleStop = capsuleManager.stopAll({ controlPlaneLost: true });
+    } catch (error) {
+      capsuleStop = Promise.reject(error);
+    }
+    const results = await Promise.allSettled([
+      capsuleStop,
+      stopControlPlaneProcesses(),
+    ]);
+    failures.push(...results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason));
+  } else {
+    // Keep Core available until Capsule has revoked its channels, even on a
+    // Capsule-originated failure, then replace the control plane too.
+    try {
+      await stopAllAppViewers();
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await stopControlPlaneProcesses();
+    } catch (error) {
+      failures.push(error);
+    }
   }
-  // Core can still issue Guard requests, so always stop it before releasing
-  // data.db ownership from the Guard utility.
-  let processFailure: unknown;
-  try {
-    await stopControlPlaneProcesses();
-  } catch (error) {
-    processFailure = error;
-    console.error(`[electron] Control-plane shutdown failed: ${errorMessage(error)}`);
-  }
-  // A workspace switch or runtime retry must not start another authority
-  // generation after Capsule teardown became ambiguous. Process exit may
-  // continue, but in-process reuse is fail-closed.
-  const failures = [capsuleFailure, processFailure].filter(
-    (failure) => failure !== undefined,
-  );
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) {
     throw new AggregateError(failures, "Runtime shutdown was incomplete");
@@ -1376,7 +1350,7 @@ async function activateWorkspace(
   if (
     activeWorkspace?.path === candidate.path
     && activeWorkspace.vaultId === candidate.vaultId
-    && coreRuntime.snapshot().phase === "ready"
+    && runtimeSupervisor.snapshot().phase === "ready"
   ) {
     return { ...activeWorkspace };
   }
@@ -1402,8 +1376,7 @@ async function activateWorkspace(
     workspace = currentCandidate.path;
     workspaceVault.begin(workspace, currentCandidate.vaultId);
     candidateSelected = true;
-    const generation = await startRuntime({ expectedVaultId: currentCandidate.vaultId });
-    await waitForCore(generation);
+    await startRuntime({ expectedVaultId: currentCandidate.vaultId });
 
     // Persistence is the commit point. The old active descriptor remains
     // authoritative until the candidate runtime is proven ready.
@@ -1420,7 +1393,7 @@ async function activateWorkspace(
     return { ...currentCandidate };
   } catch (error) {
     if (!oldRuntimeStopped) {
-      markCoreFailed(error);
+      markRuntimeFailed(error);
       throw error;
     }
 
@@ -1447,13 +1420,12 @@ async function activateWorkspace(
 
     if (failures.length === 1 && previous) {
       try {
-        const generation = await startRuntime({ expectedVaultId: previous.vaultId });
-        await waitForCore(generation);
+        await startRuntime({ expectedVaultId: previous.vaultId });
       } catch (rollbackError) {
         failures.push(rollbackError);
       }
     } else if (!previous) {
-      markCoreFailed(error);
+      markRuntimeFailed(error);
     }
 
     if (failures.length > 1) {
@@ -1463,7 +1435,7 @@ async function activateWorkspace(
           ? "Workspace switch failed and the previous Workspace could not be restored"
           : "Workspace startup failed and cleanup was incomplete",
       );
-      markCoreFailed(failure);
+      markRuntimeFailed(failure);
       throw failure;
     }
     throw error;
@@ -2615,15 +2587,14 @@ async function waitForCore(
 ): Promise<void> {
   const deadline = performance.now() + CORE_READY_TIMEOUT_MS;
   while (performance.now() < deadline) {
-    const expectedCore = core;
-    const expectedGuard = guard;
+    const expectedCore = runtimeSupervisor.core;
+    const expectedGuard = runtimeSupervisor.guard;
     if (!expectedCore || !expectedGuard) {
       const failure = new Error(
-        coreRuntime.snapshot().error
-        ?? coreStartError
+        runtimeSupervisor.snapshot().error
         ?? "Core runtime stopped during startup",
       );
-      markCoreFailed(failure, generation);
+      markRuntimeFailed(failure, generation);
       throw failure;
     }
     const request = new AbortController();
@@ -2633,26 +2604,26 @@ async function waitForCore(
       Math.min(CORE_READY_REQUEST_TIMEOUT_MS, remaining),
     );
     try {
-      const res = await fetch(`${coreBaseUrl()}/api/apps`, {
+      const res = await fetch(`${coreBaseUrl()}/api/health`, {
         headers: { Authorization: `Bearer ${CORE_TOKEN}` },
         signal: request.signal,
       });
       if (!res.ok) throw new Error(`Core returned ${res.status}`);
-      const state = coreRuntime.snapshot();
+      const state = runtimeSupervisor.snapshot();
       if (
         state.generation !== generation
         || state.phase !== "starting"
-        || core !== expectedCore
-        || guard !== expectedGuard
+        || runtimeSupervisor.core !== expectedCore
+        || runtimeSupervisor.guard !== expectedGuard
       ) {
         throw new Error("Core readiness belonged to a stale runtime generation");
       }
-      if (!markCoreReady(generation)) {
+      if (!markRuntimeReady(generation)) {
         throw new Error("Core readiness could not publish its runtime generation");
       }
       return;
     } catch (error) {
-      const state = coreRuntime.snapshot();
+      const state = runtimeSupervisor.snapshot();
       if (state.generation !== generation) throw error;
       if (state.phase === "failed") {
         throw new Error(state.error ?? "Core runtime failed during startup");
@@ -2669,37 +2640,33 @@ async function waitForCore(
     }
   }
   const failure = new Error("Core server did not start in time");
-  markCoreFailed(failure, generation);
+  markRuntimeFailed(failure, generation);
   throw failure;
 }
 
 function coreBaseUrl(): string {
-  if (!core) throw new Error("Node Core is not running");
+  if (!runtimeSupervisor.core) throw new Error("Node Core is not running");
   return `http://localhost:${corePort}`;
 }
 
 async function retryCore(): Promise<{ coreBaseUrl: string }> {
-  markCoreStarting();
   try {
     await stopRuntime();
-    const generation = await startRuntime();
-    await waitForCore(generation);
+    await startRuntime();
     return { coreBaseUrl: coreBaseUrl() };
   } catch (error) {
-    markCoreFailed(error);
+    markRuntimeFailed(error);
     throw error;
   }
 }
 
 async function rotateCorePort(): Promise<{ coreBaseUrl: string }> {
-  markCoreStarting();
   try {
     await stopRuntime();
-    const generation = await startRuntime({ rotatePort: true });
-    await waitForCore(generation);
+    await startRuntime({ rotatePort: true });
     return { coreBaseUrl: coreBaseUrl() };
   } catch (error) {
-    markCoreFailed(error);
+    markRuntimeFailed(error);
     throw error;
   }
 }
@@ -2800,6 +2767,12 @@ async function createWindow(): Promise<void> {
 
 app.whenReady().then(async () => {
   if (!ownsSingleInstance) return;
+  powerMonitor.on("suspend", () => {
+    guardHeartbeat.suspend();
+  });
+  powerMonitor.on("resume", () => {
+    guardHeartbeat.resume();
+  });
   registerMarketplaceProtocolClient();
   const initialWorkspace = initializeWorkspaceSelection();
   if (initialWorkspace) {
@@ -2831,14 +2804,12 @@ app.whenReady().then(async () => {
       if (!workspaceVault.unlock(selection, importedKey)) {
         throw new Error("Workspace changed while its recovery code was being imported");
       }
-      markCoreStarting();
       try {
         await stopRuntime();
-        const generation = await startRuntime({ expectedVaultId: descriptor.vaultId });
-        await waitForCore(generation);
+        await startRuntime({ expectedVaultId: descriptor.vaultId });
         return { coreBaseUrl: coreBaseUrl() };
       } catch (error) {
-        markCoreFailed(error);
+        markRuntimeFailed(error);
         throw error;
       }
     });
@@ -2849,11 +2820,11 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("core:getStartError", (event) => {
     requireShellIpc(event);
-    return coreStartError;
+    return runtimeSupervisor.snapshot().error;
   });
   ipcMain.handle("core:getRuntimeState", (event) => {
     requireShellIpc(event);
-    return coreRuntimeState();
+    return runtimeState();
   });
   ipcMain.handle("core:retry", (event) => {
     requireShellIpc(event);
@@ -3049,8 +3020,7 @@ app.whenReady().then(async () => {
         if (isQuitting) {
           throw new Error("Runtime startup was cancelled because Lamarck is quitting");
         }
-        const generation = await startRuntime({ expectedVaultId: initialWorkspace.vaultId });
-        await waitForCore(generation);
+        await startRuntime({ expectedVaultId: initialWorkspace.vaultId });
         if (workspaceSelectionNeedsPersistence) {
           saveActiveWorkspace(initialWorkspace);
           workspaceSelectionNeedsPersistence = false;
@@ -3068,7 +3038,7 @@ app.whenReady().then(async () => {
     try {
       await initialStartup;
     } catch (err) {
-      const failure = markCoreFailed(err);
+      const failure = markRuntimeFailed(err);
       console.error(`[electron] Core failed to start: ${failure}`);
     }
   }
@@ -3084,7 +3054,7 @@ app.on("before-quit", (event) => {
   if (isQuitting) return;
   isQuitting = true;
   disposeAllTerminals();
-  void stopRuntime()
+  void stopRuntimeAfterFailure(false)
     .catch((error) => {
       console.error(`[electron] Runtime shutdown required process exit: ${errorMessage(error)}`);
     })

@@ -227,6 +227,7 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
   );
 
   test("discovers a directly-created App without revoking unchanged capabilities", async () => {
+    await expect(hostRequest("/api/health")).resolves.toEqual({ ok: true });
     const existing = await issueCapability("app-a");
 
     // An unchanged Shell poll must not retire the currently issued manifest
@@ -427,7 +428,7 @@ async function waitForCore(): Promise<void> {
       throw new Error(`Core exited before readiness: ${coreOutput}`);
     }
     try {
-      const response = await fetch(`${coreOrigin}/api/apps`, {
+      const response = await fetch(`${coreOrigin}/api/health`, {
         headers: { Authorization: `Bearer ${CORE_TOKEN}` },
       });
       if (response.ok) return;

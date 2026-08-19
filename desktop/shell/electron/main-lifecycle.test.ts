@@ -44,6 +44,19 @@ describe("Shell window lifecycle", () => {
 });
 
 describe("App viewer IPC contract", () => {
+  test("isolates an unexpected App UI loss to its viewer", () => {
+    const start = mainSource.indexOf("  onUiLost(event) {");
+    const end = mainSource.indexOf("\n  },\n});", start);
+    if (start < 0 || end < 0) throw new Error("App UI loss handler is missing");
+    const handler = mainSource.slice(start, end);
+
+    expect(handler).toContain("appViewers.get(event.viewerId)");
+    expect(handler).toContain("detachAppViewerRecord(event.viewerId, record)");
+    expect(handler).not.toContain("scheduleRuntimeRestart");
+    expect(handler).not.toContain("systemBroker.unbindAll");
+    expect(handler).not.toContain("stopRuntime");
+  });
+
   test("serializes a busy Host state for bounded renderer retry", () => {
     const handler = mainSource.match(
       /ipcMain\.handle\("app-viewer:open",[\s\S]*?\n  \}\);/,
@@ -184,93 +197,95 @@ describe("Shell Host configuration", () => {
     )?.[0];
     if (!quit) throw new Error("before-quit lifecycle is missing");
     expect(quit.indexOf("isQuitting = true")).toBeLessThan(
-      quit.indexOf("void stopRuntime()"),
+      quit.indexOf("void stopRuntimeAfterFailure(false)"),
     );
   });
 
-  test("reports starting, ready, and failed Core phases from the Host lifecycle", () => {
+  test("publishes the Supervisor lifecycle from the Host", () => {
     const startup = mainSource.match(
       /async function startRuntime\([\s\S]*?\n\}\n\nasync function stopRuntime/,
     )?.[0];
     if (!startup) throw new Error("runtime startup lifecycle is missing");
-    expect(startup.indexOf("markCoreStarting()")).toBeLessThan(
+    expect(startup.indexOf("beginRuntimeGeneration()")).toBeLessThan(
       startup.indexOf("await ensureWorkspaceRuntimeSettings(opts)"),
     );
-    expect(startup).toContain("markCoreFailed(error, generation)");
+    expect(startup).toContain("markRuntimeFailed(error, generation)");
 
     const readiness = mainSource.match(
       /async function waitForCore\([\s\S]*?\n\}\n\nfunction coreBaseUrl/,
     )?.[0];
     if (!readiness) throw new Error("Core readiness lifecycle is missing");
     const successfulResponse = readiness.indexOf("if (!res.ok)");
-    const ready = readiness.indexOf("markCoreReady(generation)");
+    const ready = readiness.indexOf("markRuntimeReady(generation)");
     expect(ready).toBeGreaterThan(successfulResponse);
-    expect(readiness).toContain("markCoreFailed(failure, generation)");
+    expect(readiness).toContain("markRuntimeFailed(failure, generation)");
     expect(readiness).toContain("performance.now()");
     expect(readiness).toContain("const request = new AbortController()");
+    expect(readiness).toContain('fetch(`${coreBaseUrl()}/api/health`');
+    expect(readiness).not.toContain('/api/apps');
     expect(readiness).toContain("signal: request.signal");
     expect(readiness).toContain("clearTimeout(requestTimeout)");
 
     expect(mainSource).toContain(`ipcMain.handle("core:getRuntimeState"`);
     expect(mainSource).toContain(`contents.send("core:runtimeState", state)`);
-    expect(mainSource).toContain("return coreRuntime.snapshot()");
+    expect(mainSource).toContain("return runtimeSupervisor.snapshot()");
+    expect(mainSource).toContain("new DesktopRuntimeSupervisor<ChildProcess, UtilityProcess>");
   });
 
-  test("collapses App authority synchronously when either control-plane process is lost", () => {
+  test("restarts the whole runtime when a current process is lost", () => {
     const collapse = mainSource.match(
-      /function beginUnexpectedControlPlaneTeardown\([\s\S]*?\n\}\n\nfunction beginUnexpectedGuardTeardown/,
+      /function scheduleRuntimeRestart\([\s\S]*?\n\}\n\nfunction beginUnexpectedGuardTeardown/,
     )?.[0];
-    if (!collapse) throw new Error("unexpected control-plane teardown is missing");
+    if (!collapse) throw new Error("whole-runtime restart is missing");
 
     const unbind = collapse.indexOf("systemBroker.unbindAll()");
     const detach = collapse.indexOf("detachAllAppWebContents()");
-    const capsuleStop = collapse.indexOf(
-      "capsuleManager.stopAll({ controlPlaneLost: true })",
-    );
-    const coreStop = collapse.indexOf(
-      "stopControlPlaneProcesses(coreChild, guardChild)",
-    );
     const queue = collapse.indexOf("enqueueRuntime(async () =>");
+    const stop = collapse.indexOf("await stopRuntimeAfterFailure(controlPlaneLost)");
+    const restart = collapse.indexOf("await startRuntime({");
     expect(unbind).toBeGreaterThan(-1);
     expect(detach).toBeGreaterThan(unbind);
-    expect(capsuleStop).toBeGreaterThan(detach);
-    expect(coreStop).toBeGreaterThan(capsuleStop);
-    expect(queue).toBeGreaterThan(coreStop);
-    expect(collapse).toContain("expectedGuardStops.add(guardChild)");
-    expect(collapse).toContain("extendControlPlaneTeardownBarrier(teardown)");
-
-    const barrier = mainSource.match(
-      /function extendControlPlaneTeardownBarrier\([\s\S]*?\n\}\n\nfunction latchControlPlaneRestartRequired/,
-    )?.[0];
-    if (!barrier) throw new Error("control-plane teardown barrier is missing");
-    expect(barrier).toContain("controlPlaneTeardownBarrier");
-    expect(barrier).toContain("void barrier.catch(() => {})");
+    expect(queue).toBeGreaterThan(detach);
+    expect(stop).toBeGreaterThan(queue);
+    expect(restart).toBeGreaterThan(stop);
+    expect(collapse).toContain("Automatic runtime restart failed");
+    expect(mainSource).not.toContain("AUTOMATIC_RUNTIME_RECOVERY_COOLDOWN_MS");
+    expect(mainSource).not.toContain("blockFutureStarts");
+    expect(mainSource).toMatch(
+      /function relaunchDesktopAfterFailedCleanup\([\s\S]*?startedFromRuntimeRelaunch[\s\S]*?app\.relaunch\([\s\S]*?app\.exit\(1\)/,
+    );
 
     const guardLoss = mainSource.match(
       /function beginUnexpectedGuardTeardown\([\s\S]*?\n\}\n\nfunction beginUnexpectedCoreTeardown/,
     )?.[0];
     if (!guardLoss) throw new Error("unexpected Guard teardown is missing");
-    expect(guardLoss).toContain("handledGuardLosses.has(child)");
     expect(guardLoss).toContain("expectedGuardStops.has(child)");
-    expect(guardLoss).toContain("guard !== child");
+    expect(guardLoss).toContain("runtimeSupervisor.guard !== child");
+    expect(guardLoss).toContain('state.phase === "ready"');
+    expect(guardLoss).toContain("scheduleRuntimeRestart(reason, true)");
 
     const coreLoss = mainSource.match(
       /function beginUnexpectedCoreTeardown\([\s\S]*?\n\}\n\nfunction isGuardReadyMessage/,
     )?.[0];
     if (!coreLoss) throw new Error("unexpected Core teardown is missing");
-    expect(coreLoss).toContain("handledCoreLosses.has(child)");
     expect(coreLoss).toContain("expectedCoreStops.has(child)");
-    expect(coreLoss).toContain("core !== child");
+    expect(coreLoss).toContain("runtimeSupervisor.core !== child");
+    expect(coreLoss).toContain('state.phase === "ready"');
+    expect(coreLoss).toContain("scheduleRuntimeRestart(reason, true)");
 
-    const heartbeat = mainSource.match(
-      /function startGuardHeartbeat\([\s\S]*?\n\}\n\nasync function startGuard/,
+    expect(mainSource).toContain("new GuardHeartbeatMonitor<UtilityProcess>");
+    expect(mainSource).toContain("isCurrent: (child) => runtimeSupervisor.guard === child");
+    expect(mainSource).toContain("onFailure: beginUnexpectedGuardTeardown");
+
+    const ready = mainSource.match(
+      /app\.whenReady\(\)\.then\(async \(\) => \{[\s\S]*?registerMarketplaceProtocolClient\(\)/,
     )?.[0];
-    if (!heartbeat) throw new Error("Guard heartbeat lifecycle is missing");
-    expect(heartbeat).toMatch(
-      /beginUnexpectedGuardTeardown\([\s\S]*?Guard utility became unresponsive/,
+    if (!ready) throw new Error("Electron ready lifecycle is missing");
+    expect(ready).toMatch(
+      /powerMonitor\.on\("suspend"[\s\S]*?guardHeartbeat\.suspend\(\)/,
     );
-    expect(heartbeat).toMatch(
-      /catch \(error\) \{[\s\S]*?beginUnexpectedGuardTeardown/,
+    expect(ready).toMatch(
+      /powerMonitor\.on\("resume"[\s\S]*?guardHeartbeat\.resume\(\)/,
     );
 
     const guardStartup = mainSource.match(
@@ -283,6 +298,7 @@ describe("Shell Host configuration", () => {
     expect(guardStartup).toMatch(
       /child\.on\("exit", \(code\)[\s\S]*?beginUnexpectedGuardTeardown/,
     );
+    expect(guardStartup).toContain("guardHeartbeat.start(child, generation)");
 
     const coreStartup = mainSource.match(
       /function startCore\([\s\S]*?\n\}\n\nasync function stopCore/,
@@ -299,9 +315,8 @@ describe("Shell Host configuration", () => {
       /async function startRuntime\([\s\S]*?\n\}\n\nasync function stopRuntime/,
     )?.[0];
     if (!runtimeStartup) throw new Error("runtime startup lifecycle is missing");
-    expect(runtimeStartup.indexOf("await controlPlaneTeardownBarrier")).toBeLessThan(
-      runtimeStartup.indexOf("markCoreStarting()"),
-    );
+    expect(runtimeStartup).not.toContain("waitForTeardown");
+    expect(runtimeStartup).toContain("beginRuntimeGeneration()");
 
     const processStops = mainSource.match(
       /async function stopCore\([\s\S]*?\n\}\n\nasync function stopGuard\([\s\S]*?\n\}\n\nasync function startRuntime/,
@@ -310,7 +325,6 @@ describe("Shell Host configuration", () => {
     expect(processStops).toContain('child.kill("SIGKILL")');
     expect(processStops).toContain("await waitForCoreExit(child, 500)");
     expect(processStops).toContain("Node Core termination was not confirmed");
-    expect(processStops).toContain("latchControlPlaneRestartRequired(failure)");
     expect(processStops).toContain("await waitForGuardExit(child, 500)");
     expect(processStops).toContain("Guard utility termination was not confirmed");
     expect(processStops).toContain("async function stopControlPlaneProcesses");
@@ -320,9 +334,7 @@ describe("Shell Host configuration", () => {
     expect(processStops.indexOf("await stopCore(coreChild)")).toBeLessThan(
       processStops.indexOf("await stopGuard(guardChild)"),
     );
-    expect(processStops).toMatch(
-      /if \(failures\.length === 0\) return;[\s\S]*?latchControlPlaneRestartRequired/,
-    );
+    expect(processStops).not.toContain("latchControlPlaneRestartRequired");
   });
 
   test("starts only a validated remembered Workspace and reserves it before renderer IPC can race", () => {
@@ -356,8 +368,8 @@ describe("Shell Host configuration", () => {
       const end = mainSource.indexOf(`function ${nextName}(`, start + 1);
       if (start < 0 || end < 0) throw new Error(`${name} lifecycle is missing`);
       const lifecycle = mainSource.slice(start, end);
-      expect(lifecycle).toContain("markCoreStarting()");
-      expect(lifecycle).toContain("markCoreFailed(error)");
+      expect(lifecycle).toContain("await stopRuntime()");
+      expect(lifecycle).toContain("markRuntimeFailed(error)");
     }
 
     const recovery = mainSource.match(
@@ -365,13 +377,13 @@ describe("Shell Host configuration", () => {
     )?.[0];
     if (!recovery) throw new Error("recovery restart lifecycle is missing");
     expect(recovery.indexOf("await importVaultKey")).toBeLessThan(
-      recovery.indexOf("markCoreStarting()"),
+      recovery.indexOf("await stopRuntime()"),
     );
     expect(recovery).toContain("inspectWorkspaceForOpen(targetWorkspace)");
     expect(recovery).toContain(
       "await startRuntime({ expectedVaultId: descriptor.vaultId })",
     );
-    expect(recovery).toContain("markCoreFailed(error)");
+    expect(recovery).toContain("markRuntimeFailed(error)");
   });
 
   test("commits a Workspace switch only after readiness and restores the old selection before rollback", () => {
@@ -388,7 +400,6 @@ describe("Shell Host configuration", () => {
     const startCandidate = activation.indexOf(
       "await startRuntime({ expectedVaultId: currentCandidate.vaultId })",
     );
-    const candidateReady = activation.indexOf("await waitForCore(generation)", startCandidate);
     const commit = activation.indexOf("saveActiveWorkspace(currentCandidate)");
     const cleanupCandidate = activation.indexOf("if (candidateSelected)");
     const restorePrevious = activation.indexOf("if (previous)", cleanupCandidate);
@@ -409,15 +420,16 @@ describe("Shell Host configuration", () => {
     expect(stopOld).toBeGreaterThan(keyPreflight);
     expect(reinspection).toBeGreaterThan(stopOld);
     expect(startCandidate).toBeGreaterThan(reinspection);
-    expect(candidateReady).toBeGreaterThan(startCandidate);
-    expect(commit).toBeGreaterThan(candidateReady);
+    expect(commit).toBeGreaterThan(startCandidate);
     expect(cleanupCandidate).toBeGreaterThan(commit);
     expect(restorePrevious).toBeGreaterThan(cleanupCandidate);
     expect(restorePath).toBeGreaterThan(restorePrevious);
     expect(restoreVault).toBeGreaterThan(restorePath);
     expect(restartGate).toBeGreaterThan(restoreVault);
     expect(restartPrevious).toBeGreaterThan(restartGate);
-    expect(activation).toContain("await waitForCore(generation)");
+    expect(mainSource).toMatch(
+      /async function startRuntime\([\s\S]*?startCore\(generation\);[\s\S]*?await waitForCore\(generation\)/,
+    );
   });
 
   test("keeps Create and Open explicit and treats path as a locator", () => {
@@ -441,7 +453,7 @@ describe("Shell Host configuration", () => {
     )?.[0];
     if (!quit) throw new Error("before-quit lifecycle is missing");
 
-    const stopRuntime = quit.indexOf("void stopRuntime()");
+    const stopRuntime = quit.indexOf("void stopRuntimeAfterFailure(false)");
     const failureLog = quit.indexOf("Runtime shutdown required process exit");
     const finallyBlock = quit.indexOf(".finally(() =>");
     const shutdownComplete = quit.indexOf("shutdownComplete = true");
@@ -699,16 +711,20 @@ describe("Shell Host configuration", () => {
     expect(reload).toContain("committed renderer cleanup also failed");
   });
 
-  test("does not restart an in-process runtime after ambiguous Capsule shutdown", () => {
+  test("uses explicit normal and failure whole-runtime shutdown paths", () => {
     const match = mainSource.match(
-      /async function stopRuntime\(\): Promise<void> \{[\s\S]*?\n\}\n\nasync function activateWorkspace/,
+      /async function stopRuntime\([\s\S]*?\n\}\n\nasync function activateWorkspace/,
     );
     if (!match) throw new Error("runtime shutdown lifecycle is missing");
 
     const shutdown = match[0];
-    expect(shutdown).toContain("capsuleFailure = error");
+    expect(shutdown).toContain("runtimeSupervisor.prepareRestart()");
+    expect(shutdown).toContain("await stopAllAppViewers()");
     expect(shutdown).toContain("await stopControlPlaneProcesses()");
-    expect(shutdown).toContain("processFailure = error");
+    expect(shutdown).toContain("async function stopRuntimeAfterFailure");
+    expect(shutdown).toContain("capsuleManager.stopAll({ controlPlaneLost: true })");
+    expect(shutdown).toContain("Promise.allSettled");
     expect(shutdown).toContain('new AggregateError(failures, "Runtime shutdown was incomplete")');
+    expect(mainSource).not.toContain("allowControlPlaneRestartAfterCapsuleFailure");
   });
 });

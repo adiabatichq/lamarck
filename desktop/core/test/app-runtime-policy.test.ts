@@ -67,6 +67,7 @@ describe("App runtime policy", () => {
 
   test("fails closed for Host, lifecycle, approval, terminal, and method variants", () => {
     const denied: Array<[string, string]> = [
+      ["/api/health", "GET"],
       ["/api/workspace", "GET"],
       ["/api/apps", "GET"],
       ["/api/apps/app-a/source", "GET"],

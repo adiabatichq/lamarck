@@ -34,7 +34,7 @@ export function WorkspacePanel({ coreStatus, onCoreChanged }: WorkspacePanelProp
     ]);
     setWorkspace(hostState?.status === "ready" ? hostState.workspace : null);
     setCoreBaseUrl(baseUrl);
-    if (runtime?.phase === "starting") {
+    if (runtime?.phase === "starting" || runtime?.phase === "restarting") {
       setCorePath("");
       return;
     }

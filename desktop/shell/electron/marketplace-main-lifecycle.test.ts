@@ -18,7 +18,7 @@ describe("Marketplace Host handoff lifecycle", () => {
       /function flushMarketplaceHandoffs\(\): void \{[\s\S]*?\n\}/,
     )?.[0];
     if (!flush) throw new Error("Marketplace handoff flush is missing");
-    expect(flush).toContain('coreRuntime.snapshot().phase !== "ready"');
+    expect(flush).toContain('runtimeSupervisor.snapshot().phase !== "ready"');
     expect(flush).toContain("marketplaceRendererWebContentsId !== contents.id");
     expect(flush).toContain('contents.send("marketplace:handoff", handoff)');
     expect(mainSource).toContain('ipcMain.handle("marketplace:rendererReady"');

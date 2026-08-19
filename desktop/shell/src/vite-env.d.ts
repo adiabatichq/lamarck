@@ -45,12 +45,12 @@ interface Window {
     getCoreStartError(): Promise<string | null>;
     getCoreRuntimeState(): Promise<{
       generation: number;
-      phase: "starting" | "ready" | "failed";
+      phase: "starting" | "ready" | "restarting" | "failed";
       error: string | null;
     }>;
     onCoreRuntimeState(callback: (state: {
       generation: number;
-      phase: "starting" | "ready" | "failed";
+      phase: "starting" | "ready" | "restarting" | "failed";
       error: string | null;
     }) => void): () => void;
     retryCore(): Promise<{ coreBaseUrl: string }>;

@@ -37,6 +37,20 @@ describe("Core startup availability", () => {
     });
   });
 
+  test("keeps automatic recovery out of the unavailable UI", async () => {
+    await expect(resolveCoreRequestFailure(
+      new Error("Node Core is restarting"),
+      async () => ({
+        generation: 2,
+        phase: "restarting",
+        error: "Guard exited",
+      }),
+    )).resolves.toEqual({
+      status: "checking",
+      error: null,
+    });
+  });
+
   test("fails unavailable with the request error when Host state cannot be inspected", async () => {
     await expect(resolveCoreRequestFailure(
       new Error("Core connection was lost"),
@@ -47,7 +61,7 @@ describe("Core startup availability", () => {
     });
   });
 
-  test("does not treat an ordinary Core response failure as pending startup", async () => {
+  test("preserves the request failure while the runtime still reports ready", async () => {
     await expect(resolveCoreRequestFailure(
       new Error("HTTP 500"),
       async () => ({ generation: 1, phase: "ready", error: null }),
