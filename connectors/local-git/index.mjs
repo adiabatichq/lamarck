@@ -198,7 +198,10 @@ export async function discoverConfiguredRepos(config, deps = {}) {
   for (const root of normalized.roots) {
     throwIfAborted(deps.signal);
     const rootPath = expandPath(root.path);
-    const discovered = await discoverReposUnder(rootPath, deps);
+    const discovered = await discoverReposUnder(rootPath, {
+      ...deps,
+      includeNestedRepos: root.includeNestedRepos,
+    });
     for (const repo of discovered) {
       repos.set(repo.path, repo);
     }
@@ -338,7 +341,7 @@ async function discoverReposUnder(rootPath, deps = {}) {
     throwIfAborted(deps.signal);
     if (await hasGitMetadata(dir, deps.statImpl)) {
       repos.push(await repoInfo(dir, deps));
-      return;
+      if (!deps.includeNestedRepos) return;
     }
     if (depth >= DISCOVERY_MAX_DEPTH) return;
 
@@ -573,7 +576,10 @@ function normalizePathItems(input) {
     const normalized = collapseHome(expandPath(path));
     if (seen.has(normalized)) continue;
     seen.add(normalized);
-    items.push({ path: normalized });
+    items.push({
+      path: normalized,
+      includeNestedRepos: isObject(item) && item.includeNestedRepos === true,
+    });
   }
   return items;
 }
@@ -889,6 +895,12 @@ function setupHtml() {
       gap: 8px;
       align-items: center;
     }
+    .rootControls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      white-space: nowrap;
+    }
     .rootActions {
       display: grid;
       grid-template-columns: auto minmax(0, 1fr) auto;
@@ -913,6 +925,19 @@ function setupHtml() {
       color: var(--muted);
       font-size: 12px;
     }
+    .repositoryList {
+      max-height: 360px;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      margin-top: 12px;
+    }
+    .repositoryList .path {
+      padding: 8px 10px;
+      border-top: 1px solid var(--line);
+    }
+    .repositoryList .path:first-child { border-top: 0; }
     .repoCapture {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -969,7 +994,7 @@ function setupHtml() {
             <input id="rootInput" placeholder="~/Projects">
             <button id="addRootPath">Add Path</button>
           </div>
-          <div class="muted" style="margin-top:8px">Roots are data sources. Local Git scans them for visible git repositories.</div>
+          <div class="muted" style="margin-top:8px">Roots are data sources. Enable nested repos when work inside submodules or embedded repositories should be included.</div>
           <div id="roots"></div>
         </section>
 
@@ -1017,7 +1042,7 @@ function setupHtml() {
             <select id="repoSelect"></select>
             <button id="addRepo">+ Add Repo</button>
           </div>
-          <div class="muted" style="margin-top:8px">Repos not listed here use the global capture settings. The list is populated from currently visible repos under code roots.</div>
+          <div class="muted" style="margin-top:8px">Repos not listed here use the global capture settings. The list is populated from currently discovered repos under code roots.</div>
           <div id="repos"></div>
         </section>
       </main>
@@ -1035,9 +1060,10 @@ function setupHtml() {
         </section>
 
         <section class="panel">
-          <h2>Preview</h2>
-          <button id="refresh">Refresh visible repos</button>
-          <div id="preview" style="margin-top:12px"></div>
+          <h2>Repositories</h2>
+          <button id="refresh">Refresh repositories</button>
+          <div id="repositorySummary" class="muted" style="margin-top:12px"></div>
+          <div id="repositoryList" class="repositoryList" role="list"></div>
         </section>
       </aside>
     </div>
@@ -1085,7 +1111,7 @@ function setupHtml() {
       const value = String(path || "").trim();
       if (!value) return false;
       if (config.roots.some((root) => root.path === value)) return false;
-      config.roots.push({ path: value });
+      config.roots.push({ path: value, includeNestedRepos: false });
       return true;
     }
     function pruneRepoOverridesToVisible() {
@@ -1115,11 +1141,11 @@ function setupHtml() {
       renderRepoSelect();
       renderRepos();
       renderIdentities();
-      renderPreview();
+      renderRepositoryList();
     }
 
     async function refreshDiscovery(statusText, options = {}) {
-      setStatus(statusText || "Refreshing visible repos...");
+      setStatus(statusText || "Refreshing repositories...");
       const data = await api("/api/discover", { method: "POST", body: JSON.stringify({ localGit: config }) });
       discoveredRepos = data.discoveredRepos || [];
       identitySuggestions = data.identitySuggestions || [];
@@ -1143,6 +1169,16 @@ function setupHtml() {
         path.className = "path";
         path.textContent = root.path;
         left.appendChild(path);
+        const controls = document.createElement("div");
+        controls.className = "rootControls";
+        const nested = repoCheckbox("Include nested repos", root.includeNestedRepos, async (value) => {
+          root.includeNestedRepos = value;
+          try {
+            await refreshDiscovery(value ? "Scanning nested repositories..." : "Scanning code roots...");
+          } catch (err) {
+            setStatus(err.message || String(err));
+          }
+        });
         const button = document.createElement("button");
         button.textContent = "Remove";
         button.onclick = async () => {
@@ -1154,7 +1190,8 @@ function setupHtml() {
             setStatus(err.message || String(err));
           }
         };
-        item.append(left, button);
+        controls.append(nested, button);
+        item.append(left, controls);
         node.appendChild(item);
       });
     }
@@ -1257,27 +1294,27 @@ function setupHtml() {
       });
     }
 
-    function renderPreview() {
-      const node = el("preview");
+    function renderRepositoryList() {
+      const summary = el("repositorySummary");
+      const node = el("repositoryList");
+      summary.innerHTML = "";
       node.innerHTML = "";
       const rootCount = config.roots.length;
       const repoCount = discoveredRepos.length;
       const identityCount = config.identities.length;
-      const lines = [
+      summary.textContent = [
         rootCount + " code root" + (rootCount === 1 ? "" : "s"),
-        repoCount + " visible git repo" + (repoCount === 1 ? "" : "s"),
+        repoCount + " discovered git repo" + (repoCount === 1 ? "" : "s"),
         identityCount + " identity email" + (identityCount === 1 ? "" : "s")
-      ];
-      lines.forEach((line) => {
-        const div = document.createElement("div");
-        div.className = "muted";
-        div.textContent = line;
-        node.appendChild(div);
-      });
-      discoveredRepos.slice(0, 12).forEach((repo) => {
+      ].join(" · ");
+      if (!discoveredRepos.length) {
+        node.appendChild(empty("No repositories discovered."));
+        return;
+      }
+      discoveredRepos.forEach((repo) => {
         const div = document.createElement("div");
         div.className = "path";
-        div.style.marginTop = "8px";
+        div.setAttribute("role", "listitem");
         div.textContent = repo.path;
         node.appendChild(div);
       });
@@ -1362,7 +1399,7 @@ function setupHtml() {
     };
     el("refresh").onclick = async () => {
       try {
-        await refreshDiscovery("Refreshing visible repos...");
+        await refreshDiscovery("Refreshing repositories...");
       } catch (err) {
         setStatus(err.message || String(err));
       }
