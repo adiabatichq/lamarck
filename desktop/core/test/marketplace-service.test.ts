@@ -140,6 +140,25 @@ describe("Marketplace lifecycle staging service", () => {
     expect(await readdir(same.stagingRoot)).toEqual([]);
   });
 
+  test("checks signed Connector release metadata without downloading its artifact", async () => {
+    const release = connectorRelease("lamarck.calendar");
+    const { service, stagingRoot, requests } = await serviceForRelease(
+      release,
+      baseLifecycle(),
+    );
+
+    await expect(service.resolveConnectorRelease(release.packageId)).resolves.toMatchObject({
+      kind: "connector",
+      packageId: release.packageId,
+      releaseId: release.releaseId,
+      contentHash: release.contentHash,
+    });
+    expect(requests).toEqual([
+      `https://api.lamarck.ai/marketplace/resolve/connector/${release.packageId}`,
+    ]);
+    expect(await readdir(stagingRoot)).toEqual([]);
+  });
+
   test("fails closed when Connector state changes after confirmation", async () => {
     const release = connectorRelease("lamarck.calendar");
     const changed = await connectorService(release, [
@@ -178,7 +197,7 @@ function baseLifecycle(): MarketplaceLifecycleAdapters {
 async function serviceForRelease(
   release: TestRelease,
   lifecycle: MarketplaceLifecycleAdapters,
-): Promise<{ service: MarketplaceService; stagingRoot: string }> {
+): Promise<{ service: MarketplaceService; stagingRoot: string; requests: string[] }> {
   const workspacePath = await mkdtemp(join(tmpdir(), "lamarck-marketplace-flow-"));
   roots.push(workspacePath);
   const unsigned = {
@@ -200,8 +219,10 @@ async function serviceForRelease(
     signature: sign(null, canonicalMarketplaceResolveBytes(unsigned), signingKey.privateKey)
       .toString("base64url"),
   };
+  const requests: string[] = [];
   const fetchImpl = (async (input: RequestInfo | URL) => {
     const url = input instanceof Request ? input.url : String(input);
+    requests.push(url);
     if (url.startsWith("https://api.lamarck.ai/marketplace/resolve/")) {
       return new Response(JSON.stringify(resolution), {
         status: 200,
@@ -226,7 +247,11 @@ async function serviceForRelease(
     fetchImpl,
     lifecycle,
   });
-  return { service, stagingRoot: join(workspacePath, ".lamarck", "marketplace", "staging") };
+  return {
+    service,
+    stagingRoot: join(workspacePath, ".lamarck", "marketplace", "staging"),
+    requests,
+  };
 }
 
 async function connectorService(release: TestRelease, hashes: Array<string | undefined>) {

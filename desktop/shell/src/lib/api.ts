@@ -414,6 +414,7 @@ export interface InstalledConnectorView {
   supported: boolean;
   packageTrust: ConnectorTrust;
   packageHash?: string;
+  updateAvailable?: boolean;
 }
 
 export interface ConnectorSourceView {

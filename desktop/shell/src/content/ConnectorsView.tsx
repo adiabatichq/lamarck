@@ -6,6 +6,7 @@
 // permissions, and lifecycle actions are per Source.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { requestMarketplaceHandoff } from "../components/MarketplaceHandoffController";
 import { useConnectors } from "../hooks/useConnectors";
 import {
   approveConnector,
@@ -359,7 +360,9 @@ function ConnectorCard({
       ? "quarantined"
       : trust === "broken"
         ? "broken"
-        : "ready";
+        : connector.updateAvailable
+          ? "update"
+          : "ready";
   const canAddSource = connector.identityKind === "connector"
     || (connector.identityKind === "device"
       ? !sources.some((sourceRecord) => sourceRunsHere(sourceRecord))
@@ -380,6 +383,9 @@ function ConnectorCard({
             <span className={styles.stateDot} />
             INSTALLED
           </span>
+          {connector.updateAvailable && (
+            <span className={styles.updateBadge}>UPDATE AVAILABLE</span>
+          )}
           <h2 className={styles.cardName}>{connector.name}</h2>
           <span className={styles.cardMeta}>
             {connector.mode}
@@ -392,6 +398,17 @@ function ConnectorCard({
             {trust === "broken" && <span className={styles.brokenSeal}>missing</span>}
           </span>
           <div className={styles.cardTopActions}>
+            {connector.updateAvailable && (
+              <button
+                className={styles.updateBtn}
+                onClick={() => requestMarketplaceHandoff({
+                  kind: "connector",
+                  packageId: connectorId,
+                })}
+              >
+                Update
+              </button>
+            )}
             {trust === "needs-approval" && panel !== "approve" && (
               <button className={styles.hazardBtn} onClick={() => setPanel("approve")}>
                 Review &amp; Approve

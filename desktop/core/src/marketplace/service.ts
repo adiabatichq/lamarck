@@ -15,6 +15,7 @@ import { resolveMarketplacePackage } from "./client";
 import { downloadMarketplaceArtifact } from "./download";
 import type {
   MarketplacePackageKind,
+  MarketplaceResolvePayload,
   MarketplaceTrustRoot,
 } from "./resolve";
 
@@ -94,6 +95,20 @@ export class MarketplaceService {
     await mkdir(service.stagingRoot, { recursive: true, mode: 0o700 });
     await chmod(service.stagingRoot, 0o700);
     return service;
+  }
+
+  /** Resolve signed release metadata without downloading the package artifact. */
+  async resolveConnectorRelease(packageId: string): Promise<MarketplaceResolvePayload> {
+    if (!SCOPED_PACKAGE_ID_PATTERN.test(packageId)) {
+      throw new Error("Marketplace package identity is invalid");
+    }
+    return resolveMarketplacePackage({
+      apiOrigin: this.options.apiOrigin,
+      kind: "connector",
+      packageId,
+      trustRoots: this.options.trustRoots,
+      fetchImpl: this.options.fetchImpl,
+    });
   }
 
   async prepare(kind: MarketplacePackageKind, packageId: string): Promise<MarketplacePreparedPackage> {

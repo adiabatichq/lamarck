@@ -209,6 +209,38 @@ const marketplaceService = await MarketplaceService.initialize({
     },
   },
 });
+const connectorUpdateCheckIntervalMs = 24 * 60 * 60 * 1_000;
+const latestOfficialConnectorReleases = new Map<string, {
+  contentHash: string;
+}>();
+let connectorUpdateCheck: Promise<void> | null = null;
+
+function refreshOfficialConnectorReleases(): Promise<void> {
+  if (connectorUpdateCheck) return connectorUpdateCheck;
+  const installed = connectorSupervisor.listInstalledConnectors()
+    .filter((connector) => connector.packageTrust === "official");
+  connectorUpdateCheck = Promise.allSettled(installed.map(async (connector) => {
+    const release = await marketplaceService.resolveConnectorRelease(connector.connectorId);
+    latestOfficialConnectorReleases.set(connector.connectorId, {
+      contentHash: release.contentHash,
+    });
+  })).then((results) => {
+    for (const result of results) {
+      if (result.status === "rejected") {
+        console.warn("[lamarck] Connector update check failed:", result.reason);
+      }
+    }
+  }).finally(() => {
+    connectorUpdateCheck = null;
+  });
+  return connectorUpdateCheck;
+}
+
+void refreshOfficialConnectorReleases();
+const connectorUpdateTimer = setInterval(() => {
+  void refreshOfficialConnectorReleases();
+}, connectorUpdateCheckIntervalMs);
+connectorUpdateTimer.unref();
 const d1ObserverState = new D1ObserverState(systemDb);
 const d1Sequencer = new D1Sequencer();
 const vfs = new VfsService(workspacePath, d1ObserverState, contentBlobStore, d1Sequencer);
@@ -1004,11 +1036,21 @@ const server = await serve<{ cwd: string }>({
           ...sourceRecord,
           oauthRedirectUri: isDirectOAuthAuthType(sourceRecord.authType) ? oauthRedirectUri : undefined,
         }));
+        const packages = connectorSupervisor.listInstalledConnectors().map((connector) => {
+          const latest = latestOfficialConnectorReleases.get(connector.connectorId);
+          return {
+            ...connector,
+            updateAvailable: connector.packageTrust === "official"
+              && connector.packageHash !== undefined
+              && latest !== undefined
+              && connector.packageHash !== latest.contentHash,
+          };
+        });
         return json({
           sources,
           // Compatibility alias while callers migrate to the ownership model.
           connectors: sources,
-          packages: connectorSupervisor.listInstalledConnectors(),
+          packages,
         });
       }
 
@@ -1588,6 +1630,7 @@ async function shutdown(): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log("\n[lamarck] Shutting down...");
+  clearInterval(connectorUpdateTimer);
   const vfsClosed = vfs.close();
   const serverStopped = server.stop().catch(() => {});
   await connectorScheduler.stop();

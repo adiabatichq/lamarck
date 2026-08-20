@@ -293,6 +293,20 @@
   flex-shrink: 0;
 }
 
+.updateBadge {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  border: 1px solid rgba(232, 193, 90, 0.48);
+  border-radius: 2px;
+  padding: 2px 6px;
+  color: var(--c-amber);
+  background: var(--c-amber-dim);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+}
+
 .stateDot {
   width: 7px;
   height: 7px;
@@ -888,6 +902,7 @@
 }
 
 .primaryBtn,
+.updateBtn,
 .hazardBtn,
 .ghostBtn {
   font-family: var(--mono);
@@ -897,6 +912,16 @@
   padding: 5px 14px;
   cursor: pointer;
   transition: background 0.12s, color 0.12s;
+}
+
+.updateBtn {
+  border: 1px solid var(--c-amber);
+  background: var(--c-amber-dim);
+  color: var(--c-amber);
+}
+
+.updateBtn:hover:not(:disabled) {
+  background: rgba(232, 193, 90, 0.2);
 }
 
 .primaryBtn {
@@ -931,6 +956,7 @@
 }
 
 .primaryBtn:disabled,
+.updateBtn:disabled,
 .hazardBtn:disabled,
 .ghostBtn:disabled {
   opacity: 0.45;
@@ -938,6 +964,7 @@
 }
 
 .primaryBtn:focus-visible,
+.updateBtn:focus-visible,
 .hazardBtn:focus-visible,
 .ghostBtn:focus-visible,
 .inlineInput:focus-visible,

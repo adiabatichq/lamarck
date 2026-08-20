@@ -13,6 +13,18 @@ export interface MarketplaceHandoff {
   packageId: string;
 }
 
+type MarketplaceHandoffListener = (handoff: MarketplaceHandoff) => void;
+const marketplaceHandoffListeners = new Set<MarketplaceHandoffListener>();
+
+export function requestMarketplaceHandoff(handoff: MarketplaceHandoff): void {
+  for (const listener of marketplaceHandoffListeners) listener(handoff);
+}
+
+function subscribeMarketplaceHandoff(listener: MarketplaceHandoffListener): () => void {
+  marketplaceHandoffListeners.add(listener);
+  return () => marketplaceHandoffListeners.delete(listener);
+}
+
 type DialogState =
   | { phase: "preparing"; handoff: MarketplaceHandoff }
   | { phase: "confirm"; handoff: MarketplaceHandoff; prepared: MarketplacePreparedPackage }
@@ -156,14 +168,17 @@ export function MarketplaceHandoffController({
     const host = window.lamarckHost;
     if (!host) return;
     mountedRef.current = true;
-    const unsubscribe = host.onMarketplaceHandoff((handoff) => {
+    const enqueue = (handoff: MarketplaceHandoff) => {
       queueRef.current.enqueue(handoff);
       pump();
-    });
+    };
+    const unsubscribeHost = host.onMarketplaceHandoff(enqueue);
+    const unsubscribeLocal = subscribeMarketplaceHandoff(enqueue);
     void host.marketplaceReady();
     return () => {
       mountedRef.current = false;
-      unsubscribe();
+      unsubscribeHost();
+      unsubscribeLocal();
       const current = dialogRef.current;
       if (current && "prepared" in current && current.phase !== "applying") {
         void cancelMarketplacePackage(current.prepared.stageId).catch(() => {});

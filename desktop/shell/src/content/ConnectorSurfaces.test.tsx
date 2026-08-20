@@ -72,6 +72,22 @@ describe("Connector surface responsibilities", () => {
     expect(markup).not.toContain("Connector Catalog");
   });
 
+  test("shows a package-level update action when Core reports a newer content hash", () => {
+    mocks.useConnectors.mockReturnValue({
+      sources: [],
+      packages: [{ ...installedConnector, updateAvailable: true }],
+      loading: false,
+      error: null,
+      refresh: vi.fn(),
+    });
+
+    const markup = renderToStaticMarkup(<ConnectorsView />);
+
+    expect(markup).toContain("UPDATE AVAILABLE");
+    expect(markup).toContain(">Update</button>");
+    expect(markup).toContain("Remove connector…");
+  });
+
   test("shows Source identity, ownership, conflict, rename, and retry controls", () => {
     mocks.useConnectors.mockReturnValue({
       sources: [identitySource],
