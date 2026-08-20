@@ -17,6 +17,26 @@ test("timestamp-backed daily records preserve the provider instant", () => {
   assert.equal(event.payload.record, record);
 });
 
+test("sleep daily records ignore the UTC date marker and use the local sleep-day range", () => {
+  const record = {
+    id: "sleep-daily-1",
+    day: "2026-01-10",
+    timestamp: "2026-01-10T00:00:00.000+00:00",
+  };
+  const temporalContext = {
+    dailyActivityOffsets: {
+      "2026-01-09": "-08:00",
+      "2026-01-10": "+08:00",
+    },
+  };
+
+  const event = eventFromRecord("daily_sleep", record, temporalContext);
+
+  assert.equal(event.startedAt, Date.parse("2026-01-09T18:00:00.000-08:00"));
+  assert.equal(event.endedAt, Date.parse("2026-01-10T18:00:00.000+08:00"));
+  assert.equal(event.payload.record, record);
+});
+
 test("date-only daily records use the same-day activity offset as a calendar range", () => {
   const record = {
     id: "stress-1",
@@ -104,7 +124,7 @@ test("syncs daily activity first and reuses its offset for date-only streams", a
   assert.equal(state.dailyActivityOffsets["2026-08-19"], "+08:00");
 });
 
-test("sync skips unresolved date-only records, warns, and keeps the cursor retryable", async () => {
+test("sync skips unresolved date-only records, warns, and advances the incremental cursor", async () => {
   const events = [];
   const warnings = new Map();
   let state;
@@ -149,9 +169,87 @@ test("sync skips unresolved date-only records, warns, and keeps the cursor retry
   });
 
   assert.equal(events.length, 0);
-  assert.equal(state.incremental.streams.daily_stress.lastSyncedDate, undefined);
+  assert.equal(state.incremental.streams.daily_stress.lastSyncedDate, "2026-08-20");
+  assert.deepEqual(state.unresolvedCalendarDays, ["daily_stress:2026-08-19"]);
   assert.deepEqual(warnings.get("calendar-day-timezone")?.details.missing, [{
     stream: "daily_stress",
     day: "2026-08-19",
+  }]);
+});
+
+test("backfill advances past unresolved date-only records", async () => {
+  const events = [];
+  const warnings = new Map();
+  let state;
+  const context = {
+    auth: {
+      type: "managedProvider",
+      getToken: async () => "test-token",
+    },
+    config: {
+      streams: ["daily_stress"],
+      "backfill-years": 1,
+    },
+    state: {
+      get: async () => state,
+      set: async (value) => {
+        state = value;
+      },
+    },
+    guard: {
+      writeEvents: async (batch) => {
+        events.push(...batch);
+      },
+    },
+    warnings: {
+      set: async (warning) => warnings.set(warning.key, warning),
+      clear: async (key) => warnings.delete(key),
+    },
+  };
+  const fetchImpl = async (input) => {
+    const url = new URL(input);
+    const isFirstBackfillChunk = url.searchParams.get("start_date") === "2025-08-20";
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => undefined },
+      text: async () => JSON.stringify({
+        data: isFirstBackfillChunk
+          ? [{ id: "stress-unresolved-backfill", day: "2025-10-24" }]
+          : [],
+      }),
+    };
+  };
+
+  await syncOnce(context, {
+    baseUrl: "https://provider.test/",
+    fetchImpl,
+    now: Date.parse("2026-08-21T00:01:00.000+08:00"),
+  });
+
+  assert.equal(events.length, 0);
+  assert.equal(state.backfill.streams.daily_stress.nextDate, "2026-08-20");
+  assert.equal(state.backfill.streams.daily_stress.done, true);
+  assert.equal(state.backfill.done, true);
+  assert.deepEqual(state.unresolvedCalendarDays, ["daily_stress:2025-10-24"]);
+  assert.deepEqual(warnings.get("calendar-day-timezone")?.details.missing, [{
+    stream: "daily_stress",
+    day: "2025-10-24",
+  }]);
+
+  await syncOnce(context, {
+    baseUrl: "https://provider.test/",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => undefined },
+      text: async () => JSON.stringify({ data: [] }),
+    }),
+    now: Date.parse("2026-08-22T00:01:00.000+08:00"),
+  });
+
+  assert.deepEqual(warnings.get("calendar-day-timezone")?.details.missing, [{
+    stream: "daily_stress",
+    day: "2025-10-24",
   }]);
 });

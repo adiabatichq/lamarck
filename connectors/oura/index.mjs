@@ -35,9 +35,11 @@ const DEFAULT_STREAM_IDS = [
 
 const STREAMS = [
   timestampedDailyStream("daily_activity", "/v1/streams/daily_activity"),
-  timestampedDailyStream("daily_sleep", "/v1/streams/daily_sleep"),
-  timestampedDailyStream("daily_readiness", "/v1/streams/daily_readiness"),
-  calendarDayStream("daily_spo2", "/v1/streams/daily_spo2"),
+  // Oura emits UTC midnight as a date marker for daily sleep/readiness. These
+  // summaries belong to its local 18:00-to-18:00 Sleep Day instead of that UTC instant.
+  sleepDayStream("daily_sleep", "/v1/streams/daily_sleep"),
+  sleepDayStream("daily_readiness", "/v1/streams/daily_readiness"),
+  sleepDayStream("daily_spo2", "/v1/streams/daily_spo2"),
   calendarDayStream("daily_stress", "/v1/streams/daily_stress"),
   calendarDayStream("daily_resilience", "/v1/streams/daily_resilience"),
   calendarDayStream("daily_cardiovascular_age", "/v1/streams/daily_cardiovascular_age"),
@@ -153,7 +155,10 @@ export async function syncOnce(context, deps = {}) {
 
   const config = normalizeConfig(context.config);
   const previous = normalizeState(await context.state.get());
-  const temporalContext = createTemporalContext(previous.dailyActivityOffsets);
+  const temporalContext = createTemporalContext(
+    previous.dailyActivityOffsets,
+    previous.unresolvedCalendarDays,
+  );
   const next = {
     version: 2,
     incremental: {
@@ -178,7 +183,6 @@ export async function syncOnce(context, deps = {}) {
       : {};
     const range = buildIncrementalRange(stream, streamState, config, nowMs);
     if (!range) continue;
-    const missingCalendarRecordsBefore = temporalContext.missingCalendarRecordCount;
     const syncStatePatch = await syncStream({
       stream,
       range,
@@ -191,13 +195,10 @@ export async function syncOnce(context, deps = {}) {
       nowMs,
       temporalContext,
     });
-    const calendarRangeIncomplete =
-      temporalContext.missingCalendarRecordCount > missingCalendarRecordsBefore;
-
     if (isAborted(context.signal)) return;
     next.incremental.streams[stream.id] = {
       ...streamState,
-      ...(calendarRangeIncomplete ? {} : range.statePatch),
+      ...range.statePatch,
       ...syncStatePatch,
       lastSyncedAt: nowMs,
     };
@@ -282,9 +283,20 @@ async function syncStream({
       const calendarDay = typeof stream.calendarDay === "function"
         ? stream.calendarDay(record)
         : undefined;
-      if (isIsoDate(calendarDay) && !calendarDayOffset(calendarDay, temporalContext)) {
+      const requiredOffsetDays = typeof stream.requiredOffsetDays === "function"
+        ? stream.requiredOffsetDays(record)
+        : isIsoDate(calendarDay)
+          ? [calendarDay]
+          : [];
+      if (
+        isIsoDate(calendarDay) &&
+        requiredOffsetDays.some((day) => !calendarDayOffset(day, temporalContext))
+      ) {
         noteMissingCalendarDay(stream.id, calendarDay, temporalContext);
         continue;
+      }
+      if (isIsoDate(calendarDay)) {
+        clearMissingCalendarDay(stream.id, calendarDay, temporalContext);
       }
       batch.push(eventFromRecord(stream.id, record, temporalContext));
       if (batch.length >= EVENT_BATCH_SIZE) {
@@ -675,7 +687,6 @@ async function syncBackfill({
 
       let syncStatePatch;
       try {
-        const missingCalendarRecordsBefore = temporalContext.missingCalendarRecordCount;
         syncStatePatch = await syncStream({
           stream,
           range: buildBackfillRange(stream, nextDate, chunkEndDate),
@@ -688,19 +699,6 @@ async function syncBackfill({
           nowMs,
           temporalContext,
         });
-        if (temporalContext.missingCalendarRecordCount > missingCalendarRecordsBefore) {
-          delete backfill.lastError;
-          backfill.streams[stream.id] = {
-            ...streamState,
-            nextDate,
-            done: false,
-            lastSyncedAt: nowMs,
-          };
-          backfill.done = false;
-          persistTemporalContext(next, temporalContext);
-          await context.state.set(next);
-          return;
-        }
       } catch (err) {
         backfill.lastError = {
           stream: stream.id,
@@ -794,6 +792,7 @@ function normalizeState(value) {
       incremental: { streams: {} },
       backfill: undefined,
       dailyActivityOffsets: {},
+      unresolvedCalendarDays: [],
     };
   }
   const legacyStreams = isObject(value.streams) ? value.streams : undefined;
@@ -805,6 +804,7 @@ function normalizeState(value) {
     incremental: { streams: incremental },
     backfill: isObject(value.backfill) ? value.backfill : undefined,
     dailyActivityOffsets: normalizeDailyActivityOffsets(value.dailyActivityOffsets),
+    unresolvedCalendarDays: normalizeUnresolvedCalendarDays(value.unresolvedCalendarDays),
   };
 }
 
@@ -818,6 +818,13 @@ function normalizeDailyActivityOffsets(value) {
     }
   }
   return offsets;
+}
+
+function normalizeUnresolvedCalendarDays(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((item) =>
+    typeof item === "string" && /^[^:]+:\d{4}-\d{2}-\d{2}$/.test(item)
+  ))].sort();
 }
 
 function selectStreams(config) {
@@ -934,11 +941,22 @@ function calendarDayStream(id, path) {
   };
 }
 
-function createTemporalContext(dailyActivityOffsets = {}) {
+function sleepDayStream(id, path) {
+  return {
+    id,
+    path,
+    range: "date",
+    startedAt: (record, temporalContext) => sleepDayRange(record.day, temporalContext)?.startedAt,
+    endedAt: (record, temporalContext) => sleepDayRange(record.day, temporalContext)?.endedAt,
+    calendarDay: (record) => record.day,
+    requiredOffsetDays: (record) => sleepDayOffsetDays(record.day),
+  };
+}
+
+function createTemporalContext(dailyActivityOffsets = {}, unresolvedCalendarDays = []) {
   return {
     dailyActivityOffsets: { ...dailyActivityOffsets },
-    missingCalendarDays: new Set(),
-    missingCalendarRecordCount: 0,
+    missingCalendarDays: new Set(unresolvedCalendarDays),
   };
 }
 
@@ -947,6 +965,11 @@ function persistTemporalContext(state, temporalContext) {
     state.dailyActivityOffsets = temporalContext.dailyActivityOffsets;
   } else {
     delete state.dailyActivityOffsets;
+  }
+  if (temporalContext.missingCalendarDays.size > 0) {
+    state.unresolvedCalendarDays = [...temporalContext.missingCalendarDays].sort();
+  } else {
+    delete state.unresolvedCalendarDays;
   }
 }
 
@@ -975,13 +998,34 @@ function calendarDayRange(day, temporalContext) {
   return { startedAt, endedAt };
 }
 
+function sleepDayRange(day, temporalContext) {
+  const [previousDay, currentDay] = sleepDayOffsetDays(day);
+  if (!previousDay || !currentDay) return undefined;
+  const previousOffset = calendarDayOffset(previousDay, temporalContext);
+  const currentOffset = calendarDayOffset(currentDay, temporalContext);
+  if (previousOffset === undefined || currentOffset === undefined) return undefined;
+  const startedAt = Date.parse(`${previousDay}T18:00:00.000${previousOffset}`);
+  const endedAt = Date.parse(`${currentDay}T18:00:00.000${currentOffset}`);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt)) return undefined;
+  return { startedAt, endedAt };
+}
+
+function sleepDayOffsetDays(day) {
+  if (!isIsoDate(day)) return [];
+  const previousDay = isoDate(addDays(Date.parse(`${day}T00:00:00.000Z`), -1));
+  return [previousDay, day];
+}
+
 function calendarDayOffset(day, temporalContext) {
   return temporalContext?.dailyActivityOffsets?.[day];
 }
 
 function noteMissingCalendarDay(streamId, day, temporalContext) {
   temporalContext.missingCalendarDays.add(`${streamId}:${day}`);
-  temporalContext.missingCalendarRecordCount += 1;
+}
+
+function clearMissingCalendarDay(streamId, day, temporalContext) {
+  temporalContext.missingCalendarDays.delete(`${streamId}:${day}`);
 }
 
 async function syncCalendarDayWarning(warnings, temporalContext) {
@@ -1002,7 +1046,7 @@ async function syncCalendarDayWarning(warnings, temporalContext) {
   const visible = missing.slice(0, 100);
   await warnings.set?.({
     key: "calendar-day-timezone",
-    message: `Oura skipped ${missing.length} date-only record${missing.length === 1 ? "" : "s"} without timezone evidence`,
+    message: `Oura skipped ${missing.length} day-scoped record${missing.length === 1 ? "" : "s"} without timezone evidence`,
     details: {
       provider: "oura",
       missing: visible,
