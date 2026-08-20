@@ -101,7 +101,7 @@
       }
     },
     "oura.daily_spo2": {
-      "description": "An Oura daily blood-oxygen summary.",
+      "description": "An Oura daily blood-oxygen summary represented as a calendar-day range.",
       "payloadSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -134,7 +134,7 @@
       }
     },
     "oura.daily_stress": {
-      "description": "An Oura daily stress summary.",
+      "description": "An Oura daily stress summary represented as a calendar-day range.",
       "payloadSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -167,7 +167,7 @@
       }
     },
     "oura.daily_resilience": {
-      "description": "An Oura daily resilience summary.",
+      "description": "An Oura daily resilience summary represented as a calendar-day range.",
       "payloadSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -200,7 +200,7 @@
       }
     },
     "oura.daily_cardiovascular_age": {
-      "description": "An Oura daily cardiovascular-age record.",
+      "description": "An Oura daily cardiovascular-age record represented as a calendar-day range.",
       "payloadSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -233,7 +233,7 @@
       }
     },
     "oura.sleep_time": {
-      "description": "An Oura recommended sleep-time record.",
+      "description": "An Oura recommended sleep-time record represented as a calendar-day range.",
       "payloadSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",

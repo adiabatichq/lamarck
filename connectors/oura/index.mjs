@@ -34,15 +34,15 @@ const DEFAULT_STREAM_IDS = [
 ];
 
 const STREAMS = [
-  dateStream("daily_activity", "/v1/streams/daily_activity"),
-  dateStream("daily_sleep", "/v1/streams/daily_sleep"),
-  dateStream("daily_readiness", "/v1/streams/daily_readiness"),
-  dateStream("daily_spo2", "/v1/streams/daily_spo2"),
-  dateStream("daily_stress", "/v1/streams/daily_stress"),
-  dateStream("daily_resilience", "/v1/streams/daily_resilience"),
-  dateStream("daily_cardiovascular_age", "/v1/streams/daily_cardiovascular_age"),
-  dateStream("sleep_time", "/v1/streams/sleep_time"),
-  dateStream("vo2_max", "/v1/streams/vo2_max"),
+  timestampedDailyStream("daily_activity", "/v1/streams/daily_activity"),
+  timestampedDailyStream("daily_sleep", "/v1/streams/daily_sleep"),
+  timestampedDailyStream("daily_readiness", "/v1/streams/daily_readiness"),
+  calendarDayStream("daily_spo2", "/v1/streams/daily_spo2"),
+  calendarDayStream("daily_stress", "/v1/streams/daily_stress"),
+  calendarDayStream("daily_resilience", "/v1/streams/daily_resilience"),
+  calendarDayStream("daily_cardiovascular_age", "/v1/streams/daily_cardiovascular_age"),
+  calendarDayStream("sleep_time", "/v1/streams/sleep_time"),
+  timestampedDailyStream("vo2_max", "/v1/streams/vo2_max"),
   {
     id: "sleep",
     path: "/v1/streams/sleep",
@@ -153,6 +153,7 @@ export async function syncOnce(context, deps = {}) {
 
   const config = normalizeConfig(context.config);
   const previous = normalizeState(await context.state.get());
+  const temporalContext = createTemporalContext(previous.dailyActivityOffsets);
   const next = {
     version: 2,
     incremental: {
@@ -177,6 +178,7 @@ export async function syncOnce(context, deps = {}) {
       : {};
     const range = buildIncrementalRange(stream, streamState, config, nowMs);
     if (!range) continue;
+    const missingCalendarRecordsBefore = temporalContext.missingCalendarRecordCount;
     const syncStatePatch = await syncStream({
       stream,
       range,
@@ -187,15 +189,19 @@ export async function syncOnce(context, deps = {}) {
       fetchImpl,
       baseUrl,
       nowMs,
+      temporalContext,
     });
+    const calendarRangeIncomplete =
+      temporalContext.missingCalendarRecordCount > missingCalendarRecordsBefore;
 
     if (isAborted(context.signal)) return;
     next.incremental.streams[stream.id] = {
       ...streamState,
-      ...range.statePatch,
+      ...(calendarRangeIncomplete ? {} : range.statePatch),
       ...syncStatePatch,
       lastSyncedAt: nowMs,
     };
+    persistTemporalContext(next, temporalContext);
     await context.state.set(next);
   }
 
@@ -208,14 +214,17 @@ export async function syncOnce(context, deps = {}) {
     nowMs,
     fetchImpl,
     baseUrl,
+    temporalContext,
   });
+  if (isAborted(context.signal)) return;
+  await syncCalendarDayWarning(context.warnings, temporalContext);
 }
 
-export function eventFromRecord(streamId, record) {
+export function eventFromRecord(streamId, record, temporalContext) {
   const stream = STREAMS_BY_ID.get(streamId);
   if (!stream) throw new Error(`Unknown Oura stream: ${streamId}`);
 
-  const startedAt = stream.startedAt(record);
+  const startedAt = stream.startedAt(record, temporalContext);
   if (!Number.isFinite(startedAt)) {
     throw new Error(`Oura ${stream.id} record is missing a usable timestamp`);
   }
@@ -232,7 +241,9 @@ export function eventFromRecord(streamId, record) {
     },
   };
 
-  const endedAt = typeof stream.endedAt === "function" ? stream.endedAt(record) : undefined;
+  const endedAt = typeof stream.endedAt === "function"
+    ? stream.endedAt(record, temporalContext)
+    : undefined;
   if (Number.isFinite(endedAt) && endedAt >= startedAt) {
     event.endedAt = endedAt;
   }
@@ -240,7 +251,18 @@ export function eventFromRecord(streamId, record) {
   return event;
 }
 
-async function syncStream({ stream, range, streamState, guard, token, signal, fetchImpl, baseUrl, nowMs }) {
+async function syncStream({
+  stream,
+  range,
+  streamState,
+  guard,
+  token,
+  signal,
+  fetchImpl,
+  baseUrl,
+  nowMs,
+  temporalContext,
+}) {
   if (stream.id === "heartrate") {
     await syncHeartrateStream({ stream, range, guard, token, signal, fetchImpl, baseUrl });
     return {};
@@ -256,7 +278,15 @@ async function syncStream({ stream, range, streamState, guard, token, signal, fe
     if (isAborted(signal)) return;
     const page = await fetchPage({ stream, range, token, nextToken, signal, fetchImpl, baseUrl });
     for (const record of page.data) {
-      batch.push(eventFromRecord(stream.id, record));
+      captureTemporalEvidence(stream, record, temporalContext);
+      const calendarDay = typeof stream.calendarDay === "function"
+        ? stream.calendarDay(record)
+        : undefined;
+      if (isIsoDate(calendarDay) && !calendarDayOffset(calendarDay, temporalContext)) {
+        noteMissingCalendarDay(stream.id, calendarDay, temporalContext);
+        continue;
+      }
+      batch.push(eventFromRecord(stream.id, record, temporalContext));
       if (batch.length >= EVENT_BATCH_SIZE) {
         await writeBatch(guard, batch.splice(0, batch.length));
       }
@@ -598,7 +628,17 @@ function buildIncrementalRange(stream, streamState, config, nowMs) {
   };
 }
 
-async function syncBackfill({ context, next, config, streams, token, nowMs, fetchImpl, baseUrl }) {
+async function syncBackfill({
+  context,
+  next,
+  config,
+  streams,
+  token,
+  nowMs,
+  fetchImpl,
+  baseUrl,
+  temporalContext,
+}) {
   if (config.backfillYears <= 0) return;
 
   const backfillStreams = streams.filter(
@@ -635,6 +675,7 @@ async function syncBackfill({ context, next, config, streams, token, nowMs, fetc
 
       let syncStatePatch;
       try {
+        const missingCalendarRecordsBefore = temporalContext.missingCalendarRecordCount;
         syncStatePatch = await syncStream({
           stream,
           range: buildBackfillRange(stream, nextDate, chunkEndDate),
@@ -645,7 +686,21 @@ async function syncBackfill({ context, next, config, streams, token, nowMs, fetc
           fetchImpl,
           baseUrl,
           nowMs,
+          temporalContext,
         });
+        if (temporalContext.missingCalendarRecordCount > missingCalendarRecordsBefore) {
+          delete backfill.lastError;
+          backfill.streams[stream.id] = {
+            ...streamState,
+            nextDate,
+            done: false,
+            lastSyncedAt: nowMs,
+          };
+          backfill.done = false;
+          persistTemporalContext(next, temporalContext);
+          await context.state.set(next);
+          return;
+        }
       } catch (err) {
         backfill.lastError = {
           stream: stream.id,
@@ -654,6 +709,7 @@ async function syncBackfill({ context, next, config, streams, token, nowMs, fetc
           message: err instanceof Error ? err.message : String(err),
           at: nowMs,
         };
+        persistTemporalContext(next, temporalContext);
         await context.state.set(next);
         await context.warnings?.set?.({
           key: "backfill",
@@ -678,6 +734,7 @@ async function syncBackfill({ context, next, config, streams, token, nowMs, fetc
         lastSyncedAt: nowMs,
       };
       backfill.done = backfillComplete(backfill, backfillStreams);
+      persistTemporalContext(next, temporalContext);
       await context.state.set(next);
 
       if (backfill.streams[stream.id].done) break;
@@ -685,6 +742,7 @@ async function syncBackfill({ context, next, config, streams, token, nowMs, fetc
   }
 
   backfill.done = backfillComplete(backfill, backfillStreams);
+  persistTemporalContext(next, temporalContext);
   await context.state.set(next);
   if (backfill.done) {
     await context.warnings?.clear?.("backfill");
@@ -731,7 +789,12 @@ function normalizeConfig(config) {
 
 function normalizeState(value) {
   if (!isObject(value)) {
-    return { version: 2, incremental: { streams: {} }, backfill: undefined };
+    return {
+      version: 2,
+      incremental: { streams: {} },
+      backfill: undefined,
+      dailyActivityOffsets: {},
+    };
   }
   const legacyStreams = isObject(value.streams) ? value.streams : undefined;
   const incremental = isObject(value.incremental) && isObject(value.incremental.streams)
@@ -741,7 +804,20 @@ function normalizeState(value) {
     version: 2,
     incremental: { streams: incremental },
     backfill: isObject(value.backfill) ? value.backfill : undefined,
+    dailyActivityOffsets: normalizeDailyActivityOffsets(value.dailyActivityOffsets),
   };
+}
+
+function normalizeDailyActivityOffsets(value) {
+  if (!isObject(value)) return {};
+  const offsets = {};
+  for (const [day, valueOffset] of Object.entries(value)) {
+    const offset = timestampOffset(valueOffset);
+    if (isIsoDate(day) && offset !== undefined) {
+      offsets[day] = offset;
+    }
+  }
+  return offsets;
 }
 
 function selectStreams(config) {
@@ -754,7 +830,11 @@ function selectStreams(config) {
     if (!stream) throw new Error(`Unknown Oura stream configured: ${id}`);
     streams.push(stream);
   }
-  return streams;
+  return streams.sort((a, b) => {
+    if (a.id === "daily_activity") return -1;
+    if (b.id === "daily_activity") return 1;
+    return 0;
+  });
 }
 
 function normalizeBackfill(value, config, nowMs) {
@@ -827,13 +907,122 @@ function backfillComplete(backfill, streams) {
   });
 }
 
-function dateStream(id, path) {
+function timestampedDailyStream(id, path) {
   return {
     id,
     path,
     range: "date",
-    startedAt: (record) => timestampFromAny(record.day, record.timestamp),
+    startedAt: (record, temporalContext) =>
+      timestampFromAny(record.timestamp) ?? calendarDayRange(record.day, temporalContext)?.startedAt,
+    endedAt: (record, temporalContext) =>
+      Number.isFinite(timestampFromAny(record.timestamp))
+        ? undefined
+        : calendarDayRange(record.day, temporalContext)?.endedAt,
+    calendarDay: (record) =>
+      Number.isFinite(timestampFromAny(record.timestamp)) ? undefined : record.day,
   };
+}
+
+function calendarDayStream(id, path) {
+  return {
+    id,
+    path,
+    range: "date",
+    startedAt: (record, temporalContext) => calendarDayRange(record.day, temporalContext)?.startedAt,
+    endedAt: (record, temporalContext) => calendarDayRange(record.day, temporalContext)?.endedAt,
+    calendarDay: (record) => record.day,
+  };
+}
+
+function createTemporalContext(dailyActivityOffsets = {}) {
+  return {
+    dailyActivityOffsets: { ...dailyActivityOffsets },
+    missingCalendarDays: new Set(),
+    missingCalendarRecordCount: 0,
+  };
+}
+
+function persistTemporalContext(state, temporalContext) {
+  if (Object.keys(temporalContext.dailyActivityOffsets).length > 0) {
+    state.dailyActivityOffsets = temporalContext.dailyActivityOffsets;
+  } else {
+    delete state.dailyActivityOffsets;
+  }
+}
+
+function captureTemporalEvidence(stream, record, temporalContext) {
+  if (
+    stream.id !== "daily_activity" ||
+    !temporalContext?.dailyActivityOffsets ||
+    !isIsoDate(record.day)
+  ) {
+    return;
+  }
+  const offset = timestampOffset(record.timestamp);
+  if (offset !== undefined) {
+    temporalContext.dailyActivityOffsets[record.day] = offset;
+  }
+}
+
+function calendarDayRange(day, temporalContext) {
+  if (!isIsoDate(day)) return undefined;
+  const offset = calendarDayOffset(day, temporalContext);
+  if (offset === undefined) return undefined;
+  const nextDay = isoDate(addDays(Date.parse(`${day}T00:00:00.000Z`), 1));
+  const startedAt = Date.parse(`${day}T00:00:00.000${offset}`);
+  const endedAt = Date.parse(`${nextDay}T00:00:00.000${offset}`);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt)) return undefined;
+  return { startedAt, endedAt };
+}
+
+function calendarDayOffset(day, temporalContext) {
+  return temporalContext?.dailyActivityOffsets?.[day];
+}
+
+function noteMissingCalendarDay(streamId, day, temporalContext) {
+  temporalContext.missingCalendarDays.add(`${streamId}:${day}`);
+  temporalContext.missingCalendarRecordCount += 1;
+}
+
+async function syncCalendarDayWarning(warnings, temporalContext) {
+  if (!warnings) return;
+  const missing = [...temporalContext.missingCalendarDays]
+    .sort()
+    .map((value) => {
+      const separator = value.lastIndexOf(":");
+      return {
+        stream: value.slice(0, separator),
+        day: value.slice(separator + 1),
+      };
+    });
+  if (missing.length === 0) {
+    await warnings.clear?.("calendar-day-timezone");
+    return;
+  }
+  const visible = missing.slice(0, 100);
+  await warnings.set?.({
+    key: "calendar-day-timezone",
+    message: `Oura skipped ${missing.length} date-only record${missing.length === 1 ? "" : "s"} without timezone evidence`,
+    details: {
+      provider: "oura",
+      missing: visible,
+      omittedCount: missing.length - visible.length,
+    },
+  });
+}
+
+function timestampOffset(value) {
+  if (typeof value !== "string") return undefined;
+  const match = value.match(/(Z|[+-]\d{2}:?\d{2})$/);
+  if (!match) return undefined;
+  if (match[1] === "Z") return "Z";
+  return match[1].includes(":")
+    ? match[1]
+    : `${match[1].slice(0, 3)}:${match[1].slice(3)}`;
+}
+
+function isIsoDate(value) {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
 
 function externalIdForRecord(stream, record) {

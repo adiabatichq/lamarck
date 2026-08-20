@@ -7933,7 +7933,7 @@ auth:
     expect(events[0]).toMatchObject({
       type: "oura.daily_sleep",
       externalId: expect.stringMatching(/^daily_sleep:sleep-doc-1:[a-f0-9]{16}$/),
-      startedAt: Date.UTC(2026, 0, 2),
+      startedAt: Date.UTC(2026, 0, 2, 8),
       payload: {
         schema: "oura.daily_sleep.v1",
         provider: "oura",
