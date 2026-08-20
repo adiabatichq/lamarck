@@ -16,7 +16,9 @@ export function buildHumanMessageEvent(input) {
   return {
     type: "code_agent.human_message",
     externalId: `human:${input.provider}:${shortHash(conversationKeyValue)}:${input.rawId}`,
-    startedAt: timestampFromRecord(input.record),
+    startedAt: typeof input.startedAt === "number" && Number.isFinite(input.startedAt)
+      ? input.startedAt
+      : timestampFromRecord(input.record),
     payload: {
       provider: input.provider,
       conversationKey: conversationKeyValue,

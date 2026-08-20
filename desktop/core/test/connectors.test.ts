@@ -5368,6 +5368,11 @@ auth:
     const parentTurnId = "019efbb0-834d-7150-91ba-7e14b20724f4";
     const forkSessionId = "019efe12-e569-7440-892a-6f4dd49937bd";
     const forkTurnId = "019efe12-f09c-7fe1-ad1f-d0a2848b4453";
+    const parentStartedAt = Date.parse("2026-06-23T10:27:59.000Z");
+    const parentAgentStartedAt = Date.parse("2026-06-23T10:28:00.750Z");
+    const parentEndedAt = Date.parse("2026-06-23T10:28:30.000Z");
+    const forkStartedAt = Date.parse("2026-06-25T09:18:34.000Z");
+    const forkEndedAt = Date.parse("2026-06-25T09:19:22.000Z");
     const transcriptPath = join(dayDir, "rollout.jsonl");
     const records = [
       {
@@ -5391,7 +5396,11 @@ auth:
           thread_source: "cli",
         },
       },
-      { timestamp: "2026-06-25T09:18:31.924Z", type: "event_msg", payload: { type: "task_started", turn_id: parentTurnId } },
+      {
+        timestamp: "2026-06-25T09:18:31.924Z",
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: parentTurnId, started_at: parentStartedAt / 1_000 },
+      },
       { timestamp: "2026-06-25T09:18:31.924Z", type: "event_msg", payload: { type: "user_message", client_id: "parent-client", message: "Parent prompt." } },
       {
         timestamp: "2026-06-25T09:18:31.924Z",
@@ -5404,8 +5413,23 @@ auth:
           internal_chat_message_metadata_passthrough: { turn_id: parentTurnId },
         },
       },
-      { timestamp: "2026-06-25T09:18:31.924Z", type: "event_msg", payload: { type: "task_complete", turn_id: parentTurnId, last_agent_message: "Parent answer." } },
-      { timestamp: "2026-06-25T09:18:34.658Z", type: "event_msg", payload: { type: "task_started", turn_id: forkTurnId } },
+      {
+        timestamp: "2026-06-25T09:18:31.924Z",
+        type: "event_msg",
+        payload: {
+          type: "task_complete",
+          turn_id: parentTurnId,
+          last_agent_message: "Parent answer.",
+          started_at: parentStartedAt / 1_000,
+          completed_at: parentEndedAt / 1_000,
+          time_to_first_token_ms: parentAgentStartedAt - parentStartedAt,
+        },
+      },
+      {
+        timestamp: "2026-06-25T09:18:34.658Z",
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: forkTurnId, started_at: forkStartedAt / 1_000 },
+      },
       { timestamp: "2026-06-25T09:18:34.688Z", type: "event_msg", payload: { type: "user_message", client_id: "fork-client", message: "Fork prompt." } },
       {
         timestamp: "2026-06-25T09:18:35.000Z",
@@ -5418,7 +5442,17 @@ auth:
           internal_chat_message_metadata_passthrough: { turn_id: forkTurnId },
         },
       },
-      { timestamp: "2026-06-25T09:19:22.444Z", type: "event_msg", payload: { type: "task_complete", turn_id: forkTurnId, last_agent_message: "Fork answer." } },
+      {
+        timestamp: "2026-06-25T09:19:22.444Z",
+        type: "event_msg",
+        payload: {
+          type: "task_complete",
+          turn_id: forkTurnId,
+          last_agent_message: "Fork answer.",
+          started_at: forkStartedAt / 1_000,
+          completed_at: forkEndedAt / 1_000,
+        },
+      },
     ];
     writeFileSync(
       transcriptPath,
@@ -5455,16 +5489,29 @@ auth:
       parentSessionId,
       parentSessionId,
     ]);
+    expect(parentEvents.map((event) => event.startedAt)).toEqual([
+      parentStartedAt,
+      parentAgentStartedAt,
+    ]);
+    expect(parentEvents[1].endedAt).toBe(parentEndedAt);
     expect(forkEvents).toHaveLength(2);
     expect(forkEvents[0].payload.interactionId).toBe(forkEvents[1].payload.interactionId);
     expect(forkEvents.map((event) => event.payload.raw.ids.sessionId)).toEqual([
       forkSessionId,
       forkSessionId,
     ]);
-    expect(run.blobWrites.map((write) => JSON.parse(write.text).root.sessionId)).toEqual([
+    expect(forkEvents[0].startedAt).toBe(Date.parse("2026-06-25T09:18:34.688Z"));
+    expect(forkEvents[1].startedAt).toBe(Date.parse("2026-06-25T09:18:35.000Z"));
+    expect(forkEvents[1].endedAt).toBe(Date.parse("2026-06-25T09:19:22.444Z"));
+    const roots = run.blobWrites.map((write) => JSON.parse(write.text).root);
+    expect(roots.map((root) => root.sessionId)).toEqual([
       parentSessionId,
       forkSessionId,
     ]);
+    expect(roots[0]).toMatchObject({
+      startedAt: parentStartedAt,
+      endedAt: parentEndedAt,
+    });
   });
 
   test("code-agent-transcripts preserves the model for each Codex turn closed in one scan", async () => {

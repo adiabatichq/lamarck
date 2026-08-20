@@ -7,6 +7,7 @@ This connector writes two current D0 event types. The catalog is connector-owned
 - `provider` is `codex` or `claude-code`.
 - `conversationKey` is `<provider>:<source transcript path>`. For Codex it always names the root transcript; Codex subagent and internal transcripts do not become normalized conversations.
 - `interactionId` is connector-generated from provider, provider session id, and the provider turn/prompt id. For Codex, the first `session_meta` is latched as the canonical rollout identity; later metadata may describe copied fork history. Replayed parent turns retain their history session id, while native turns at or after the canonical rollout start use the canonical session id even when its repeated metadata appears later. Human messages and their agent turn share the resulting interaction id. Steering may produce multiple human messages for one interaction.
+- Codex fork transcripts rewrite the envelope `timestamp` on copied records to the fork serialization time. For replayed parent turns, normalized event time therefore comes from the preserved lifecycle `started_at`, `completed_at`, duration, and time-to-first-token fields instead of the copied record envelope. Native turns continue to use their record timestamps for point, first-agent, and terminal activity precision.
 - Provider-native ids remain under `raw.ids`.
 - Reconstruct the normalized conversation by grouping on `conversationKey`, ordering interactions by their earliest human `startedAt`, ordering human messages inside an interaction by `startedAt`, and placing the agent turn's projected `content` after those human messages. Use raw `sourceLineIndex` anchors when exact provider order is required.
 
@@ -61,6 +62,8 @@ A point event for one provider-authored human message. It has `startedAt` and no
 
 Human raw is one provider record. It stays inline through the same limit. Above it, `records` is omitted, `format` becomes `<provider>-jsonl`, and `raw.contentRef` resolves JSONL text containing `{ sourceLineIndex, record }` wrappers.
 
+For a native Codex turn, human `startedAt` is the user-message record timestamp. A replayed fork turn no longer has the original per-record envelope timestamp, so its human messages use the preserved turn start. Multiple replayed steering messages can consequently share `startedAt`; `sourceLineIndex` retains their exact provider order.
+
 ## `code_agent.agent_turn`
 
 A duration event for one completed, interrupted, or failed agent interaction. It has both `startedAt` and `endedAt`.
@@ -106,7 +109,7 @@ A duration event for one completed, interrupted, or failed agent interaction. It
 }
 ```
 
-`status` is `completed`, `interrupted`, or `failed`. A Codex `task_complete` carrying a terminal `error` is `failed`; an error-free `task_complete` is `completed`, and `turn_aborted` is `interrupted`. Agent `startedAt` is the first selected agent activity; if a Codex turn fails or aborts before producing agent activity, it falls back to the root `task_started` timestamp instead of creating a zero-duration terminal event. For Codex, `content` is only the root agent's final-answer projection; non-root output never populates D0 `content`. It is absent when the root has no final answer. The same 8192-byte content rule as human messages applies.
+`status` is `completed`, `interrupted`, or `failed`. A Codex `task_complete` carrying a terminal `error` is `failed`; an error-free `task_complete` is `completed`, and `turn_aborted` is `interrupted`. Agent `startedAt` is the first selected agent activity for native records. For replayed Codex fork history, it is reconstructed from the preserved lifecycle start plus time-to-first-token when available, then falls back to the lifecycle start; copied envelope timestamps are never used as event time. If a Codex turn fails or aborts before producing agent activity, it also falls back to the root `task_started` timestamp instead of creating a zero-duration terminal event. Replayed Codex `endedAt` prefers the lifecycle `completed_at`, then start plus duration, before falling back to the terminal record timestamp; native turns retain the precise terminal record timestamp. For Codex, `content` is only the root agent's final-answer projection; non-root output never populates D0 `content`. It is absent when the root has no final answer. The same 8192-byte content rule as human messages applies.
 
 Agent raw is always written through `guard.writeTextBlob`, even for a very short turn. D0 contains only fixed-size counts, the root source bounds, size/hash, provider ids, and one `contentRef`.
 

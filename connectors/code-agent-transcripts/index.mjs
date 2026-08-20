@@ -370,10 +370,16 @@ async function buildAgentTurnEvent(input) {
     config: input.config,
   });
 
+  const projectedStartedAt = projection.firstAgentAt
+    ?? projection.lifecycleStartedAt
+    ?? input.closed.startedAt;
   return compactObject({
     type: "code_agent.agent_turn",
     externalId: `agent:${providerName}:${shortHash(conversationKeyValue)}:${providerInteractionId}`,
-    startedAt: projection.firstAgentAt ?? projection.lifecycleStartedAt ?? input.closed.startedAt,
+    startedAt: typeof input.closed.agentStartedAt === "number"
+      && Number.isFinite(input.closed.agentStartedAt)
+      ? input.closed.agentStartedAt
+      : projectedStartedAt,
     endedAt: input.closed.endedAt,
     payload: compactObject({
       provider: providerName,
@@ -571,6 +577,7 @@ function normalizeOpenInteractions(value) {
       startLineIndex: integerInRange(child.startLineIndex, 1, Number.MAX_SAFE_INTEGER, 1),
       startedAt: typeof child.startedAt === "number" && Number.isFinite(child.startedAt) ? child.startedAt : Date.now(),
       sessionId: stringFrom(child.sessionId),
+      replayed: child.replayed === true ? true : undefined,
     };
   }
   return normalized;

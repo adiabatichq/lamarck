@@ -58,12 +58,16 @@ function scanCodexRecord(record, ctx, scan, session) {
 
   if (payload.type === "task_started" && typeof payload.turn_id === "string") {
     const turnId = payload.turn_id;
+    const replayed = isCodexReplayedTurn(session, turnId);
     scan.openInteractions[turnId] = {
       providerInteractionId: turnId,
       startOffset: ctx.recordStartOffset,
       startLineIndex: ctx.lineIndex,
-      startedAt: timestampFromRecord(record),
+      startedAt: replayed
+        ? codexTurnStartedAt(payload, record)
+        : timestampFromRecord(record),
       sessionId: sessionIdForTurn(session, turnId),
+      replayed: replayed || undefined,
     };
     scan.activeInteractionId = turnId;
     return;
@@ -83,6 +87,7 @@ function scanCodexRecord(record, ctx, scan, session) {
       rawId,
       text: typeof payload.message === "string" ? payload.message : "",
       record,
+      startedAt: open?.replayed === true ? open.startedAt : undefined,
       lineIndex: ctx.lineIndex,
       session: interactionSession,
       ids: compactObject({
@@ -96,18 +101,33 @@ function scanCodexRecord(record, ctx, scan, session) {
 
   if ((payload.type === "task_complete" || payload.type === "turn_aborted") && typeof payload.turn_id === "string") {
     const turnId = payload.turn_id;
-    const open = scan.openInteractions[turnId] ?? {
+    const existingOpen = scan.openInteractions[turnId];
+    const replayed = existingOpen?.replayed === true || isCodexReplayedTurn(session, turnId);
+    const startedAt = replayed
+      ? timestampValue(payload.started_at)
+        ?? existingOpen?.startedAt
+        ?? codexIdTimestamp(turnId)
+        ?? timestampFromRecord(record)
+      : existingOpen?.startedAt ?? timestampFromRecord(record);
+    const endedAt = replayed
+      ? codexTurnEndedAt(payload, record, startedAt)
+      : timestampFromRecord(record);
+    const open = existingOpen ?? {
       providerInteractionId: turnId,
       startOffset: ctx.recordStartOffset,
       startLineIndex: ctx.lineIndex,
-      startedAt: timestampFromRecord(record),
       sessionId: sessionIdForTurn(session, turnId),
     };
     scan.closedInteractions.push({
       ...open,
+      startedAt,
+      replayed: replayed || undefined,
+      agentStartedAt: replayed
+        ? codexReplayedAgentStartedAt(payload, startedAt, endedAt)
+        : undefined,
       endOffset: ctx.recordEndOffset,
       endLineIndex: ctx.lineIndex,
-      endedAt: timestampFromRecord(record),
+      endedAt,
       model: session.model,
       status: payload.type === "turn_aborted"
         ? "interrupted"
@@ -164,6 +184,41 @@ function sessionIdForTurn(session, turnId) {
     return canonicalSessionId;
   }
   return stringFrom(session?.id) ?? canonicalSessionId;
+}
+
+function isCodexReplayedTurn(session, turnId) {
+  const canonicalStartedAt = session?.canonicalStartedAt;
+  const turnStartedAt = codexIdTimestamp(turnId);
+  return Number.isFinite(canonicalStartedAt)
+    && Number.isFinite(turnStartedAt)
+    && turnStartedAt < canonicalStartedAt;
+}
+
+function codexTurnStartedAt(payload, record) {
+  return timestampValue(payload?.started_at)
+    ?? codexIdTimestamp(payload?.turn_id)
+    ?? timestampFromRecord(record);
+}
+
+function codexTurnEndedAt(payload, record, startedAt) {
+  const completedAt = timestampValue(payload?.completed_at);
+  if (Number.isFinite(completedAt)) return completedAt;
+  const durationMs = payload?.duration_ms;
+  if (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 0) {
+    return startedAt + durationMs;
+  }
+  return timestampFromRecord(record);
+}
+
+function codexReplayedAgentStartedAt(payload, startedAt, endedAt) {
+  const timeToFirstTokenMs = payload?.time_to_first_token_ms;
+  if (typeof timeToFirstTokenMs === "number"
+    && Number.isFinite(timeToFirstTokenMs)
+    && timeToFirstTokenMs >= 0) {
+    const firstAgentAt = startedAt + timeToFirstTokenMs;
+    if (firstAgentAt <= endedAt) return firstAgentAt;
+  }
+  return startedAt;
 }
 
 function codexIdTimestamp(value) {
