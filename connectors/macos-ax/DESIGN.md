@@ -19,6 +19,8 @@ The collector samples at roughly one-second cadence:
 - mouse location and hovered visible-window hint
 - system HID idle time and screen-lock state
 
+The helper schedules sampling against a monotonic `nextTick` deadline. Snapshot capture, JSON encoding, and output consume the current interval, and the helper sleeps only for the remaining time before the next tick. If a cycle overruns, the deadline resets to the current monotonic time rather than accumulating drift or bursting to replay missed ticks.
+
 Visible AX text is captured locally by default, with a hard exclusion for OS-declared secure fields. Persistence is controlled by app, website/category, and domain privacy policy actions rather than a connector-wide capture mode.
 
 Frontmost selection uses the first onscreen layer-0 CGWindow owner as the primary source, with `NSWorkspace.frontmostApplication` as fallback. Visible window inventory is always enabled for the connector; it is part of the desktop attention model, not a user-facing capture toggle. In the Codex-spawned helper path, `NSWorkspace` can remain pinned to Codex even while the actual top window is Chrome, Terminal, Telegram, or another app. Snapshots include `frontmostSource` diagnostics with the chosen source, chosen window, workspace app, and whether the sources matched.

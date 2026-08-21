@@ -3,7 +3,7 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
-let helperVersion = 3
+let helperVersion = 4
 let maxTreeDepth = 6
 let maxTreeNodes = 600
 let maxChildrenPerNode = 120
@@ -203,13 +203,23 @@ func main() {
 
   case .jsonl:
     var emitted = 0
+    let intervalSeconds = Double(max(1, options.intervalMs)) / 1_000.0
+    var nextTickAt = ProcessInfo.processInfo.systemUptime
     while true {
+      let remainingSeconds = nextTickAt - ProcessInfo.processInfo.systemUptime
+      if remainingSeconds > 0 {
+        Thread.sleep(forTimeInterval: remainingSeconds)
+      }
       emitJSON(buildSnapshot(options: options))
       emitted += 1
       if let count = options.count, emitted >= count {
         break
       }
-      Thread.sleep(forTimeInterval: Double(options.intervalMs) / 1_000.0)
+      nextTickAt += intervalSeconds
+      let emittedAt = ProcessInfo.processInfo.systemUptime
+      if nextTickAt < emittedAt {
+        nextTickAt = emittedAt
+      }
     }
   }
 }
