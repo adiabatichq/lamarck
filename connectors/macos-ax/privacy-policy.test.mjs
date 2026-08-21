@@ -46,6 +46,18 @@ function spawnSnapshotsThenSilence(snapshots) {
   };
 }
 
+function spawnSequence(spawnImpls) {
+  let callCount = 0;
+  const spawnImpl = (...args) => {
+    const next = spawnImpls[callCount];
+    assert.ok(next, `unexpected helper spawn ${callCount + 1}`);
+    callCount += 1;
+    return next(...args);
+  };
+  spawnImpl.callCount = () => callCount;
+  return spawnImpl;
+}
+
 function decisionForUrl(url, config = {}) {
   return __test__.decidePrivacy({
     app: { name: "Chrome", bundleId: "com.google.Chrome" },
@@ -1318,7 +1330,7 @@ test("desktop context connector writes large visible text through content blobs"
   });
 });
 
-test("desktop context connector fails when a context window cannot close", async () => {
+test("desktop context connector skips an incomplete window and restarts its helper", async () => {
   const startedAt = Date.UTC(2026, 6, 6, 15, 15, 0);
   const snapshot = (offsetMs) => ({
     timestamp: startedAt + offsetMs,
@@ -1334,41 +1346,88 @@ test("desktop context connector fails when a context window cannot close", async
     },
   });
   const writes = [];
+  const warningOperations = [];
+  const helperRestarts = [];
+  let stateValue = {};
+  const spawnImpl = spawnSequence([
+    spawnSnapshotsThenSilence([
+      snapshot(0),
+      snapshot(10),
+      snapshot(20),
+    ]),
+    spawnSnapshots([
+      snapshot(1000),
+      snapshot(1010),
+      snapshot(1020),
+      snapshot(1030),
+    ]),
+  ]);
 
-  await assert.rejects(
-    __test__.runDesktopContextConnector({
-      config: {},
-      signal: new AbortController().signal,
-      guard: {
-        async writeEvent(event) {
-          writes.push(event);
-          return { id: `event-${writes.length}` };
-        },
+  await __test__.runDesktopContextConnector({
+    config: {},
+    signal: new AbortController().signal,
+    guard: {
+      async writeEvent(event) {
+        writes.push(event);
+        return { id: `event-${writes.length}` };
       },
-      state: {
-        async get() {
-          return {};
-        },
-        async set() {},
+    },
+    state: {
+      async get() {
+        return stateValue;
       },
-      warnings: { async set() {}, async clear() {} },
-    }, {
-      profileWindowMs: 30,
-      intervalMs: 10,
-      noSampleGraceMs: 20,
-      spawnImpl: spawnSnapshotsThenSilence([
-        snapshot(0),
-        snapshot(10),
-        snapshot(20),
-      ]),
-    }),
-    /context window .* could not be closed/u,
-  );
+      async set(value) {
+        stateValue = value;
+      },
+    },
+    warnings: {
+      async set(warning) {
+        warningOperations.push({ operation: "set", warning });
+      },
+      async clear(key) {
+        warningOperations.push({ operation: "clear", key });
+      },
+    },
+  }, {
+    profileWindowMs: 30,
+    intervalMs: 10,
+    noSampleGraceMs: 20,
+    spawnImpl,
+    async onHelperRestart(input) {
+      helperRestarts.push(input);
+    },
+  });
 
-  assert.deepEqual(writes, []);
+  assert.equal(spawnImpl.callCount(), 2);
+  assert.deepEqual(helperRestarts.map((item) => item.reason), ["sample-gap"]);
+  assert.equal(writes.filter((event) => event.type === "desktop.context").length, 1);
+  const contextEvent = writes.find((event) => event.type === "desktop.context");
+  assert.equal(contextEvent.startedAt, startedAt + 1000);
+  assert.equal(contextEvent.endedAt, startedAt + 1030);
+  const presenceEvents = writes.filter((event) => event.type === "desktop.presence");
+  assert.equal(presenceEvents.length, 2);
+  assert.equal(presenceEvents[0].startedAt, startedAt);
+  assert.equal(presenceEvents[0].endedAt, startedAt + 30);
+  assert.equal(presenceEvents[0].payload.recovered, true);
+  assert.equal(presenceEvents[0].payload.endReason, "sample-gap");
+  assert.equal(presenceEvents[1].startedAt, startedAt + 1000);
+  assert.equal(presenceEvents[1].endedAt, startedAt + 1040);
+  const warningSetIndex = warningOperations.findIndex((item) => item.operation === "set");
+  assert.ok(warningSetIndex >= 0);
+  assert.equal(warningOperations[warningSetIndex].warning.key, "macos-ax-sample-gap");
+  assert.ok(warningOperations.slice(warningSetIndex + 1).some((item) =>
+    item.operation === "clear" && item.key === "macos-ax-sample-gap"
+  ));
 });
 
-test("desktop context connector fails when AX helper never emits a first sample", async () => {
+test("desktop context connector fails after three helpers emit no first sample", async () => {
+  const warningOperations = [];
+  const spawnImpl = spawnSequence([
+    spawnSnapshotsThenSilence([]),
+    spawnSnapshotsThenSilence([]),
+    spawnSnapshotsThenSilence([]),
+  ]);
+
   await assert.rejects(
     __test__.runDesktopContextConnector({
       config: {},
@@ -1384,15 +1443,33 @@ test("desktop context connector fails when AX helper never emits a first sample"
         },
         async set() {},
       },
-      warnings: { async set() {}, async clear() {} },
+      warnings: {
+        async set(warning) {
+          warningOperations.push({ operation: "set", warning });
+        },
+        async clear(key) {
+          warningOperations.push({ operation: "clear", key });
+        },
+      },
     }, {
       profileWindowMs: 30,
       intervalMs: 10,
       noSampleGraceMs: 20,
-      spawnImpl: spawnSnapshotsThenSilence([]),
+      spawnImpl,
     }),
-    /produced no samples/u,
+    /failed to produce a first sample in 3 consecutive sessions/u,
   );
+
+  assert.equal(spawnImpl.callCount(), 3);
+  assert.deepEqual(
+    warningOperations.filter((item) => item.operation === "set")
+      .map((item) => item.warning.details.failureCount),
+    [1, 2],
+  );
+  assert.deepEqual(warningOperations.at(-1), {
+    operation: "clear",
+    key: "macos-ax-sample-gap",
+  });
 });
 
 test("desktop presence is emitted as state segments, not context-window aggregates", async () => {

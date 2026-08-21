@@ -93,7 +93,7 @@ D0 should not receive one event per raw sample. The target D0 shape is a bounded
 
 The 30s window is not a semantic task boundary. It is a fixed durability, replay, and query envelope. Once opened, the envelope keeps its absolute 30s boundary; late samples can close the prior window but do not stretch it. D2 can later merge these envelopes into task episodes.
 
-The packer waits for a right-side boundary sample before writing a context envelope. With the default 1s sampler and 30s window, the fatal no-sample deadline is 30s plus a 10s grace. If no boundary sample arrives before that deadline, the connector run raises a fatal error so the shell can show the Source as needing attention.
+The packer waits for a right-side boundary sample before writing a context envelope. With the default 1s sampler and 30s window, the no-sample deadline is 30s plus a 10s grace. If no boundary sample arrives before that deadline, the connector drops the incomplete envelope, closes presence at the last real sample, records a warning, and restarts the helper. This covers both ordinary macOS sleep/wake suspension and a transient helper hang without inventing activity during the gap. Three consecutive helper sessions that fail to produce even their first sample are fatal so the shell can show the Source as needing attention. Helper spawn and protocol failures remain immediately fatal.
 
 The aggregate should keep events self-contained in v0:
 

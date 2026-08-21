@@ -57,7 +57,10 @@ const INTERNAL_DEFAULTS = {
   helperShutdownMs: 2_000,
   axTimeoutMs: 500,
   snapshotBudgetMs: 850,
+  maxHelperStartFailures: 3,
 };
+
+const SAMPLE_GAP_WARNING_KEY = "macos-ax-sample-gap";
 
 const INLINE_CONTENT_TEXT_CHARS = 8_192;
 const BLOB_CONTENT_PREVIEW_CHARS = 4_096;
@@ -84,7 +87,71 @@ export default {
 };
 
 export async function runDesktopContextConnector(context, deps = {}) {
-  await runSnapshotProfiler(context, { ...deps, writeContextEvents: true });
+  const maxHelperStartFailures = Math.max(
+    1,
+    Math.floor(readPositiveNumber(
+      deps.maxHelperStartFailures,
+      INTERNAL_DEFAULTS.maxHelperStartFailures,
+    )),
+  );
+  let consecutiveHelperStartFailures = 0;
+  let presenceRecoveryEndReason;
+
+  while (!context.signal.aborted) {
+    try {
+      await runSnapshotProfiler(context, {
+        ...deps,
+        writeContextEvents: true,
+        presenceRecoveryEndReason,
+        async onFirstSnapshot(input) {
+          consecutiveHelperStartFailures = 0;
+          presenceRecoveryEndReason = undefined;
+          await clearWarningSafely(context, SAMPLE_GAP_WARNING_KEY);
+          await deps.onFirstSnapshot?.(input);
+        },
+      });
+      return;
+    } catch (err) {
+      if (context.signal.aborted) return;
+      if (!(err instanceof ContextWindowDeadlineError)) throw err;
+
+      presenceRecoveryEndReason = "sample-gap";
+      if (err.hadSamples) {
+        consecutiveHelperStartFailures = 0;
+        await setWarningSafely(context, {
+          key: SAMPLE_GAP_WARNING_KEY,
+          message: "macOS AX sampling stopped; the incomplete context window was skipped and the helper will restart.",
+          details: {
+            error: err.message,
+            recovery: "helper-restart",
+          },
+        });
+        await deps.onHelperRestart?.({ error: err, reason: "sample-gap" });
+        continue;
+      }
+
+      consecutiveHelperStartFailures += 1;
+      if (consecutiveHelperStartFailures >= maxHelperStartFailures) {
+        await clearWarningSafely(context, SAMPLE_GAP_WARNING_KEY);
+        const terminalError = new Error(
+          `macOS AX helper failed to produce a first sample in ${maxHelperStartFailures} consecutive sessions.`,
+        );
+        terminalError.cause = err;
+        throw terminalError;
+      }
+
+      await setWarningSafely(context, {
+        key: SAMPLE_GAP_WARNING_KEY,
+        message: "macOS AX helper produced no samples and will be restarted.",
+        details: {
+          error: err.message,
+          failureCount: consecutiveHelperStartFailures,
+          retriesRemaining: maxHelperStartFailures - consecutiveHelperStartFailures,
+        },
+      });
+      await deps.onHelperRestart?.({ error: err, reason: "no-first-sample" });
+    }
+  }
 }
 
 export async function runSnapshotProfiler(context, deps = {}) {
@@ -103,7 +170,10 @@ export async function runSnapshotProfiler(context, deps = {}) {
     includeTextInProfile: deps.includeTextInProfiles === true,
   });
   if (deps.writeContextEvents === true) {
-    await recoverOpenPresenceSegment(context, deps);
+    await recoverOpenPresenceSegment(context, {
+      ...deps,
+      recoveryEndReason: deps.presenceRecoveryEndReason,
+    });
   }
   const helper = spawnHelper([
     "--jsonl",
@@ -132,6 +202,7 @@ export async function runSnapshotProfiler(context, deps = {}) {
 
   let deadlineTimer;
   let failRun;
+  let receivedSample = false;
   const helperStartedAt = Date.now();
   const startupDeadlineAt = helperStartedAt + profileWindowMs + noSampleGraceMs;
   const deadlineFailure = new Promise((_, reject) => {
@@ -159,6 +230,10 @@ export async function runSnapshotProfiler(context, deps = {}) {
       await deps.onSnapshot?.({ line, value });
       const rawBytes = Buffer.byteLength(line);
       const profiles = profiler.add(value, rawBytes, config);
+      if (!receivedSample) {
+        receivedSample = true;
+        await deps.onFirstSnapshot?.({ line, value });
+      }
       const presenceSegments = profiler.drainPresenceSegments();
       if (presenceSegments.length > 0) {
         await publishPresenceSegments(presenceSegments, context, deps);
@@ -185,6 +260,11 @@ export async function runSnapshotProfiler(context, deps = {}) {
     }
     await publishPresenceSegments(profiler.flushPresence({ final: true }), context, deps);
     await clearPresenceOpen(context, deps);
+  } catch (err) {
+    if (err instanceof ContextWindowDeadlineError && deps.writeContextEvents === true) {
+      await checkpointPresenceOpen(profiler, context, deps);
+    }
+    throw err;
   } finally {
     clearDeadlineTimer();
     context.signal.removeEventListener("abort", onAbort);
@@ -1037,11 +1117,15 @@ class SnapshotProfiler {
     const endedAt = startedAt === undefined ? undefined : startedAt + this.profileWindowMs;
     const graceSeconds = Math.round(this.noSampleGraceMs / 1000);
     if (startedAt === undefined) {
-      return new Error(`macOS AX helper produced no samples within the ${graceSeconds}s context grace window.`);
+      return new ContextWindowDeadlineError(
+        `macOS AX helper produced no samples within the ${graceSeconds}s context grace window.`,
+        { hadSamples: false },
+      );
     }
-    return new Error(
+    return new ContextWindowDeadlineError(
       `macOS AX helper stopped producing samples; context window ${isoTimestamp(startedAt)}`
         + ` to ${isoTimestamp(endedAt)} could not be closed within ${graceSeconds}s grace.`,
+      { hadSamples: true },
     );
   }
 
@@ -2584,7 +2668,9 @@ async function recoverOpenPresenceSegment(context, opts = {}) {
   if (!open) return undefined;
   const segment = presenceSegmentFromOpenCursor(open, {
     recovered: true,
-    endReason: "connector-restart",
+    endReason: typeof opts.recoveryEndReason === "string"
+      ? opts.recoveryEndReason
+      : "connector-restart",
   });
   if (!segment) {
     await clearPresenceOpen(context, opts);
@@ -2690,6 +2776,30 @@ function presenceSegmentFromOpenCursor(open, opts = {}) {
     presenceModel: open.presenceModel,
     state: open.state,
   };
+}
+
+class ContextWindowDeadlineError extends Error {
+  constructor(message, opts = {}) {
+    super(message);
+    this.name = "ContextWindowDeadlineError";
+    this.hadSamples = opts.hadSamples === true;
+  }
+}
+
+async function setWarningSafely(context, warning) {
+  try {
+    await context.warnings?.set?.(warning);
+  } catch {
+    // Warning persistence must not stop desktop context capture.
+  }
+}
+
+async function clearWarningSafely(context, key) {
+  try {
+    await context.warnings?.clear?.(key);
+  } catch {
+    // Warning persistence must not stop desktop context capture.
+  }
 }
 
 async function appendJsonlLine(path, line) {
