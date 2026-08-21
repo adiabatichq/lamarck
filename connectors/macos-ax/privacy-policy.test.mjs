@@ -107,17 +107,23 @@ test("System Settings defaults to app-level metadata-only", () => {
   assert.equal(decision.matchedRules[0].value, "com.apple.systempreferences");
 });
 
-test("Lamarck defaults to app-level metadata-only under its canonical bundle identity", () => {
-  const decision = __test__.decidePrivacy({
-    app: { name: "Lamarck", bundleId: "ai.lamarck.desktop" },
-    window: { title: "Personal system" },
-    text: { excerpts: ["private workspace content"] },
-  });
+test("Lamarck release variants default to app-level metadata-only", () => {
+  for (const bundleId of [
+    "ai.lamarck.desktop",
+    "ai.lamarck.desktop.alpha",
+    "ai.lamarck.desktop.dev",
+  ]) {
+    const decision = __test__.decidePrivacy({
+      app: { name: "Lamarck", bundleId },
+      window: { title: "Personal system" },
+      text: { excerpts: ["private workspace content"] },
+    });
 
-  assert.equal(decision.action, "metadata_only");
-  assert.equal(decision.reason, "app-policy");
-  assert.equal(decision.matchedRules[0].kind, "app");
-  assert.equal(decision.matchedRules[0].value, "ai.lamarck.desktop");
+    assert.equal(decision.action, "metadata_only");
+    assert.equal(decision.reason, "app-policy");
+    assert.equal(decision.matchedRules[0].kind, "app");
+    assert.equal(decision.matchedRules[0].value, bundleId);
+  }
 });
 
 test("adult domains default to metadata-only", () => {

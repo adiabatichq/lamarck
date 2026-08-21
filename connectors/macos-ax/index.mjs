@@ -24,6 +24,8 @@ const DEFAULT_PRIVACY_POLICY = {
     "com.apple.finder": { action: "metadata_only" },
     "com.apple.systempreferences": { action: "metadata_only" },
     "ai.lamarck.desktop": { action: "metadata_only" },
+    "ai.lamarck.desktop.alpha": { action: "metadata_only" },
+    "ai.lamarck.desktop.dev": { action: "metadata_only" },
   },
   domains: {},
   categories: {
