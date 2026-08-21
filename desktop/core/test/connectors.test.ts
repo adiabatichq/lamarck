@@ -7212,7 +7212,12 @@ auth:
         async clear() {},
         async set() {},
       },
-      config: {},
+      config: {
+        telegramSetup: {
+          dm: { mode: "capture_all" },
+          groups: { mode: "disabled", requireMention: true },
+        },
+      },
       signal: new AbortController().signal,
     };
 
@@ -7297,6 +7302,8 @@ auth:
         chatKey: "bot:42:chat:123",
         text: "/start",
         textKind: "text",
+        attachmentTypes: [],
+        mediaRefs: [],
         message: {
           message_id: 1,
           date: 1700000000,
@@ -7311,7 +7318,7 @@ auth:
     expect(events[0].payload.messageTransport).toBeUndefined();
     expect(events[0].payload.from).toBeUndefined();
     expect(events[0].payload.chat).toBeUndefined();
-    expect(events[0].payload.mediaRefs).toBeUndefined();
+    expect(events[0].payload.mediaRefs).toEqual([]);
     expect(syncState.cursor.lastUpdateId).toBe(12);
     expect(syncState.setup.pendingUsers["123"]).toMatchObject({
       id: 123,
@@ -7323,6 +7330,19 @@ auth:
       id: -100,
       title: "Test Group",
       lastUpdateId: 11,
+    });
+  });
+
+  test("telegram-bot defaults direct messages to paired users only", async () => {
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { normalizeConfig } = await import(telegramUrl) as {
+      normalizeConfig(config: unknown): any;
+    };
+
+    expect(normalizeConfig({}).telegramSetup).toEqual({
+      version: 1,
+      dm: { mode: "paired_only" },
+      groups: { mode: "disabled", requireMention: true },
     });
   });
 
@@ -7689,6 +7709,97 @@ auth:
           from: { id: 123, username: "alice" },
         },
       },
+    });
+  });
+
+  test("telegram-bot observes a pairing code created during long polling", async () => {
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { syncOnce, pairingChallengeForCode } = await import(telegramUrl) as {
+      syncOnce(context: unknown, deps?: unknown): Promise<{ updates: number; events: number }>;
+      pairingChallengeForCode(code: string, nowMs: number, opts?: { salt?: string }): unknown;
+    };
+
+    let syncState: any = {
+      version: 1,
+      bot: { id: 42, username: "lamarck_test_bot" },
+      setup: {
+        pendingUsers: {},
+        pendingGroups: {},
+      },
+    };
+    const events: any[] = [];
+    const context = {
+      auth: {
+        type: "apiKey",
+        async getToken() {
+          return "telegram-token";
+        },
+      },
+      guard: {
+        async writeEvents(batch: any[]) {
+          events.push(...batch);
+          return { ids: batch.map((_, index) => `event-${index}`) };
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      warnings: {
+        async clear() {},
+        async set() {},
+      },
+      config: {
+        telegramSetup: {
+          dm: { mode: "paired_only" },
+          groups: { mode: "disabled", requireMention: true },
+        },
+      },
+      signal: new AbortController().signal,
+    };
+
+    const result = await syncOnce(context, {
+      now: () => 2000,
+      fetchImpl: async () => {
+        syncState = {
+          ...syncState,
+          setup: {
+            ...syncState.setup,
+            pairingChallenge: pairingChallengeForCode("950658", 1500, { salt: "long-poll-salt" }),
+          },
+        };
+        return Response.json({
+          ok: true,
+          result: [{
+            update_id: 12,
+            message: {
+              message_id: 1,
+              date: 1700000002,
+              text: "/pair 950658",
+              from: { id: 123, is_bot: false, username: "alice", first_name: "Alice" },
+              chat: { id: 123, type: "private", username: "alice", first_name: "Alice" },
+            },
+          }],
+        });
+      },
+    });
+
+    expect(result).toEqual({ updates: 1, events: 0 });
+    expect(events).toHaveLength(0);
+    expect(syncState.setup.pairingChallenge).toBeUndefined();
+    expect(syncState.setup.pairedUsers["123"]).toMatchObject({
+      id: 123,
+      username: "alice",
+      pairingMethod: "otp",
+      lastUpdateId: 12,
+    });
+    expect(syncState.setup.lastPairingAttempt).toMatchObject({
+      status: "paired_user",
+      id: "123",
     });
   });
 

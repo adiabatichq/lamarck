@@ -8,7 +8,7 @@ const DEFAULT_CONFIG = {
 
 const DEFAULT_SETUP = {
   version: 1,
-  dm: { mode: "capture_all" },
+  dm: { mode: "paired_only" },
   groups: { mode: "disabled", requireMention: true },
 };
 
@@ -108,14 +108,10 @@ export async function syncOnce(context, deps = {}) {
   }
 
   const config = normalizeConfig(context.config);
-  const previous = normalizeState(await context.state.get());
-  const next = cloneJson(previous);
-  next.version = 1;
-  next.cursor = isObject(next.cursor) ? next.cursor : {};
-  next.setup = normalizeSetupState(next.setup);
+  const cursorState = normalizeState(await context.state.get());
 
-  const offset = Number.isFinite(next.cursor.lastUpdateId)
-    ? next.cursor.lastUpdateId + 1
+  const offset = Number.isFinite(cursorState.cursor.lastUpdateId)
+    ? cursorState.cursor.lastUpdateId + 1
     : undefined;
   let updates;
   try {
@@ -134,6 +130,10 @@ export async function syncOnce(context, deps = {}) {
     throw err;
   }
 
+  // getUpdates can block for the full long-poll timeout. Re-read state after it
+  // returns so a pairing challenge created by the setup panel while the poll was
+  // pending is visible and is not overwritten by the pre-poll snapshot.
+  const next = normalizeState(await context.state.get());
   const events = [];
   const setup = normalizeSetupConfig(config.telegramSetup);
   for (const update of Array.isArray(updates) ? updates : []) {
@@ -199,8 +199,8 @@ export function eventFromUpdate(update, opts = {}) {
       message: cloneJson(message),
       text: textFromMessage(message) ?? null,
       textKind: textKindFromMessage(message) ?? null,
-      attachmentTypes: attachmentTypesFromMessage(message),
-      mediaRefs: mediaRefsFromMessage(message),
+      attachmentTypes: attachmentTypesFromMessage(message) ?? [],
+      mediaRefs: mediaRefsFromMessage(message) ?? [],
     }),
   };
 }
