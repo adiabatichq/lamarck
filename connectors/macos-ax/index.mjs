@@ -63,6 +63,13 @@ const INTERNAL_DEFAULTS = {
 };
 
 const SAMPLE_GAP_WARNING_KEY = "macos-ax-sample-gap";
+const UNAVAILABLE_REASON_PRIORITY = [
+  "logout_or_poweroff",
+  "system_sleep",
+  "session_inactive",
+  "locked",
+  "screen_off",
+];
 
 const INLINE_CONTENT_TEXT_CHARS = 8_192;
 const BLOB_CONTENT_PREVIEW_CHARS = 4_096;
@@ -105,10 +112,13 @@ export async function runDesktopContextConnector(context, deps = {}) {
         ...deps,
         writeContextEvents: true,
         presenceRecoveryEndReason,
-        async onFirstSnapshot(input) {
+        async onFirstHelperOutput(input) {
           consecutiveHelperStartFailures = 0;
           presenceRecoveryEndReason = undefined;
           await clearWarningSafely(context, SAMPLE_GAP_WARNING_KEY);
+          await deps.onFirstHelperOutput?.(input);
+        },
+        async onFirstSnapshot(input) {
           await deps.onFirstSnapshot?.(input);
         },
       });
@@ -204,9 +214,11 @@ export async function runSnapshotProfiler(context, deps = {}) {
 
   let deadlineTimer;
   let failRun;
-  let receivedSample = false;
+  let helperReady = false;
+  let receivedSnapshot = false;
+  let waitingForFirstSample = true;
   const helperStartedAt = Date.now();
-  const startupDeadlineAt = helperStartedAt + profileWindowMs + noSampleGraceMs;
+  let sampleDeadlineAt = helperStartedAt + profileWindowMs + noSampleGraceMs;
   const deadlineFailure = new Promise((_, reject) => {
     failRun = reject;
   });
@@ -216,7 +228,9 @@ export async function runSnapshotProfiler(context, deps = {}) {
   };
   const scheduleDeadlineTimer = () => {
     clearDeadlineTimer();
-    const deadlineAt = profiler.contextWindowDeadlineAt() ?? startupDeadlineAt;
+    if (profiler.isUnavailable()) return;
+    const deadlineAt = profiler.contextWindowDeadlineAt()
+      ?? (waitingForFirstSample ? sampleDeadlineAt : undefined);
     if (!deadlineAt) return;
     deadlineTimer = setTimeout(() => {
       if (context.signal.aborted) return;
@@ -229,12 +243,27 @@ export async function runSnapshotProfiler(context, deps = {}) {
   try {
     scheduleDeadlineTimer();
     await Promise.race([consumeJsonLines(helper, async ({ line, value }) => {
-      await deps.onSnapshot?.({ line, value });
-      const rawBytes = Buffer.byteLength(line);
-      const profiles = profiler.add(value, rawBytes, config);
-      if (!receivedSample) {
-        receivedSample = true;
-        await deps.onFirstSnapshot?.({ line, value });
+      const lifecycle = availabilityLifecycleRecord(value);
+      let profiles;
+      if (lifecycle) {
+        profiles = profiler.setAvailability(lifecycle);
+        waitingForFirstSample = lifecycle.available === true;
+        if (waitingForFirstSample) {
+          sampleDeadlineAt = Date.now() + profileWindowMs + noSampleGraceMs;
+        }
+        await deps.onLifecycle?.({ line, value: lifecycle });
+      } else {
+        await deps.onSnapshot?.({ line, value });
+        profiles = profiler.add(value, Buffer.byteLength(line), config);
+        waitingForFirstSample = false;
+        if (!receivedSnapshot) {
+          receivedSnapshot = true;
+          await deps.onFirstSnapshot?.({ line, value });
+        }
+      }
+      if (!helperReady) {
+        helperReady = true;
+        await deps.onFirstHelperOutput?.({ line, value });
       }
       const presenceSegments = profiler.drainPresenceSegments();
       if (presenceSegments.length > 0) {
@@ -997,11 +1026,26 @@ class SnapshotProfiler {
       afkThresholdSeconds,
     });
     this.pendingPresenceSegments = [];
+    this.unavailable = false;
   }
 
   add(snapshot, rawBytes, config) {
     const receivedAt = Date.now();
     const timestamp = readSnapshotTimestamp(snapshot);
+    const presence = presenceForSnapshot(snapshot, {
+      idleThresholdSeconds: this.idleThresholdSeconds,
+      afkThresholdSeconds: this.afkThresholdSeconds,
+    });
+    if (presence.state === "unavailable") {
+      return this.setAvailability({
+        timestamp,
+        available: false,
+        reasons: [presence.reason],
+        trigger: "snapshot",
+      });
+    }
+
+    this.unavailable = false;
     const redaction = redactSnapshot(snapshot);
     const redacted = applyCapturePolicy(redaction.value, config);
     this.pendingPresenceSegments.push(...this.presenceTracker.add(redacted));
@@ -1039,6 +1083,43 @@ class SnapshotProfiler {
       this.windowStartedWallClockAt = (this.windowStartedWallClockAt ?? receivedAt) + this.profileWindowMs;
     }
     return profiles;
+  }
+
+  setAvailability(record) {
+    const timestamp = readSnapshotTimestamp(record);
+    if (record.available === true) {
+      this.unavailable = false;
+      this.pendingPresenceSegments.push(...this.presenceTracker.resume(timestamp));
+      return [];
+    }
+
+    const reason = primaryUnavailableReason(record.reasons, record.trigger);
+    this.pendingPresenceSegments.push(...this.presenceTracker.markUnavailable(timestamp, reason));
+    const profile = this.closeContextAt(timestamp);
+    this.unavailable = true;
+    return profile ? [profile] : [];
+  }
+
+  closeContextAt(timestamp) {
+    if (this.samples.length === 0) {
+      this.windowStartedAt = undefined;
+      this.windowStartedWallClockAt = undefined;
+      return undefined;
+    }
+    const samples = this.samples.filter((sample) => sample.timestamp < timestamp);
+    const startedAt = this.windowStartedAt ?? samples[0]?.timestamp;
+    this.samples = [];
+    this.windowStartedAt = undefined;
+    this.windowStartedWallClockAt = undefined;
+    if (!Number.isFinite(startedAt) || samples.length === 0 || timestamp <= startedAt) {
+      return undefined;
+    }
+    return this.buildProfile(samples, {
+      startedAt,
+      endedAt: timestamp,
+      final: false,
+      allowTailMissing: true,
+    });
   }
 
   flush(opts = {}) {
@@ -1114,6 +1195,10 @@ class SnapshotProfiler {
     return this.windowStartedWallClockAt + this.profileWindowMs + this.noSampleGraceMs;
   }
 
+  isUnavailable() {
+    return this.unavailable;
+  }
+
   contextWindowDeadlineError() {
     const startedAt = this.windowStartedAt;
     const endedAt = startedAt === undefined ? undefined : startedAt + this.profileWindowMs;
@@ -1161,20 +1246,36 @@ class PresenceSegmentTracker {
 
   add(snapshot) {
     const timestamp = readSnapshotTimestamp(snapshot);
-    if (this.lastTimestamp !== undefined) {
+    const presence = presenceForSnapshot(snapshot, {
+      idleThresholdSeconds: this.idleThresholdSeconds,
+      afkThresholdSeconds: this.afkThresholdSeconds,
+    });
+    return this.observe(timestamp, presence.state, presence.reason);
+  }
+
+  markUnavailable(timestamp, reason) {
+    return this.observe(timestamp, "unavailable", reason);
+  }
+
+  resume(timestamp) {
+    if (!this.current || this.current.state !== "unavailable") return [];
+    const segment = this.closeAt(timestamp);
+    this.lastTimestamp = timestamp;
+    this.lastIntervalMs = INTERNAL_DEFAULTS.intervalMs;
+    return segment ? [segment] : [];
+  }
+
+  observe(timestamp, state, reason) {
+    if (this.lastTimestamp !== undefined && this.current?.state !== "unavailable") {
       const intervalMs = timestamp - this.lastTimestamp;
       if (Number.isFinite(intervalMs) && intervalMs > 0) {
         this.lastIntervalMs = intervalMs;
       }
     }
-
-    const state = publicPresenceState(presenceStateForSnapshot(snapshot, {
-      idleThresholdSeconds: this.idleThresholdSeconds,
-      afkThresholdSeconds: this.afkThresholdSeconds,
-    }));
     if (!this.current) {
       this.current = {
         state,
+        reason,
         startedAt: timestamp,
         sampleCount: 1,
       };
@@ -1182,7 +1283,7 @@ class PresenceSegmentTracker {
       return [];
     }
 
-    if (state === this.current.state) {
+    if (state === this.current.state && reason === this.current.reason) {
       this.current.sampleCount += 1;
       this.lastTimestamp = timestamp;
       return [];
@@ -1191,6 +1292,7 @@ class PresenceSegmentTracker {
     const segment = this.closeAt(timestamp);
     this.current = {
       state,
+      reason,
       startedAt: timestamp,
       sampleCount: 1,
     };
@@ -1210,6 +1312,7 @@ class PresenceSegmentTracker {
       schema: "macos-ax.presence.open.v1",
       platform: "macos",
       state: this.current.state,
+      reason: this.current.reason,
       startedAt: this.current.startedAt,
       lastObservedAt: this.lastTimestamp ?? this.current.startedAt,
       lastIntervalMs: this.lastIntervalMs,
@@ -1242,6 +1345,7 @@ class PresenceSegmentTracker {
         afkThresholdSeconds: this.afkThresholdSeconds,
       },
       state: current.state,
+      reason: current.reason,
     };
   }
 }
@@ -1256,7 +1360,7 @@ function buildContextAggregateV0(snapshots, opts = {}) {
       endedAt: undefined,
       durationMs: 0,
       sampleCount: 0,
-      presence: { activeMs: 0, idleMs: 0, afkMs: 0, lockedMs: 0, missingMs: 0, unattributedMs: 0 },
+      presence: { activeMs: 0, idleMs: 0, afkMs: 0, missingMs: 0, unattributedMs: 0 },
       displays: {},
       windows: {},
       attentionSpans: [],
@@ -1288,7 +1392,7 @@ function buildContextAggregateV0(snapshots, opts = {}) {
   const windowIdsByKey = new Map();
   const spans = [];
   const observations = [];
-  const presence = { activeMs: 0, idleMs: 0, afkMs: 0, lockedMs: 0, missingMs: 0, unattributedMs: 0 };
+  const presence = { activeMs: 0, idleMs: 0, afkMs: 0, missingMs: 0, unattributedMs: 0 };
   let contentSequence = 0;
   let displaySequence = 0;
   let windowSequence = 0;
@@ -1362,15 +1466,23 @@ function buildContextAggregateV0(snapshots, opts = {}) {
     const idle = isObject(normalized.idle) ? normalized.idle : {};
     const visibleWindows = Array.isArray(normalized.visibleWindows) ? normalized.visibleWindows : [];
 
-    const presenceState = presenceFromSnapshot({
+    const presenceObservation = presenceFromSnapshot({
       session,
       idle,
       idleThresholdSeconds: opts.idleThresholdSeconds,
       afkThresholdSeconds: opts.afkThresholdSeconds,
     });
+    const presenceState = presenceObservation.state;
+    if (presenceState === "unavailable") {
+      presence.missingMs += sampleDurationMs;
+      appendMissingInterval(sampleStartedAtMs, sampleEndedAtMs, {
+        countPresenceMissing: false,
+        reason: presenceObservation.reason ?? "unavailable",
+      });
+      return;
+    }
     if (!foregroundContextReliable(normalized.frontmostSource)) {
-      if (presenceState === "screen_locked") presence.lockedMs += sampleDurationMs;
-      else presence.unattributedMs += sampleDurationMs;
+      presence.unattributedMs += sampleDurationMs;
       appendMissingInterval(sampleStartedAtMs, sampleEndedAtMs, {
         countPresenceMissing: false,
         reason: "unattributed",
@@ -1378,8 +1490,7 @@ function buildContextAggregateV0(snapshots, opts = {}) {
       return;
     }
 
-    if (presenceState === "screen_locked") presence.lockedMs += sampleDurationMs;
-    else if (presenceState === "afk") presence.afkMs += sampleDurationMs;
+    if (presenceState === "afk") presence.afkMs += sampleDurationMs;
     else if (presenceState === "idle") presence.idleMs += sampleDurationMs;
     else presence.activeMs += sampleDurationMs;
 
@@ -1635,6 +1746,7 @@ function buildDesktopPresenceEvent(segment) {
     schema: segment.schema,
     platform: segment.platform,
     state: segment.state,
+    reason: typeof segment.reason === "string" ? segment.reason : undefined,
     durationMs: segment.durationMs,
     sampleCount: segment.sampleCount,
     presenceModel: segment.presenceModel,
@@ -2550,7 +2662,40 @@ function isPrivateBrowsingSurface(window) {
   return title.includes("private browsing") || title.includes("incognito");
 }
 
-function presenceStateForSnapshot(snapshot, opts = {}) {
+function availabilityLifecycleRecord(value) {
+  if (!isObject(value)) return undefined;
+  if (value.schema !== "macos-ax.lifecycle.v1" || value.type !== "desktop_availability") {
+    return undefined;
+  }
+  if (!Number.isFinite(value.timestamp) || typeof value.available !== "boolean") {
+    throw new Error("macOS AX helper emitted an invalid desktop availability lifecycle record");
+  }
+  const reasons = Array.isArray(value.reasons)
+    ? [...new Set(value.reasons.filter((reason) => typeof reason === "string" && reason))]
+    : [];
+  if (value.available === false && reasons.length === 0) {
+    throw new Error("macOS AX helper marked the desktop unavailable without evidence");
+  }
+  return {
+    schema: value.schema,
+    type: value.type,
+    timestamp: value.timestamp,
+    available: value.available,
+    reasons,
+    trigger: typeof value.trigger === "string" ? value.trigger : undefined,
+  };
+}
+
+function primaryUnavailableReason(reasons, fallback) {
+  const values = Array.isArray(reasons) ? reasons : [];
+  for (const reason of UNAVAILABLE_REASON_PRIORITY) {
+    if (values.includes(reason)) return reason;
+  }
+  return values.find((reason) => typeof reason === "string" && reason)
+    ?? (typeof fallback === "string" && fallback ? fallback : "unavailable");
+}
+
+function presenceForSnapshot(snapshot, opts = {}) {
   const normalized = isObject(snapshot?.normalized) ? snapshot.normalized : {};
   return presenceFromSnapshot({
     session: isObject(normalized.session) ? normalized.session : {},
@@ -2560,16 +2705,18 @@ function presenceStateForSnapshot(snapshot, opts = {}) {
   });
 }
 
-function publicPresenceState(state) {
-  return state === "screen_locked" ? "locked" : state;
-}
-
 function presenceFromSnapshot({ session, idle, idleThresholdSeconds, afkThresholdSeconds }) {
-  if (session.screenLocked === true) return "screen_locked";
+  const reasons = Array.isArray(session.unavailableReasons)
+    ? session.unavailableReasons.filter((reason) => typeof reason === "string" && reason)
+    : [];
+  if (session.screenLocked === true && !reasons.includes("locked")) reasons.push("locked");
+  if (session.desktopAvailable === false || reasons.length > 0) {
+    return { state: "unavailable", reason: primaryUnavailableReason(reasons) };
+  }
   const seconds = typeof idle.seconds === "number" ? idle.seconds : undefined;
-  if (seconds !== undefined && seconds >= afkThresholdSeconds) return "afk";
-  if (seconds !== undefined && seconds >= idleThresholdSeconds) return "idle";
-  return "active";
+  if (seconds !== undefined && seconds >= afkThresholdSeconds) return { state: "afk" };
+  if (seconds !== undefined && seconds >= idleThresholdSeconds) return { state: "idle" };
+  return { state: "active" };
 }
 
 function summarizeVisibleWindows(windows) {
@@ -2739,7 +2886,7 @@ async function updateConnectorState(context, updater) {
 function normalizePresenceOpenCursor(value) {
   if (!isObject(value)) return undefined;
   if (value.schema !== "macos-ax.presence.open.v1") return undefined;
-  if (!["active", "idle", "afk", "locked"].includes(value.state)) return undefined;
+  if (!["active", "idle", "afk", "unavailable"].includes(value.state)) return undefined;
   const startedAt = Number(value.startedAt);
   const lastObservedAt = Number(value.lastObservedAt);
   const lastIntervalMs = readPositiveNumber(value.lastIntervalMs, INTERNAL_DEFAULTS.intervalMs);
@@ -2751,6 +2898,7 @@ function normalizePresenceOpenCursor(value) {
     schema: value.schema,
     platform: value.platform === "macos" ? value.platform : "macos",
     state: value.state,
+    reason: typeof value.reason === "string" ? value.reason : undefined,
     startedAt,
     lastObservedAt,
     lastIntervalMs,
@@ -2777,6 +2925,7 @@ function presenceSegmentFromOpenCursor(open, opts = {}) {
     sampleCount: open.sampleCount,
     presenceModel: open.presenceModel,
     state: open.state,
+    reason: open.reason,
   };
 }
 

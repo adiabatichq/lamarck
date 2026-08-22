@@ -40,7 +40,7 @@
           },
           "presence": {
             "type": "object",
-            "description": "Time attributed to active, idle, AFK, locked, missing, and unattributed states.",
+            "description": "Time attributed to active, idle, AFK, missing, and unattributed states.",
             "additionalProperties": true
           },
           "displays": {
@@ -78,7 +78,7 @@
       }
     },
     "desktop.presence": {
-      "description": "A continuous macOS active, idle, AFK, locked, or missing presence segment.",
+      "description": "A continuous macOS active, idle, AFK, or unavailable presence segment.",
       "payloadSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -95,7 +95,12 @@
           },
           "state": {
             "type": "string",
+            "enum": ["active", "idle", "afk", "unavailable"],
             "description": "Presence state represented by the segment."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Observed reason for an unavailable segment, such as locked, screen_off, system_sleep, session_inactive, or logout_or_poweroff."
           },
           "durationMs": {
             "type": "number",

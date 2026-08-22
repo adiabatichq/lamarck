@@ -18,8 +18,11 @@ The collector samples at roughly one-second cadence:
 - all visible window metadata across displays
 - mouse location and hovered visible-window hint
 - system HID idle time and screen-lock state
+- macOS workspace lifecycle evidence for display sleep/wake, system sleep/wake, session activation, and logout/power-off
 
 The helper schedules sampling against a monotonic `nextTick` deadline. Snapshot capture, JSON encoding, and output consume the current interval, and the helper sleeps only for the remaining time before the next tick. If a cycle overruns, the deadline resets to the current monotonic time rather than accumulating drift or bursting to replay missed ticks.
+
+AX capture runs only while the desktop is observable. Screen lock and `NSWorkspace` lifecycle notifications maintain a set of unavailable reasons: `locked`, `screen_off`, `system_sleep`, `session_inactive`, and `logout_or_poweroff`. The helper emits a lifecycle record whenever that set changes and skips the expensive AX snapshot entirely while any reason remains active. Wake notifications do not resume capture until every overlapping unavailable reason has cleared.
 
 Visible AX text is captured locally by default, with a hard exclusion for OS-declared secure fields. Persistence is controlled by app, website/category, and domain privacy policy actions rather than a connector-wide capture mode.
 
@@ -121,7 +124,7 @@ When a foreground window can be joined to the event-local visible window invento
 
 `disabled` samples create privacy-hidden attention spans and minimal observations so consumers can distinguish an intentional privacy gap from missing data or a bug. Disabled spans keep timing and `privacy.action = "disabled"`, but omit app, window, focus, surface, display refs, window refs, and content refs.
 
-The context envelope presence summary uses mutually exclusive buckets that should sum to the envelope duration: `activeMs`, `idleMs`, `afkMs`, `lockedMs`, `missingMs`, and `unattributedMs`.
+The context envelope presence summary uses the mutually exclusive buckets `activeMs`, `idleMs`, `afkMs`, `missingMs`, and `unattributedMs`. Normal production context windows end at the unavailable boundary. Defensive aggregation of unavailable legacy helper samples records a missing capture interval rather than retaining AX context.
 
 Bounded sample gaps inside a closed context envelope are represented as `capture.state = "missing"` and `capture.reason = "sample_gap"` spans/observations and contribute to `presence.missingMs`. The connector only writes missing intervals that are bounded by the fixed envelope and a later real sample. Tail gaps from connector stop, sleep, or shutdown are not recovered for `desktop.context`.
 
@@ -163,7 +166,7 @@ Window snapshot identity includes geometry. If a window moves/resizes across dis
 The target window is 30s. Future D0 writer should flush earlier when:
 
 - privacy boundary changes
-- screen locks/sleeps/shuts down
+- the desktop becomes unavailable because it locks, its screens sleep, the system sleeps, its session resigns, or logout/power-off begins
 - payload becomes unusually large
 - span/sample count becomes unusually high
 - connector is stopping
@@ -178,12 +181,12 @@ Presence is a separate timeline from context. The default thresholds are:
 
 - idle after 15s without HID input
 - AFK after 60s without HID input
-- screen locked immediately
+- unavailable immediately when the screen locks or macOS lifecycle evidence says the desktop cannot be observed
 
 - `desktop.context` records what was on screen and what had focus. It keeps the same presence summary for local query convenience, but disabled-only context windows do not include attributed app/window/focus/layout data.
-- `desktop.presence` records active, idle, AFK, locked, sleep/wake state as `desktop.presence.segment.v0` state segments.
+- `desktop.presence` records `active`, `idle`, `afk`, and `unavailable` as `desktop.presence.segment.v0` state segments. Unavailable segments retain the observed cause in `reason`.
 
-Presence segments flush when the state changes and when the connector stops. They are not tied to the 30s context envelope, so AFK does not create repeated 30s D0 events. When the screen is locked or the machine sleeps, the connector should stop writing repeated context and must not synthesize tail context without a right-side sample. Downstream queries join the presence timeline to the context timeline.
+Presence segments flush when the state or unavailable reason changes and when the connector stops. They are not tied to the 30s context envelope, so AFK does not create repeated 30s D0 events. When the desktop becomes unavailable, the connector closes the observable portion of the current context immediately, stops its context deadline, and writes no context until availability resumes. Downstream queries join the presence timeline to the context timeline.
 
 The connector also checkpoints the currently open presence segment in connector state when the context envelope flushes or a presence transition is emitted. On startup, an open cursor from a previous run is emitted once as a recovered `desktop.presence.segment.v0` with `endReason = "connector-restart"`, then the cursor is cleared. `desktop.context` is not recovered from state; losing the final unflushed context window on crash is acceptable for v0.
 
@@ -192,6 +195,7 @@ The connector also checkpoints the currently open presence segment in connector 
 This package currently implements:
 
 - Swift AX JSONL snapshot helper with AX messaging timeout and per-snapshot budget diagnostics
+- Swift desktop-availability lifecycle monitoring that suppresses AX traversal while unavailable
 - JavaScript snapshot profiler
 - `desktop.context.aggregate.v0` builder
 - D0 `desktop.context` writer for the normal connector run path

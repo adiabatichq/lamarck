@@ -3,7 +3,7 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
-let helperVersion = 4
+let helperVersion = 5
 let maxTreeDepth = 6
 let maxTreeNodes = 600
 let maxChildrenPerNode = 120
@@ -117,6 +117,79 @@ struct FrontmostSelection {
   let workspaceApp: NSRunningApplication?
 }
 
+final class DesktopAvailabilityMonitor {
+  private let notificationCenter = NSWorkspace.shared.notificationCenter
+  private var observerTokens: [NSObjectProtocol] = []
+  private var unavailableReasons = Set<String>()
+
+  init() {
+    observe(NSWorkspace.willSleepNotification) { monitor in
+      monitor.setReason("system_sleep", active: true, trigger: "will_sleep")
+    }
+    observe(NSWorkspace.didWakeNotification) { monitor in
+      monitor.refreshScreenLock()
+      monitor.setReason("system_sleep", active: false, trigger: "did_wake")
+    }
+    observe(NSWorkspace.screensDidSleepNotification) { monitor in
+      monitor.setReason("screen_off", active: true, trigger: "screens_did_sleep")
+    }
+    observe(NSWorkspace.screensDidWakeNotification) { monitor in
+      monitor.refreshScreenLock()
+      monitor.setReason("screen_off", active: false, trigger: "screens_did_wake")
+    }
+    observe(NSWorkspace.sessionDidResignActiveNotification) { monitor in
+      monitor.setReason("session_inactive", active: true, trigger: "session_did_resign_active")
+    }
+    observe(NSWorkspace.sessionDidBecomeActiveNotification) { monitor in
+      monitor.refreshScreenLock()
+      monitor.setReason("session_inactive", active: false, trigger: "session_did_become_active")
+    }
+    observe(NSWorkspace.willPowerOffNotification) { monitor in
+      monitor.setReason("logout_or_poweroff", active: true, trigger: "will_power_off")
+    }
+  }
+
+  deinit {
+    for token in observerTokens {
+      notificationCenter.removeObserver(token)
+    }
+  }
+
+  var isAvailable: Bool {
+    unavailableReasons.isEmpty
+  }
+
+  func refreshScreenLock() {
+    setReason("locked", active: currentScreenLocked(), trigger: "screen_lock_sample")
+  }
+
+  private func observe(_ name: NSNotification.Name, handler: @escaping (DesktopAvailabilityMonitor) -> Void) {
+    let token = notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+      guard let self else { return }
+      handler(self)
+    }
+    observerTokens.append(token)
+  }
+
+  private func setReason(_ reason: String, active: Bool, trigger: String) {
+    let changed: Bool
+    if active {
+      changed = unavailableReasons.insert(reason).inserted
+    } else {
+      changed = unavailableReasons.remove(reason) != nil
+    }
+    guard changed else { return }
+    emitJSON([
+      "schema": "macos-ax.lifecycle.v1",
+      "type": "desktop_availability",
+      "timestamp": Int64(Date().timeIntervalSince1970 * 1_000),
+      "available": unavailableReasons.isEmpty,
+      "reasons": unavailableReasons.sorted(),
+      "trigger": trigger,
+    ])
+  }
+}
+
 func parseOptions(_ args: [String]) -> Options {
   var options = Options()
   var index = 0
@@ -202,18 +275,22 @@ func main() {
     emitJSON(buildSnapshot(options: options))
 
   case .jsonl:
+    let availability = DesktopAvailabilityMonitor()
     var emitted = 0
     let intervalSeconds = Double(max(1, options.intervalMs)) / 1_000.0
     var nextTickAt = ProcessInfo.processInfo.systemUptime
     while true {
       let remainingSeconds = nextTickAt - ProcessInfo.processInfo.systemUptime
       if remainingSeconds > 0 {
-        Thread.sleep(forTimeInterval: remainingSeconds)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: remainingSeconds))
       }
-      emitJSON(buildSnapshot(options: options))
-      emitted += 1
-      if let count = options.count, emitted >= count {
-        break
+      availability.refreshScreenLock()
+      if availability.isAvailable {
+        emitJSON(buildSnapshot(options: options))
+        emitted += 1
+        if let count = options.count, emitted >= count {
+          break
+        }
       }
       nextTickAt += intervalSeconds
       let emittedAt = ProcessInfo.processInfo.systemUptime

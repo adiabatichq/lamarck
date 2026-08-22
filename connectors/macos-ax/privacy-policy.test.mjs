@@ -727,7 +727,6 @@ test("disabled and rich samples share one context envelope with privacy-hidden s
     activeMs: 1000,
     idleMs: 0,
     afkMs: 1000,
-    lockedMs: 0,
     missingMs: 0,
     unattributedMs: 0,
   });
@@ -1031,7 +1030,6 @@ test("context aggregate records bounded sample gaps as missing capture", () => {
     activeMs: 3000,
     idleMs: 0,
     afkMs: 0,
-    lockedMs: 0,
     missingMs: 27_000,
     unattributedMs: 0,
   });
@@ -1098,7 +1096,6 @@ test("context aggregate drops ns-workspace foreground fallback as missing captur
     activeMs: 0,
     idleMs: 0,
     afkMs: 0,
-    lockedMs: 0,
     missingMs: 0,
     unattributedMs: 1000,
   });
@@ -1163,7 +1160,6 @@ test("context aggregate trusts cg-window foreground even when workspace mismatch
     activeMs: 1000,
     idleMs: 0,
     afkMs: 0,
-    lockedMs: 0,
     missingMs: 0,
     unattributedMs: 0,
   });
@@ -1476,6 +1472,145 @@ test("desktop context connector fails after three helpers emit no first sample",
     operation: "clear",
     key: "macos-ax-sample-gap",
   });
+});
+
+test("desktop availability lifecycle closes context and suppresses it until resume", async () => {
+  const startedAt = Date.UTC(2026, 6, 6, 15, 25, 0);
+  const snapshot = (offsetMs, text) => ({
+    timestamp: startedAt + offsetMs,
+    raw: {
+      displays: [{ id: 1, bounds: { x: 0, y: 0, width: 1280, height: 800 } }],
+    },
+    normalized: {
+      app: { name: "Codex", bundleId: "com.openai.codex", pid: 123 },
+      window: { title: "Codex", role: "AXWindow" },
+      focus: { role: "AXTextArea" },
+      text: { captureEnabled: true, excerpts: [text], totalChars: text.length, sourceCount: 1 },
+      session: { screenLocked: false },
+      idle: { seconds: 0 },
+      visibleWindows: [],
+      permission: { accessibility: true },
+    },
+  });
+  const lifecycle = (offsetMs, available, reasons, trigger) => ({
+    schema: "macos-ax.lifecycle.v1",
+    type: "desktop_availability",
+    timestamp: startedAt + offsetMs,
+    available,
+    reasons,
+    trigger,
+  });
+  const writes = [];
+  let stateValue = {};
+
+  await __test__.runDesktopContextConnector({
+    config: {},
+    signal: new AbortController().signal,
+    guard: {
+      async writeEvent(event) {
+        writes.push(event);
+        return { id: `event-${writes.length}` };
+      },
+    },
+    state: {
+      async get() {
+        return stateValue;
+      },
+      async set(value) {
+        stateValue = value;
+      },
+    },
+    warnings: { async set() {}, async clear() {} },
+  }, {
+    profileWindowMs: 10_000,
+    intervalMs: 1000,
+    spawnImpl: spawnSnapshots([
+      snapshot(0, "before unavailable"),
+      snapshot(1000, "still observable"),
+      lifecycle(1500, false, ["screen_off"], "screens_did_sleep"),
+      lifecycle(2000, false, ["screen_off", "system_sleep"], "will_sleep"),
+      lifecycle(5000, true, [], "screens_did_wake"),
+      snapshot(5000, "after resume"),
+      snapshot(6000, "after resume again"),
+    ]),
+  });
+
+  const contextEvents = writes.filter((event) => event.type === "desktop.context");
+  assert.equal(contextEvents.length, 1);
+  assert.equal(contextEvents[0].startedAt, startedAt);
+  assert.equal(contextEvents[0].endedAt, startedAt + 1500);
+  assert.equal(JSON.stringify(contextEvents[0].payload).includes("after resume"), false);
+
+  const presenceEvents = writes.filter((event) => event.type === "desktop.presence");
+  assert.deepEqual(presenceEvents.map((event) => [
+    event.payload.state,
+    event.payload.reason,
+    event.startedAt,
+    event.endedAt,
+  ]), [
+    ["active", undefined, startedAt, startedAt + 1500],
+    ["unavailable", "screen_off", startedAt + 1500, startedAt + 2000],
+    ["unavailable", "system_sleep", startedAt + 2000, startedAt + 5000],
+    ["active", undefined, startedAt + 5000, startedAt + 7000],
+  ]);
+});
+
+test("locked snapshots become unavailable presence without persisting locked AX content", async () => {
+  const startedAt = Date.UTC(2026, 6, 6, 15, 27, 0);
+  const snapshot = (offsetMs, screenLocked, text) => ({
+    timestamp: startedAt + offsetMs,
+    raw: {
+      displays: [{ id: 1, bounds: { x: 0, y: 0, width: 1280, height: 800 } }],
+    },
+    normalized: {
+      app: { name: "Codex", bundleId: "com.openai.codex", pid: 123 },
+      window: { title: "Codex", role: "AXWindow" },
+      focus: { role: "AXTextArea" },
+      text: { captureEnabled: true, excerpts: [text], totalChars: text.length, sourceCount: 1 },
+      session: { screenLocked },
+      idle: { seconds: 0 },
+      visibleWindows: [],
+      permission: { accessibility: true },
+    },
+  });
+  const writes = [];
+
+  await __test__.runDesktopContextConnector({
+    config: {},
+    signal: new AbortController().signal,
+    guard: {
+      async writeEvent(event) {
+        writes.push(event);
+        return { id: `event-${writes.length}` };
+      },
+    },
+    state: { async get() { return {}; }, async set() {} },
+    warnings: { async set() {}, async clear() {} },
+  }, {
+    profileWindowMs: 10_000,
+    intervalMs: 1000,
+    spawnImpl: spawnSnapshots([
+      snapshot(0, false, "visible before lock"),
+      snapshot(1000, true, "secret captured by an older helper"),
+      snapshot(2000, true, "another locked secret"),
+      snapshot(3000, false, "visible after unlock"),
+      snapshot(4000, false, "still visible after unlock"),
+    ]),
+  });
+
+  const contextEvents = writes.filter((event) => event.type === "desktop.context");
+  assert.equal(contextEvents.length, 1);
+  assert.equal(contextEvents[0].endedAt, startedAt + 1000);
+  assert.equal(JSON.stringify(contextEvents[0].payload).includes("secret"), false);
+
+  const presenceEvents = writes.filter((event) => event.type === "desktop.presence");
+  assert.deepEqual(presenceEvents.map((event) => [event.payload.state, event.payload.reason]), [
+    ["active", undefined],
+    ["unavailable", "locked"],
+    ["active", undefined],
+  ]);
+  assert.equal(presenceEvents[1].startedAt, startedAt + 1000);
+  assert.equal(presenceEvents[1].endedAt, startedAt + 3000);
 });
 
 test("desktop presence is emitted as state segments, not context-window aggregates", async () => {
