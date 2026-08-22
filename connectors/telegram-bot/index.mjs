@@ -320,9 +320,13 @@ async function handleSetupRequest(req, ctx) {
     if (req.method === "POST" && url.pathname === "/api/pairing-code") {
       return jsonResponse(await createPairingCode(ctx));
     }
-    if (req.method === "POST" && url.pathname === "/api/deny") {
+    if (req.method === "POST" && url.pathname === "/api/clear") {
       const body = await req.json().catch(() => ({}));
-      return jsonResponse(await denyCandidate(ctx, body.kind, body.id));
+      return jsonResponse(await clearCandidate(ctx, body.kind, body.id));
+    }
+    if (req.method === "POST" && url.pathname === "/api/unpair") {
+      const body = await req.json().catch(() => ({}));
+      return jsonResponse(await unpairCandidate(ctx, body.kind, body.id));
     }
     return jsonResponse({ error: "not_found" }, 404);
   } catch (err) {
@@ -347,6 +351,7 @@ async function createPairingCode(ctx) {
   const nowMs = Date.now();
   const currentState = normalizeState(await ctx.state.get());
   currentState.setup.pairingChallenge = pairingChallengeForCode(code, nowMs);
+  delete currentState.setup.lastPairingAttempt;
   await ctx.state.set(currentState);
   return {
     code,
@@ -356,19 +361,37 @@ async function createPairingCode(ctx) {
   };
 }
 
-async function denyCandidate(ctx, kind, id) {
+async function clearCandidate(ctx, kind, id) {
   const candidateId = stringFrom(id);
-  if (!candidateId) throw new Error("deny requires an id");
+  if (!candidateId) throw new Error("clear requires an id");
   const currentState = normalizeState(await ctx.state.get());
   if (kind === "user") {
     delete currentState.setup.pendingUsers[candidateId];
   } else if (kind === "group") {
     delete currentState.setup.pendingGroups[candidateId];
   } else {
-    throw new Error("deny kind must be user or group");
+    throw new Error("clear kind must be user or group");
   }
   await ctx.state.set(currentState);
-  return { state: currentState };
+  return { state: publicState(currentState) };
+}
+
+export async function unpairCandidate(ctx, kind, id) {
+  const candidateId = stringFrom(id);
+  if (!candidateId) throw new Error("unpair requires an id");
+  const currentState = normalizeState(await ctx.state.get());
+  if (kind === "user") {
+    delete currentState.setup.pairedUsers[candidateId];
+  } else if (kind === "group") {
+    delete currentState.setup.pairedGroups[candidateId];
+  } else {
+    throw new Error("unpair kind must be user or group");
+  }
+  if (String(currentState.setup.lastPairingAttempt?.id) === candidateId) {
+    delete currentState.setup.lastPairingAttempt;
+  }
+  await ctx.state.set(currentState);
+  return { state: publicState(currentState) };
 }
 
 async function telegramApi(token, method, params, opts) {
@@ -876,7 +899,7 @@ function assertApiKeyAuth(auth) {
   }
 }
 
-function setupHtml() {
+export function setupHtml() {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -997,6 +1020,11 @@ function setupHtml() {
       background: transparent;
       color: var(--dark);
     }
+    button[hidden] { display: none; }
+    button:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 3px solid rgba(15, 118, 110, 0.28);
+      outline-offset: 2px;
+    }
     .row {
       display: grid;
       grid-template-columns: 1fr auto auto;
@@ -1014,6 +1042,12 @@ function setupHtml() {
       display: grid;
       gap: 10px;
     }
+    .pair-command {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: stretch;
+    }
     .pair-code {
       border: 1px solid var(--dark);
       background: #eef3ef;
@@ -1027,10 +1061,16 @@ function setupHtml() {
       font-size: 13px;
       margin: 0;
     }
+    .pair-meta {
+      color: var(--muted);
+      font-family: "SF Mono", Menlo, monospace;
+      font-size: 12px;
+      min-height: 18px;
+    }
     @media (max-width: 760px) {
       header, .grid, .field { grid-template-columns: 1fr; }
       .status { min-width: 0; }
-      .row { grid-template-columns: 1fr; }
+      .row, .pair-command { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1039,7 +1079,7 @@ function setupHtml() {
     <header>
       <div>
         <h1>Telegram Setup</h1>
-        <p class="sub">Create a bot with <code>@BotFather</code>, paste the token into the connector auth field, then pair users or groups with a one-time command.</p>
+        <p class="sub">Create a bot with <code>@BotFather</code>, then pair the chats Lamarck should capture.</p>
       </div>
       <div class="status" id="connection">Loading connection state</div>
     </header>
@@ -1051,33 +1091,45 @@ function setupHtml() {
           <li>Send <code>/newbot</code>, choose a display name, then choose a globally unique username ending in <code>bot</code>.</li>
           <li>Copy the token BotFather gives you.</li>
           <li>Paste it into the Telegram Bot auth field in Source Console.</li>
-          <li>Generate a pairing code here, then send the shown <code>/pair</code> command to your bot or group.</li>
+          <li>Generate a pairing code here, then send the shown <code>/pair</code> command from the direct message or group you want to pair.</li>
         </ol>
       </section>
       <section>
-        <h2>Owner pairing</h2>
+        <h2>Pair a chat</h2>
         <div class="pairing">
-          <p class="pair-note">Generate a one-time code, then send the command to your bot from a direct message or from the group you want to pair. Codes expire after 10 minutes and can be used once.</p>
-          <div id="pairing-status" class="pair-code">No active pairing code</div>
-          <button id="generate-pairing">Generate pairing code</button>
+          <p class="pair-note">Generate a command, then send it from the direct message or group you want to pair.</p>
+          <div class="pair-command">
+            <div id="pairing-status" class="pair-code">Ready to pair</div>
+            <button id="copy-pairing" class="secondary" hidden>Copy</button>
+          </div>
+          <div id="pairing-meta" class="pair-meta"></div>
+          <button id="generate-pairing">Generate code</button>
         </div>
+      </section>
+      <section>
+        <h2>Paired users</h2>
+        <div id="paired-users" class="empty">No paired users</div>
+      </section>
+      <section>
+        <h2>Paired groups</h2>
+        <div id="paired-groups" class="empty">No paired groups</div>
       </section>
       <section>
         <h2>Capture policy</h2>
         <div class="field">
           <label for="dm-mode">Direct messages</label>
           <select id="dm-mode">
-            <option value="capture_all">Capture all direct messages</option>
-            <option value="paired_only">Capture paired users only</option>
-            <option value="disabled">Disabled</option>
+            <option value="paired_only">Paired users only</option>
+            <option value="capture_all">All direct messages</option>
+            <option value="disabled">Do not capture</option>
           </select>
         </div>
         <div class="field">
           <label for="group-mode">Groups</label>
           <select id="group-mode">
-            <option value="disabled">Disabled</option>
-            <option value="paired_only">Capture paired groups only</option>
-            <option value="capture_all">Capture all groups</option>
+            <option value="disabled">Do not capture</option>
+            <option value="paired_only">Paired groups only</option>
+            <option value="capture_all">All groups</option>
           </select>
         </div>
         <div class="field">
@@ -1087,20 +1139,12 @@ function setupHtml() {
         <button id="save-policy">Save policy</button>
       </section>
       <section>
-        <h2>Pending users</h2>
-        <div id="pending-users" class="empty">No pending users</div>
+        <h2>Unpaired activity</h2>
+        <div id="pending-users" class="empty">No unpaired users seen</div>
       </section>
       <section>
-        <h2>Paired users</h2>
-        <div id="paired-users" class="empty">No paired users</div>
-      </section>
-      <section>
-        <h2>Pending groups</h2>
-        <div id="pending-groups" class="empty">No pending groups</div>
-      </section>
-      <section>
-        <h2>Paired groups</h2>
-        <div id="paired-groups" class="empty">No paired groups</div>
+        <h2>Unpaired group activity</h2>
+        <div id="pending-groups" class="empty">No unpaired groups seen</div>
       </section>
     </div>
   </main>
@@ -1108,6 +1152,7 @@ function setupHtml() {
     const token = new URLSearchParams(location.search).get("token");
     let snapshot = null;
     let latestPairingCommand = null;
+    let pairingRefreshTimer = null;
 
     async function api(path, options = {}) {
       const res = await fetch(path + "?token=" + encodeURIComponent(token), {
@@ -1122,6 +1167,7 @@ function setupHtml() {
     async function load() {
       snapshot = await api("/api/snapshot");
       render();
+      schedulePairingRefresh();
     }
 
     function render() {
@@ -1137,27 +1183,61 @@ function setupHtml() {
       document.getElementById("require-mention").checked = setup.groups.requireMention;
       renderCandidates("pending-users", state.setup.pendingUsers, "user");
       renderCandidates("pending-groups", state.setup.pendingGroups, "group");
-      renderReadOnlyRecords("paired-users", state.setup.pairedUsers, "No paired users");
-      renderReadOnlyRecords("paired-groups", state.setup.pairedGroups, "No paired groups");
+      renderPairedRecords("paired-users", state.setup.pairedUsers, "user");
+      renderPairedRecords("paired-groups", state.setup.pairedGroups, "group");
     }
 
     function renderPairing(setupState) {
       const el = document.getElementById("pairing-status");
+      const meta = document.getElementById("pairing-meta");
+      const copy = document.getElementById("copy-pairing");
       const last = setupState.lastPairingAttempt;
-      if (last && (last.status === "paired_user" || last.status === "paired_group")) {
-        latestPairingCommand = null;
-        el.textContent = last.status === "paired_group" ? "Last group pairing completed" : "Last user pairing completed";
-        return;
-      }
-      if (latestPairingCommand) {
+      const challenge = setupState.pairingChallenge;
+      const challengeActive = Number.isFinite(challenge?.expiresAt) && challenge.expiresAt >= Date.now();
+      if (latestPairingCommand && challengeActive) {
         el.textContent = latestPairingCommand.command;
+        copy.hidden = false;
+        meta.textContent = pairingMeta(latestPairingCommand.expiresAt, last?.status);
         return;
       }
-      if (setupState.pairingChallenge && setupState.pairingChallenge.expiresAt) {
-        el.textContent = "A pairing code is active until " + new Date(setupState.pairingChallenge.expiresAt).toLocaleTimeString();
+      latestPairingCommand = null;
+      if (challengeActive) {
+        el.textContent = last?.status === "wrong_code" ? "Code not recognized" : "Code active";
+        copy.hidden = true;
+        meta.textContent = pairingMeta(challenge.expiresAt, last?.status);
         return;
       }
-      el.textContent = "No active pairing code";
+      copy.hidden = true;
+      meta.textContent = "";
+      if (last && (last.status === "paired_user" || last.status === "paired_group")) {
+        const records = last.status === "paired_group" ? setupState.pairedGroups : setupState.pairedUsers;
+        const item = records?.[String(last.id)];
+        el.textContent = "Paired · " + recordLabel(item, last.id);
+        return;
+      }
+      if (last?.status === "expired_or_missing") {
+        el.textContent = "Code expired";
+        return;
+      }
+      if (challenge?.expiresAt) {
+        el.textContent = "Code expired";
+        return;
+      }
+      el.textContent = "Ready to pair";
+    }
+
+    function pairingMeta(expiresAt, lastStatus) {
+      const prefix = lastStatus === "wrong_code" ? "Try again · " : "";
+      return prefix + "Expires " + new Date(expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + " · One use";
+    }
+
+    function schedulePairingRefresh() {
+      clearTimeout(pairingRefreshTimer);
+      const expiresAt = snapshot?.state?.setup?.pairingChallenge?.expiresAt;
+      if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return;
+      pairingRefreshTimer = setTimeout(() => {
+        load().catch(showError);
+      }, 1500);
     }
 
     function renderCandidates(id, records, kind) {
@@ -1165,29 +1245,33 @@ function setupHtml() {
       const entries = Object.entries(records || {});
       if (!entries.length) {
         el.className = "empty";
-        el.textContent = kind === "user" ? "No pending users" : "No pending groups";
+        el.textContent = kind === "user" ? "No unpaired users seen" : "No unpaired groups seen";
         return;
       }
       el.className = "";
       el.innerHTML = entries.map(([key, item]) => {
-        const name = item.title || item.username || [item.firstName, item.lastName].filter(Boolean).join(" ") || key;
-        return "<div class='row'><div><div class='name'>" + escapeHtml(name) + "</div><div class='meta'>ID " + escapeHtml(key) + " · pair before capture</div></div><button class='secondary' data-action='deny' data-kind='" + kind + "' data-id='" + escapeHtml(key) + "'>Deny</button></div>";
+        return "<div class='row'><div><div class='name'>" + escapeHtml(recordLabel(item, key)) + "</div><div class='meta'>ID " + escapeHtml(key) + " · unpaired</div></div><button class='secondary' data-action='clear' data-kind='" + kind + "' data-id='" + escapeHtml(key) + "'>Clear</button></div>";
       }).join("");
     }
 
-    function renderReadOnlyRecords(id, records, emptyText) {
+    function renderPairedRecords(id, records, kind) {
       const el = document.getElementById(id);
       const entries = Object.entries(records || {});
       if (!entries.length) {
         el.className = "empty";
-        el.textContent = emptyText;
+        el.textContent = kind === "user" ? "No paired users" : "No paired groups";
         return;
       }
       el.className = "";
       el.innerHTML = entries.map(([key, item]) => {
-        const name = item.title || item.username || [item.firstName, item.lastName].filter(Boolean).join(" ") || key;
-        return "<div class='row'><div><div class='name'>" + escapeHtml(name) + "</div><div class='meta'>ID " + escapeHtml(key) + "</div></div></div>";
+        return "<div class='row'><div><div class='name'>" + escapeHtml(recordLabel(item, key)) + "</div><div class='meta'>ID " + escapeHtml(key) + "</div></div><button class='secondary' data-action='unpair' data-kind='" + kind + "' data-id='" + escapeHtml(key) + "'>Unpair</button></div>";
       }).join("");
+    }
+
+    function recordLabel(item, fallback) {
+      if (item?.title) return item.title;
+      if (item?.username) return "@" + item.username;
+      return [item?.firstName, item?.lastName].filter(Boolean).join(" ") || String(fallback);
     }
 
     document.addEventListener("click", async (event) => {
@@ -1204,7 +1288,12 @@ function setupHtml() {
         latestPairingCommand = await api("/api/pairing-code", { method: "POST", body: "{}" });
         await load();
       }
-      if (target.dataset.action === "deny") {
+      if (target.id === "copy-pairing" && latestPairingCommand) {
+        await navigator.clipboard.writeText(latestPairingCommand.command);
+        target.textContent = "Copied";
+        setTimeout(() => { target.textContent = "Copy"; }, 1200);
+      }
+      if (target.dataset.action === "clear" || target.dataset.action === "unpair") {
         await api("/api/" + target.dataset.action, {
           method: "POST",
           body: JSON.stringify({ kind: target.dataset.kind, id: target.dataset.id }),
@@ -1217,9 +1306,11 @@ function setupHtml() {
       return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
     }
 
-    load().catch((err) => {
+    function showError(err) {
       document.getElementById("connection").textContent = err.message;
-    });
+    }
+
+    load().catch(showError);
   </script>
 </body>
 </html>`;

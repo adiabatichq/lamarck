@@ -7069,6 +7069,63 @@ auth:
     ]);
   });
 
+  test("telegram-bot setup presents pairing, unpairing, and activity clearing as distinct actions", async () => {
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { setupHtml } = await import(telegramUrl) as {
+      setupHtml(): string;
+    };
+
+    const html = setupHtml();
+    expect(html).toContain("Pair a chat");
+    expect(html).toContain(">Generate code</button>");
+    expect(html).toContain("Unpaired activity");
+    expect(html).toContain("data-action='clear'");
+    expect(html).toContain("data-action='unpair'");
+    expect(html).not.toContain("Pending users");
+    expect(html).not.toContain(">Deny</button>");
+    expect(html).not.toContain("approval step");
+    expect(html).not.toContain("data-action='dismiss'");
+    expect(html).not.toContain("pair before capture");
+  });
+
+  test("telegram-bot can unpair users and groups from setup state", async () => {
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { unpairCandidate } = await import(telegramUrl) as {
+      unpairCandidate(context: unknown, kind: "user" | "group", id: string): Promise<unknown>;
+    };
+
+    let syncState: any = {
+      version: 1,
+      cursor: { lastUpdateId: 44 },
+      setup: {
+        pendingUsers: {},
+        pendingGroups: {},
+        pairedUsers: { "123": { id: 123, username: "alice" } },
+        pairedGroups: { "-456": { id: -456, title: "Project room" } },
+        lastPairingAttempt: { status: "paired_user", id: "123", updateId: 44 },
+      },
+    };
+    const context = {
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+    };
+
+    await unpairCandidate(context, "user", "123");
+    expect(syncState.setup.pairedUsers["123"]).toBeUndefined();
+    expect(syncState.setup.pairedGroups["-456"]).toMatchObject({ title: "Project room" });
+    expect(syncState.setup.lastPairingAttempt).toBeUndefined();
+    expect(syncState.cursor.lastUpdateId).toBe(44);
+
+    await unpairCandidate(context, "group", "-456");
+    expect(syncState.setup.pairedGroups["-456"]).toBeUndefined();
+  });
+
   test("telegram-bot resolves Source identity from getMe and rejects invalid bot ids", async () => {
     const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
     const { resolveSourceIdentity } = await import(telegramUrl) as {
