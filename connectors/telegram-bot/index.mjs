@@ -1210,9 +1210,7 @@ export function setupHtml() {
       copy.hidden = true;
       meta.textContent = "";
       if (last && (last.status === "paired_user" || last.status === "paired_group")) {
-        const records = last.status === "paired_group" ? setupState.pairedGroups : setupState.pairedUsers;
-        const item = records?.[String(last.id)];
-        el.textContent = "Paired · " + recordLabel(item, last.id);
+        el.textContent = "Ready to pair another chat";
         return;
       }
       if (last?.status === "expired_or_missing") {

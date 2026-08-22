@@ -7078,12 +7078,14 @@ auth:
     const html = setupHtml();
     expect(html).toContain("Pair a chat");
     expect(html).toContain(">Generate code</button>");
+    expect(html).toContain("Ready to pair another chat");
     expect(html).toContain("Unpaired activity");
     expect(html).toContain("data-action='clear'");
     expect(html).toContain("data-action='unpair'");
     expect(html).not.toContain("Pending users");
     expect(html).not.toContain(">Deny</button>");
     expect(html).not.toContain("approval step");
+    expect(html).not.toContain("Paired ·");
     expect(html).not.toContain("data-action='dismiss'");
     expect(html).not.toContain("pair before capture");
   });
