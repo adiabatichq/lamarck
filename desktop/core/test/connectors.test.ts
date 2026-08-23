@@ -7405,6 +7405,35 @@ auth:
     });
   });
 
+  test("telegram-bot removes paired identities from stale pending state", async () => {
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { normalizeState } = await import(telegramUrl) as {
+      normalizeState(state: unknown): any;
+    };
+
+    const state = normalizeState({
+      setup: {
+        pendingUsers: {
+          "123": { id: 123, username: "alice" },
+          "789": { id: 789, username: "pending-user" },
+        },
+        pendingGroups: {
+          "-100": { id: -100, title: "Paired group" },
+          "-200": { id: -200, title: "Pending group" },
+        },
+        pairedUsers: { "123": { id: 123, username: "alice" } },
+        pairedGroups: { "-100": { id: -100, title: "Paired group" } },
+      },
+    });
+
+    expect(state.setup.pendingUsers).toEqual({
+      "789": { id: 789, username: "pending-user" },
+    });
+    expect(state.setup.pendingGroups).toEqual({
+      "-200": { id: -200, title: "Pending group" },
+    });
+  });
+
   test("telegram-bot preserves raw messages and extracts media refs", async () => {
     const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
     const { eventFromUpdate } = await import(telegramUrl) as {
@@ -7769,6 +7798,7 @@ auth:
         },
       },
     });
+    expect(syncState.setup.pendingUsers["123"]).toBeUndefined();
   });
 
   test("telegram-bot observes a pairing code created during long polling", async () => {
@@ -7986,6 +8016,7 @@ auth:
         },
       },
     });
+    expect(syncState.setup.pendingGroups["-100"]).toBeUndefined();
   });
 
   test("oura resolves Source identity through the managed provider origin", async () => {

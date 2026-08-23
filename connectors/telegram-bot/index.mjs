@@ -535,6 +535,10 @@ function recordPendingCandidate(setupState, message, update) {
   const chat = message.chat;
   if (chat.type === "private" && message.from?.id) {
     const id = String(message.from.id);
+    if (setupState.pairedUsers[id]) {
+      delete setupState.pendingUsers[id];
+      return;
+    }
     setupState.pendingUsers[id] = {
       ...summarizeUser(message.from),
       firstSeenAt: setupState.pendingUsers[id]?.firstSeenAt ?? nowMs,
@@ -546,6 +550,10 @@ function recordPendingCandidate(setupState, message, update) {
   }
 
   const id = String(chat.id);
+  if (setupState.pairedGroups[id]) {
+    delete setupState.pendingGroups[id];
+    return;
+  }
   setupState.pendingGroups[id] = {
     ...summarizeChat(chat),
     firstSeenAt: setupState.pendingGroups[id]?.firstSeenAt ?? nowMs,
@@ -807,11 +815,17 @@ function normalizeSetupConfig(value) {
 
 function normalizeSetupState(value) {
   const raw = isObject(value) ? value : {};
+  const pendingUsers = normalizeRecord(raw.pendingUsers);
+  const pendingGroups = normalizeRecord(raw.pendingGroups);
+  const pairedUsers = normalizeRecord(raw.pairedUsers);
+  const pairedGroups = normalizeRecord(raw.pairedGroups);
+  for (const id of Object.keys(pairedUsers)) delete pendingUsers[id];
+  for (const id of Object.keys(pairedGroups)) delete pendingGroups[id];
   return compactObject({
-    pendingUsers: normalizeRecord(raw.pendingUsers),
-    pendingGroups: normalizeRecord(raw.pendingGroups),
-    pairedUsers: normalizeRecord(raw.pairedUsers),
-    pairedGroups: normalizeRecord(raw.pairedGroups),
+    pendingUsers,
+    pendingGroups,
+    pairedUsers,
+    pairedGroups,
     pairingChallenge: normalizePairingChallenge(raw.pairingChallenge),
     lastPairingAttempt: isObject(raw.lastPairingAttempt) ? cloneJson(raw.lastPairingAttempt) : undefined,
     lastCheckedAt: Number.isFinite(raw.lastCheckedAt) ? raw.lastCheckedAt : undefined,
