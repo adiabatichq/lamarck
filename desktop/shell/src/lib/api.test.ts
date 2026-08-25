@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
+  approveSchemaRequest,
   cancelConnectorAuthAttempt,
   clearCoreBaseUrlCache,
   createConnectorSource,
   getCoreBaseUrl,
+  inspectDataSchema,
   retryConnectorSourceIdentity,
   startConnectorAuth,
   updateConnectorSource,
@@ -131,6 +133,41 @@ describe("Core endpoint resolution", () => {
       2,
       "http://localhost:32100/api/connectors/sources/source%2F1/auth/attempts/attempt%2F1",
       expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  test("uses Host-only schema inspection and sends approve-once", async () => {
+    const schema = {
+      tables: [{
+        name: "focus",
+        sql: "CREATE TABLE focus (id TEXT PRIMARY KEY NOT NULL)",
+        columns: [{ name: "id", type: "TEXT", notnull: 1, dflt_value: null, pk: 1 }],
+      }],
+      indexes: [{ name: "focus_by_id", table: "focus", sql: "CREATE INDEX focus_by_id ON focus(id)" }],
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify(schema) })
+      .mockResolvedValueOnce({
+        ok: true,
+        text: async () => JSON.stringify({ request: { status: "applied" } }),
+      });
+    vi.stubGlobal("window", {
+      lamarckHost: {
+        getCoreBaseUrl: vi.fn().mockResolvedValue("http://localhost:32100"),
+        getCoreToken: vi.fn().mockResolvedValue("test-token"),
+      },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(inspectDataSchema()).resolves.toEqual(schema);
+    await approveSchemaRequest("request/1");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]![0]).toBe("http://localhost:32100/api/schema/inspect");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://localhost:32100/api/schema/requests/request%2F1/approve",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({}) }),
     );
   });
 });

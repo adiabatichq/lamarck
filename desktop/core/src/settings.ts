@@ -2,7 +2,6 @@ import { mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 
 export interface CoreSettings {
-  allowCodingAgentSchemaDecisions?: boolean;
   corePort?: number;
   vaultId?: string;
 }

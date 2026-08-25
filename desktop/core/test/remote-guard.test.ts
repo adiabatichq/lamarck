@@ -29,6 +29,14 @@ class FakeRpc {
     this.executionOptions.push(options);
     if (method === "query") return [{ id: "first" }] as T;
     if (method === "writeEvent" || method === "writeWorkspaceEvent") return "event-id" as T;
+    if (method === "schema.plan") {
+      return {
+        ddl: ["CREATE TABLE focus (id TEXT PRIMARY KEY NOT NULL)"],
+        beforeSchema: { tables: [], indexes: [] },
+        afterSchema: { tables: [], indexes: [] },
+      } as T;
+    }
+    if (method === "schema.apply") return { ok: true } as T;
     throw new Error(`Unexpected method: ${method}`);
   }
 
@@ -157,6 +165,47 @@ describe("RemoteGuard capability binding", () => {
 
     expect(callsObservedDuringPrepare).toEqual([1]);
     expect(rpc.calls.map((call) => call.method)).toEqual(["query", "writeWorkspaceEvent"]);
+  });
+
+  test("plans and applies one exact schema-change contract without caller classification", async () => {
+    const rpc = new FakeRpc();
+    const guard = createGuard(rpc);
+    const plan = await guard.schemaPlan("CREATE TABLE focus (id TEXT PRIMARY KEY NOT NULL)");
+    await guard.applySchemaPlan(plan, {
+      approved: true,
+      author: "codex",
+      context: "Add focus storage.",
+    });
+
+    expect(rpc.calls).toEqual([
+      {
+        method: "schema.plan",
+        params: {
+          principal: {
+            source: "system:server",
+            producerRef: TEST_PRODUCER_REF,
+            tableGrants: "*",
+            schemaGrant: true,
+          },
+          ddl: "CREATE TABLE focus (id TEXT PRIMARY KEY NOT NULL)",
+        },
+      },
+      {
+        method: "schema.apply",
+        params: {
+          principal: {
+            source: "system:server",
+            producerRef: TEST_PRODUCER_REF,
+            tableGrants: "*",
+            schemaGrant: true,
+          },
+          plan,
+          approved: true,
+          author: "codex",
+          context: "Add focus storage.",
+        },
+      },
+    ]);
   });
 
   test("App grants are concrete arrays and queryOne stays a client helper", async () => {

@@ -17,4 +17,4 @@ export type {
   SchemaPlan,
   SchemaSnapshot,
 } from "./remote-guard";
-export type { EventInput, SchemaOp } from "./guard-types";
+export type { EventInput } from "./guard-types";

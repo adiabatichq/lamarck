@@ -420,6 +420,10 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     }, /authorized|prohibited/i);
     await assertRpcRejects("query", {
       principal: host,
+      sql: "SELECT * FROM pragma_table_xinfo('parents')",
+    }, /authorized|prohibited/i);
+    await assertRpcRejects("query", {
+      principal: host,
       sql: "ATTACH DATABASE ':memory:' AS other",
     }, /authorized/i);
     await assertRpcRejects("query", { principal: host, sql: "DETACH DATABASE other" }, /authorized/i);
@@ -752,11 +756,9 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
       "CREATE TABLE rejected_composite_pk (a TEXT NOT NULL, b TEXT, PRIMARY KEY (a, b))",
       "CREATE TABLE rejected_desc_integer_pk (id INTEGER PRIMARY KEY DESC, value TEXT)",
     ]) {
-      await assertRpcRejects("schema.apply", {
+      await assertRpcRejects("schema.plan", {
         principal: host,
-        kind: "promote",
         ddl,
-        approved: true,
       }, /GUARD_D2_PRIMARY_KEY|primary.?key/i);
     }
     assert.deepEqual(await queryRows(
@@ -769,12 +771,7 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
       "CREATE TABLE accepted_strict_pk (id TEXT PRIMARY KEY, value TEXT) STRICT",
       "CREATE TABLE accepted_without_rowid_pk (a TEXT, b TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID",
     ]) {
-      await rpc("schema.apply", {
-        principal: host,
-        kind: "promote",
-        ddl,
-        approved: true,
-      });
+      await applySchema(ddl);
     }
     assert.deepEqual(await queryRows(
       "SELECT name FROM sqlite_master WHERE name LIKE 'accepted_%' ORDER BY name",
@@ -786,7 +783,7 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     ]);
   });
 
-  test("schema methods are separately privileged and refresh CDC", async () => {
+  test("schema changes are separately privileged, exact-plan, and refresh CDC", async () => {
     const inspected = await rpc("schema.inspect", { principal: host });
     assert.ok(inspected.tables.some((table) => table.name === "events"));
     assert.ok(inspected.tables.some((table) => table.name === "parents"));
@@ -801,32 +798,25 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
         tableGrants: [],
         schemaGrant: true,
       },
-      kind: "promote",
       ddl: "CREATE TABLE forged_schema (id TEXT PRIMARY KEY NOT NULL)",
     }, /requires a system source/i);
     await assertRpcRejects("schema.plan", {
       principal: principal("app:no-schema", []),
-      kind: "promote",
       ddl: "CREATE TABLE schema_denied (id TEXT PRIMARY KEY NOT NULL)",
     }, /schema lifecycle capability/i);
-    await assertRpcRejects("schema.apply", {
+    await assertRpcRejects("schema.plan", {
       principal: host,
-      kind: "promote",
       ddl: "CREATE TABLE ctas_escape AS SELECT 'unaudited' AS value",
-      approved: true,
     }, /DDL is not allowed/i);
     assert.deepEqual(await queryRows(
       "SELECT name FROM sqlite_master WHERE name = 'ctas_escape'",
     ), []);
-    await assertRpcRejects("schema.apply", {
+    await assertRpcRejects("schema.plan", {
       principal: host,
-      kind: "promote",
       ddl: "/* target-hiding comment */ CREATE TABLE commented_schema (id TEXT)",
-      approved: true,
     }, /DDL is not allowed/i);
     await assertRpcRejects("schema.plan", {
       principal: host,
-      kind: "promote",
       ddl: `CREATE TABLE forbidden_event_fk (
         id TEXT PRIMARY KEY NOT NULL,
         event_id TEXT REFERENCES events(id) ON DELETE CASCADE
@@ -835,26 +825,33 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
 
     const plan = await rpc("schema.plan", {
       principal: host,
-      kind: "promote",
       ddl: "CREATE TABLE schema_created (id TEXT PRIMARY KEY NOT NULL, value TEXT)",
     });
-    assert.equal(plan.kind, "promote");
     assert.ok(Array.isArray(plan.beforeSchema.tables));
+    assert.equal(plan.beforeSchema.tables.some((table) => table.name === "schema_created"), false);
+    assert.equal(plan.afterSchema.tables.some((table) => table.name === "schema_created"), true);
     await rpc("schema.apply", {
       principal: host,
-      kind: "promote",
-      ddl: "CREATE TABLE schema_created (id TEXT PRIMARY KEY NOT NULL, value TEXT)",
+      plan,
       approved: true,
-      requestedBy: "node-test",
+      author: "node-test",
+      context: "Add schema-created storage.",
     });
-    assert.deepEqual(await queryRows(
-      `SELECT producer_ref
+    const schemaEvent = (await queryRows(
+      `SELECT producer_ref,
+              json_extract(payload, '$.author') AS author,
+              json_extract(payload, '$.context') AS context,
+              json_type(payload, '$.requested_by') AS requested_by_type
        FROM events
-       WHERE source = ? AND type = 'ddl.promote'
+       WHERE source = ? AND type = 'workspace.schema.changed'
        ORDER BY created_at DESC, rowid DESC
        LIMIT 1`,
       [host.source],
-    ), [{ producer_ref: TEST_PRODUCER_REF }]);
+    ))[0];
+    assert.equal(schemaEvent.producer_ref, TEST_PRODUCER_REF);
+    assert.equal(schemaEvent.author, "node-test");
+    assert.equal(schemaEvent.context, "Add schema-created storage.");
+    assert.equal(schemaEvent.requested_by_type, null);
     const result = await rpc("mutate", {
       principal: principal("app:schema-created", ["schema_created"]),
       sql: "INSERT INTO schema_created (id, value) VALUES (?, ?)",
@@ -864,16 +861,25 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     const audit = await auditPayloads("app:schema-created");
     assert.equal(audit[0].payload.table, "schema_created");
 
-    await rpc("schema.apply", {
+    const alterPlan = await rpc("schema.plan", {
       principal: host,
-      kind: "promote",
-      ddl: [
+      ddl: "ALTER TABLE schema_created ADD COLUMN note TEXT",
+    });
+    assert.equal(
+      alterPlan.afterSchema.tables
+        .find((table) => table.name === "schema_created")
+        ?.columns.some((column) => column.name === "note"),
+      true,
+    );
+    await rpc("schema.apply", { principal: host, plan: alterPlan, approved: true });
+
+    await applySchema(
+      [
         'CREATE TABLE "schema weird" (id TEXT PRIMARY KEY NOT NULL, value TEXT)',
         'CREATE INDEX "schema weird idx" ON "schema weird" (value)',
       ],
-      approved: true,
-      requestedBy: "node-test-quoted",
-    });
+      { author: "node-test-quoted" },
+    );
     await rpc("mutate", {
       principal: principal("app:schema-quoted", ["schema weird"]),
       sql: 'INSERT INTO "schema weird" (id, value) VALUES (?, ?)',
@@ -882,56 +888,71 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     assert.deepEqual(await queryRows(
       'SELECT name FROM sqlite_master WHERE type = \'index\' AND name = \'schema weird idx\'',
     ), [{ name: "schema weird idx" }]);
-    await rpc("schema.apply", {
-      principal: host,
-      kind: "demote",
-      ddl: [
+    await applySchema(
+      [
         'DROP INDEX "schema weird idx"',
         'DROP TABLE "schema weird"',
       ],
-      approved: true,
-      requestedBy: "node-test-quoted-drop",
-    });
+      { author: "node-test-quoted-drop" },
+    );
     assert.deepEqual(await queryRows(
       "SELECT name FROM sqlite_master WHERE name = 'schema weird'",
     ), []);
 
+    await assertRpcRejects("schema.plan", {
+      principal: host,
+      ddl: "CREATE TRIGGER forbidden AFTER INSERT ON schema_created BEGIN SELECT 1; END",
+    }, /DDL is not allowed|exactly one/i);
+
+    const stalePlan = await rpc("schema.plan", {
+      principal: host,
+      ddl: "CREATE TABLE stale_schema (id TEXT PRIMARY KEY NOT NULL)",
+    });
+    await applySchema("CREATE TABLE intervening_schema (id TEXT PRIMARY KEY NOT NULL)");
     await assertRpcRejects("schema.apply", {
       principal: host,
-      kind: "promote",
-      ddl: "CREATE TRIGGER forbidden AFTER INSERT ON schema_created BEGIN SELECT 1; END",
+      plan: stalePlan,
       approved: true,
-    }, /DDL is not allowed|exactly one/i);
+    }, /GUARD_SCHEMA_STALE|changed after planning/i);
+    assert.deepEqual(await queryRows(
+      "SELECT name FROM sqlite_schema WHERE name = 'stale_schema'",
+    ), []);
+
+    await applySchema([
+      "CREATE TABLE mixed_schema (id TEXT PRIMARY KEY NOT NULL)",
+      "DROP TABLE intervening_schema",
+    ]);
+    assert.deepEqual(await queryRows(
+      "SELECT name FROM sqlite_schema WHERE name IN ('intervening_schema', 'mixed_schema') ORDER BY name",
+    ), [{ name: "mixed_schema" }]);
+
+    const eventCountBeforeNoop = (await queryRows(
+      "SELECT COUNT(*) AS count FROM events WHERE type = 'workspace.schema.changed'",
+    ))[0].count;
+    const noopPlan = await rpc("schema.plan", {
+      principal: host,
+      ddl: "CREATE TABLE IF NOT EXISTS schema_created (id TEXT PRIMARY KEY NOT NULL, value TEXT)",
+    });
+    await rpc("schema.apply", { principal: host, plan: noopPlan, approved: true });
+    const eventCountAfterNoop = (await queryRows(
+      "SELECT COUNT(*) AS count FROM events WHERE type = 'workspace.schema.changed'",
+    ))[0].count;
+    assert.equal(eventCountAfterNoop, eventCountBeforeNoop);
   });
 
-  test("schema handles SQLite-owned objects and does not widen batch demotion", async () => {
-    await rpc("schema.apply", {
-      principal: host,
-      kind: "promote",
-      ddl: "CREATE TABLE auto_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)",
-      approved: true,
-    });
+  test("schema handles SQLite-owned objects and does not widen destructive batches", async () => {
+    await applySchema("CREATE TABLE auto_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)");
     await rpc("mutate", {
       principal: principal("app:auto", ["auto_rows"]),
       sql: "INSERT INTO auto_rows (value) VALUES (?)",
       params: ["captured"],
     });
-    await rpc("schema.apply", {
-      principal: host,
-      kind: "demote",
-      ddl: "DROP TABLE auto_rows",
-      approved: true,
-    });
+    await applySchema("DROP TABLE auto_rows");
     assert.deepEqual(await queryRows(
       "SELECT name FROM sqlite_master WHERE name = 'auto_rows'",
     ), []);
 
-    await rpc("schema.apply", {
-      principal: host,
-      kind: "demote",
-      ddl: "DROP TABLE drop_trigger_table",
-      approved: true,
-    });
+    await applySchema("DROP TABLE drop_trigger_table");
     assert.deepEqual(await queryRows(
       "SELECT name FROM sqlite_master WHERE name = 'drop_trigger_table'",
     ), []);
@@ -946,14 +967,12 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
       sql: "INSERT INTO demote_child (id, parent_id) VALUES (?, ?)",
       params: ["batch-child", "batch-parent"],
     });
-    await assertRpcRejects("schema.apply", {
+    await assertRpcRejects("schema.plan", {
       principal: host,
-      kind: "demote",
       ddl: [
         "DROP TABLE demote_parent",
         "DROP INDEX demote_child_parent_idx",
       ],
-      approved: true,
     }, /not authorized|authorization denied/i);
     assert.equal((await queryRows(
       "SELECT count(*) AS n FROM demote_child WHERE id = 'batch-child'",
@@ -1179,6 +1198,16 @@ function seedDataDb(path) {
 
 function principal(source, tableGrants, producerRef = TEST_PRODUCER_REF) {
   return { source, producerRef, tableGrants, schemaGrant: false };
+}
+
+async function applySchema(ddl, metadata = {}) {
+  const plan = await rpc("schema.plan", { principal: host, ddl });
+  return rpc("schema.apply", {
+    principal: host,
+    plan,
+    approved: true,
+    ...metadata,
+  });
 }
 
 async function rpc(method, params, options = {}) {

@@ -51,8 +51,6 @@ export interface GuardEventInput {
 export type GuardMutationResult = MutationResult;
 export type GuardTransactionStatementResult = TransactionStatementResult;
 
-export type GuardSchemaKind = "promote" | "demote";
-
 export interface GuardSchemaSnapshot {
   tables: Array<{
     name: string;
@@ -69,10 +67,13 @@ export interface GuardSchemaSnapshot {
 }
 
 export interface GuardSchemaPlan {
-  kind: GuardSchemaKind;
   ddl: string[];
   beforeSchema: GuardSchemaSnapshot;
+  afterSchema: GuardSchemaSnapshot;
 }
+
+export const SCHEMA_CHANGE_AUTHOR_MAX_CHARS = 200;
+export const SCHEMA_CHANGE_CONTEXT_MAX_CHARS = 2_000;
 
 export interface GuardRpcMethods {
   query: {
@@ -100,16 +101,16 @@ export interface GuardRpcMethods {
     result: GuardSchemaSnapshot;
   };
   "schema.plan": {
-    params: { principal: GuardPrincipal; kind: GuardSchemaKind; ddl: string | string[] };
+    params: { principal: GuardPrincipal; ddl: string | string[] };
     result: GuardSchemaPlan;
   };
   "schema.apply": {
     params: {
       principal: GuardPrincipal;
-      kind: GuardSchemaKind;
-      ddl: string | string[];
+      plan: GuardSchemaPlan;
       approved: true;
-      requestedBy?: string;
+      author?: string;
+      context?: string;
     };
     result: { ok: true };
   };

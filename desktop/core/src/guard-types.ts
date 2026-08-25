@@ -8,5 +8,3 @@ export interface EventInput {
   endedAt?: number;
   payload: JsonValue;
 }
-
-export type SchemaOp = "promote" | "demote";

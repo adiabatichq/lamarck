@@ -326,8 +326,8 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
     setWorkspaceState((current) => closeUseApp(current, appId));
   }, []);
 
-  const handleApproveSchema = useCallback(async (id: string, remember: boolean) => {
-    await approveSchemaRequest(id, remember);
+  const handleApproveSchema = useCallback(async (id: string) => {
+    await approveSchemaRequest(id);
     setSchemaRequest(null);
   }, []);
 

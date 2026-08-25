@@ -5,12 +5,12 @@ import { randomBytes } from "crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { openSystemDatabase } from "./db";
 import { ContentBlobStore } from "./blob-store";
-import type { SchemaOp } from "./guard-types";
 import {
   APP_GUARD_DEADLINE_MS,
   HOST_GUARD_DEADLINE_MS,
   RemoteGuard,
   type GuardStatement,
+  type SchemaSnapshot,
 } from "./remote-guard";
 import { D1ObserverState } from "./d1-observer-state";
 import { D1Observer } from "./d1-observer";
@@ -55,7 +55,11 @@ import {
   type AuthSecrets,
 } from "./auth";
 import type { JsonValue } from "./json";
-import type { GuardSqlParams } from "./guard-service/protocol";
+import {
+  SCHEMA_CHANGE_AUTHOR_MAX_CHARS,
+  SCHEMA_CHANGE_CONTEXT_MAX_CHARS,
+  type GuardSqlParams,
+} from "./guard-service/protocol";
 import { serve, type NodeWebSocket } from "./node-server";
 import { HttpStatusError, readJsonBody } from "./http-body";
 import {
@@ -265,12 +269,13 @@ await d1Observer.start();
 
 interface SchemaRequest {
   id: string;
-  kind: SchemaOp;
   ddl: string[];
-  requestedBy: string;
+  author?: string;
+  context?: string;
   createdAt: number;
-  beforeSchema: unknown;
-  status: "pending" | "applied" | "rejected" | "failed";
+  beforeSchema: SchemaSnapshot;
+  afterSchema: SchemaSnapshot;
+  status: "pending" | "applied" | "rejected" | "stale" | "failed";
   error?: string;
 }
 
@@ -433,28 +438,29 @@ function parseAppWorkload(workload: AppWorkload): AppWorkloadIdentity {
 }
 
 async function createSchemaRequest(
-  kind: SchemaOp,
   ddl: string | string[],
-  requestedBy: string,
+  metadata: { author?: string; context?: string },
   requestGuard: RemoteGuard = guard,
-): Promise<{ status: "pending" | "applied"; request?: SchemaRequest }> {
-  if ((await settings.get()).allowCodingAgentSchemaDecisions) {
-    if (kind === "promote") {
-      await requestGuard.promote(ddl, { approved: true, requestedBy });
-    } else {
-      await requestGuard.demote(ddl, { approved: true, requestedBy });
-    }
-    return { status: "applied" };
-  }
-
-  const plan = await requestGuard.schemaPlan(kind, ddl);
+): Promise<{ status: "pending"; request: SchemaRequest }> {
+  const author = normalizeSchemaChangeMetadata(
+    metadata.author,
+    SCHEMA_CHANGE_AUTHOR_MAX_CHARS,
+    "author",
+  );
+  const context = normalizeSchemaChangeMetadata(
+    metadata.context,
+    SCHEMA_CHANGE_CONTEXT_MAX_CHARS,
+    "context",
+  );
+  const plan = await requestGuard.schemaPlan(ddl);
   const request: SchemaRequest = {
     id: ulid(),
-    kind,
     ddl: plan.ddl,
-    requestedBy,
+    ...(author === undefined ? {} : { author }),
+    ...(context === undefined ? {} : { context }),
     createdAt: Date.now(),
     beforeSchema: plan.beforeSchema,
+    afterSchema: plan.afterSchema,
     status: "pending",
   };
   schemaRequests.set(request.id, request);
@@ -463,7 +469,6 @@ async function createSchemaRequest(
 
 async function approveSchemaRequest(
   id: string,
-  remember: boolean,
   requestGuard: RemoteGuard = guard,
 ): Promise<SchemaRequest> {
   const request = schemaRequests.get(id);
@@ -474,23 +479,18 @@ async function approveSchemaRequest(
 
   const operation = (async () => {
     try {
-      if (request.kind === "promote") {
-        await requestGuard.promote(request.ddl, { approved: true, requestedBy: request.requestedBy });
-      } else {
-        await requestGuard.demote(request.ddl, { approved: true, requestedBy: request.requestedBy });
-      }
+      await requestGuard.applySchemaPlan({
+        ddl: request.ddl,
+        beforeSchema: request.beforeSchema,
+        afterSchema: request.afterSchema,
+      }, {
+        approved: true,
+        author: request.author,
+        context: request.context,
+      });
       request.status = "applied";
-      if (remember) {
-        try {
-          await settings.update({ allowCodingAgentSchemaDecisions: true });
-        } catch (err) {
-          request.error = `Schema applied, but the approval preference was not saved: ${
-            err instanceof Error ? err.message : String(err)
-          }`;
-        }
-      }
     } catch (err) {
-      request.status = "failed";
+      request.status = errorCode(err) === "GUARD_SCHEMA_STALE" ? "stale" : "failed";
       request.error = err instanceof Error ? err.message : String(err);
     }
     return request;
@@ -501,6 +501,26 @@ async function approveSchemaRequest(
   } finally {
     schemaApprovals.delete(id);
   }
+}
+
+function normalizeSchemaChangeMetadata(
+  value: unknown,
+  maxChars: number,
+  label: "author" | "context",
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length > maxChars || /[\x00-\x1f\x7f]/.test(value)) {
+    throw new HttpStatusError(
+      400,
+      `Schema ${label} must be at most ${maxChars} characters and contain no control characters`,
+    );
+  }
+  return value;
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  return typeof error.code === "string" ? error.code : undefined;
 }
 
 function rejectSchemaRequest(id: string): SchemaRequest {
@@ -943,16 +963,30 @@ const server = await serve<{ cwd: string }>({
         return json(await guardForRequest(auth!, { signal: requestGuardSignal }).schemaInspect());
       }
 
-      const schemaRequestMatch = path.match(/^\/api\/schema\/(promote|demote)\/request$/);
-      if (schemaRequestMatch && method === "POST") {
+      if (path === "/api/schema/change/request" && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const kind = schemaRequestMatch[1] as SchemaOp;
-        const body = await readBody<{ ddl: string | string[]; requestedBy?: string }>(req);
-        const requestedBy = body.requestedBy ?? "coding-agent";
+        const body = await readJsonBody<Record<string, unknown>>(req, 300 * 1024);
+        assertAllowedRequestFields(body, ["ddl", "author", "context"]);
+        if (
+          typeof body.ddl !== "string"
+          && !(Array.isArray(body.ddl) && body.ddl.every((statement) => typeof statement === "string"))
+        ) {
+          throw new HttpStatusError(400, "schema change ddl must be a string or string array");
+        }
         const result = await createSchemaRequest(
-          kind,
           body.ddl,
-          requestedBy,
+          {
+            author: normalizeSchemaChangeMetadata(
+              body.author,
+              SCHEMA_CHANGE_AUTHOR_MAX_CHARS,
+              "author",
+            ),
+            context: normalizeSchemaChangeMetadata(
+              body.context,
+              SCHEMA_CHANGE_CONTEXT_MAX_CHARS,
+              "context",
+            ),
+          },
           guardForRequest(auth!, { signal: requestGuardSignal }),
         );
         return json(result);
@@ -974,10 +1008,10 @@ const server = await serve<{ cwd: string }>({
       const approveMatch = path.match(/^\/api\/schema\/requests\/([^/]+)\/approve$/);
       if (approveMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
-        const body = await readBody<{ remember?: boolean }>(req);
+        const body = await readJsonBody<Record<string, unknown>>(req, 1024);
+        assertAllowedRequestFields(body, []);
         const request = await approveSchemaRequest(
           decodeURIComponent(approveMatch[1]),
-          body.remember === true,
           guardForRequest(auth!, { signal: requestGuardSignal }),
         );
         return json({ request });

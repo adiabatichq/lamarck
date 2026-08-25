@@ -385,7 +385,6 @@ interface AppSettings {
 }
 
 interface WorkspaceSettings {
-  allowCodingAgentSchemaDecisions?: boolean;
   corePort?: number;
   vaultId?: string;
   vaultKeyVerifier?: string;

@@ -59,7 +59,7 @@ describe("greenfield data.db and system.db V1 schemas", () => {
       .toBe("d1645aa52007ac3412a9ddfe8aa11ec0bbc9f6bc6fa8506925b920edf5fe3105");
   });
 
-  test("D2 promotion and demotion do not change the data database version", () => {
+  test("D2 schema changes do not change the greenfield V1 data database version", () => {
     const guard = new GuardEngine({ workspacePath: workspace });
     const host = {
       source: "system:database-version-test",
@@ -67,17 +67,16 @@ describe("greenfield data.db and system.db V1 schemas", () => {
       tableGrants: "*" as const,
       schemaGrant: true,
     };
-    guard.schemaApply(
+    const createPlan = guard.schemaPlan(
       host,
-      "promote",
       "CREATE TABLE version_invariant (id TEXT PRIMARY KEY NOT NULL)",
-      true,
-      "database-version-test",
     );
+    guard.schemaApply(host, createPlan, true, "database-version-test");
     const afterPromotion = new DatabaseSync(dataPath());
     expect(readDatabaseVersion(afterPromotion, DATA_DB_FILENAME)).toBe(DATA_DATABASE_VERSION);
     afterPromotion.close();
-    guard.schemaApply(host, "demote", "DROP TABLE version_invariant", true, "database-version-test");
+    const dropPlan = guard.schemaPlan(host, "DROP TABLE version_invariant");
+    guard.schemaApply(host, dropPlan, true, "database-version-test");
     guard.close();
 
     const db = new DatabaseSync(dataPath());

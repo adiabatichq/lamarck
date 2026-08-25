@@ -1,9 +1,10 @@
 import type { JsonValue } from "./json";
-import type { EventInput, SchemaOp } from "./guard-types";
+import type { EventInput } from "./guard-types";
 import type {
   GuardMutationResult,
   GuardPrincipal,
   GuardSchemaPlan,
+  GuardSchemaSnapshot,
   GuardSqlParams,
   GuardStatement as RpcGuardStatement,
   GuardTransactionStatementResult,
@@ -28,11 +29,7 @@ export interface GuardStatement {
 
 export type GuardStatementResult = GuardMutationResult;
 
-export interface SchemaSnapshot {
-  tables: Array<{ name: string; sql: string; columns: unknown[] }>;
-  indexes: Array<{ name: string; table: string; sql: string | null }>;
-}
-
+export type SchemaSnapshot = GuardSchemaSnapshot;
 export type SchemaPlan = GuardSchemaPlan;
 
 interface RpcResponse<T> {
@@ -249,40 +246,30 @@ export class RemoteGuard {
     return this.call<string>("writeWorkspaceEvent", { principal: this.principal(), event });
   }
 
-  async schemaPlan(kind: SchemaOp, ddl: string | string[]): Promise<SchemaPlan> {
-    return this.call<SchemaPlan>("schema.plan", {
-      principal: this.principal(),
-      kind,
-      ddl,
-    });
-  }
-
   async schemaInspect(): Promise<SchemaSnapshot> {
     return this.call<SchemaSnapshot>("schema.inspect", {
       principal: this.principal(),
     });
   }
 
-  async promote(ddl: string | string[], opts?: { approved?: boolean; requestedBy?: string }): Promise<void> {
-    await this.applySchema("promote", ddl, opts);
+  async schemaPlan(ddl: string | string[]): Promise<SchemaPlan> {
+    return this.call<SchemaPlan>("schema.plan", {
+      principal: this.principal(),
+      ddl,
+    });
   }
 
-  async demote(ddl: string | string[], opts?: { approved?: boolean; requestedBy?: string }): Promise<void> {
-    await this.applySchema("demote", ddl, opts);
-  }
-
-  private async applySchema(
-    kind: SchemaOp,
-    ddl: string | string[],
-    opts?: { approved?: boolean; requestedBy?: string },
+  async applySchemaPlan(
+    plan: SchemaPlan,
+    opts?: { approved?: boolean; author?: string; context?: string },
   ): Promise<void> {
     await this.prepareProducer();
     await this.call("schema.apply", {
       principal: this.principal(),
-      kind,
-      ddl,
+      plan,
       approved: opts?.approved === true,
-      requestedBy: opts?.requestedBy,
+      author: opts?.author,
+      context: opts?.context,
     });
   }
 
@@ -312,4 +299,4 @@ function positiveDeadline(value: number): number {
   return value;
 }
 
-export type { EventInput, SchemaOp, JsonValue };
+export type { EventInput, JsonValue };

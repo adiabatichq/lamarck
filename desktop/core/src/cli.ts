@@ -20,22 +20,22 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (command === "promote" || command === "demote") {
-    const ddl = await readDdlArg(args);
-    if (!ddl.trim()) die(`${command} requires DDL`);
+  if (command === "schema") {
+    if (args[0] !== "change") die("schema requires the change command");
+    const change = await readSchemaChangeArgs(args.slice(1));
+    if (!change.ddl.trim()) die("schema change requires DDL");
     const result = await post<{
-      status: "pending" | "applied";
-      request?: { id: string; status: string };
-    }>(`/api/schema/${command}/request`, { ddl, requestedBy: "coding-agent" });
+      status: "pending";
+      request: { id: string; status: string };
+    }>("/api/schema/change/request", {
+      ddl: change.ddl,
+      ...(change.author === undefined ? {} : { author: change.author }),
+      ...(change.context === undefined ? {} : { context: change.context }),
+    });
 
-    if (result.status === "applied") {
-      console.log(`${command} applied`);
-      return;
-    }
-
-    const id = result.request?.id;
+    const id = result.request.id;
     if (!id) die("schema request returned without id");
-    console.log(`${command} pending approval: ${id}`);
+    console.log(`schema change pending approval: ${id}`);
     await waitForSchemaRequest(id);
     return;
   }
@@ -93,13 +93,43 @@ function quoteVfsWord(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-async function readDdlArg(args: string[]): Promise<string> {
-  if (args[0] === "--file" || args[0] === "-f") {
-    const file = args[1];
-    if (!file) die("--file requires a path");
-    return readFile(file, "utf8");
+async function readSchemaChangeArgs(args: string[]): Promise<{
+  ddl: string;
+  author?: string;
+  context?: string;
+}> {
+  let file: string | undefined;
+  let author: string | undefined;
+  let context: string | undefined;
+  const ddlParts: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--file" || arg === "-f") {
+      if (file !== undefined) die("schema change accepts only one --file");
+      file = args[++index];
+      if (file === undefined) die("--file requires a path");
+      continue;
+    }
+    if (arg === "--author") {
+      if (author !== undefined) die("schema change accepts only one --author");
+      author = args[++index];
+      if (author === undefined) die("--author requires a value");
+      continue;
+    }
+    if (arg === "--context") {
+      if (context !== undefined) die("schema change accepts only one --context");
+      context = args[++index];
+      if (context === undefined) die("--context requires a value");
+      continue;
+    }
+    if (arg.startsWith("-")) die(`unknown schema change option: ${arg}`);
+    ddlParts.push(arg);
   }
-  return args.join(" ");
+  if (file !== undefined && ddlParts.length > 0) {
+    die("schema change accepts either inline DDL or --file, not both");
+  }
+  const ddl = file === undefined ? ddlParts.join(" ") : await readFile(file, "utf8");
+  return { ddl, author, context };
 }
 
 async function waitForSchemaRequest(id: string): Promise<void> {
@@ -113,6 +143,9 @@ async function waitForSchemaRequest(id: string): Promise<void> {
     }
     if (result.request.status === "failed") {
       die(`schema request failed: ${result.request.error ?? id}`);
+    }
+    if (result.request.status === "stale") {
+      die(`schema request stale: ${result.request.error ?? id}`);
     }
     die(`schema request ${result.request.status}: ${id}`);
   }
@@ -154,10 +187,8 @@ async function readResponse<T>(res: Response): Promise<T> {
 function usage(): void {
   console.log(`Usage:
   lamarck query "<sql>"
-  lamarck promote "<ddl>"
-  lamarck promote --file schema.sql
-  lamarck demote "<ddl>"
-  lamarck demote --file cleanup.sql
+  lamarck schema change "<ddl>"
+  lamarck schema change --file schema.sql [--author name] [--context text]
   lamarck vfs [--author name] ls -R notes/
   lamarck vfs [--author name] tee -- notes/result.md
   lamarck vfs import <host-source> <d1-destination>

@@ -14,19 +14,20 @@ import { assertJsonValue, type JsonValue } from "../json";
 import { parseProducerRef } from "../producer-descriptor";
 import { foldSqliteIdentifier as normalizeName } from "../sqlite-identifiers";
 import { ulid } from "../utils/ulid";
-import type {
-  GuardEventInput,
-  GuardInteger,
-  GuardMutationResult,
-  GuardPrincipal,
-  GuardRpcMethod,
-  GuardSchemaKind,
-  GuardSchemaPlan,
-  GuardSchemaSnapshot,
-  GuardSqlParam,
-  GuardSqlParams,
-  GuardStatement,
-  GuardTransactionStatementResult,
+import {
+  SCHEMA_CHANGE_AUTHOR_MAX_CHARS,
+  SCHEMA_CHANGE_CONTEXT_MAX_CHARS,
+  type GuardEventInput,
+  type GuardInteger,
+  type GuardMutationResult,
+  type GuardPrincipal,
+  type GuardRpcMethod,
+  type GuardSchemaPlan,
+  type GuardSchemaSnapshot,
+  type GuardSqlParam,
+  type GuardSqlParams,
+  type GuardStatement,
+  type GuardTransactionStatementResult,
 } from "./protocol";
 
 export { DATA_DB_FILENAME };
@@ -89,7 +90,7 @@ interface MutatePolicy {
 
 interface SchemaPolicy {
   mode: "schema";
-  kind: GuardSchemaKind;
+  operation: SchemaChangeOperation;
   objects: Set<string>;
   tableObjects: Set<string>;
   indexTables: Set<string>;
@@ -130,6 +131,20 @@ interface SchemaTargets {
   objects: Set<string>;
   tableObjects: Set<string>;
   indexTables: Set<string>;
+}
+
+type SchemaChangeOperation =
+  | "create-table"
+  | "create-index"
+  | "alter-table-add-column"
+  | "drop-table"
+  | "drop-index";
+
+interface ParsedDdl {
+  operation: SchemaChangeOperation;
+  type: "table" | "index";
+  object: string;
+  table?: string;
 }
 
 export interface GuardEngineOptions {
@@ -452,6 +467,33 @@ export class GuardEngine {
     }
   }
 
+  schemaPlan(
+    principalInput: GuardPrincipal,
+    ddl: string | string[],
+  ): GuardSchemaPlan {
+    this.assertOpen();
+    const principal = normalizePrincipal(principalInput);
+    assertSchemaGrant(principal);
+    const statements = normalizeDdl(ddl);
+    const targets = this.collectSchemaTargets(statements);
+
+    this.beginImmediate();
+    try {
+      const beforeSchema = this.snapshotSchema();
+      for (const statement of statements) {
+        this.executeSchemaStatement(statement);
+      }
+      this.assertNoSystemForeignKeys(targets.tableObjects);
+      this.assertD2PrimaryKeys(targets.tableObjects);
+      const afterSchema = this.snapshotSchema();
+      this.rollback();
+      return { ddl: statements, beforeSchema, afterSchema };
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
   schemaInspect(principalInput: GuardPrincipal): GuardSchemaSnapshot {
     this.assertOpen();
     const principal = normalizePrincipal(principalInput);
@@ -459,59 +501,69 @@ export class GuardEngine {
     return this.snapshotSchema(true);
   }
 
-  schemaPlan(
-    principalInput: GuardPrincipal,
-    kind: GuardSchemaKind,
-    ddl: string | string[],
-  ): GuardSchemaPlan {
-    this.assertOpen();
-    const principal = normalizePrincipal(principalInput);
-    assertSchemaGrant(principal);
-    const statements = normalizeDdl(ddl, kind);
-    const targets = this.collectSchemaTargets(kind, statements);
-    this.dryRunSchema(kind, statements, targets);
-    return {
-      kind,
-      ddl: statements,
-      beforeSchema: this.snapshotSchema(),
-    };
-  }
-
   schemaApply(
     principalInput: GuardPrincipal,
-    kind: GuardSchemaKind,
-    ddl: string | string[],
+    plan: GuardSchemaPlan,
     approved: boolean,
-    requestedBy?: string,
+    author?: string,
+    context?: string,
   ): { ok: true } {
     this.assertOpen();
     const principal = normalizePrincipal(principalInput);
     assertSchemaGrant(principal);
     if (approved !== true) {
-      throw new GuardServiceError("GUARD_SCHEMA_APPROVAL", `Guard: ${kind} requires approval`);
+      throw new GuardServiceError("GUARD_SCHEMA_APPROVAL", "Guard: schema change requires approval");
     }
-    const statements = normalizeDdl(ddl, kind);
-    const targets = this.collectSchemaTargets(kind, statements);
-    this.dryRunSchema(kind, statements, targets);
+    const normalizedPlan = normalizeSchemaPlan(plan);
+    const statements = normalizeDdl(normalizedPlan.ddl);
+    const targets = this.collectSchemaTargets(statements);
+    const normalizedAuthor = normalizeSchemaChangeText(
+      author,
+      SCHEMA_CHANGE_AUTHOR_MAX_CHARS,
+      "author",
+    );
+    const normalizedContext = normalizeSchemaChangeText(
+      context,
+      SCHEMA_CHANGE_CONTEXT_MAX_CHARS,
+      "context",
+    );
 
-    const before = this.snapshotSchema();
     this.beginImmediate();
     try {
+      const before = this.snapshotSchema();
+      if (!schemaSnapshotsEqual(before, normalizedPlan.beforeSchema)) {
+        throw new GuardServiceError(
+          "GUARD_SCHEMA_STALE",
+          "Guard: schema changed after planning; create and approve a new request",
+        );
+      }
+      const schemaCookieBefore = this.readSchemaCookie();
       for (const statement of statements) {
-        this.executeSchemaStatement(kind, statement, targets);
+        this.executeSchemaStatement(statement);
       }
       this.assertNoSystemForeignKeys(targets.tableObjects);
+      this.assertD2PrimaryKeys(targets.tableObjects);
       const after = this.snapshotSchema();
+      if (!schemaSnapshotsEqual(after, normalizedPlan.afterSchema)) {
+        throw new GuardServiceError(
+          "GUARD_SCHEMA_PLAN_MISMATCH",
+          "Guard: applied schema does not match the approved plan",
+        );
+      }
+      const schemaChanged = this.readSchemaCookie() !== schemaCookieBefore;
       // Rebuild row capture while the schema transaction is still open. A new
       // or altered table that cannot be captured never becomes durable.
-      this.refreshCdcCapture(new Set([...targets.tableObjects, ...targets.indexTables]));
-      this.logD0(principal, kind === "promote" ? "ddl.promote" : "ddl.demote", {
-        ddl: statements,
-        before_schema: before,
-        after_schema: after,
-        requested_by: requestedBy ?? null,
-        schema_version: D0_SCHEMA_VERSION,
-      });
+      if (schemaChanged) {
+        this.refreshCdcCapture(new Set([...targets.tableObjects, ...targets.indexTables]));
+        this.logD0(principal, "workspace.schema.changed", {
+          ddl: statements,
+          before_schema: before,
+          after_schema: after,
+          ...(normalizedAuthor === undefined ? {} : { author: normalizedAuthor }),
+          ...(normalizedContext === undefined ? {} : { context: normalizedContext }),
+          schema_version: D0_SCHEMA_VERSION,
+        });
+      }
       this.commit();
     } catch (error) {
       this.rollback();
@@ -555,18 +607,19 @@ export class GuardEngine {
       case "schema.plan":
         return this.schemaPlan(
           params.principal as GuardPrincipal,
-          requireSchemaKind(params.kind),
           requireDdl(params.ddl),
         );
       case "schema.apply":
         return this.schemaApply(
           params.principal as GuardPrincipal,
-          requireSchemaKind(params.kind),
-          requireDdl(params.ddl),
+          requireSchemaPlan(params.plan),
           params.approved === true,
-          params.requestedBy === undefined
+          params.author === undefined
             ? undefined
-            : requireString(params.requestedBy, "params.requestedBy"),
+            : requireStringValue(params.author, "params.author"),
+          params.context === undefined
+            ? undefined
+            : requireStringValue(params.context, "params.context"),
         );
       default:
         throw new GuardServiceError("GUARD_METHOD_NOT_FOUND", `Unknown Guard RPC method: ${method}`);
@@ -953,7 +1006,13 @@ export class GuardEngine {
         tables: tables.map((table) => ({
           name: table.name,
           sql: table.sql,
-          columns: this.getTableColumnsInternal(table.name).map(({ hidden: _hidden, ...column }) => column),
+          columns: this.getTableColumnsInternal(table.name).map((column) => ({
+            name: column.name,
+            type: column.type,
+            notnull: column.notnull,
+            dflt_value: column.dflt_value,
+            pk: column.pk,
+          })),
         })),
         indexes: indexes.map((index) => ({
           name: index.name,
@@ -964,16 +1023,23 @@ export class GuardEngine {
     });
   }
 
-  private collectSchemaTargets(kind: GuardSchemaKind, statements: string[]): SchemaTargets {
+  private readSchemaCookie(): number {
+    return this.withPolicy({ mode: "internal" }, () => {
+      const row = this.db.prepare("PRAGMA schema_version").get() as { schema_version: number };
+      return row.schema_version;
+    });
+  }
+
+  private collectSchemaTargets(statements: string[]): SchemaTargets {
     const objects = new Set<string>();
     const tableObjects = new Set<string>();
     const indexTables = new Set<string>();
     for (const statement of statements) {
-      const parsed = parseDdl(kind, statement);
+      const parsed = parseDdl(statement);
       objects.add(normalizeName(parsed.object));
       if (parsed.table) indexTables.add(normalizeName(parsed.table));
       if (parsed.type === "table") tableObjects.add(normalizeName(parsed.object));
-      if (parsed.type === "index" && kind === "demote") {
+      if (parsed.operation === "drop-index") {
         const row = this.withPolicy({ mode: "internal" }, () =>
           this.db.prepare(
             "SELECT tbl_name FROM main.sqlite_schema WHERE type = 'index' AND lower(name) = lower(?)",
@@ -993,34 +1059,12 @@ export class GuardEngine {
     return { objects, tableObjects, indexTables };
   }
 
-  private dryRunSchema(
-    kind: GuardSchemaKind,
-    statements: string[],
-    targets: SchemaTargets,
-  ): void {
-    this.beginImmediate();
-    try {
-      for (const statement of statements) {
-        this.executeSchemaStatement(kind, statement, targets);
-      }
-      this.assertNoSystemForeignKeys(targets.tableObjects);
-      if (kind === "promote") this.assertD2PrimaryKeys(targets.tableObjects);
-      this.rollback();
-    } catch (error) {
-      this.rollback();
-      throw error;
-    }
-  }
-
-  private executeSchemaStatement(
-    kind: GuardSchemaKind,
-    statement: string,
-    targets: SchemaTargets,
-  ): void {
+  private executeSchemaStatement(statement: string): void {
+    const targets = this.collectSchemaTargets([statement]);
     this.withPolicy(
       {
         mode: "schema",
-        kind,
+        operation: parseDdl(statement).operation,
         objects: targets.objects,
         tableObjects: targets.tableObjects,
         indexTables: targets.indexTables,
@@ -1135,7 +1179,7 @@ export class GuardEngine {
       const table = normalizeName(arg1 ?? "");
       if (
         policy.mode === "schema" &&
-        policy.kind === "demote" &&
+        policy.operation === "drop-table" &&
         dbName === "temp" &&
         table === "sqlite_temp_master"
       ) {
@@ -1391,7 +1435,7 @@ function authorizeSchema(
 ): number {
   if (dbName === "temp") {
     if (
-      policy.kind === "demote" &&
+      policy.operation === "drop-table" &&
       action === constants.SQLITE_DROP_TEMP_TRIGGER &&
       arg1?.startsWith(CDC_TRIGGER_PREFIX) &&
       arg2 &&
@@ -1401,7 +1445,7 @@ function authorizeSchema(
       return constants.SQLITE_OK;
     }
     if (
-      policy.kind === "demote" &&
+      policy.operation === "drop-table" &&
       dmlOpForAction(action) !== null &&
       normalizeName(arg1 ?? "") === "sqlite_temp_master" &&
       policy.tableObjects.size > 0
@@ -1412,13 +1456,13 @@ function authorizeSchema(
   }
   if (dbName !== null && dbName !== "main") return constants.SQLITE_DENY;
   if (action === constants.SQLITE_REINDEX && arg1) {
-    return policy.kind === "promote" && policy.objects.has(normalizeName(arg1))
+    return isAdditiveSchemaOperation(policy.operation) && policy.objects.has(normalizeName(arg1))
       ? constants.SQLITE_OK
       : constants.SQLITE_DENY;
   }
   if (
     action === constants.SQLITE_DROP_TRIGGER &&
-    policy.kind === "demote" &&
+    policy.operation === "drop-table" &&
     arg2 &&
     policy.tableObjects.has(normalizeName(arg2))
   ) {
@@ -1436,6 +1480,7 @@ function authorizeSchema(
       action === constants.SQLITE_CREATE_INDEX &&
       arg1?.startsWith("sqlite_autoindex_") &&
       arg2 &&
+      policy.operation === "create-table" &&
       policy.tableObjects.has(normalizeName(arg2))
     ) {
       // PRIMARY KEY / UNIQUE constraints create an engine-owned implicit
@@ -1447,7 +1492,7 @@ function authorizeSchema(
     if (
       action === constants.SQLITE_CREATE_TABLE &&
       normalizeName(name) === "sqlite_sequence" &&
-      policy.kind === "promote" &&
+      policy.operation === "create-table" &&
       policy.tableObjects.size > 0
     ) {
       // SQLite creates this engine-owned table for an approved AUTOINCREMENT
@@ -1455,8 +1500,7 @@ function authorizeSchema(
       return constants.SQLITE_OK;
     }
     if (isSystemTable(name)) return constants.SQLITE_DENY;
-    if (policy.kind === "promote" && !createActions.has(action)) return constants.SQLITE_DENY;
-    if (policy.kind === "demote" && !dropActions.has(action)) return constants.SQLITE_DENY;
+    if (!schemaOperationAllowsAction(policy.operation, action)) return constants.SQLITE_DENY;
     const normalizedName = normalizeName(name);
     if (action === constants.SQLITE_CREATE_TABLE || action === constants.SQLITE_ALTER_TABLE || action === constants.SQLITE_DROP_TABLE) {
       return policy.tableObjects.has(normalizedName) ? constants.SQLITE_OK : constants.SQLITE_DENY;
@@ -1473,19 +1517,33 @@ function authorizeSchema(
     if (table === "sqlite_master" || table === "sqlite_schema") return constants.SQLITE_OK;
     if (
       table === "sqlite_sequence" &&
-      policy.kind === "demote" &&
+      policy.operation === "drop-table" &&
       policy.tableObjects.size > 0
     ) {
       return constants.SQLITE_OK;
     }
-    // CREATE TABLE AS SELECT would insert data without D2 row audit, so promote
-    // never permits target-table DML. DROP TABLE's implicit delete is allowed,
-    // but cascades into any non-target table still fail closed.
-    return policy.kind === "demote" && policy.tableObjects.has(table)
+    // CREATE TABLE AS SELECT would insert data without D2 row audit, so schema
+    // creation never permits target-table DML. DROP TABLE's implicit delete is
+    // allowed, but cascades into any non-target table still fail closed.
+    return policy.operation === "drop-table" && policy.tableObjects.has(table)
       ? constants.SQLITE_OK
       : constants.SQLITE_DENY;
   }
   return constants.SQLITE_DENY;
+}
+
+function isAdditiveSchemaOperation(operation: SchemaChangeOperation): boolean {
+  return operation === "create-table"
+    || operation === "create-index"
+    || operation === "alter-table-add-column";
+}
+
+function schemaOperationAllowsAction(operation: SchemaChangeOperation, action: number): boolean {
+  if (operation === "create-table") return action === constants.SQLITE_CREATE_TABLE;
+  if (operation === "create-index") return action === constants.SQLITE_CREATE_INDEX;
+  if (operation === "alter-table-add-column") return action === constants.SQLITE_ALTER_TABLE;
+  if (operation === "drop-table") return action === constants.SQLITE_DROP_TABLE;
+  return action === constants.SQLITE_DROP_INDEX;
 }
 
 function dmlOpForAction(action: number): DmlOp | null {
@@ -1650,60 +1708,65 @@ function assertEventTypeAllowed(source: string, type: string): void {
   }
 }
 
-function normalizeDdl(ddl: string | string[], kind: GuardSchemaKind): string[] {
-  if (kind !== "promote" && kind !== "demote") {
-    throw new GuardServiceError("GUARD_SCHEMA_KIND", "Guard: invalid schema lifecycle kind");
-  }
+function normalizeDdl(ddl: string | string[]): string[] {
   const raw = Array.isArray(ddl) ? ddl : splitStatements(ddl);
-  const statements = raw.map((statement, index) => singleStatement(statement, `${kind}[${index}]`));
+  const statements = raw.map((statement, index) =>
+    singleStatement(statement, `schema change[${index}]`));
   if (statements.length === 0) {
-    throw new GuardServiceError("GUARD_SCHEMA_EMPTY", `Guard: ${kind} requires at least one DDL statement`);
+    throw new GuardServiceError(
+      "GUARD_SCHEMA_EMPTY",
+      "Guard: schema change requires at least one DDL statement",
+    );
   }
-  for (const statement of statements) parseDdl(kind, statement);
+  for (const statement of statements) parseDdl(statement);
   return statements;
 }
 
 const IDENTIFIER = `(?:"(?:[^"]|"")+"|\`(?:[^\`]|\`\`)+\`|\\[[^\\]]+\\]|[A-Za-z_][A-Za-z0-9_]*)`;
 
-function parseDdl(
-  kind: GuardSchemaKind,
-  statement: string,
-): { type: "table" | "index"; object: string; table?: string } {
-  const patterns = kind === "promote"
-    ? [
-        {
-          type: "table" as const,
-          regex: new RegExp(
-            `^\\s*CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(${IDENTIFIER})(?=\\s*\\()`,
-            "i",
-          ),
-        },
-        {
-          type: "index" as const,
-          regex: new RegExp(
-            `^\\s*CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(${IDENTIFIER})\\s+ON\\s+(${IDENTIFIER})(?=\\s*\\()`,
-            "i",
-          ),
-        },
-        {
-          type: "table" as const,
-          regex: new RegExp(`^\\s*ALTER\\s+TABLE\\s+(${IDENTIFIER})\\s+ADD\\s+COLUMN\\b`, "i"),
-        },
-      ]
-    : [
-        {
-          type: "table" as const,
-          regex: new RegExp(`^\\s*DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(${IDENTIFIER})\\s*$`, "i"),
-        },
-        {
-          type: "index" as const,
-          regex: new RegExp(`^\\s*DROP\\s+INDEX\\s+(?:IF\\s+EXISTS\\s+)?(${IDENTIFIER})\\s*$`, "i"),
-        },
-      ];
+function parseDdl(statement: string): ParsedDdl {
+  const patterns: Array<{
+    operation: SchemaChangeOperation;
+    type: "table" | "index";
+    regex: RegExp;
+  }> = [
+    {
+      operation: "create-table",
+      type: "table",
+      regex: new RegExp(
+        `^\\s*CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(${IDENTIFIER})(?=\\s*\\()`,
+        "i",
+      ),
+    },
+    {
+      operation: "create-index",
+      type: "index",
+      regex: new RegExp(
+        `^\\s*CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(${IDENTIFIER})\\s+ON\\s+(${IDENTIFIER})(?=\\s*\\()`,
+        "i",
+      ),
+    },
+    {
+      operation: "alter-table-add-column",
+      type: "table",
+      regex: new RegExp(`^\\s*ALTER\\s+TABLE\\s+(${IDENTIFIER})\\s+ADD\\s+COLUMN\\b`, "i"),
+    },
+    {
+      operation: "drop-table",
+      type: "table",
+      regex: new RegExp(`^\\s*DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(${IDENTIFIER})\\s*$`, "i"),
+    },
+    {
+      operation: "drop-index",
+      type: "index",
+      regex: new RegExp(`^\\s*DROP\\s+INDEX\\s+(?:IF\\s+EXISTS\\s+)?(${IDENTIFIER})\\s*$`, "i"),
+    },
+  ];
   for (const pattern of patterns) {
     const match = statement.match(pattern.regex);
     if (!match) continue;
     return {
+      operation: pattern.operation,
       type: pattern.type,
       object: unquoteIdentifier(match[1]),
       table: match[2] ? unquoteIdentifier(match[2]) : undefined,
@@ -1711,7 +1774,7 @@ function parseDdl(
   }
   throw new GuardServiceError(
     "GUARD_SCHEMA_SQL",
-    `Guard: ${kind} DDL is not allowed: ${statement.slice(0, 80)}`,
+    `Guard: schema-change DDL is not allowed: ${statement.slice(0, 80)}`,
   );
 }
 
@@ -1847,9 +1910,94 @@ function requireString(value: unknown, label: string): string {
   return value;
 }
 
-function requireSchemaKind(value: unknown): GuardSchemaKind {
-  if (value === "promote" || value === "demote") return value;
-  throw new GuardServiceError("GUARD_SCHEMA_KIND", "Guard: schema kind must be promote or demote");
+function requireStringValue(value: unknown, label: string): string {
+  if (typeof value !== "string") {
+    throw new GuardServiceError("GUARD_INVALID_REQUEST", `Guard: ${label} must be a string`);
+  }
+  return value;
+}
+
+function requireSchemaPlan(value: unknown): GuardSchemaPlan {
+  return normalizeSchemaPlan(value as GuardSchemaPlan);
+}
+
+function normalizeSchemaPlan(value: GuardSchemaPlan): GuardSchemaPlan {
+  const raw = requireObject(value, "schema plan");
+  if (!Array.isArray(raw.ddl) || !raw.ddl.every((statement) => typeof statement === "string")) {
+    throw new GuardServiceError("GUARD_SCHEMA_SQL", "Guard: schema plan ddl must be a string array");
+  }
+  return {
+    ddl: [...raw.ddl],
+    beforeSchema: normalizeSchemaSnapshot(raw.beforeSchema, "schema plan beforeSchema"),
+    afterSchema: normalizeSchemaSnapshot(raw.afterSchema, "schema plan afterSchema"),
+  };
+}
+
+function normalizeSchemaSnapshot(value: unknown, label: string): GuardSchemaSnapshot {
+  const raw = requireObject(value, label);
+  if (!Array.isArray(raw.tables) || !Array.isArray(raw.indexes)) {
+    throw new GuardServiceError("GUARD_INVALID_REQUEST", `Guard: ${label} is invalid`);
+  }
+  const tables = raw.tables.map((value, tableIndex) => {
+    const table = requireObject(value, `${label}.tables[${tableIndex}]`);
+    if (typeof table.name !== "string" || typeof table.sql !== "string" || !Array.isArray(table.columns)) {
+      throw new GuardServiceError("GUARD_INVALID_REQUEST", `Guard: ${label}.tables[${tableIndex}] is invalid`);
+    }
+    const columns = table.columns.map((value, columnIndex) => {
+      const column = requireObject(value, `${label}.tables[${tableIndex}].columns[${columnIndex}]`);
+      if (
+        typeof column.name !== "string"
+        || typeof column.type !== "string"
+        || !Number.isSafeInteger(column.notnull)
+        || !Number.isSafeInteger(column.pk)
+        || !Object.hasOwn(column, "dflt_value")
+      ) {
+        throw new GuardServiceError(
+          "GUARD_INVALID_REQUEST",
+          `Guard: ${label}.tables[${tableIndex}].columns[${columnIndex}] is invalid`,
+        );
+      }
+      return {
+        name: column.name,
+        type: column.type,
+        notnull: column.notnull as number,
+        dflt_value: column.dflt_value,
+        pk: column.pk as number,
+      };
+    });
+    return { name: table.name, sql: table.sql, columns };
+  });
+  const indexes = raw.indexes.map((value, index) => {
+    const item = requireObject(value, `${label}.indexes[${index}]`);
+    if (
+      typeof item.name !== "string"
+      || typeof item.table !== "string"
+      || (item.sql !== null && typeof item.sql !== "string")
+    ) {
+      throw new GuardServiceError("GUARD_INVALID_REQUEST", `Guard: ${label}.indexes[${index}] is invalid`);
+    }
+    return { name: item.name, table: item.table, sql: item.sql as string | null };
+  });
+  return { tables, indexes };
+}
+
+function schemaSnapshotsEqual(left: GuardSchemaSnapshot, right: GuardSchemaSnapshot): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function normalizeSchemaChangeText(
+  value: string | undefined,
+  maxChars: number,
+  label: "author" | "context",
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length > maxChars || /[\x00-\x1f\x7f]/.test(value)) {
+    throw new GuardServiceError(
+      "GUARD_SCHEMA_METADATA",
+      `Guard: schema ${label} must be at most ${maxChars} characters and contain no control characters`,
+    );
+  }
+  return value;
 }
 
 function requireDdl(value: unknown): string | string[] {

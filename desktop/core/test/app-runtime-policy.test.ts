@@ -74,6 +74,7 @@ describe("App runtime policy", () => {
       ["/api/apps/app-a/archive", "POST"],
       ["/api/app-runtime/channels", "POST"],
       ["/api/schema/inspect", "GET"],
+      ["/api/schema/change/request", "POST"],
       ["/api/schema/requests/x/approve", "POST"],
       ["/api/connectors", "GET"],
       ["/api/terminal", "GET"],

@@ -686,12 +686,13 @@ export function removeConnector(connectorId: string): Promise<{ ok: true; remove
 
 export interface SchemaRequest {
   id: string;
-  kind: "promote" | "demote";
   ddl: string[];
-  requestedBy: string;
+  author?: string;
+  context?: string;
   createdAt: number;
-  beforeSchema: unknown;
-  status: "pending" | "applied" | "rejected" | "failed";
+  beforeSchema: DataSchemaSnapshot;
+  afterSchema: DataSchemaSnapshot;
+  status: "pending" | "applied" | "rejected" | "stale" | "failed";
   error?: string;
 }
 
@@ -701,11 +702,10 @@ export function listSchemaRequests(): Promise<{ requests: SchemaRequest[] }> {
 
 export function approveSchemaRequest(
   id: string,
-  remember = false,
 ): Promise<{ request: SchemaRequest }> {
   return request(`/api/schema/requests/${encodeURIComponent(id)}/approve`, {
     method: "POST",
-    body: JSON.stringify({ remember }),
+    body: JSON.stringify({}),
   });
 }
 
