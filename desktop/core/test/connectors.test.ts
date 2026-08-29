@@ -7234,6 +7234,123 @@ auth:
     });
   });
 
+  test("telegram-bot watch recovers when a sleeping network drops long polling", async () => {
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { runWatch } = await import(telegramUrl) as {
+      runWatch(context: unknown, deps?: unknown): Promise<void>;
+    };
+
+    const controller = new AbortController();
+    let syncState: any;
+    let updateCalls = 0;
+    const retryDelays: number[] = [];
+    const warningSets: any[] = [];
+    const warnings = new Map<string, any>();
+    const context = {
+      auth: {
+        type: "apiKey",
+        async getToken() {
+          return "telegram-token";
+        },
+      },
+      state: {
+        async get() {
+          return syncState;
+        },
+        async set(next: unknown) {
+          syncState = next;
+        },
+      },
+      warnings: {
+        async set(warning: any) {
+          warningSets.push(warning);
+          warnings.set(warning.key, warning);
+        },
+        async clear(key: string) {
+          warnings.delete(key);
+        },
+      },
+      config: {},
+      signal: controller.signal,
+    };
+    const fetchImpl = async (url: string) => {
+      if (String(url).endsWith("/getMe")) {
+        return Response.json({
+          ok: true,
+          result: { id: 42, username: "lamarck_test_bot", first_name: "Lamarck Test" },
+        });
+      }
+      updateCalls += 1;
+      if (updateCalls === 1) throw new TypeError("fetch failed");
+      controller.abort();
+      return Response.json({ ok: true, result: [] });
+    };
+
+    await runWatch(context, {
+      connectOnceDeps: { fetchImpl, now: () => 1000 },
+      syncOnceDeps: { fetchImpl, now: () => 2000 },
+      async waitImpl(ms: number) {
+        retryDelays.push(ms);
+      },
+    });
+
+    expect(updateCalls).toBe(2);
+    expect(retryDelays).toEqual([1000]);
+    expect(warningSets).toContainEqual({
+      key: "telegram-api",
+      message: "fetch failed",
+      details: { retryInMs: 1000 },
+    });
+    expect(warnings.size).toBe(0);
+    expect(syncState).toMatchObject({
+      connection: { status: "connected", checkedAt: 1000 },
+      setup: { lastCheckedAt: 2000 },
+    });
+  });
+
+  test("telegram-bot watch keeps permanent authentication failures terminal", async () => {
+    const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
+    const { runWatch } = await import(telegramUrl) as {
+      runWatch(context: unknown, deps?: unknown): Promise<void>;
+    };
+
+    let waits = 0;
+    const context = {
+      auth: {
+        type: "apiKey",
+        async getToken() {
+          return "invalid-token";
+        },
+      },
+      state: {
+        async get() {
+          return undefined;
+        },
+        async set() {},
+      },
+      warnings: {
+        async set() {},
+        async clear() {},
+      },
+      config: {},
+      signal: new AbortController().signal,
+    };
+
+    await expect(runWatch(context, {
+      connectOnceDeps: {
+        fetchImpl: async () => Response.json({
+          ok: false,
+          error_code: 401,
+          description: "Unauthorized",
+        }, { status: 401 }),
+      },
+      async waitImpl() {
+        waits += 1;
+      },
+    })).rejects.toThrow("Unauthorized");
+    expect(waits).toBe(0);
+  });
+
   test("telegram-bot captures inbound messages as raw-first events", async () => {
     const telegramUrl = new URL("../../../connectors/telegram-bot/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(telegramUrl) as {

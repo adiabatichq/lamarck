@@ -22,14 +22,12 @@ const UPDATE_TYPES = [
   "guest_message",
 ];
 const PAIRING_CODE_TTL_MS = 10 * 60 * 1000;
+const RETRY_INITIAL_MS = 1_000;
+const RETRY_MAX_MS = 60_000;
 
 export default {
   async run(context) {
-    await connectOnce(context);
-
-    while (!context.signal.aborted) {
-      await syncOnce(context);
-    }
+    await runWatch(context);
   },
 
   async configUi(context) {
@@ -40,6 +38,30 @@ export default {
     return resolveSourceIdentity(context);
   },
 };
+
+export async function runWatch(context, deps = {}) {
+  const waitImpl = deps.waitImpl ?? waitForRetry;
+  let connected = false;
+  let retryMs = RETRY_INITIAL_MS;
+
+  while (!context.signal.aborted) {
+    try {
+      if (!connected) {
+        await connectOnce(context, deps.connectOnceDeps);
+        connected = true;
+      }
+      await syncOnce(context, deps.syncOnceDeps);
+      retryMs = RETRY_INITIAL_MS;
+    } catch (err) {
+      if (context.signal.aborted) return;
+      if (!isRetryableTelegramError(err)) throw err;
+
+      await recordTelegramWarning(context, err, { retryInMs: retryMs });
+      await waitImpl(retryMs, context.signal);
+      retryMs = Math.min(retryMs * 2, RETRY_MAX_MS);
+    }
+  }
+}
 
 export async function resolveSourceIdentity(context, deps = {}) {
   assertApiKeyAuth(context.auth);
@@ -426,7 +448,7 @@ class TelegramApiError extends Error {
   }
 }
 
-async function recordTelegramWarning(context, err) {
+async function recordTelegramWarning(context, err, retry = {}) {
   if (!context.warnings?.set) return;
   const details = err instanceof TelegramApiError ? err.details : {};
   const code = details?.code;
@@ -440,7 +462,36 @@ async function recordTelegramWarning(context, err) {
       code,
       status: details?.status,
       method: details?.method,
+      retryInMs: retry.retryInMs,
     }),
+  });
+}
+
+function isRetryableTelegramError(err) {
+  if (err instanceof TelegramApiError) {
+    const status = Number(err.details?.status);
+    const code = Number(err.details?.code);
+    return code === 409
+      || code === 429
+      || status === 408
+      || status === 425
+      || status === 429
+      || status >= 500;
+  }
+  return err instanceof TypeError && err.message === "fetch failed";
+}
+
+function waitForRetry(ms, signal) {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    timer = setTimeout(finish, ms);
+    signal.addEventListener("abort", finish, { once: true });
   });
 }
 
