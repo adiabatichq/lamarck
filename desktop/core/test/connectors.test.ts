@@ -8192,7 +8192,15 @@ auth:
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
 
-    let syncState: unknown;
+    const dailyActivityOffsets = {
+      "2026-01-01": "+00:00",
+      "2026-01-02": "+00:00",
+    };
+    let syncState: unknown = {
+      version: 2,
+      incremental: { streams: {} },
+      dailyActivityOffsets,
+    };
     let score = 90;
     const events: any[] = [];
     const requests: URL[] = [];
@@ -8251,7 +8259,7 @@ auth:
     expect(events[0]).toMatchObject({
       type: "oura.daily_sleep",
       externalId: expect.stringMatching(/^daily_sleep:sleep-doc-1:[a-f0-9]{16}$/),
-      startedAt: Date.UTC(2026, 0, 2, 8),
+      startedAt: Date.UTC(2026, 0, 1, 18),
       payload: {
         schema: "oura.daily_sleep.v1",
         provider: "oura",
@@ -8274,6 +8282,7 @@ auth:
         },
       },
       backfill: undefined,
+      dailyActivityOffsets,
     });
     expect(requests[0].origin).toBe("https://dev-api.example.test");
     expect(requests[0].pathname).toBe("/providers/oura/v1/streams/daily_sleep");
@@ -8296,7 +8305,25 @@ auth:
       syncOnce(context: unknown, deps?: unknown): Promise<void>;
     };
 
-    let syncState: unknown;
+    const dailyActivityOffsets = Object.fromEntries([
+      "2025-01-02",
+      "2025-01-03",
+      "2025-04-02",
+      "2025-04-03",
+      "2025-07-01",
+      "2025-07-02",
+      "2025-09-29",
+      "2025-09-30",
+      "2025-12-28",
+      "2025-12-29",
+      "2026-01-01",
+      "2026-01-02",
+    ].map((day) => [day, "+00:00"]));
+    let syncState: unknown = {
+      version: 2,
+      incremental: { streams: {} },
+      dailyActivityOffsets,
+    };
     const events: any[] = [];
     const requests: URL[] = [];
     const context = {
@@ -8378,6 +8405,7 @@ auth:
         },
         done: true,
       },
+      dailyActivityOffsets,
     });
 
     await syncOnce(context, { fetchImpl, now });
