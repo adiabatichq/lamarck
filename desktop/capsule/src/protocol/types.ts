@@ -6,6 +6,7 @@ export type GuestArchitecture = "arm64" | "x64";
 export type WorkloadKind = "ui" | "service" | "job";
 export type StreamKind =
   | "sdk"
+  | "cli"
   | "viewer"
   | "package-in"
   | "dependency-in"
@@ -95,6 +96,7 @@ export interface WorkloadPrepareBody {
   cwd: string;
   environment: Record<string, string>;
   sdkTicket: string;
+  cliTicket: string;
   logsTicket?: string;
   uiPort?: number;
 }

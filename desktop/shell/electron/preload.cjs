@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld("lamarckHost", {
   setAppViewerBounds: (viewerId, bounds) => ipcRenderer.send("app-viewer:bounds", { viewerId, bounds }),
   closeAppViewer: (viewerId) => ipcRenderer.invoke("app-viewer:close", viewerId),
   reloadAppRuntime: (appId) => ipcRenderer.invoke("app-runtime:reload", appId),
+  getAppRuntimeStates: () => ipcRenderer.invoke("app-runtime:states"),
   archiveApp: (appId) => ipcRenderer.invoke("app-runtime:archive", appId),
   createTerminal: () => ipcRenderer.invoke("terminal:create"),
   writeTerminal: (id, data) => ipcRenderer.send("terminal:input", { id, data }),

@@ -5,9 +5,12 @@ export const CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE = 8;
 
 export interface CapsuleUiSpec {
   appId: string;
-  /** Exact Core authority snapshot which must match manifest.json in packageDir. */
-  manifestGeneration: number;
+  /** Exact Core activation authority which must match every launch input. */
+  activationId: string;
+  activationSequence: number;
+  version: string;
   manifestDigest: AppManifestDigest;
+  packageDigest: `sha256:${string}`;
   packageDir: string;
   command: string[];
   port: number;

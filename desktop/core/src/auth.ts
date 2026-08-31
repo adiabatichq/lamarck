@@ -16,8 +16,9 @@ export type AppWorkload =
 export type HostAuthContext = Readonly<{ kind: "host" }>;
 
 export type AppAuthorizationSnapshot = Readonly<{
-  manifestGeneration: number;
+  activationId: string;
   manifestDigest: AppManifestDigest;
+  packageDigest: `sha256:${string}`;
   /** Host-resolved exact App activation commit; never accepted from App traffic. */
   appCommit: string;
   writeTables: readonly string[];
@@ -41,8 +42,10 @@ export interface AuthSecrets {
 export type IssuedAppCapability = Readonly<{
   capability: string;
   channelId: string;
-  manifestGeneration: number;
+  activationId: string;
+  appCommit: string;
   manifestDigest: AppManifestDigest;
+  packageDigest: `sha256:${string}`;
 }>;
 
 interface StoredChannel {
@@ -63,6 +66,7 @@ export type AuthAdmission = Readonly<{
 }>;
 
 const RAW_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const ACTIVATION_ID_PATTERN = /^activation_[A-Za-z0-9_-]{32}$/;
 const HOST_CONTEXT: HostAuthContext = Object.freeze({ kind: "host" });
 const HOST_SIGNAL = new AbortController().signal;
 const HOST_ADMISSION: AuthAdmission = Object.freeze({
@@ -83,7 +87,6 @@ export class AppCapabilityRegistry {
   #channelsByDigest = new Map<string, StoredChannel>();
   #channelsById = new Map<string, StoredChannel>();
   #channelDeletedListeners = new Set<(channelId: string) => void>();
-  #invalidManifestGeneration = 0;
 
   get size(): number {
     return this.#channelsByDigest.size;
@@ -105,11 +108,6 @@ export class AppCapabilityRegistry {
   ): IssuedAppCapability {
     validateAppIdentity(appId, workload);
     const frozenAuthorization = freezeAuthorizationSnapshot(authorization);
-    if (frozenAuthorization.manifestGeneration <= this.#invalidManifestGeneration) {
-      throw new Error(
-        `App manifest generation ${frozenAuthorization.manifestGeneration} is no longer active`,
-      );
-    }
 
     let capability: string;
     let digest: string;
@@ -145,8 +143,10 @@ export class AppCapabilityRegistry {
     return Object.freeze({
       capability,
       channelId,
-      manifestGeneration: frozenAuthorization.manifestGeneration,
+      activationId: frozenAuthorization.activationId,
+      appCommit: frozenAuthorization.appCommit,
       manifestDigest: frozenAuthorization.manifestDigest,
+      packageDigest: frozenAuthorization.packageDigest,
     });
   }
 
@@ -184,31 +184,6 @@ export class AppCapabilityRegistry {
   async revokeApp(appId: string): Promise<number> {
     const channels = [...this.#channelsById.values()].filter(
       ({ context }) => context.appId === appId,
-    );
-    let newlyClosed = 0;
-    for (const channel of channels) {
-      if (this.#close(channel)) newlyClosed++;
-    }
-    await Promise.all(channels.map((channel) => this.#drain(channel)));
-    for (const channel of channels) this.#deleteDrained(channel);
-    return newlyClosed;
-  }
-
-  /**
-   * Atomically retires a manifest generation before waiting for its requests.
-   * Calls to issue() for that generation fail closed even while drain is in
-   * progress, preventing a reload/issuance race from reviving old authority.
-   */
-  async invalidateManifestGeneration(manifestGeneration: number): Promise<number> {
-    if (!Number.isSafeInteger(manifestGeneration) || manifestGeneration < 1) {
-      throw new Error("manifestGeneration must be a positive safe integer");
-    }
-    this.#invalidManifestGeneration = Math.max(
-      this.#invalidManifestGeneration,
-      manifestGeneration,
-    );
-    const channels = [...this.#channelsById.values()].filter(
-      ({ context }) => context.authorization.manifestGeneration <= manifestGeneration,
     );
     let newlyClosed = 0;
     for (const channel of channels) {
@@ -301,14 +276,14 @@ function validateAppIdentity(appId: string, workload: AppWorkload): void {
 function freezeAuthorizationSnapshot(
   authorization: AppAuthorizationSnapshot,
 ): AppAuthorizationSnapshot {
-  if (
-    !Number.isSafeInteger(authorization.manifestGeneration)
-    || authorization.manifestGeneration < 1
-  ) {
-    throw new Error("manifestGeneration must be a positive safe integer");
+  if (!ACTIVATION_ID_PATTERN.test(authorization.activationId)) {
+    throw new Error("activationId must name a Host-prepared App activation");
   }
   if (!APP_MANIFEST_DIGEST_PATTERN.test(authorization.manifestDigest)) {
     throw new Error("manifestDigest must be a canonical sha256 digest");
+  }
+  if (!APP_MANIFEST_DIGEST_PATTERN.test(authorization.packageDigest)) {
+    throw new Error("packageDigest must be a canonical sha256 digest");
   }
   if (
     !Array.isArray(authorization.writeTables)
@@ -319,8 +294,9 @@ function freezeAuthorizationSnapshot(
     throw new Error("App authorization grants must be string arrays");
   }
   return Object.freeze({
-    manifestGeneration: authorization.manifestGeneration,
+    activationId: authorization.activationId,
     manifestDigest: authorization.manifestDigest,
+    packageDigest: authorization.packageDigest,
     appCommit: validateFullGitCommit(authorization.appCommit, "App authorization commit"),
     writeTables: Object.freeze([...authorization.writeTables]),
     fileGrants: Object.freeze([...authorization.fileGrants]),

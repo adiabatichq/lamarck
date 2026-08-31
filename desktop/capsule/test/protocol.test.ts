@@ -498,6 +498,7 @@ function workloadPrepareRequest() {
       cwd: "/app",
       environment: { NODE_ENV: "production" },
       sdkTicket: SDK_TICKET,
+      cliTicket: "C".repeat(43),
       uiPort: 3_000,
     },
   };

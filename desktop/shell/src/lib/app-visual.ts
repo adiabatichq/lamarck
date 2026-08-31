@@ -12,7 +12,7 @@ const APP_ACCENTS = [
 ] as const;
 
 export function isUiApp(app: AppInfo): boolean {
-  return Boolean(app.runtime.ui);
+  return Boolean(app.runtime?.ui);
 }
 
 export function appAccent(appId: string): string {
@@ -33,9 +33,9 @@ export function appInitials(name: string): string {
 
 export function appWorkloads(app: AppInfo): string[] {
   const workloads: string[] = [];
-  if (app.runtime.ui) workloads.push("UI");
-  const serviceCount = Object.keys(app.runtime.services ?? {}).length;
-  const jobCount = Object.keys(app.runtime.jobs ?? {}).length;
+  if (app.runtime?.ui) workloads.push("UI");
+  const serviceCount = Object.keys(app.runtime?.services ?? {}).length;
+  const jobCount = Object.keys(app.runtime?.jobs ?? {}).length;
   if (serviceCount > 0) workloads.push(`${serviceCount} service${serviceCount === 1 ? "" : "s"}`);
   if (jobCount > 0) workloads.push(`${jobCount} job${jobCount === 1 ? "" : "s"}`);
   return workloads;

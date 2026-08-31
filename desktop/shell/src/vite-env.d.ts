@@ -93,6 +93,11 @@ interface Window {
     ): void;
     closeAppViewer(viewerId: string): Promise<{ ok: true }>;
     reloadAppRuntime(appId: string): Promise<{ active: boolean }>;
+    getAppRuntimeStates(): Promise<Array<{
+      appId: string;
+      runningWorkloads: number;
+      latestFailure: string | null;
+    }>>;
     archiveApp(appId: string): Promise<{ ok: true; id: string }>;
     createTerminal(): Promise<{ id: string }>;
     writeTerminal(id: string, data: string): void;

@@ -7,7 +7,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, test } from "vitest";
 import { instantiateMarketplaceApp } from "../src/marketplace/app-instantiation";
 
 async function fixture() {
@@ -37,7 +37,7 @@ describe("Marketplace App instantiation", () => {
       appsDir: apps,
       packageId: "lamarck.notes",
       releaseId: "release-1",
-      initializeGit: async (dir) => await mkdir(join(dir, ".git")),
+      initializeRepository: async (dir) => await mkdir(join(dir, ".git")),
     });
     expect(result.id).toBe("lamarck.notes");
     expect(result.manifest.createdFrom).toEqual({
@@ -63,7 +63,7 @@ describe("Marketplace App instantiation", () => {
       packageId: "lamarck.notes",
       releaseId: "release-2",
       localId: "my-notes",
-      initializeGit: async (dir) => await mkdir(join(dir, ".git")),
+      initializeRepository: async (dir) => await mkdir(join(dir, ".git")),
     });
     expect(result.id).toBe("my-notes");
     expect(result.manifest.id).toBe("my-notes");
@@ -78,23 +78,20 @@ describe("Marketplace App instantiation", () => {
       appsDir: apps,
       packageId: "lamarck.notes",
       releaseId: "release-1",
-      initializeGit: async () => {},
+      initializeRepository: async () => {},
     })).rejects.toMatchObject({ code: "EEXIST" });
   });
 
-  test("keeps Git initialization best-effort", async () => {
+  test("rolls back when repository initialization fails", async () => {
     const { source, apps } = await fixture();
-    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const result = await instantiateMarketplaceApp({
+    await expect(instantiateMarketplaceApp({
       verifiedSourceDir: source,
       appsDir: apps,
       packageId: "lamarck.notes",
       releaseId: "release-1",
-      initializeGit: async () => { throw new Error("git unavailable"); },
-    });
+      initializeRepository: async () => { throw new Error("repository unavailable"); },
+    })).rejects.toThrow("repository unavailable");
 
-    expect(result.id).toBe("lamarck.notes");
-    expect(warning).toHaveBeenCalledOnce();
-    warning.mockRestore();
+    await expect(stat(join(apps, "lamarck.notes"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

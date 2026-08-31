@@ -18,6 +18,10 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  appPackagePortablePathKey,
+  validateAppPackagePath,
+} from "../../../core/src/apps/package-tree";
+import {
   normalizeCapsuleStorageError,
   type CapsuleStorageBudgetLike,
   type CapsuleStorageReservation,
@@ -63,7 +67,10 @@ export interface CapsuleTreeSnapshot {
   createReadStream(): ReturnType<typeof createReadStream>;
 }
 
-export type CapsulePackageSnapshot = CapsuleTreeSnapshot;
+export interface CapsulePackageSnapshot extends CapsuleTreeSnapshot {
+  /** Canonical logical App package identity shared with Core versioning. */
+  readonly packageDigest: `sha256:${string}`;
+}
 
 interface CapsuleSnapshotWriterDependencies {
   removeTemporary(path: string): Promise<void>;
@@ -117,9 +124,9 @@ export async function createCapsulePackageSnapshot(options: {
     canonical: canonicalRoot,
   });
   const entries = await collectEntries(packageDir, canonicalRoot, packageInfo);
-  return writeCapsuleTreeSnapshot(entries, canonicalCache, async () => {
+  return await writeCapsuleTreeSnapshot(entries, canonicalCache, async () => {
     await assertTreeStable(packageDir, packageInfo, entries);
-  }, storageOptions(options), snapshotWriter(options.snapshotWriter));
+  }, storageOptions(options), snapshotWriter(options.snapshotWriter), true) as CapsulePackageSnapshot;
 }
 
 /**
@@ -295,7 +302,8 @@ async function writeCapsuleTreeSnapshot(
     scope: "package-snapshot" | "dependency-cache";
   },
   writer: CapsuleSnapshotWriterDependencies = DEFAULT_SNAPSHOT_WRITER_DEPENDENCIES,
-): Promise<CapsuleTreeSnapshot> {
+  logicalPackage = false,
+): Promise<CapsuleTreeSnapshot | CapsulePackageSnapshot> {
   const expectedBytes = encodedTreeBytes(entries);
   let reservation: CapsuleStorageReservation | undefined;
   if (storage) {
@@ -321,6 +329,9 @@ async function writeCapsuleTreeSnapshot(
     throw normalizeCapsuleStorageError(error, "Capsule package snapshot storage is full");
   }
   const hash = createHash("sha256");
+  const packageHash = logicalPackage
+    ? createHash("sha256").update(Buffer.from("lamarck-app-package-v1\0", "utf8"))
+    : undefined;
   let bytes = 0;
 
   const append = async (chunk: Uint8Array) => {
@@ -337,11 +348,19 @@ async function writeCapsuleTreeSnapshot(
       await append(encodeHeader(entry));
       await append(entry.pathBytes);
       if (entry.type !== TYPE_FILE) continue;
+      if (packageHash) {
+        const packageHeader = Buffer.alloc(17);
+        packageHeader.writeUInt8(1, 0);
+        packageHeader.writeBigUInt64BE(BigInt(entry.pathBytes.byteLength), 1);
+        packageHeader.writeBigUInt64BE(BigInt(entry.size), 9);
+        packageHash.update(packageHeader).update(entry.pathBytes);
+      }
       let contentBytes = 0;
       await streamEntryContent(entry, async (chunk) => {
         if (!(chunk instanceof Uint8Array)) throw new Error(`Tree file emitted non-byte content: ${entry.path}`);
         contentBytes += chunk.byteLength;
         if (contentBytes > entry.size) throw contentSizeError(entry);
+        packageHash?.update(chunk);
         await append(chunk);
       });
       if (contentBytes !== entry.size) throw contentSizeError(entry);
@@ -469,6 +488,9 @@ async function writeCapsuleTreeSnapshot(
       return Object.freeze({
         format: CAPSULE_TREE_FORMAT,
         digest: `sha256:${hex}` as const,
+        ...(packageHash === undefined
+          ? {}
+          : { packageDigest: `sha256:${packageHash.digest("hex")}` as const }),
         bytes,
         entries: entries.length,
         path: finalPath,
@@ -692,6 +714,7 @@ async function collectEntries(
 ): Promise<SnapshotEntry[]> {
   const entries: SnapshotEntry[] = [];
   const seenPaths = new Set<string>();
+  const portablePaths = new Map<string, string>();
 
   const visit = async (
     absoluteDirectory: string,
@@ -702,15 +725,24 @@ async function collectEntries(
     const children = await readdir(absoluteDirectory, { withFileTypes: true });
     children.sort((left, right) => compareUtf8(left.name.normalize("NFC"), right.name.normalize("NFC")));
     for (const child of children) {
-      if (EXCLUDED_NAMES.has(child.name)) continue;
+      if (relativeDirectory === "" && EXCLUDED_NAMES.has(child.name)) continue;
       const normalizedName = child.name.normalize("NFC");
       if (normalizedName !== child.name) {
         throw new Error(`Package path is not NFC-normalized: ${child.name}`);
       }
       const entryPath = relativeDirectory ? `${relativeDirectory}/${normalizedName}` : normalizedName;
+      // Version admission and Capsule runtime packaging share the exact Core
+      // projection path/exclusion contract.
+      validateAppPackagePath(entryPath);
       validateRelativePath(entryPath);
       if (seenPaths.has(entryPath)) throw new Error(`Duplicate normalized package path: ${entryPath}`);
       seenPaths.add(entryPath);
+      const portableKey = appPackagePortablePathKey(entryPath);
+      const collision = portablePaths.get(portableKey);
+      if (collision !== undefined) {
+        throw new Error(`Package paths collide on a portable filesystem: ${collision}, ${entryPath}`);
+      }
+      portablePaths.set(portableKey, entryPath);
 
       const absolutePath = join(absoluteDirectory, child.name);
       const info = await lstat(absolutePath, { bigint: true });

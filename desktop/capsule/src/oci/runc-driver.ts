@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { accessSync, constants, createWriteStream } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chown, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { PassThrough } from "node:stream";
 import {
@@ -37,6 +37,7 @@ interface ActiveExecution {
   cgroupPath: string;
   bundlePath: string;
   sdkBridge: WorkloadSdkBridge;
+  appEditRoot: string;
   stopPromise?: Promise<void>;
   deletePromise?: Promise<void>;
 }
@@ -121,6 +122,13 @@ export class LinuxRuncDriver implements RuncDriver {
     await mkdir(this.runcRoot, { recursive: true, mode: 0o700 });
     await rm(plan.bundlePath, { recursive: true, force: true });
     await mkdir(plan.bundlePath, { recursive: true, mode: 0o700 });
+    await rm(plan.appEditRoot, { recursive: true, force: true });
+    await mkdir(plan.appEditRoot, { recursive: true, mode: 0o700 });
+    await chown(
+      plan.appEditRoot,
+      request.expectedIdentity.mappedHostUid + 1_000,
+      request.expectedIdentity.mappedHostGid + 1_000,
+    );
     await writeFile(
       `${plan.bundlePath}/config.json`,
       `${JSON.stringify(plan.config)}\n`,
@@ -135,11 +143,19 @@ export class LinuxRuncDriver implements RuncDriver {
         uid: request.expectedIdentity.mappedHostUid + 1_000,
         gid: request.expectedIdentity.mappedHostGid + 1_000,
         upstream: request.sdkChannel.source,
+        appCli: {
+          socketPath: plan.cliSocketHostPath,
+          upstream: request.cliChannel.source,
+          editRoot: plan.appEditRoot,
+          lowerRoot: "/mnt/lamarck-apps-lower",
+        },
       });
       sdkBridge.assertOpen();
     } catch (error) {
       request.sdkChannel.source.destroy();
+      request.cliChannel.source.destroy();
       await rm(plan.bundlePath, { recursive: true, force: true });
+      await rm(plan.appEditRoot, { recursive: true, force: true });
       throw error;
     }
 
@@ -205,6 +221,7 @@ export class LinuxRuncDriver implements RuncDriver {
       cgroupPath,
       bundlePath: plan.bundlePath,
       sdkBridge,
+      appEditRoot: plan.appEditRoot,
     };
     active.exit = waitForChild(child).then(
       async (exit) => {
@@ -424,6 +441,7 @@ export class LinuxRuncDriver implements RuncDriver {
       // Retain the active handle and bundle as quarantine evidence until both
       // the cgroup proof and exact runc-state deletion have succeeded.
       await rm(active.bundlePath, { recursive: true, force: true });
+      await rm(active.appEditRoot, { recursive: true, force: true });
       this.active.delete(containerId);
       this.rememberRetired(containerId);
     })();

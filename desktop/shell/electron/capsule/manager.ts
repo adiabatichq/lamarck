@@ -1,4 +1,3 @@
-import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { Duplex } from "node:stream";
 import type {
@@ -15,22 +14,30 @@ import { PACKAGE_ID_PATTERN } from "../package-id";
 
 const STOP_ALL_QUIESCENCE_TIMEOUT_MS = 20_000;
 
-interface AppInfo {
-  id: string;
-  manifestGeneration: number;
+interface PreparedActivation {
+  schemaVersion: 1;
+  activationId: string;
+  activationSequence: number;
+  appId: string;
+  workload: "ui";
+  version: string;
   manifestDigest: AppManifestDigest;
-  runtime: {
-    ui?: { command: string[]; port: number };
-    services?: Record<string, { command: string[] }>;
-    jobs?: Record<string, { command: string[] }>;
+  packageDigest: `sha256:${string}`;
+  immutablePackagePath: string;
+  manifest: {
+    runtime: {
+      ui?: { command: string[]; port: number };
+    };
   };
 }
 
 interface IssuedCapability {
   capability: string;
   channelId: string;
-  manifestGeneration: number;
+  activationId: string;
+  appCommit: string;
   manifestDigest: AppManifestDigest;
+  packageDigest: `sha256:${string}`;
 }
 
 export interface OpenedAppViewer {
@@ -99,6 +106,12 @@ export type PublishReloadedViewer = (
 export interface ReloadedApp {
   readonly active: boolean;
   readonly browserBindings: readonly ReloadedBrowserBinding[];
+}
+
+export interface AppRuntimeAggregate {
+  readonly appId: string;
+  readonly runningWorkloads: number;
+  readonly latestFailure: string | null;
 }
 
 interface StoredViewer extends OpenedAppViewer {
@@ -177,7 +190,6 @@ export interface CapsuleManagerOptions {
  */
 export class CapsuleManager {
   readonly #backend: CapsuleBackend;
-  readonly #workspacePath: () => string;
   readonly #coreBaseUrl: () => string;
   readonly #coreToken: string;
   readonly #fetch: typeof globalThis.fetch;
@@ -193,6 +205,7 @@ export class CapsuleManager {
   readonly #stopOperations = new Map<string, Promise<void>>();
   readonly #retireOperations = new Map<string, Promise<void>>();
   readonly #unexpectedUiLossOperations = new Set<Promise<void>>();
+  readonly #latestFailureByApp = new Map<string, string>();
   readonly #stoppingApps = new Set<string>();
   #stoppingAll = false;
   #stopAllOperation: Promise<void> | null = null;
@@ -203,7 +216,6 @@ export class CapsuleManager {
 
   constructor(options: CapsuleManagerOptions) {
     this.#backend = options.backend;
-    this.#workspacePath = options.workspacePath;
     this.#coreBaseUrl = options.coreBaseUrl;
     this.#coreToken = options.coreToken;
     this.#fetch = options.fetch ?? globalThis.fetch;
@@ -231,6 +243,17 @@ export class CapsuleManager {
       });
     }
     return this.#backend.status();
+  }
+
+  appRuntimeStates(): readonly AppRuntimeAggregate[] {
+    const appIds = new Set<string>(this.#latestFailureByApp.keys());
+    for (const viewer of this.#viewers.values()) appIds.add(viewer.appId);
+    return Object.freeze([...appIds].sort().map((appId) => Object.freeze({
+      appId,
+      runningWorkloads: [...this.#viewers.values()]
+        .filter((viewer) => viewer.appId === appId).length,
+      latestFailure: this.#latestFailureByApp.get(appId) ?? null,
+    })));
   }
 
   async openViewer(
@@ -277,7 +300,12 @@ export class CapsuleManager {
       verifyPreparedViewer,
     ).then(resolveOpening, rejectOpening);
     try {
-      return await operation;
+      const viewer = await operation;
+      this.#latestFailureByApp.delete(appId);
+      return viewer;
+    } catch (error) {
+      if (!isExpectedCancellation(error)) this.#recordFailure(appId, error);
+      throw error;
     } finally {
       if (this.#openingOperations.get(appId) === tracked) {
         this.#openingOperations.delete(appId);
@@ -300,11 +328,12 @@ export class CapsuleManager {
       throw new Error(message);
     }
 
-    const app = await this.#loadApp(appId);
+    const activation = await this.#prepareActivation(appId);
+    try {
     this.#assertOpeningCurrent(opening, generation);
-    this.#assertSupportedRuntime(app);
-    if (!app.runtime.ui) throw new Error(`App "${appId}" does not declare a UI workload`);
-    const runtimeIssued = await this.#issueCapability(appId, "ui", app);
+    const ui = activation.manifest.runtime.ui;
+    if (!ui) throw new Error(`App "${appId}" does not declare a UI workload`);
+    const runtimeIssued = await this.#issueCapability(activation);
     try {
       this.#assertOpeningCurrent(opening, generation);
     } catch (error) {
@@ -338,18 +367,21 @@ export class CapsuleManager {
       this.#assertPendingUiCurrent(pending, "launch");
       const prepared = await this.#backend.prepareUi({
         appId,
-        manifestGeneration: app.manifestGeneration,
-        manifestDigest: app.manifestDigest,
-        packageDir: join(this.#workspacePath(), "apps", appId),
-        command: [...app.runtime.ui.command],
-        port: app.runtime.ui.port,
+        activationId: activation.activationId,
+        activationSequence: activation.activationSequence,
+        version: activation.version,
+        manifestDigest: activation.manifestDigest,
+        packageDigest: activation.packageDigest,
+        packageDir: activation.immutablePackagePath,
+        command: [...ui.command],
+        port: ui.port,
         sdkSenderId: runtimeSenderId,
       });
       pending.preparationId = prepared.preparationId;
       pending.instanceId = prepared.instanceId;
       this.#assertPendingUiCurrent(pending, "launch");
 
-      const browserIssued = await this.#issueCapability(appId, "ui", app);
+      const browserIssued = await this.#issueCapability(activation);
       pending.browserIssued = browserIssued;
       this.#assertPendingUiCurrent(pending, "launch");
 
@@ -380,6 +412,9 @@ export class CapsuleManager {
       return viewer;
     } catch (error) {
       return await this.#failPendingUiOperation(pending, error);
+    }
+    } finally {
+      await this.#releaseActivation(activation.activationId).catch(() => {});
     }
   }
 
@@ -525,7 +560,12 @@ export class CapsuleManager {
     );
     this.#rebuildOperations.set(appId, operation);
     try {
-      return await operation;
+      const result = await operation;
+      if (result.active) this.#latestFailureByApp.delete(appId);
+      return result;
+    } catch (error) {
+      if (!isExpectedCancellation(error)) this.#recordFailure(appId, error);
+      throw error;
     } finally {
       if (this.#rebuildOperations.get(appId) === operation) {
         this.#rebuildOperations.delete(appId);
@@ -539,16 +579,17 @@ export class CapsuleManager {
     verifyPreparedViewer: VerifyPreparedViewer,
     publishReloadedViewer: PublishReloadedViewer,
   ): Promise<ReloadedApp> {
-    const app = await this.#loadApp(viewer.appId);
+    const activation = await this.#prepareActivation(viewer.appId);
+    try {
     this.#assertViewerCurrent(viewer, generation, "reload");
-    this.#assertSupportedRuntime(app);
-    if (!app.runtime.ui) throw new Error(`App "${viewer.appId}" does not declare a UI workload`);
-    const runtimeIssued = await this.#issueCapability(viewer.appId, "ui", app);
+    const ui = activation.manifest.runtime.ui;
+    if (!ui) throw new Error(`App "${viewer.appId}" does not declare a UI workload`);
+    const runtimeIssued = await this.#issueCapability(activation);
     if (generation !== this.#generation || this.#viewers.get(viewer.viewerId) !== viewer) {
       await this.#revokeCapability(runtimeIssued.channelId).catch(() => {});
       throw new Error("App Capsule reload was cancelled");
     }
-    const browserIssued = await this.#issueCapability(viewer.appId, "ui", app).catch(async (error) => {
+    const browserIssued = await this.#issueCapability(activation).catch(async (error) => {
       await this.#revokeCapability(runtimeIssued.channelId).catch(() => {});
       throw error;
     });
@@ -591,11 +632,14 @@ export class CapsuleManager {
       this.#assertPendingUiCurrent(pending, "reload");
       const prepared = await this.#backend.prepareUi({
         appId: viewer.appId,
-        manifestGeneration: app.manifestGeneration,
-        manifestDigest: app.manifestDigest,
-        packageDir: join(this.#workspacePath(), "apps", viewer.appId),
-        command: [...app.runtime.ui.command],
-        port: app.runtime.ui.port,
+        activationId: activation.activationId,
+        activationSequence: activation.activationSequence,
+        version: activation.version,
+        manifestDigest: activation.manifestDigest,
+        packageDigest: activation.packageDigest,
+        packageDir: activation.immutablePackagePath,
+        command: [...ui.command],
+        port: ui.port,
         sdkSenderId: runtimeSenderId,
       }, viewer.instanceId);
       pending.preparationId = prepared.preparationId;
@@ -676,6 +720,9 @@ export class CapsuleManager {
         pending,
         error,
       );
+    }
+    } finally {
+      await this.#releaseActivation(activation.activationId).catch(() => {});
     }
   }
 
@@ -936,6 +983,7 @@ export class CapsuleManager {
       );
     }
     const remaining = [...this.#viewers.values()];
+    for (const viewer of remaining) this.#recordFailure(viewer.appId, causes[0]);
     this.#viewers.clear();
     for (const viewer of remaining) this.#unbindSystemSender(viewer.runtimeSenderId);
     try {
@@ -963,6 +1011,7 @@ export class CapsuleManager {
   }
 
   #handleUnexpectedUiLoss(event: CapsuleUiLostEvent): void {
+    this.#recordFailure(event.appId, event.error);
     const pending = this.#pendingUiOperations.get(event.appId);
     if (pending) {
       if (
@@ -997,6 +1046,17 @@ export class CapsuleManager {
       });
     this.#unexpectedUiLossOperations.add(settlement);
     void settlement.catch(() => {});
+  }
+
+  #recordFailure(appId: string, error: unknown): void {
+    if (
+      error instanceof AppControlPlaneError
+      && (error.code === "APP_PACKAGE_INVALID" || error.code === "APP_VERSION_HISTORY_UNAVAILABLE")
+    ) return;
+    this.#latestFailureByApp.set(
+      appId,
+      error instanceof Error ? error.message : String(error),
+    );
   }
 
   #beginPendingUiOperation(
@@ -1350,59 +1410,59 @@ export class CapsuleManager {
     await this.#collapseBackendBoundary([cause, ...failures]);
   }
 
-  #assertSupportedRuntime(app: AppInfo): void {
-    const services = Object.keys(app.runtime.services ?? {});
-    const jobs = Object.keys(app.runtime.jobs ?? {});
-    if (services.length === 0 && jobs.length === 0) return;
-    const declarations = [
-      ...(services.length > 0 ? [`services (${services.join(", ")})`] : []),
-      ...(jobs.length > 0 ? [`jobs (${jobs.join(", ")})`] : []),
-    ].join(" and ");
-    throw new Error(
-      `App "${app.id}" declares ${declarations}, but this Host only supports UI workloads`,
+  async #prepareActivation(appId: string): Promise<PreparedActivation> {
+    const response = await this.#hostRequest(
+      `/api/apps/${encodeURIComponent(appId)}/activation/prepare`,
+      { method: "POST", body: JSON.stringify({ workload: "ui" }) },
     );
-  }
-
-  async #loadApp(appId: string): Promise<AppInfo> {
-    const response = await this.#hostRequest("/api/apps");
-    const body = await response.json() as { apps?: AppInfo[] };
-    const app = body.apps?.find((candidate) => candidate.id === appId);
-    if (!app) throw new Error(`App not found: ${appId}`);
+    const body = await response.json() as { activation?: Partial<PreparedActivation> };
+    const activation = body.activation;
     if (
-      !Number.isSafeInteger(app.manifestGeneration)
-      || app.manifestGeneration < 1
-      || !APP_MANIFEST_DIGEST_PATTERN.test(app.manifestDigest)
+      activation?.schemaVersion !== 1
+      || activation.appId !== appId
+      || activation.workload !== "ui"
+      || !/^activation_[A-Za-z0-9_-]{32}$/.test(activation.activationId ?? "")
+      || !Number.isSafeInteger(activation.activationSequence)
+      || (activation.activationSequence ?? 0) < 1
+      || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(activation.version ?? "")
+      || !APP_MANIFEST_DIGEST_PATTERN.test(activation.manifestDigest ?? "")
+      || !APP_MANIFEST_DIGEST_PATTERN.test(activation.packageDigest ?? "")
+      || typeof activation.immutablePackagePath !== "string"
+      || !activation.manifest
+      || typeof activation.manifest !== "object"
     ) {
-      throw new Error("Core returned invalid App manifest authority");
+      throw new Error("Core returned an invalid App activation record");
     }
-    return app;
+    return activation as PreparedActivation;
   }
 
-  async #issueCapability(
-    appId: string,
-    workload: "ui",
-    authority: Pick<AppInfo, "manifestGeneration" | "manifestDigest">,
-  ): Promise<IssuedCapability> {
+  async #issueCapability(activation: PreparedActivation): Promise<IssuedCapability> {
     const response = await this.#hostRequest("/api/app-runtime/channels", {
       method: "POST",
       body: JSON.stringify({
-        appId,
-        workload,
-        manifestGeneration: authority.manifestGeneration,
-        manifestDigest: authority.manifestDigest,
+        appId: activation.appId,
+        workload: activation.workload,
+        activationId: activation.activationId,
       }),
     });
     const issued = await response.json() as Partial<IssuedCapability>;
     if (
       typeof issued.capability !== "string"
       || typeof issued.channelId !== "string"
-      || issued.manifestGeneration !== authority.manifestGeneration
-      || issued.manifestDigest !== authority.manifestDigest
-      || !APP_MANIFEST_DIGEST_PATTERN.test(issued.manifestDigest)
+      || issued.activationId !== activation.activationId
+      || issued.appCommit !== activation.version
+      || issued.manifestDigest !== activation.manifestDigest
+      || issued.packageDigest !== activation.packageDigest
     ) {
-      throw new Error("Core returned a capability for a different App manifest authority");
+      throw new Error("Core returned a capability for a different App activation");
     }
     return issued as IssuedCapability;
+  }
+
+  async #releaseActivation(activationId: string): Promise<void> {
+    await this.#hostRequest(`/api/apps/activation/${encodeURIComponent(activationId)}`, {
+      method: "DELETE",
+    });
   }
 
   async #revokeCapability(channelId: string): Promise<void> {
@@ -1432,8 +1492,27 @@ export class CapsuleManager {
       controlPlane,
     );
     if (response.ok) return response;
-    const body = await response.json().catch(() => ({})) as { error?: string };
-    throw new Error(body.error ?? `Core returned HTTP ${response.status}`);
+    const body = await response.json().catch(() => ({})) as {
+      error?: string | { code?: unknown; message?: unknown };
+    };
+    const message = typeof body.error === "string"
+      ? body.error
+      : body.error && typeof body.error.message === "string"
+        ? body.error.message
+        : `Core returned HTTP ${response.status}`;
+    throw new AppControlPlaneError(
+      body.error && typeof body.error === "object" && typeof body.error.code === "string"
+        ? body.error.code
+        : "APP_CONTROL_PLANE_ERROR",
+      message,
+    );
+  }
+}
+
+class AppControlPlaneError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = "AppControlPlaneError";
   }
 }
 
@@ -1467,6 +1546,12 @@ function sameViewerOwner(left: AppViewerOwner, right: AppViewerOwner): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : error === undefined ? "" : String(error);
+}
+
+function isExpectedCancellation(error: unknown): boolean {
+  if (error instanceof ControlPlaneLostError) return true;
+  const message = errorMessage(error).toLowerCase();
+  return message.includes("cancelled") || message.includes("is stopping");
 }
 
 async function withAbortSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {

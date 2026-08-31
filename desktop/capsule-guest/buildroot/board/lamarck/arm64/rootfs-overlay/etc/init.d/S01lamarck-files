@@ -4,6 +4,8 @@ set -eu
 
 tag=lamarck-files
 mountpoint=/mnt/lamarck-files
+apps_tag=lamarck-app-versions
+apps_mountpoint=/mnt/lamarck-apps-lower
 
 start() {
 	[ -d "$mountpoint" ] && [ ! -L "$mountpoint" ] || {
@@ -11,16 +13,28 @@ start() {
 		return 1
 	}
 	mount -t virtiofs -o ro,nosuid,nodev,noexec "$tag" "$mountpoint"
+	[ -d "$apps_mountpoint" ] && [ ! -L "$apps_mountpoint" ] || {
+		echo "Lamarck App-version mountpoint is missing from the read-only Guest image" >&2
+		return 1
+	}
+	mount -t virtiofs -o ro,nosuid,nodev,noexec "$apps_tag" "$apps_mountpoint"
 	awk -v target="$mountpoint" \
 		'$2 == target && $3 == "virtiofs" && $4 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit(found ? 0 : 1) }' \
 		/proc/mounts || {
 		echo "Lamarck D1 share is not mounted read-only" >&2
 		return 1
 	}
+	awk -v target="$apps_mountpoint" \
+		'$2 == target && $3 == "virtiofs" && $4 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit(found ? 0 : 1) }' \
+		/proc/mounts || {
+		echo "Lamarck App-version share is not mounted read-only" >&2
+		return 1
+	}
 }
 
 stop() {
 	umount "$mountpoint" 2>/dev/null || true
+	umount "$apps_mountpoint" 2>/dev/null || true
 }
 
 case "${1:-}" in

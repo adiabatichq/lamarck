@@ -26,6 +26,7 @@ import Virtualization
     let configuration = try CapsuleVmConfigurationBuilder.makeUnvalidatedConfiguration(
         image: image,
         workspaceFilesURL: stateDirectory,
+        appVersionsURL: stateDirectory,
         stateDiskLease: stateDiskLease,
         cpuCount: cpuCount,
         memorySize: memorySize,
@@ -75,7 +76,7 @@ import Virtualization
     #expect(configuration.serialPorts.first is VZVirtioConsoleDeviceSerialPortConfiguration)
 
     #expect(configuration.networkDevices.isEmpty)
-    #expect(configuration.directorySharingDevices.count == 1)
+    #expect(configuration.directorySharingDevices.count == 2)
     let filesShare = try #require(
         configuration.directorySharingDevices.first as? VZVirtioFileSystemDeviceConfiguration
     )
@@ -83,6 +84,13 @@ import Virtualization
     let sharedDirectory = try #require(filesShare.share as? VZSingleDirectoryShare)
     #expect(sharedDirectory.directory.url == stateDirectory)
     #expect(sharedDirectory.directory.isReadOnly)
+    let appsShare = try #require(
+        configuration.directorySharingDevices.last as? VZVirtioFileSystemDeviceConfiguration
+    )
+    #expect(appsShare.tag == CapsuleVmConfigurationBuilder.appVersionsShareTag)
+    let sharedAppsDirectory = try #require(appsShare.share as? VZSingleDirectoryShare)
+    #expect(sharedAppsDirectory.directory.url == stateDirectory)
+    #expect(sharedAppsDirectory.directory.isReadOnly)
     #expect(configuration.graphicsDevices.isEmpty)
     #expect(configuration.audioDevices.isEmpty)
     #expect(configuration.consoleDevices.isEmpty)
@@ -116,6 +124,7 @@ import Virtualization
         try CapsuleVmConfigurationBuilder.makeUnvalidatedConfiguration(
             image: image,
             workspaceFilesURL: stateDirectory,
+            appVersionsURL: stateDirectory,
             stateDiskLease: stateDiskLease,
             cpuCount: VZVirtualMachineConfiguration.minimumAllowedCPUCount - 1,
             memorySize: memorySize,
@@ -126,6 +135,7 @@ import Virtualization
         try CapsuleVmConfigurationBuilder.makeUnvalidatedConfiguration(
             image: image,
             workspaceFilesURL: stateDirectory,
+            appVersionsURL: stateDirectory,
             stateDiskLease: stateDiskLease,
             cpuCount: VZVirtualMachineConfiguration.minimumAllowedCPUCount,
             memorySize: VZVirtualMachineConfiguration.minimumAllowedMemorySize + 1,

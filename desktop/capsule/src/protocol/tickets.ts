@@ -166,6 +166,7 @@ export function generateStreamTicket(): string {
 function assertStreamKind(value: unknown): asserts value is StreamKind {
   if (![
     "sdk",
+    "cli",
     "viewer",
     "package-in",
     "dependency-in",

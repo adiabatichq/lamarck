@@ -114,6 +114,7 @@ interface AppBlobReference {
 interface WorkloadRecord {
   body: WorkloadPrepareBody;
   sdk?: { socket: GuestProtocolStream; binding: ConsumedTicketBinding };
+  cli?: { socket: GuestProtocolStream; binding: ConsumedTicketBinding };
   logs?: { socket: GuestProtocolStream; binding: ConsumedTicketBinding };
   execution?: RuncExecution;
   exit?: Promise<void>;
@@ -189,6 +190,7 @@ export class CapsuleGuestSupervisor {
         "build-v1",
         "oci-policy-v1",
         "sdk-uds-v1",
+        "app-cli-v1",
         "tickets-v1",
         "vsock-record-v2",
         "warm-rebuild-v1",
@@ -695,15 +697,24 @@ export class CapsuleGuestSupervisor {
     });
     if (existing) {
       const awaitingStreams = existing.sdk === undefined
+        || existing.cli === undefined
         || (existing.body.logsTicket !== undefined && existing.logs === undefined);
       return { awaitingStreams, reused: true };
     }
     this.workloads.set(body.workloadHandle, { body, finalized: false });
-    const issuedTickets = [body.sdkTicket];
+    const issuedTickets = [body.sdkTicket, body.cliTicket];
     this.issueTicket({
       sessionId,
       ticket: body.sdkTicket,
       kind: "sdk",
+      appHandle: body.appHandle,
+      subjectHandle: body.workloadHandle,
+      ttlMs: this.ticketTtlMs,
+    });
+    this.issueTicket({
+      sessionId,
+      ticket: body.cliTicket,
+      kind: "cli",
       appHandle: body.appHandle,
       subjectHandle: body.workloadHandle,
       ttlMs: this.ticketTtlMs,
@@ -725,6 +736,7 @@ export class CapsuleGuestSupervisor {
       for (const ticket of issuedTickets) this.revokeTicket(ticket);
       const record = this.workloads.get(body.workloadHandle);
       record?.sdk?.socket.destroy();
+      record?.cli?.socket.destroy();
       record?.logs?.socket.destroy();
       this.workloads.delete(body.workloadHandle);
       this.state = transitionSupervisor(this.state, {
@@ -741,6 +753,7 @@ export class CapsuleGuestSupervisor {
   private async startWorkload(appHandle: string, workloadHandle: string, sessionId: string): Promise<void> {
     const record = this.requireWorkload(appHandle, workloadHandle);
     if (!record.sdk || record.sdk.socket.destroyed) throw new Error("authenticated SDK stream has not attached");
+    if (!record.cli || record.cli.socket.destroyed) throw new Error("authenticated App CLI stream has not attached");
     if (record.body.logsTicket && (!record.logs || record.logs.socket.destroyed)) {
       throw new Error("declared logs stream has not attached");
     }
@@ -792,6 +805,10 @@ export class CapsuleGuestSupervisor {
         sdkChannel: {
           source: record.sdk.socket,
           consumedTicket: record.sdk.binding,
+        },
+        cliChannel: {
+          source: record.cli.socket,
+          consumedTicket: record.cli.binding,
         },
         ...(record.logs === undefined
           ? {}
@@ -901,6 +918,7 @@ export class CapsuleGuestSupervisor {
     record.resourceLease = undefined;
     record.logs?.socket.end();
     record.sdk?.socket.destroy();
+    record.cli?.socket.destroy();
     this.emit("workload.exited", { appHandle, workloadHandle, ...exit });
   }
 
@@ -973,6 +991,7 @@ export class CapsuleGuestSupervisor {
         signal: "SIGTERM",
       });
       record.sdk?.socket.destroy();
+      record.cli?.socket.destroy();
       record.logs?.socket.end();
     }
   }
@@ -1200,7 +1219,7 @@ export class CapsuleGuestSupervisor {
       this.finishBlob(pending, "blob.exported");
       return;
     }
-    if (prelude.kind === "sdk" || prelude.kind === "logs") {
+    if (prelude.kind === "sdk" || prelude.kind === "cli" || prelude.kind === "logs") {
       const record = this.workloads.get(binding.subjectHandle);
       if (!record || record.body.appHandle !== binding.appHandle) {
         throw new Error("workload stream references an unknown launch");
@@ -1213,6 +1232,9 @@ export class CapsuleGuestSupervisor {
           appHandle: binding.appHandle,
           workloadHandle: binding.subjectHandle,
         });
+      } else if (prelude.kind === "cli") {
+        if (record.cli) throw new Error("App CLI stream already attached");
+        record.cli = { socket, binding };
       } else {
         if (record.logs) throw new Error("logs stream already attached");
         record.logs = { socket, binding };
@@ -1632,6 +1654,7 @@ export class CapsuleGuestSupervisor {
   ): void {
     for (const [workloadHandle, record] of workloads) {
       this.revokeTicket(record.body.sdkTicket);
+      this.revokeTicket(record.body.cliTicket);
       if (record.body.logsTicket) this.revokeTicket(record.body.logsTicket);
       const sockets = this.viewerSockets.get(workloadHandle);
       if (sockets) for (const socket of sockets) socket.destroy();

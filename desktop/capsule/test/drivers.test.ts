@@ -122,6 +122,14 @@ function launchRequest(): RuncLaunchRequest {
     ticket: SDK_TICKET,
   });
   const consumedTicket = tickets.consume(SDK_TICKET, SESSION_ID, "sdk");
+  const cli = tickets.issue({
+    sessionId: SESSION_ID,
+    kind: "cli",
+    appHandle: APP_HANDLE,
+    subjectHandle: WORKLOAD_HANDLE,
+    ttlMs: 1_000,
+  });
+  const consumedCliTicket = tickets.consume(cli.ticket, SESSION_ID, "cli");
   return {
     plan: plan(),
     expectedIdentity: {
@@ -144,6 +152,10 @@ function launchRequest(): RuncLaunchRequest {
     sdkChannel: {
       source: new PassThrough(),
       consumedTicket,
+    },
+    cliChannel: {
+      source: new PassThrough(),
+      consumedTicket: consumedCliTicket,
     },
   };
 }

@@ -14,7 +14,8 @@ install -d -m 0700 "$target/var/lib/lamarck"
 
 for file in "$prebuilt/capsule-guest/dist/supervisor.js" \
 	"$prebuilt/capsule-guest/dist/offline-npm.js" \
-	"$prebuilt/capsule-guest/dist/release-runc-smoke.js"; do
+	"$prebuilt/capsule-guest/dist/release-runc-smoke.js" \
+	"$prebuilt/capsule-guest/dist/lamarck.js"; do
 	[ -f "$file" ] || { echo "missing prebuilt Guest input $file" >&2; exit 1; }
 done
 
@@ -31,7 +32,8 @@ make_oci_root() {
 	mkdir -p "$root" "$root/etc" "$root/usr/bin" "$root/opt" "$root/app" \
 		"$root/home/app" "$root/home/build" "$root/run/app" "$root/run/lamarck" "$root/tmp" \
 		"$root/proc" "$root/dev" "$root/sys" "$root/dependencies" "$root/workspace" \
-		"$root/mnt/lamarck-files"
+		"$root/mnt/lamarck-files" "$root/mnt/lamarck-apps" \
+		"$root/mnt/lamarck-apps-lower"
 	for name in bin sbin lib lib64; do
 		[ ! -e "$target/$name" ] || cp -a "$target/$name" "$root/$name"
 	done
@@ -68,6 +70,8 @@ make_oci_root() {
 
 runtime_root="$target/opt/lamarck/rootfs/node24"
 make_oci_root "$runtime_root"
+install -D -m 0755 "$prebuilt/capsule-guest/dist/lamarck.js" \
+	"$runtime_root/usr/bin/lamarck"
 make_oci_root "$target/opt/lamarck/rootfs/build-node24"
 # Python/pkgconf are target packages only because Buildroot does not produce a
 # target-native compiler package.  Their libraries must not leak into the
@@ -224,6 +228,7 @@ ln -sf /usr/bin/mkfs.erofs "$target/usr/sbin/mkfs.erofs"
 
 mkdir -p "$target/opt/lamarck/config"
 mkdir -p "$target/mnt/lamarck-files"
+mkdir -p "$target/mnt/lamarck-apps-lower"
 : > "$target/opt/lamarck/config/empty-resolv.conf"
 printf '127.0.0.1 localhost\n::1 localhost\n' > "$target/opt/lamarck/config/loopback-hosts"
 

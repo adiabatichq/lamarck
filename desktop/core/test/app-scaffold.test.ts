@@ -42,7 +42,7 @@ function copyScaffold(root: string, name: string): string {
   return scaffoldDir;
 }
 
-async function initializeGit(appDir: string): Promise<void> {
+async function initializeRepository(appDir: string): Promise<void> {
   mkdirSync(join(appDir, ".git"));
   writeFileSync(join(appDir, ".git", "HEAD"), "ref: refs/heads/main\n");
 }
@@ -61,10 +61,13 @@ describe("blank App scaffold v1", () => {
       id: "daily-notes",
       name,
       description: "A blank notes App.",
-      async initializeGit(appDir) {
-        expect(existsSync(join(appDir, "manifest.json"))).toBe(false);
-        expect(readdirSync(appDir).sort()).toEqual([...APP_V1_SCAFFOLD_FILES].sort());
-        await initializeGit(appDir);
+      async initializeRepository(appDir) {
+        expect(existsSync(join(appDir, "manifest.json"))).toBe(true);
+        expect(readdirSync(appDir).sort()).toEqual([
+          ...APP_V1_SCAFFOLD_FILES,
+          "manifest.json",
+        ].sort());
+        await initializeRepository(appDir);
       },
     });
 
@@ -110,7 +113,7 @@ describe("blank App scaffold v1", () => {
       id: "safe-copy",
       name: "Safe Copy",
       description: "Tests allowlisted copying.",
-      initializeGit,
+      initializeRepository,
     });
     expect(existsSync(join(result.dir, "ambient-secret.txt"))).toBe(false);
   });
@@ -126,7 +129,7 @@ describe("blank App scaffold v1", () => {
       id: "already-here",
       name: "Already Here",
       description: "Must not replace.",
-      initializeGit,
+      initializeRepository,
     })).rejects.toThrow();
     expect(readFileSync(join(appsDir, "already-here", "mine.txt"), "utf8")).toBe("preserve");
   });
@@ -142,7 +145,7 @@ describe("blank App scaffold v1", () => {
       id: "missing-required-file",
       name: "Missing Required File",
       description: "Must roll back.",
-      initializeGit,
+      initializeRepository,
     })).rejects.toMatchObject({ code: "ENOENT" });
     expect(existsSync(join(appsDir, "missing-required-file"))).toBe(false);
   });
@@ -165,28 +168,25 @@ describe("blank App scaffold v1", () => {
       id: "invalid-after-write",
       name: "Invalid After Write",
       description: "Must roll back.",
-      initializeGit,
+      initializeRepository,
     })).rejects.toThrow("validation failed");
     expect(existsSync(join(appsDir, "invalid-after-write"))).toBe(false);
   });
 
-  test("keeps external Git initialization best-effort", async () => {
+  test("rolls back when required repository initialization fails", async () => {
     const { appsDir, scaffoldDir } = fixture();
-    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const result = await instantiateBlankApp({
+    await expect(instantiateBlankApp({
       appsDir,
       scaffoldDir,
       id: "git-unavailable",
       name: "Git Unavailable",
-      description: "Creation must still succeed.",
-      async initializeGit() {
-        throw new Error("git executable not found");
+      description: "Creation must fail atomically.",
+      async initializeRepository() {
+        throw new Error("repository initialization failed");
       },
-    });
+    })).rejects.toThrow("repository initialization failed");
 
-    expect(warning).toHaveBeenCalledOnce();
-    expect(existsSync(join(result.dir, "manifest.json"))).toBe(true);
-    expect(existsSync(join(result.dir, ".git"))).toBe(false);
+    expect(existsSync(join(appsDir, "git-unavailable"))).toBe(false);
   });
 
   test("rolls back when a required scaffold token is malformed", async () => {
@@ -200,7 +200,7 @@ describe("blank App scaffold v1", () => {
       id: "bad-token",
       name: "Bad Token",
       description: "Must roll back.",
-      initializeGit,
+      initializeRepository,
     })).rejects.toThrow("must contain exactly 1");
     expect(existsSync(join(appsDir, "bad-token"))).toBe(false);
   });

@@ -38,6 +38,7 @@ const BLOB = "L".repeat(22);
 const IMAGE = `sha256:${"a".repeat(64)}`;
 const DIGEST = `sha256:${"b".repeat(64)}`;
 const SDK_TICKET = "K".repeat(43);
+const CLI_TICKET = "C".repeat(43);
 const LOGS_TICKET = "G".repeat(43);
 const VIEWER_TICKET = "V".repeat(43);
 const OWNER = "a".repeat(64);
@@ -639,11 +640,14 @@ describe("Capsule Guest supervisor data routing", () => {
       cwd: "/app",
       environment: {},
       sdkTicket: SDK_TICKET,
+      cliTicket: CLI_TICKET,
       uiPort: 3_000,
     };
     const prepared = harness.request("workload.prepare", workload);
     const sdk = await harness.dialer.nextHostSocket();
+    const cli = await harness.dialer.nextHostSocket();
     sdk.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "sdk")));
+    cli.write(encodeJsonFrame(dataPrelude(CLI_TICKET, "cli")));
     expect(await prepared).toMatchObject({ ok: true, result: { awaitingStreams: true } });
     await eventually(() => expect(harness.supervisor.snapshot().apps[APP]?.workloads[WORKLOAD]?.status).toBe("prepared"));
     expect(await harness.request("workload.prepare", workload)).toMatchObject({
@@ -693,12 +697,15 @@ describe("Capsule Guest supervisor data routing", () => {
       cwd: "/app",
       environment: {},
       sdkTicket: SDK_TICKET,
+      cliTicket: CLI_TICKET,
       logsTicket: LOGS_TICKET,
     };
     const initial = harness.request("workload.prepare", workload);
     const sdk = await harness.dialer.nextHostSocket();
+    const cli = await harness.dialer.nextHostSocket();
     const logs = await harness.dialer.nextHostSocket();
     sdk.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "sdk")));
+    cli.write(encodeJsonFrame(dataPrelude(CLI_TICKET, "cli")));
     expect(await initial).toMatchObject({ ok: true, result: { awaitingStreams: true } });
     expect(await harness.request("workload.prepare", workload)).toMatchObject({
       ok: true,
@@ -1180,9 +1187,12 @@ describe("Capsule Guest supervisor data routing", () => {
       cwd: "/app",
       environment: {},
       sdkTicket: SDK_TICKET,
+      cliTicket: CLI_TICKET,
     });
     const firstSdk = await harness.dialer.nextHostSocket();
+    const firstCli = await harness.dialer.nextHostSocket();
     firstSdk.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "sdk")));
+    firstCli.write(encodeJsonFrame(dataPrelude(CLI_TICKET, "cli")));
     await firstPrepare;
     await eventually(() => expect(
       harness.supervisor.snapshot().apps[APP]?.workloads[WORKLOAD]?.status,
@@ -1194,6 +1204,7 @@ describe("Capsule Guest supervisor data routing", () => {
 
     const secondWorkload = "X".repeat(22);
     const secondTicket = "Y".repeat(43);
+    const secondCliTicket = "Z".repeat(43);
     const secondPrepare = harness.request("workload.prepare", {
       appHandle: APP,
       workloadHandle: secondWorkload,
@@ -1202,9 +1213,12 @@ describe("Capsule Guest supervisor data routing", () => {
       cwd: "/app",
       environment: {},
       sdkTicket: secondTicket,
+      cliTicket: secondCliTicket,
     });
     const secondSdk = await harness.dialer.nextHostSocket();
+    const secondCli = await harness.dialer.nextHostSocket();
     secondSdk.write(encodeJsonFrame(dataPrelude(secondTicket, "sdk")));
+    secondCli.write(encodeJsonFrame(dataPrelude(secondCliTicket, "cli")));
     await secondPrepare;
     await eventually(() => expect(
       harness.supervisor.snapshot().apps[APP]?.workloads[secondWorkload]?.status,
@@ -1249,9 +1263,12 @@ describe("Capsule Guest supervisor data routing", () => {
       cwd: "/app",
       environment: {},
       sdkTicket: SDK_TICKET,
+      cliTicket: CLI_TICKET,
     });
     const sdk = await harness.dialer.nextHostSocket();
+    const cli = await harness.dialer.nextHostSocket();
     sdk.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "sdk")));
+    cli.write(encodeJsonFrame(dataPrelude(CLI_TICKET, "cli")));
     await prepared;
     await eventually(() => expect(
       harness.supervisor.snapshot().apps[APP]?.workloads[WORKLOAD]?.status,
@@ -1375,11 +1392,14 @@ async function prepareAndStartWorkload(
     cwd: "/app",
     environment: {},
     sdkTicket: SDK_TICKET,
+    cliTicket: CLI_TICKET,
     ...(options.uiPort === undefined ? {} : { uiPort: options.uiPort }),
   };
   const preparing = harness.request("workload.prepare", body);
   const sdk = await harness.dialer.nextHostSocket();
+  const cli = await harness.dialer.nextHostSocket();
   sdk.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "sdk")));
+  cli.write(encodeJsonFrame(dataPrelude(CLI_TICKET, "cli")));
   await preparing;
   await eventually(() => expect(
     harness.supervisor.snapshot().apps[APP]?.workloads[WORKLOAD]?.status,

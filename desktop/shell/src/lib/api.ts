@@ -74,8 +74,19 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const text = await res.text();
   const data = text ? JSON.parse(text) : {};
   if (!res.ok) {
-    const error = new Error(data.error || `HTTP ${res.status}`);
-    Object.assign(error, { status: res.status });
+    const failure = data.error;
+    const message = typeof failure === "string"
+      ? failure
+      : failure && typeof failure === "object" && typeof failure.message === "string"
+        ? failure.message
+        : `HTTP ${res.status}`;
+    const error = new Error(message);
+    Object.assign(error, {
+      status: res.status,
+      ...(failure && typeof failure === "object" && typeof failure.code === "string"
+        ? { code: failure.code }
+        : {}),
+    });
     throw error;
   }
   return data as T;
@@ -184,15 +195,25 @@ export function removeD1HistoryExclusion(rule: string): Promise<{ ok: true; remo
 // -- Apps --
 
 export interface AppInfo {
-  manifestVersion: 1;
+  schemaVersion: 1;
   id: string;
+  path: string;
+  version: string | null;
+  packageDirty: boolean;
+  manifestHealth:
+    | { status: "valid" }
+    | { status: "invalid"; message: string };
+  versionHealth:
+    | { status: "healthy" }
+    | { status: "unversioned" }
+    | { status: "unavailable"; message: string };
   name: string;
   description: string;
   createdFrom?: {
     packageId: string;
     releaseId: string;
   };
-  runtime: {
+  runtime?: {
     ui?: {
       command: string[];
       port: number;
@@ -200,7 +221,7 @@ export interface AppInfo {
     services?: Record<string, { command: string[] }>;
     jobs?: Record<string, { command: string[] }>;
   };
-  permissions: {
+  permissions?: {
     writes: {
       files: string[];
       tables: string[];
@@ -212,8 +233,57 @@ export function listApps(): Promise<{ apps: AppInfo[] }> {
   return request("/api/apps");
 }
 
-export function getAppSource(appId: string): Promise<Record<string, string>> {
-  return request(`/api/apps/${encodeURIComponent(appId)}/source`);
+export interface AppVersionRecordV1 {
+  schemaVersion: 1;
+  appId: string;
+  version: string;
+  parentVersion: string | null;
+  trigger: "save" | "activate" | "restore";
+  createdAt: number;
+  message?: string;
+  author?: string;
+  restoredFrom?: string;
+}
+
+export interface AppVersionPage {
+  versions: AppVersionRecordV1[];
+  nextCursor: string | null;
+}
+
+export function listAppVersions(
+  appId: string,
+  options: { cursor?: string; limit?: number } = {},
+): Promise<AppVersionPage> {
+  const query = new URLSearchParams();
+  if (options.cursor !== undefined) query.set("cursor", options.cursor);
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  const suffix = query.size > 0 ? `?${query}` : "";
+  return request(`/api/apps/${encodeURIComponent(appId)}/versions${suffix}`);
+}
+
+export function restoreAppVersion(
+  appId: string,
+  version: string,
+): Promise<{ version: string; created: boolean; record: AppVersionRecordV1 }> {
+  return request(`/api/apps/${encodeURIComponent(appId)}/restore`, {
+    method: "POST",
+    body: JSON.stringify({ version }),
+  });
+}
+
+export interface AppVersionHistoryRebuildResultV1 {
+  schemaVersion: 1;
+  outcome: "healthy" | "reconstructed" | "reset";
+  currentVersion: string | null;
+}
+
+export function rebuildAppVersionHistory(
+  appId: string,
+): Promise<AppVersionHistoryRebuildResultV1> {
+  return request(`/api/apps/${encodeURIComponent(appId)}/version-history/rebuild`, {
+    method: "POST",
+    body: JSON.stringify({ confirmed: true }),
+  });
 }
 
 export function createApp(
@@ -282,17 +352,6 @@ export async function archiveApp(appId: string): Promise<{ ok: true; id: string 
   if (window.lamarckHost) return window.lamarckHost.archiveApp(appId);
   return request(`/api/apps/${encodeURIComponent(appId)}/archive`, {
     method: "POST",
-  });
-}
-
-export function saveAppFile(
-  appId: string,
-  filename: string,
-  content: string,
-): Promise<{ ok: true }> {
-  return request(`/api/apps/${encodeURIComponent(appId)}/files/${encodeURIComponent(filename)}`, {
-    method: "PUT",
-    body: JSON.stringify({ content }),
   });
 }
 

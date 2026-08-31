@@ -22,7 +22,7 @@ export interface BlankAppScaffoldOptions {
   id: string;
   name: string;
   description: string;
-  initializeGit(appDir: string): Promise<void>;
+  initializeRepository(appDir: string): Promise<void>;
 }
 
 export interface BlankAppScaffoldResult {
@@ -32,9 +32,9 @@ export interface BlankAppScaffoldResult {
 
 /**
  * Creates one complete local App from the checked-in allowlisted scaffold.
- * The target directory is reserved with mkdir, every failure removes only
- * that newly created directory, and manifest.json is written last so Core
- * never observes a partially composed App as runnable authority.
+ * The target directory is reserved with mkdir and every failure removes only
+ * that newly created directory. Repository initialization happens only after
+ * the complete package has been published and is required for success.
  */
 export async function instantiateBlankApp(
   options: BlankAppScaffoldOptions,
@@ -57,12 +57,6 @@ export async function instantiateBlankApp(
       });
     }
 
-    try {
-      await options.initializeGit(appDir);
-    } catch (error) {
-      console.warn(`[app-scaffold] Could not initialize git for ${options.id}:`, error);
-    }
-
     const manifest: AppManifest = {
       manifestVersion: 1,
       id: options.id,
@@ -82,13 +76,16 @@ export async function instantiateBlankApp(
       },
     };
 
-    // Authority is published only after every required project file and the
-    // best-effort local Git initialization attempt are complete.
+    // Authority is published only after every required project file exists.
     await writeFile(
       join(appDir, "manifest.json"),
       `${JSON.stringify(manifest, null, 2)}\n`,
       { flag: "wx", mode: 0o644 },
     );
+
+    // Repository initialization is required composition state. Creation owns
+    // the still-unregistered target and rolls it back if initialization fails.
+    await options.initializeRepository(appDir);
 
     const loaded = (await loadApps(options.appsDir)).apps.get(options.id);
     if (!loaded || loaded.dir !== appDir) {

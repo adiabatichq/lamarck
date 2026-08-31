@@ -6,6 +6,9 @@ import {
   createConnectorSource,
   getCoreBaseUrl,
   inspectDataSchema,
+  listAppVersions,
+  rebuildAppVersionHistory,
+  restoreAppVersion,
   retryConnectorSourceIdentity,
   startConnectorAuth,
   updateConnectorSource,
@@ -169,5 +172,61 @@ describe("Core endpoint resolution", () => {
       "http://localhost:32100/api/schema/requests/request%2F1/approve",
       expect.objectContaining({ method: "POST", body: JSON.stringify({}) }),
     );
+  });
+
+  test("uses paginated App history and explicit restore/rebuild mutations", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({ versions: [], nextCursor: null }),
+    });
+    vi.stubGlobal("window", {
+      lamarckHost: {
+        getCoreBaseUrl: vi.fn().mockResolvedValue("http://localhost:32100"),
+        getCoreToken: vi.fn().mockResolvedValue("test-token"),
+      },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await listAppVersions("notes/work", { cursor: "page/token", limit: 30 });
+    await restoreAppVersion("notes/work", "aaaaaaaa");
+    await rebuildAppVersionHistory("notes/work");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://localhost:32100/api/apps/notes%2Fwork/versions?cursor=page%2Ftoken&limit=30",
+      expect.objectContaining({ headers: expect.any(Headers) }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://localhost:32100/api/apps/notes%2Fwork/restore",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ version: "aaaaaaaa" }) }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "http://localhost:32100/api/apps/notes%2Fwork/version-history/rebuild",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ confirmed: true }) }),
+    );
+  });
+
+  test("preserves structured lifecycle error messages and codes", async () => {
+    vi.stubGlobal("window", {
+      lamarckHost: {
+        getCoreBaseUrl: vi.fn().mockResolvedValue("http://localhost:32100"),
+        getCoreToken: vi.fn().mockResolvedValue("test-token"),
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      text: async () => JSON.stringify({
+        error: { code: "APP_VERSION_CONFLICT", message: "App changed" },
+      }),
+    }));
+
+    await expect(restoreAppVersion("notes", "aaaaaaaa")).rejects.toMatchObject({
+      message: "App changed",
+      code: "APP_VERSION_CONFLICT",
+      status: 409,
+    });
   });
 });

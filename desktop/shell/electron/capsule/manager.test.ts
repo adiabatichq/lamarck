@@ -14,9 +14,12 @@ import {
   type PreparedViewerBinding,
 } from "./manager";
 
-const MANIFEST_GENERATION = 7;
 const MANIFEST_DIGEST = `sha256:${"a".repeat(64)}`;
 const OTHER_MANIFEST_DIGEST = `sha256:${"b".repeat(64)}`;
+const PACKAGE_DIGEST = `sha256:${"c".repeat(64)}`;
+const APP_VERSION = "d".repeat(40);
+const ACTIVATION_ID = `activation_${"e".repeat(32)}`;
+const ACTIVATION_SEQUENCE = 7;
 
 function viewerOwner(
   webContentsId: number,
@@ -135,44 +138,67 @@ class FakeBackend implements CapsuleBackend {
 
 function createFetch(
   runtimeByApp: Record<string, unknown> = {},
-  options: { issuedManifestDigest?: string } = {},
+  options: {
+    issuedManifestDigest?: string;
+    activationError?: { code: string; message: string };
+  } = {},
 ) {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   let issued = 0;
   const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, init });
-    if (url.endsWith("/api/apps")) {
+    const activationMatch = /\/api\/apps\/([^/]+)\/activation\/prepare$/.exec(url);
+    if (activationMatch && init?.method === "POST") {
+      if (options.activationError) {
+        return Response.json({ error: options.activationError }, { status: 409 });
+      }
+      const appId = decodeURIComponent(activationMatch[1]!);
       return Response.json({
-        apps: ["app-a", "app-b"].map((id) => ({
-          id,
-          manifestGeneration: MANIFEST_GENERATION,
+        activation: {
+          schemaVersion: 1,
+          activationId: ACTIVATION_ID,
+          activationSequence: ACTIVATION_SEQUENCE,
+          appId,
+          workload: "ui",
+          version: APP_VERSION,
           manifestDigest: MANIFEST_DIGEST,
-          runtime: runtimeByApp[id]
+          packageDigest: PACKAGE_DIGEST,
+          immutablePackagePath: `/immutable/apps/${appId}/${APP_VERSION}`,
+          manifest: { runtime: runtimeByApp[appId]
             ?? { ui: { command: ["npm", "run", "start"], port: 3000 } },
-        })),
+          },
+        },
       });
     }
     if (url.endsWith("/api/app-runtime/channels") && init?.method === "POST") {
       const request = JSON.parse(String(init.body)) as {
         appId: string;
-        manifestGeneration: number;
-        manifestDigest: string;
+        workload: string;
+        activationId: string;
       };
       const { appId } = request;
       issued += 1;
       return Response.json({
         capability: `secret-capability-${appId}-${issued}`,
         channelId: `channel-${appId}-${issued}`,
-        manifestGeneration: request.manifestGeneration,
-        manifestDigest: options.issuedManifestDigest ?? request.manifestDigest,
+        activationId: request.activationId,
+        appCommit: APP_VERSION,
+        manifestDigest: options.issuedManifestDigest ?? MANIFEST_DIGEST,
+        packageDigest: PACKAGE_DIGEST,
       });
+    }
+    if (url.includes("/api/apps/activation/") && init?.method === "DELETE") {
+      return Response.json({ ok: true });
     }
     if (url.includes("/api/app-runtime/channels/channel-") && init?.method === "DELETE") {
       return Response.json({ ok: true });
     }
     if (url.includes("/api/app-runtime/apps/") && init?.method === "DELETE") {
       return Response.json({ ok: true, revoked: 0 });
+    }
+    if (/\/api\/apps\/[^/]+\/save$/.test(url) && init?.method === "POST") {
+      return Response.json({ version: APP_VERSION, created: false });
     }
     return Response.json({ error: "not found" }, { status: 404 });
   }) as typeof globalThis.fetch;
@@ -203,6 +229,85 @@ const verifyPreparedViewer = async (binding: {
 const publishReloadedViewer = (): void => {};
 
 describe("CapsuleManager", () => {
+  test("aggregates running workloads and the latest activation failure", async () => {
+    const backend = new FakeBackend();
+    const { fetch } = createFetch();
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+
+    expect(manager.appRuntimeStates()).toEqual([]);
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
+    expect(manager.appRuntimeStates()).toEqual([{
+      appId: "app-a",
+      runningWorkloads: 1,
+      latestFailure: null,
+    }]);
+
+    await expect(manager.reloadApp("app-a", async () => {
+      throw new Error("replacement build failed");
+    }, publishReloadedViewer)).rejects.toThrow("replacement build failed");
+    expect(manager.appRuntimeStates()).toEqual([{
+      appId: "app-a",
+      runningWorkloads: 1,
+      latestFailure: "replacement build failed",
+    }]);
+
+    const saveResponse = await fetch("http://127.0.0.1:32100/api/apps/app-a/save", {
+      method: "POST",
+    });
+    expect(saveResponse.ok).toBe(true);
+    expect(manager.appRuntimeStates()).toEqual([{
+      appId: "app-a",
+      runningWorkloads: 1,
+      latestFailure: "replacement build failed",
+    }]);
+
+    await manager.reloadApp("app-a", verifyPreparedViewer, publishReloadedViewer);
+    expect(manager.appRuntimeStates()[0]).toMatchObject({
+      runningWorkloads: 1,
+      latestFailure: null,
+    });
+    await manager.closeViewer(opened.viewerId, viewerOwner(7));
+    expect(manager.appRuntimeStates()).toEqual([]);
+  });
+
+  test.each([
+    ["APP_PACKAGE_INVALID", "manifest invalid"],
+    ["APP_VERSION_HISTORY_UNAVAILABLE", "App version history is unavailable"],
+  ])("keeps %s as live inventory health instead of a persisted runtime failure", async (code, message) => {
+    const backend = new FakeBackend();
+    const options: {
+      activationError?: { code: string; message: string };
+    } = { activationError: { code, message } };
+    const { fetch } = createFetch({}, options);
+    const manager = new CapsuleManager({
+      backend,
+      workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100",
+      coreToken: "host-token",
+      fetch,
+      ...systemBindings(),
+    });
+
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer))
+      .rejects.toThrow(message);
+    expect(manager.appRuntimeStates()).toEqual([]);
+
+    delete options.activationError;
+    await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
+    expect(manager.appRuntimeStates()).toEqual([{
+      appId: "app-a",
+      runningWorkloads: 1,
+      latestFailure: null,
+    }]);
+  });
+
   test("derives the UI launch from Core and keeps the capability Host-side", async () => {
     const backend = new FakeBackend();
     const { fetch, calls } = createFetch();
@@ -223,9 +328,12 @@ describe("CapsuleManager", () => {
     });
     expect(backend.starts).toEqual([{
       appId: "app-a",
-      manifestGeneration: MANIFEST_GENERATION,
+      activationId: ACTIVATION_ID,
+      activationSequence: ACTIVATION_SEQUENCE,
+      version: APP_VERSION,
       manifestDigest: MANIFEST_DIGEST,
-      packageDir: "/workspace/apps/app-a",
+      packageDigest: PACKAGE_DIGEST,
+      packageDir: `/immutable/apps/app-a/${APP_VERSION}`,
       command: ["npm", "run", "start"],
       port: 3000,
       sdkSenderId: expect.stringMatching(/^capsule_/),
@@ -502,7 +610,7 @@ describe("CapsuleManager", () => {
     });
 
     await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer))
-      .rejects.toThrow("different App manifest authority");
+      .rejects.toThrow("different App activation");
     expect(backend.starts).toEqual([]);
     const issuance = calls.find((call) => (
       call.url.endsWith("/api/app-runtime/channels")
@@ -511,8 +619,7 @@ describe("CapsuleManager", () => {
     expect(JSON.parse(String(issuance?.init?.body))).toEqual({
       appId: "app-a",
       workload: "ui",
-      manifestGeneration: MANIFEST_GENERATION,
-      manifestDigest: MANIFEST_DIGEST,
+      activationId: ACTIVATION_ID,
     });
   });
 
@@ -1007,7 +1114,7 @@ describe("CapsuleManager", () => {
     });
   });
 
-  test("fails closed when a manifest declares unsupported service or job workloads", async () => {
+  test("launches a declared UI without rejecting sibling Service or Job declarations", async () => {
     const backend = new FakeBackend();
     const { fetch, calls } = createFetch({
       "app-a": {
@@ -1027,11 +1134,13 @@ describe("CapsuleManager", () => {
       ...systemBindings(),
     });
 
-    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)).rejects.toThrow("declares services");
-    await expect(manager.openViewer("app-b", viewerOwner(7), verifyPreparedViewer)).rejects.toThrow("declares jobs");
-    expect(backend.starts).toEqual([]);
+    await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer))
+      .resolves.toMatchObject({ appId: "app-a" });
+    await expect(manager.openViewer("app-b", viewerOwner(7), verifyPreparedViewer))
+      .rejects.toThrow("does not declare a UI workload");
+    expect(backend.starts).toHaveLength(1);
     expect(calls.filter((call) => call.url.endsWith("/api/app-runtime/channels")))
-      .toEqual([]);
+      .toHaveLength(2);
   });
 
   test("cancels an in-flight rebuild before waiting for it to settle", async () => {
@@ -1190,7 +1299,7 @@ describe("CapsuleManager", () => {
       reportDeleteStarted = resolve;
     });
     const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      if (init?.method === "DELETE") {
+      if (init?.method === "DELETE" && String(input).includes("/api/app-runtime/")) {
         reportDeleteStarted();
         return await new Promise<Response>(() => {});
       }
@@ -1222,7 +1331,7 @@ describe("CapsuleManager", () => {
     const base = createFetch();
     let deleteCalls = 0;
     const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      if (init?.method === "DELETE") {
+      if (init?.method === "DELETE" && String(input).includes("/api/app-runtime/")) {
         deleteCalls += 1;
         return await new Promise<Response>(() => {});
       }
@@ -1482,9 +1591,12 @@ describe("CapsuleManager", () => {
       instanceId: "instance-app-a",
       spec: {
         appId: "app-a",
-        manifestGeneration: MANIFEST_GENERATION,
+        activationId: ACTIVATION_ID,
+        activationSequence: ACTIVATION_SEQUENCE,
+        version: APP_VERSION,
         manifestDigest: MANIFEST_DIGEST,
-        packageDir: "/workspace/apps/app-a",
+        packageDigest: PACKAGE_DIGEST,
+        packageDir: `/immutable/apps/app-a/${APP_VERSION}`,
         command: ["npm", "run", "start"],
         port: 3000,
         sdkSenderId: expect.stringMatching(/^capsule_/),

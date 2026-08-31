@@ -14,6 +14,7 @@ afterEach(async () => {
 });
 
 const OWNER = "a".repeat(64);
+const APP_VERSION = "b".repeat(40);
 
 function fixture(options: ConstructorParameters<typeof HostArtifactStore>[1] = {}): {
   root: string;
@@ -50,8 +51,11 @@ describe("HostArtifactStore", () => {
     const artifact = await store.receive(OWNER, expected.digest, expected.bytes, Readable.from([bytes]));
     expect(await readFile(artifact.path)).toEqual(bytes);
     const provenance = {
+      appVersion: APP_VERSION,
       packageDigest: `sha256:${"1".repeat(64)}`,
       imageDigest: `sha256:${"2".repeat(64)}`,
+      installDigest: `sha256:${"3".repeat(64)}`,
+      dependencyDigest: `sha256:${"4".repeat(64)}`,
     };
     await store.activate("a".repeat(64), artifact, provenance);
     expect(await store.active("a".repeat(64))).toMatchObject({
@@ -59,7 +63,7 @@ describe("HostArtifactStore", () => {
       ...provenance,
     });
     const activation = JSON.parse(await readFile(join(root, "active", `${"a".repeat(64)}.json`), "utf8"));
-    expect(activation).toEqual({ version: 1, ...expected, ...provenance });
+    expect(activation).toEqual({ schemaVersion: 1, ...expected, ...provenance });
     await store.deactivate("a".repeat(64));
     expect(await store.active("a".repeat(64))).toBeUndefined();
     await expect(store.deactivate("a".repeat(64))).resolves.toBeUndefined();
@@ -102,8 +106,11 @@ describe("HostArtifactStore", () => {
       Readable.from([activeBytes]),
     );
     await store.activate(OWNER, activeArtifact, {
+      appVersion: APP_VERSION,
       packageDigest: `sha256:${"1".repeat(64)}`,
       imageDigest: `sha256:${"2".repeat(64)}`,
+      installDigest: `sha256:${"3".repeat(64)}`,
+      dependencyDigest: `sha256:${"4".repeat(64)}`,
     });
     const candidateBytes = Buffer.from("late retained candidate");
     const candidateIdentity = identity(candidateBytes);
@@ -382,12 +389,13 @@ describe("HostArtifactStore", () => {
     await expect(read).resolves.toMatchObject(expected);
   });
 
-  test("persists exact V2 install and dependency provenance while still reading V1 pointers", async () => {
+  test("persists the one exact V1 activation schema and rejects incomplete provenance", async () => {
     const { root, store } = fixture();
     const bytes = Buffer.from("warm artifact");
     const expected = identity(bytes);
     const artifact = await store.receive(OWNER, expected.digest, expected.bytes, Readable.from([bytes]));
     const provenance = {
+      appVersion: APP_VERSION,
       packageDigest: `sha256:${"1".repeat(64)}`,
       imageDigest: `sha256:${"2".repeat(64)}`,
       installDigest: `sha256:${"3".repeat(64)}`,
@@ -396,13 +404,14 @@ describe("HostArtifactStore", () => {
     await store.activate(OWNER, artifact, provenance);
     expect(await store.active(OWNER)).toMatchObject({ artifact: expected, ...provenance });
     expect(JSON.parse(await readFile(join(root, "active", `${OWNER}.json`), "utf8")))
-      .toEqual({ version: 2, ...expected, ...provenance });
+      .toEqual({ schemaVersion: 1, ...expected, ...provenance });
 
     await expect(store.activate(OWNER, artifact, {
+      appVersion: APP_VERSION,
       packageDigest: provenance.packageDigest,
       imageDigest: provenance.imageDigest,
       installDigest: provenance.installDigest,
-    })).rejects.toThrow(/appear together/);
+    } as never)).rejects.toThrow("Artifact digest must be canonical lowercase sha256");
   });
 
   test("fails closed when a sealed CAS object is tampered", async () => {
@@ -423,10 +432,13 @@ describe("HostArtifactStore", () => {
     await mkdir(join(root, "active"), { recursive: true, mode: 0o700 });
     const target = join(root, "forged.json");
     await writeFile(target, `${JSON.stringify({
-      version: 1,
+      schemaVersion: 1,
+      appVersion: APP_VERSION,
       ...expected,
       packageDigest: `sha256:${"1".repeat(64)}`,
       imageDigest: `sha256:${"2".repeat(64)}`,
+      installDigest: `sha256:${"3".repeat(64)}`,
+      dependencyDigest: `sha256:${"4".repeat(64)}`,
     })}\n`, { mode: 0o600 });
     await symlink(target, join(root, "active", `${"b".repeat(64)}.json`));
     await expect(store.active("b".repeat(64))).rejects.toThrow("activation pointer is invalid");
@@ -456,6 +468,7 @@ describe("HostArtifactStore", () => {
       Readable.from([secondBytes]),
     );
     const firstProvenance = {
+      appVersion: APP_VERSION,
       packageDigest: `sha256:${"1".repeat(64)}`,
       imageDigest: `sha256:${"2".repeat(64)}`,
       installDigest: `sha256:${"5".repeat(64)}`,
@@ -465,6 +478,7 @@ describe("HostArtifactStore", () => {
 
     failAfterRename = true;
     await expect(store.activate(OWNER, second, {
+      appVersion: "c".repeat(40),
       packageDigest: `sha256:${"3".repeat(64)}`,
       imageDigest: `sha256:${"4".repeat(64)}`,
       installDigest: `sha256:${"7".repeat(64)}`,

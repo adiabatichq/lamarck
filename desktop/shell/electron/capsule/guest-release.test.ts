@@ -60,6 +60,7 @@ describe("Capsule Guest release descriptor", () => {
       expectedArchitecture: "arm64",
       expectedSupervisorVersion: "0.1.0",
       expectedFeatures: [
+        "app-cli-v1",
         "artifact-adoption-receipt-v1",
         "artifact-erofs-v1",
         "build-v1",
@@ -101,6 +102,9 @@ describe("Capsule Guest release descriptor", () => {
       ["public key size", (value) => { value.pinnedEd25519PublicKey = Buffer.alloc(31).toString("base64"); }],
       ["feature ordering", (value) => { value.features = ["build-v1", "artifact-erofs-v1"]; }],
       ["duplicate feature", (value) => { value.features = ["build-v1", "build-v1"]; }],
+      ["missing required private App CLI feature", (value) => {
+        value.features = (value.features as string[]).filter((item) => item !== "app-cli-v1");
+      }],
       ["missing required warm Build feature", (value) => {
         value.features = (value.features as string[]).filter((item) => item !== "warm-rebuild-v1");
       }],
@@ -266,6 +270,7 @@ function validDescriptor(): CapsuleGuestReleaseDescriptor {
     pinnedEd25519PublicKey: PUBLIC_KEY,
     supervisorVersion: "0.1.0",
     features: [
+      "app-cli-v1",
       "artifact-adoption-receipt-v1",
       "artifact-erofs-v1",
       "build-v1",

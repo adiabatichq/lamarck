@@ -9,7 +9,9 @@ import {
 const FORGED_APP_ID_HEADER = "x-lamarck-app-id";
 const FORGED_BRIDGE_TOKEN_HEADER = "x-lamarck-bridge-token";
 const MANIFEST_DIGEST = `sha256:${"a".repeat(64)}` as const;
+const PACKAGE_DIGEST = `sha256:${"c".repeat(64)}` as const;
 const APP_COMMIT = "b".repeat(40);
+const ACTIVATION_ID = `activation_${"d".repeat(32)}`;
 
 const secrets = {
   coreToken: "core-secret",
@@ -25,13 +27,13 @@ function appRequest(capability: string, extraHeaders: Record<string, string> = {
 }
 
 function authorization(
-  manifestGeneration = 1,
   writeTables: string[] = [],
   fileGrants: string[] = [],
 ): AppAuthorizationSnapshot {
   return {
-    manifestGeneration,
+    activationId: ACTIVATION_ID,
     manifestDigest: MANIFEST_DIGEST,
+    packageDigest: PACKAGE_DIGEST,
     appCommit: APP_COMMIT,
     writeTables,
     fileGrants,
@@ -55,7 +57,7 @@ describe("auth", () => {
     const appA = registry.issue(
       "app-a",
       "service:indexer",
-      authorization(1, ["notes"], ["apps/app-a/"]),
+      authorization(["notes"], ["apps/app-a/"]),
     );
 
     const admission = admitRequest(
@@ -74,8 +76,9 @@ describe("auth", () => {
       workload: "service:indexer",
       channelId: appA.channelId,
       authorization: {
-        manifestGeneration: 1,
+        activationId: ACTIVATION_ID,
         manifestDigest: MANIFEST_DIGEST,
+        packageDigest: PACKAGE_DIGEST,
         appCommit: APP_COMMIT,
         writeTables: ["notes"],
         fileGrants: ["apps/app-a/"],
@@ -163,7 +166,7 @@ describe("auth", () => {
     const registry = new AppCapabilityRegistry();
     const tables = ["notes"];
     const files = ["apps/app-a/"];
-    const issued = registry.issue("app-a", "ui", authorization(1, tables, files));
+    const issued = registry.issue("app-a", "ui", authorization(tables, files));
     tables.push("secrets");
     files.push("private/");
     const admission = admitRequest(appRequest(issued.capability), secrets, registry);
@@ -183,29 +186,16 @@ describe("auth", () => {
     admission.release();
   });
 
-  test("invalidating a manifest generation cannot race with channel issuance", async () => {
+  test("draft changes do not revoke activation-bound capabilities", async () => {
     const registry = new AppCapabilityRegistry();
-    const issued = registry.issue("app-a", "ui", authorization(1, ["notes"]));
+    const issued = registry.issue("app-a", "ui", authorization(["notes"]));
     const active = admitRequest(appRequest(issued.capability), secrets, registry);
     if (!active) throw new Error("Expected active App admission");
 
-    let drained = false;
-    const invalidation = registry.invalidateManifestGeneration(1).then((count) => {
-      drained = true;
-      return count;
-    });
-    expect(active.signal.aborted).toBe(true);
-    expect(admitRequest(appRequest(issued.capability), secrets, registry)).toBeNull();
-    expect(() => registry.issue("app-a", "ui", authorization(1))).toThrow(
-      "generation 1 is no longer active",
-    );
-    expect(drained).toBe(false);
-
+    expect(active.signal.aborted).toBe(false);
+    expect(registry.isOpen(issued.channelId)).toBe(true);
     active.release();
-    await expect(invalidation).resolves.toBe(1);
-    expect(registry.issue("app-a", "ui", authorization(2))).toMatchObject({
-      channelId: expect.stringMatching(/^appch_/),
-    });
+    expect(await registry.revoke(issued.channelId)).toBe(true);
   });
 
   test("rejects malformed identities before issuing a capability", () => {

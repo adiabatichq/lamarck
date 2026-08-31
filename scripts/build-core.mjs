@@ -25,6 +25,16 @@ const common = {
   sourcemap: true,
   external: ["node:sqlite"],
   define: systemIdentityEsbuildDefine(buildIdentity),
+  // The package's Node export selects its CJS build, whose dynamic requires
+  // cannot execute inside Core's ESM bundle. Bundle the published ESM entry
+  // directly so the installed Desktop has no native Git or runtime package
+  // dependency.
+  alias: {
+    "isomorphic-git": resolve(root, "node_modules/isomorphic-git/index.js"),
+  },
+};
+const esmBanner = {
+  js: 'import { createRequire as __lamarckCreateRequire } from "node:module"; const require = __lamarckCreateRequire(import.meta.url);',
 };
 
 await Promise.all([
@@ -33,6 +43,7 @@ await Promise.all([
     entryPoints: [resolve(coreDir, "src/index.ts")],
     outfile: resolve(outDir, "core.mjs"),
     format: "esm",
+    banner: esmBanner,
   }),
   esbuild.build({
     ...common,
@@ -51,6 +62,7 @@ await Promise.all([
     entryPoints: [resolve(coreDir, "src/cli.ts")],
     outfile: resolve(outDir, "cli.mjs"),
     format: "esm",
+    banner: esmBanner,
   }),
   cp(resolve(coreDir, "src/pty-helper.cjs"), resolve(outDir, "pty-helper.cjs")),
   cp(

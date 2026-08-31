@@ -30,10 +30,24 @@ describe("deterministic OCI bundle planning", () => {
     );
     expect(first.sdkBridgeRoot).toMatch(/^\/run\/lamarck\/sdk-bridges\/w-[a-f0-9]{32}$/);
     expect(first.sdkSocketHostPath).toBe(`${first.sdkBridgeRoot}/system.sock`);
+    expect(first.cliSocketHostPath).toBe(`${first.sdkBridgeRoot}/cli.sock`);
+    expect(first.appEditRoot).toMatch(/^\/var\/lib\/lamarck\/app-edits\/w-[a-f0-9]{32}$/);
     expect(first.config.mounts).toContainEqual({
       destination: "/run/lamarck",
       type: "bind",
       source: first.sdkBridgeRoot,
+      options: ["rbind", "ro", "nosuid", "nodev", "noexec"],
+    });
+    expect(first.config.mounts).toContainEqual({
+      destination: "/mnt/lamarck-apps",
+      type: "bind",
+      source: first.appEditRoot,
+      options: ["rbind", "rw", "nosuid", "nodev"],
+    });
+    expect(first.config.mounts).toContainEqual({
+      destination: "/mnt/lamarck-apps-lower",
+      type: "bind",
+      source: "/mnt/lamarck-apps-lower",
       options: ["rbind", "ro", "nosuid", "nodev", "noexec"],
     });
     expect(first.config.mounts).toContainEqual({
@@ -50,6 +64,8 @@ describe("deterministic OCI bundle planning", () => {
       { containerID: 0, hostID: 100_000, size: 65_536 },
     ]);
     expect(first.config.mounts.some((mount) => mount.destination === "/sys")).toBe(false);
+    expect(first.config.mounts.some((mount) => mount.source.includes("/workspace/apps"))).toBe(false);
+    expect(first.config.process.env.some((entry) => entry.includes("CORE_TOKEN"))).toBe(false);
     expect(() => assertOciSecurityInvariants(first, expectedIdentity())).not.toThrow();
   });
 
@@ -111,6 +127,14 @@ describe("deterministic OCI bundle planning", () => {
       (mount) => mount.destination === "/run/lamarck",
     )!.options = ["rbind", "rw"];
     expect(() => assertOciSecurityInvariants(writableSdkBridge, expectedIdentity())).toThrowError(
+      expect.objectContaining<Partial<OciSecurityError>>({ invariant: "mounts" }),
+    );
+
+    const writableAppLower = copyPlan();
+    writableAppLower.config.mounts.find(
+      (mount) => mount.destination === "/mnt/lamarck-apps-lower",
+    )!.options = ["rbind", "rw"];
+    expect(() => assertOciSecurityInvariants(writableAppLower, expectedIdentity())).toThrowError(
       expect.objectContaining<Partial<OciSecurityError>>({ invariant: "mounts" }),
     );
 

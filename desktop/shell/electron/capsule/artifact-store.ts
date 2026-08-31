@@ -42,11 +42,11 @@ export interface HostArtifact extends HostArtifactIdentity {
 
 export interface HostArtifactActivation {
   readonly artifact: HostArtifact;
+  readonly appVersion: string;
   readonly packageDigest: `sha256:${string}`;
   readonly imageDigest: `sha256:${string}`;
-  /** Present together on V2 pointers; absent on legacy V1 pointers. */
-  readonly installDigest?: `sha256:${string}`;
-  readonly dependencyDigest?: `sha256:${string}`;
+  readonly installDigest: `sha256:${string}`;
+  readonly dependencyDigest: `sha256:${string}`;
 }
 
 export interface HostArtifactRetention {
@@ -338,25 +338,20 @@ export class HostArtifactStore {
     appKeyValue: string,
     artifactValue: HostArtifactIdentity,
     provenance: {
+      appVersion: string;
       packageDigest: string;
       imageDigest: string;
-      installDigest?: string;
-      dependencyDigest?: string;
+      installDigest: string;
+      dependencyDigest: string;
     },
   ): Promise<void> {
     const appKey = validateAppKey(appKeyValue);
     const digest = validateDigest(artifactValue.digest);
+    const appVersion = validateAppVersion(provenance.appVersion);
     const packageDigest = validateDigest(provenance.packageDigest);
     const imageDigest = validateDigest(provenance.imageDigest);
-    if ((provenance.installDigest === undefined) !== (provenance.dependencyDigest === undefined)) {
-      throw new Error("Artifact install and dependency digests must appear together");
-    }
-    const installDigest = provenance.installDigest === undefined
-      ? undefined
-      : validateDigest(provenance.installDigest);
-    const dependencyDigest = provenance.dependencyDigest === undefined
-      ? undefined
-      : validateDigest(provenance.dependencyDigest);
+    const installDigest = validateDigest(provenance.installDigest);
+    const dependencyDigest = validateDigest(provenance.dependencyDigest);
     validateArtifactBytes(artifactValue.bytes);
     const artifact = await this.require(digest, artifactValue.bytes);
     const previous = await this.active(appKey);
@@ -376,12 +371,14 @@ export class HostArtifactStore {
       `.activation-${process.pid}-${randomBytes(16).toString("hex")}.tmp`,
     );
     const payload = Buffer.from(`${JSON.stringify({
-      version: installDigest === undefined ? 1 : 2,
+      schemaVersion: 1,
+      appVersion,
       digest,
       bytes: artifactValue.bytes,
       packageDigest,
       imageDigest,
-      ...(installDigest === undefined ? {} : { installDigest, dependencyDigest }),
+      installDigest,
+      dependencyDigest,
     })}\n`, "utf8");
     let renamed = false;
     try {
@@ -511,11 +508,9 @@ export class HostArtifactStore {
     if (!isPlainObject(value)) {
       throw new Error("Host artifact activation pointer has an invalid schema");
     }
-    const legacy = value.version === 1 && hasExactKeys(value, [
-      "version", "digest", "bytes", "packageDigest", "imageDigest",
-    ]);
-    const current = value.version === 2 && hasExactKeys(value, [
-      "version",
+    const current = value.schemaVersion === 1 && hasExactKeys(value, [
+      "schemaVersion",
+      "appVersion",
       "digest",
       "bytes",
       "packageDigest",
@@ -523,14 +518,15 @@ export class HostArtifactStore {
       "installDigest",
       "dependencyDigest",
     ]);
-    if (!legacy && !current) {
+    if (!current) {
       throw new Error("Unsupported Host artifact activation version or schema");
     }
+    const appVersion = validateAppVersion(value.appVersion);
     const digest = validateDigest(value.digest);
     const packageDigest = validateDigest(value.packageDigest);
     const imageDigest = validateDigest(value.imageDigest);
-    const installDigest = current ? validateDigest(value.installDigest) : undefined;
-    const dependencyDigest = current ? validateDigest(value.dependencyDigest) : undefined;
+    const installDigest = validateDigest(value.installDigest);
+    const dependencyDigest = validateDigest(value.dependencyDigest);
     validateArtifactBytes(value.bytes);
     const artifact = await this.require(digest, value.bytes);
     await this.#storageBudget?.claim({
@@ -541,9 +537,11 @@ export class HostArtifactStore {
     });
     return Object.freeze({
       artifact,
+      appVersion,
       packageDigest,
       imageDigest,
-      ...(installDigest === undefined ? {} : { installDigest, dependencyDigest }),
+      installDigest,
+      dependencyDigest,
     });
   }
 
@@ -684,17 +682,14 @@ export class HostArtifactStore {
       `.activation-rollback-${process.pid}-${randomBytes(16).toString("hex")}.tmp`,
     );
     const payload = Buffer.from(`${JSON.stringify({
-      version: previous.installDigest === undefined ? 1 : 2,
+      schemaVersion: 1,
+      appVersion: previous.appVersion,
       digest: previous.artifact.digest,
       bytes: previous.artifact.bytes,
       packageDigest: previous.packageDigest,
       imageDigest: previous.imageDigest,
-      ...(previous.installDigest === undefined
-        ? {}
-        : {
-            installDigest: previous.installDigest,
-            dependencyDigest: previous.dependencyDigest,
-          }),
+      installDigest: previous.installDigest,
+      dependencyDigest: previous.dependencyDigest,
     })}\n`, "utf8");
     try {
       const output = await open(
@@ -777,6 +772,13 @@ function validateDigest(value: unknown): `sha256:${string}` {
     throw new Error("Artifact digest must be canonical lowercase sha256");
   }
   return value as `sha256:${string}`;
+}
+
+function validateAppVersion(value: unknown): string {
+  if (typeof value !== "string" || !(/^[0-9a-f]{40}$/.test(value) || /^[0-9a-f]{64}$/.test(value))) {
+    throw new Error("Artifact App version must be a full lowercase Git commit");
+  }
+  return value;
 }
 
 function validateArtifactBytes(value: unknown): asserts value is number {

@@ -1,6 +1,6 @@
-import { dirname, extname, join, relative, resolve } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "fs/promises";
+import { mkdir, readFile, rm, stat } from "fs/promises";
 import { randomBytes } from "crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { openSystemDatabase } from "./db";
@@ -64,14 +64,17 @@ import { serve, type NodeWebSocket } from "./node-server";
 import { HttpStatusError, readJsonBody } from "./http-body";
 import {
   isAppSystemRoute,
-  isDeclaredWorkload,
   parseRequestedWorkload,
 } from "./app-runtime-policy";
 import { instantiateBlankApp } from "./app-scaffold";
 import { PACKAGE_ID_PATTERN, SCOPED_PACKAGE_ID_PATTERN } from "./package-id";
-import { APP_MANIFEST_DIGEST_PATTERN } from "../../capsule/src/app-manifest-authority";
 import { resolveDeviceIdentity } from "./device-identity";
-import { resolveCommittedAppRevision } from "./app-revision";
+import { AppRepositoryService } from "./apps/repository";
+import { AppActivationCoordinator } from "./apps/activation";
+import { AppEditMaterializationCoordinator } from "./apps/edit-materialization";
+import { ArchiveHttpError, readAppPackageArchive } from "./apps/package-archive";
+import { AppLifecycleService } from "./apps/lifecycle";
+import { AppLifecycleError } from "./apps/errors";
 import {
   ProducerDescriptorStore,
   createAppProducerDescriptor,
@@ -121,6 +124,29 @@ const guard = RemoteGuard.fromEnvironment(
   systemProducer.prepareProducer,
 );
 await guard.health();
+const appVersionGuard = guard.withSource("system:apps", {
+  producerRef: systemProducer.producerRef,
+  prepareProducer: systemProducer.prepareProducer,
+  writeTables: [],
+  schemaGrant: false,
+  deadlineMs: HOST_GUARD_DEADLINE_MS,
+});
+const appRepository = new AppRepositoryService({ eventWriter: appVersionGuard });
+const appActivationCoordinator = new AppActivationCoordinator(
+  appRepository,
+  join(lamarckDir, "cache", "app-versions"),
+);
+const appEditMaterializations = new AppEditMaterializationCoordinator(
+  appRepository,
+  join(lamarckDir, "cache", "app-versions"),
+);
+const appLifecycle = new AppLifecycleService(
+  appsDir,
+  join(lamarckDir, "archived-apps"),
+  appRepository,
+  appActivationCoordinator,
+  appEditMaterializations,
+);
 const contentBlobStore = new ContentBlobStore(workspacePath);
 const settings = new SettingsStore(lamarckDir);
 const coreSettings = await settings.get();
@@ -169,7 +195,6 @@ const connectorScheduler = new ConnectorScheduler({
   },
 });
 let registry = await loadApps(appsDir);
-let appManifestGeneration = 1;
 let appRegistryTail: Promise<void> = Promise.resolve();
 const marketplaceService = await MarketplaceService.initialize({
   workspacePath,
@@ -347,9 +372,8 @@ function guardForRequest(auth: AuthContext, opts?: {
   return guard.withSource(sourceForAppWorkload(auth.appId, parseAppWorkload(auth.workload)), {
     producerRef: appProducer.producerRef,
     prepareProducer: appProducer.prepareProducer,
-    // Authority is the immutable manifest snapshot bound when the Host issued
-    // this channel. A later manifest edit can neither expand an in-flight
-    // request nor revive this channel after its generation is invalidated.
+    // Authority is the immutable activation snapshot bound when the Host
+    // issued this channel. Later draft edits cannot change a running workload.
     writeTables: [...auth.authorization.writeTables],
     schemaGrant: false,
     signal: opts?.signal,
@@ -384,12 +408,7 @@ function vfsCallerForRequest(auth: AuthContext, req: Request, signal: AbortSigna
 async function reloadAppRegistry(): Promise<void> {
   return enqueueAppRegistryUpdate(async () => {
     const candidate = await loadApps(appsDir);
-    const retiredGeneration = appManifestGeneration;
-    // invalidateManifestGeneration closes admissions synchronously before its
-    // first await, then drains requests already admitted under that snapshot.
-    await appCapabilities.invalidateManifestGeneration(retiredGeneration);
     registry = candidate;
-    appManifestGeneration = retiredGeneration + 1;
   });
 }
 
@@ -398,13 +417,9 @@ async function refreshAppRegistryIfChanged(): Promise<void> {
     const candidate = await loadApps(appsDir);
     if (sameAppManifests(registry, candidate)) return;
 
-    const retiredGeneration = appManifestGeneration;
-    await appCapabilities.invalidateManifestGeneration(retiredGeneration);
-    // The loader returns a stable, fully validated snapshot. Publish that
-    // exact snapshot after the old capability generation is closed rather
-    // than scanning again and racing a later partial write.
+    // Running workloads retain the activation manifest and grants captured by
+    // their own capability. Draft authoring changes only refresh inventory.
     registry = candidate;
-    appManifestGeneration = retiredGeneration + 1;
   });
 }
 
@@ -531,36 +546,6 @@ function rejectSchemaRequest(id: string): SchemaRequest {
   return request;
 }
 
-async function readAppFiles(appDir: string): Promise<Record<string, string>> {
-  const files: Record<string, string> = {};
-  async function walk(dir: string, prefix = ""): Promise<void> {
-    const entries = await readdir(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.name === ".git" || entry.name === "node_modules" || entry.name === "dist") {
-        continue;
-      }
-      const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-      const fullPath = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        await walk(fullPath, relPath);
-      } else if (entry.isFile()) {
-        files[relPath] = await readFile(fullPath, "utf8");
-      }
-    }
-  }
-  await walk(appDir);
-  return files;
-}
-
-function resolveAppFile(appDir: string, filename: string): string {
-  const target = join(appDir, filename);
-  const rel = relative(appDir, target);
-  if (!rel || rel.startsWith("..") || rel.includes("../") || rel === ".git" || rel.startsWith(".git/")) {
-    throw new Error("Invalid filename");
-  }
-  return target;
-}
-
 function escapeHtml(value: string): string {
   return value
     .replaceAll("&", "&amp;")
@@ -616,7 +601,7 @@ async function instantiateVerifiedMarketplaceApp(input: {
     packageId: input.packageId,
     releaseId: input.releaseId,
     ...(input.localId === undefined ? {} : { localId: input.localId }),
-    initializeGit: (dir) => runProcess("git", ["init", "--quiet"], dir),
+    initializeRepository: (dir) => appRepository.initializeRepository(input.localId ?? input.packageId, dir),
   });
   try {
     await reloadAppRegistry();
@@ -653,6 +638,24 @@ async function fileResponse(
   return new Response(new Uint8Array(await readFile(path)), {
     headers: contentType ? { "Content-Type": contentType, ...headers } : headers,
   });
+}
+
+function appLifecycleErrorResponse(
+  error: unknown,
+  json: (data: unknown, status?: number) => Response,
+): Response {
+  if (error instanceof AppLifecycleError) {
+    const status = error.code === "APP_NOT_FOUND"
+      ? 404
+      : error.code === "APP_PACKAGE_INVALID"
+        ? 400
+        : error.code === "APP_VERSION_HISTORY_UNAVAILABLE"
+          ? 503
+          : 409;
+    return json({ error: { code: error.code, message: error.message } }, status);
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return json({ error: { code: "APP_INTERNAL_ERROR", message } }, 500);
 }
 
 function staticContentType(path: string): string | undefined {
@@ -1330,47 +1333,109 @@ const server = await serve<{ cwd: string }>({
       }
 
       // -- Apps --
+      const editBaseMatch = path.match(/^\/api\/apps\/([^/]+)\/edit-base$/);
+      if (editBaseMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        try {
+          return json({
+            editBase: await appLifecycle.prepareEditBase(
+              decodeURIComponent(editBaseMatch[1]),
+            ),
+          });
+        } catch (error) {
+          return appLifecycleErrorResponse(error, json);
+        }
+      }
+
+      const editSaveMatch = path.match(/^\/api\/apps\/([^/]+)\/edit-package$/);
+      if (editSaveMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const appId = decodeURIComponent(editSaveMatch[1]);
+        try {
+          const upload = await readAppPackageArchive(
+            req,
+            join(lamarckDir, "staging", "app-edits"),
+          );
+          const result = await appLifecycle.savePackage(appId, upload.entries, {
+            baseVersion: upload.metadata.baseVersion,
+            basePackageDigest: upload.metadata.basePackageDigest,
+            ...(upload.metadata.message === undefined ? {} : { message: upload.metadata.message }),
+            ...(upload.metadata.author === undefined ? {} : { author: upload.metadata.author }),
+          });
+          await refreshAppRegistryIfChanged();
+          return json({ result, editBase: await appLifecycle.prepareEditBase(appId) });
+        } catch (error) {
+          if (error instanceof ArchiveHttpError) {
+            return json({ error: { code: "APP_PACKAGE_INVALID", message: error.message } }, error.status);
+          }
+          return appLifecycleErrorResponse(error, json);
+        }
+      }
+
+      const activationPrepareMatch = path.match(/^\/api\/apps\/([^/]+)\/activation\/prepare$/);
+      if (activationPrepareMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const appId = decodeURIComponent(activationPrepareMatch[1]);
+        const body = await readBody<{ workload?: unknown }>(req);
+        const workload = parseRequestedWorkload(body.workload);
+        if (!workload) return json({ error: "valid workload is required" }, 400);
+        try {
+          const activation = await appLifecycle.prepareActivation(appId, workload);
+          return json({ activation });
+        } catch (error) {
+          return appLifecycleErrorResponse(error, json);
+        }
+      }
+
+      const activationReleaseMatch = path.match(/^\/api\/apps\/activation\/([^/]+)$/);
+      if (activationReleaseMatch && method === "DELETE") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const activationId = decodeURIComponent(activationReleaseMatch[1]);
+        return json({ ok: await appActivationCoordinator.release(activationId) });
+      }
+
       if (path === "/api/app-runtime/channels" && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const body = await readBody<{
           appId?: unknown;
           workload?: unknown;
-          manifestGeneration?: unknown;
-          manifestDigest?: unknown;
+          activationId?: unknown;
         }>(req);
         const workload = parseRequestedWorkload(body.workload);
         if (
           typeof body.appId !== "string"
           || !workload
-          || !Number.isSafeInteger(body.manifestGeneration)
-          || Number(body.manifestGeneration) < 1
-          || typeof body.manifestDigest !== "string"
-          || !APP_MANIFEST_DIGEST_PATTERN.test(body.manifestDigest)
+          || typeof body.activationId !== "string"
         ) {
-          return json({ error: "appId, workload, and manifest authority are required" }, 400);
+          return json({ error: "appId, workload, and activationId are required" }, 400);
         }
-        // Re-scan immediately before issuance. The caller's generation and
-        // digest must still name this exact authority snapshot; a later file
-        // edit is caught again by the Capsule package-snapshot verifier.
-        await refreshAppRegistryIfChanged();
-        const app = registry.apps.get(body.appId);
-        if (!app || !isDeclaredWorkload(app.manifest, workload)) {
-          return json({ error: "unknown App or undeclared workload" }, 404);
+        try {
+          const activation = appActivationCoordinator.require(
+            body.activationId,
+            body.appId,
+            workload,
+          );
+          await appRepository.verifyRetainedVersions(body.appId, join(appsDir, body.appId));
+          const descriptor = producerDescriptorStore.publish(createAppProducerDescriptor(
+            body.appId,
+            activation.version,
+            systemIdentity,
+          ));
+          producerDescriptorStore.resolve(descriptor.ref);
+          return json(appCapabilities.issue(body.appId, workload, {
+            activationId: activation.activationId,
+            manifestDigest: activation.manifestDigest,
+            packageDigest: activation.packageDigest,
+            appCommit: activation.version,
+            writeTables: activation.manifest.permissions.writes.tables,
+            fileGrants: [
+              `apps/${body.appId}/`,
+              ...activation.manifest.permissions.writes.files,
+            ],
+          }));
+        } catch (error) {
+          return json({ error: error instanceof Error ? error.message : String(error) }, 409);
         }
-        if (
-          body.manifestGeneration !== appManifestGeneration
-          || body.manifestDigest !== app.manifestDigest
-        ) {
-          return json({ error: "App manifest authority changed; refresh and retry" }, 409);
-        }
-        const appCommit = await resolveCommittedAppRevision(app.dir);
-        return json(appCapabilities.issue(body.appId, workload, {
-          manifestGeneration: appManifestGeneration,
-          manifestDigest: app.manifestDigest,
-          appCommit,
-          writeTables: registry.getTableGrants(body.appId),
-          fileGrants: registry.getFileGrants(body.appId),
-        }));
       }
 
       const runtimeChannelMatch = path.match(/^\/api\/app-runtime\/channels\/([^/]+)$/);
@@ -1393,33 +1458,85 @@ const server = await serve<{ cwd: string }>({
         // agent may create an App directory directly, so make this read an
         // authoritative semantic rescan without revoking unchanged Apps.
         await refreshAppRegistryIfChanged();
-        const apps = [...registry.apps.values()].map((a) => ({
-          manifestVersion: a.manifest.manifestVersion,
-          id: a.manifest.id,
-          name: a.manifest.name,
-          description: a.manifest.description,
-          ...(a.manifest.createdFrom === undefined
-            ? {}
-            : { createdFrom: a.manifest.createdFrom }),
-          runtime: a.manifest.runtime,
-          permissions: a.manifest.permissions,
-          manifestGeneration: appManifestGeneration,
-          manifestDigest: a.manifestDigest,
-        }));
-        return json({ apps });
+        return json({ apps: await appLifecycle.inventory() });
       }
 
-      // -- App Source (Host editing/build snapshot input; never a runtime mount) --
-      const sourceMatch = path.match(/^\/api\/apps\/([^/]+)\/source$/);
-      if (sourceMatch && method === "GET") {
-        const appId = decodeURIComponent(sourceMatch[1]);
-        const app = registry.apps.get(appId);
-        if (!app) return json({ error: "app not found" }, 404);
+      const versionsMatch = path.match(/^\/api\/apps\/([^/]+)\/versions$/);
+      if (versionsMatch && method === "GET") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const appId = decodeURIComponent(versionsMatch[1]);
+        const cursor = url.searchParams.get("cursor") ?? undefined;
+        const limitValue = url.searchParams.get("limit");
+        const limit = limitValue === null ? undefined : Number(limitValue);
         try {
-          return json(await readAppFiles(app.dir));
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          return json({ error: message }, 500);
+          return json(await appLifecycle.versions(appId, { cursor, limit }));
+        } catch (error) {
+          return appLifecycleErrorResponse(error, json);
+        }
+      }
+
+      const saveMatch = path.match(/^\/api\/apps\/([^/]+)\/save$/);
+      if (saveMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const appId = decodeURIComponent(saveMatch[1]);
+        const body = await readBody<{ message?: unknown; author?: unknown }>(req);
+        if (
+          (body.message !== undefined && typeof body.message !== "string")
+          || (body.author !== undefined && typeof body.author !== "string")
+        ) return json({ error: { code: "APP_PACKAGE_INVALID", message: "message and author must be strings" } }, 400);
+        try {
+          const result = await appLifecycle.save(appId, {
+            ...(body.message === undefined ? {} : { message: body.message }),
+            ...(body.author === undefined ? {} : { author: body.author }),
+          });
+          await refreshAppRegistryIfChanged();
+          return json(result);
+        } catch (error) {
+          return appLifecycleErrorResponse(error, json);
+        }
+      }
+
+      const restoreMatch = path.match(/^\/api\/apps\/([^/]+)\/restore$/);
+      if (restoreMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const appId = decodeURIComponent(restoreMatch[1]);
+        const body = await readBody<{ version?: unknown; message?: unknown; author?: unknown }>(req);
+        if (
+          typeof body.version !== "string"
+          || (body.message !== undefined && typeof body.message !== "string")
+          || (body.author !== undefined && typeof body.author !== "string")
+        ) return json({ error: { code: "APP_PACKAGE_INVALID", message: "version and descriptive metadata are invalid" } }, 400);
+        try {
+          const result = await appLifecycle.restore(appId, body.version, {
+            ...(body.message === undefined ? {} : { message: body.message }),
+            ...(body.author === undefined ? {} : { author: body.author }),
+          });
+          await refreshAppRegistryIfChanged();
+          return json(result);
+        } catch (error) {
+          return appLifecycleErrorResponse(error, json);
+        }
+      }
+
+      const rebuildHistoryMatch = path.match(
+        /^\/api\/apps\/([^/]+)\/version-history\/rebuild$/,
+      );
+      if (rebuildHistoryMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const appId = decodeURIComponent(rebuildHistoryMatch[1]);
+        const body = await readBody<{ confirmed?: unknown }>(req);
+        if (body.confirmed !== true) {
+          return json({
+            error: {
+              code: "APP_PACKAGE_INVALID",
+              message: "Version history rebuild requires explicit confirmation",
+            },
+          }, 400);
+        }
+        try {
+          return json(await appLifecycle.rebuildVersionHistory(appId));
+        } catch (error) {
+          return appLifecycleErrorResponse(error, json);
         }
       }
 
@@ -1457,11 +1574,9 @@ const server = await serve<{ cwd: string }>({
           id,
           name,
           description,
-          initializeGit: (dir) => runProcess("git", ["init", "--quiet"], dir),
+          initializeRepository: (dir) => appRepository.initializeRepository(id, dir),
         });
 
-        // Reloading invalidates every channel issued from the prior manifest
-        // generation before the new App becomes visible.
         await reloadAppRegistry();
         await guard.withExecution({
           signal: requestGuardSignal,
@@ -1483,6 +1598,7 @@ const server = await serve<{ cwd: string }>({
 
         // Stop admission and drain active App requests before moving its code.
         await appCapabilities.revokeApp(appId);
+        await appRepository.verifyRetainedVersions(appId, app.dir);
         await archiveApp(appsDir, join(lamarckDir, "archived-apps"), appId);
         await reloadAppRegistry();
 
@@ -1498,28 +1614,6 @@ const server = await serve<{ cwd: string }>({
           payload: { appId },
         });
         return json({ ok: true, id: appId });
-      }
-
-      // -- Save App File --
-      const fileMatch = path.match(/^\/api\/apps\/([^/]+)\/files\/(.+)$/);
-      if (fileMatch && method === "PUT") {
-        const appId = decodeURIComponent(fileMatch[1]);
-        const filename = decodeURIComponent(fileMatch[2]);
-
-        const app = registry.apps.get(appId);
-        if (!app) return json({ error: "app not found" }, 404);
-
-        const body = await readBody<{ content: string }>(req);
-        const filePath = resolveAppFile(app.dir, filename);
-        await mkdir(dirname(filePath), { recursive: true });
-        await writeFile(filePath, body.content);
-
-        // Reload registry if manifest was modified
-        if (filename === "manifest.json" || filename === "package.json") {
-          await reloadAppRegistry();
-        }
-
-        return json({ ok: true });
       }
 
       // -- Shell (static SPA) --

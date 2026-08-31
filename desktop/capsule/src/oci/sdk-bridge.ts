@@ -2,6 +2,10 @@ import { chmod, chown, lstat, mkdir, rmdir, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 import type { Duplex } from "node:stream";
+import {
+  openWorkloadAppCliBridge,
+  type WorkloadAppCliBridge,
+} from "../app-edit/guest-bridge";
 
 export interface WorkloadSdkBridge {
   readonly socketPath: string;
@@ -15,6 +19,12 @@ export interface WorkloadSdkBridgeOptions {
   readonly uid: number;
   readonly gid: number;
   readonly upstream: Duplex;
+  readonly appCli?: {
+    readonly socketPath: string;
+    readonly upstream: Duplex;
+    readonly editRoot: string;
+    readonly lowerRoot: string;
+  };
 }
 
 /**
@@ -34,6 +44,7 @@ export async function openWorkloadSdkBridge(
   let failure: Error | undefined;
   let closePromise: Promise<void> | undefined;
   let listenerClosePromise: Promise<void> | undefined;
+  let appCliBridge: WorkloadAppCliBridge | undefined;
 
   const closeListener = (): Promise<void> => {
     listenerClosePromise ??= server.listening
@@ -61,7 +72,13 @@ export async function openWorkloadSdkBridge(
       ready = false;
       local?.destroy();
       options.upstream.destroy();
+      options.appCli?.upstream.destroy();
       const failures: unknown[] = [];
+      try {
+        await appCliBridge?.close();
+      } catch (error) {
+        failures.push(error);
+      }
       try {
         await closeListener();
       } catch (error) {
@@ -152,6 +169,13 @@ export async function openWorkloadSdkBridge(
     assertUpstreamOpen(options.upstream, failure);
     await listen(server, options.socketPath);
     assertUpstreamOpen(options.upstream, failure);
+    if (options.appCli) {
+      appCliBridge = await openWorkloadAppCliBridge({
+        ...options.appCli,
+        uid: options.uid,
+        gid: options.gid,
+      });
+    }
     await chmod(options.socketPath, 0o600);
     await chown(options.socketPath, options.uid, options.gid);
     // The App can traverse its private mounted directory and connect to the
@@ -165,11 +189,13 @@ export async function openWorkloadSdkBridge(
     ready = false;
     local?.destroy();
     options.upstream.destroy();
+    options.appCli?.upstream.destroy();
     removeUpstreamListeners();
     const failures: unknown[] = failure && failure !== error
       ? [failure, error]
       : [error];
     await closeListener().catch((cleanupError) => failures.push(cleanupError));
+    await appCliBridge?.close().catch((cleanupError) => failures.push(cleanupError));
     if (rootCreated) {
       await chmod(options.bridgeRoot, 0o700).catch((cleanupError) => failures.push(cleanupError));
       await unlinkIfPresent(options.socketPath).catch((cleanupError) => failures.push(cleanupError));
@@ -244,6 +270,15 @@ function validateOptions(options: WorkloadSdkBridgeOptions): void {
     || typeof options.upstream.destroy !== "function"
   ) throw new Error("SDK bridge upstream must be an open Duplex stream");
   assertUpstreamOpen(options.upstream);
+  if (options.appCli) {
+    if (options.appCli.socketPath !== `${options.bridgeRoot}/cli.sock`) {
+      throw new Error("App CLI socket must be the fixed child of its bridge root");
+    }
+    if (!options.appCli.editRoot.startsWith("/") || !options.appCli.lowerRoot.startsWith("/")) {
+      throw new Error("App CLI materialization roots must be absolute");
+    }
+    assertUpstreamOpen(options.appCli.upstream);
+  }
 }
 
 function assertUpstreamOpen(upstream: Duplex, failure?: Error): void {

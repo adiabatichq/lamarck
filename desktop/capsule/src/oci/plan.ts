@@ -8,6 +8,10 @@ import {
   validateOpaqueId,
 } from "../protocol/validate";
 import type { WorkloadKind } from "../protocol/types";
+import {
+  APP_EDIT_LOWER_ROOT_PATH,
+  APP_EDIT_ROOT_PATH,
+} from "../app-edit/protocol";
 
 export const OCI_POLICY_VERSION = 1;
 export const LAMARCK_SDK_SOCKET_ENV = "LAMARCK_SDK_SOCKET" as const;
@@ -20,6 +24,7 @@ const RUNTIME_ROOT = "/var/lib/lamarck/runtime";
 const BUNDLE_ROOT = "/run/lamarck/bundles";
 const NETNS_ROOT = "/run/lamarck/netns";
 const SDK_BRIDGE_ROOT = "/run/lamarck/sdk-bridges";
+const APP_EDIT_GUEST_ROOT = "/var/lib/lamarck/app-edits";
 const EMPTY_RESOLV_CONF = "/opt/lamarck/config/empty-resolv.conf";
 const LOOPBACK_HOSTS = "/opt/lamarck/config/loopback-hosts";
 
@@ -135,6 +140,8 @@ export interface OciBundlePlan {
   networkNamespacePath: string;
   sdkBridgeRoot: string;
   sdkSocketHostPath: string;
+  cliSocketHostPath: string;
+  appEditRoot: string;
   config: {
     ociVersion: "1.1.0";
     root: { path: string; readonly: true };
@@ -262,6 +269,8 @@ export function createOciBundlePlan(rawInput: OciPlanInput): OciBundlePlan {
   const networkNamespacePath = `${NETNS_ROOT}/${appKey}`;
   const sdkBridgeRoot = `${SDK_BRIDGE_ROOT}/${workloadKey}`;
   const sdkSocketHostPath = `${sdkBridgeRoot}/system.sock`;
+  const cliSocketHostPath = `${sdkBridgeRoot}/cli.sock`;
+  const appEditRoot = `${APP_EDIT_GUEST_ROOT}/${workloadKey}`;
   const environment = Object.entries({
     ...DEFAULT_ENVIRONMENT,
     [LAMARCK_SDK_SOCKET_ENV]: LAMARCK_SDK_SOCKET_PATH,
@@ -281,6 +290,8 @@ export function createOciBundlePlan(rawInput: OciPlanInput): OciBundlePlan {
     networkNamespacePath,
     sdkBridgeRoot,
     sdkSocketHostPath,
+    cliSocketHostPath,
+    appEditRoot,
     config: {
       ociVersion: "1.1.0",
       root: { path: NODE_ROOTFS, readonly: true },
@@ -304,7 +315,7 @@ export function createOciBundlePlan(rawInput: OciPlanInput): OciBundlePlan {
           { type: "RLIMIT_NOFILE", hard: 4_096, soft: 4_096 },
         ],
       },
-      mounts: fixedMounts(runtimeRoot, sdkBridgeRoot),
+      mounts: fixedMounts(runtimeRoot, sdkBridgeRoot, appEditRoot),
       linux: {
         cgroupsPath: `lamarck/apps/${appKey}/workloads/${workloadKey}`,
         rootfsPropagation: "private",
@@ -354,6 +365,8 @@ export function assertOciSecurityInvariants(
   const expectedNetworkNamespacePath = `${NETNS_ROOT}/${expectedAppKey}`;
   const expectedSdkBridgeRoot = `${SDK_BRIDGE_ROOT}/${expectedWorkloadKey}`;
   const expectedSdkSocketHostPath = `${expectedSdkBridgeRoot}/system.sock`;
+  const expectedCliSocketHostPath = `${expectedSdkBridgeRoot}/cli.sock`;
+  const expectedAppEditRoot = `${APP_EDIT_GUEST_ROOT}/${expectedWorkloadKey}`;
   const plan = value as Partial<OciBundlePlan>;
   if (plan.policyVersion !== OCI_POLICY_VERSION) invariant("policy-version", "unknown OCI policy");
   if (plan.containerId !== expectedWorkloadKey) {
@@ -374,6 +387,12 @@ export function assertOciSecurityInvariants(
   }
   if (plan.sdkSocketHostPath !== expectedSdkSocketHostPath) {
     invariant("sdk-bridge-path", "SDK socket path is not bound to the trusted workload handle");
+  }
+  if (plan.cliSocketHostPath !== expectedCliSocketHostPath) {
+    invariant("cli-bridge-path", "App CLI socket path is not bound to the trusted workload handle");
+  }
+  if (plan.appEditRoot !== expectedAppEditRoot) {
+    invariant("app-edit-path", "App edit root is not bound to the trusted workload handle");
   }
 
   const config = plan.config as (OciBundlePlan["config"] & { hooks?: unknown }) | undefined;
@@ -436,7 +455,11 @@ export function assertOciSecurityInvariants(
     invariant("environment", "process environment differs from the trusted launch specification");
   }
 
-  if (!structurallyEqual(config.mounts, fixedMounts(expectedRuntimeRoot, expectedSdkBridgeRoot))) {
+  if (!structurallyEqual(config.mounts, fixedMounts(
+    expectedRuntimeRoot,
+    expectedSdkBridgeRoot,
+    expectedAppEditRoot,
+  ))) {
     invariant("mounts", "mount table differs from the closed policy");
   }
 
@@ -549,7 +572,7 @@ function normalizeExpectedIdentity(raw: OciExpectedIdentity): OciExpectedIdentit
   };
 }
 
-function fixedMounts(runtimeRoot: string, sdkBridgeRoot: string): OciMount[] {
+function fixedMounts(runtimeRoot: string, sdkBridgeRoot: string, appEditRoot: string): OciMount[] {
   return [
     { destination: "/proc", type: "proc", source: "proc", options: ["nosuid", "noexec", "nodev"] },
     { destination: "/dev", type: "tmpfs", source: "tmpfs", options: ["nosuid", "noexec", "mode=755", "size=65536k"] },
@@ -560,6 +583,8 @@ function fixedMounts(runtimeRoot: string, sdkBridgeRoot: string): OciMount[] {
     { destination: "/home/app", type: "bind", source: `${runtimeRoot}/home`, options: ["rbind", "rw", "nosuid", "nodev"] },
     { destination: "/run/app", type: "bind", source: `${runtimeRoot}/run`, options: ["rbind", "rw", "nosuid", "nodev"] },
     { destination: "/run/lamarck", type: "bind", source: sdkBridgeRoot, options: ["rbind", "ro", "nosuid", "nodev", "noexec"] },
+    { destination: APP_EDIT_ROOT_PATH, type: "bind", source: appEditRoot, options: ["rbind", "rw", "nosuid", "nodev"] },
+    { destination: APP_EDIT_LOWER_ROOT_PATH, type: "bind", source: APP_EDIT_LOWER_ROOT_PATH, options: ["rbind", "ro", "nosuid", "nodev", "noexec"] },
     { destination: LAMARCK_FILES_ROOT_PATH, type: "bind", source: LAMARCK_FILES_ROOT_PATH, options: ["rbind", "ro", "nosuid", "nodev", "noexec"] },
     { destination: "/tmp", type: "tmpfs", source: "tmpfs", options: ["nosuid", "nodev", "mode=1777", "size=262144k"] },
     { destination: "/etc/resolv.conf", type: "bind", source: EMPTY_RESOLV_CONF, options: ["bind", "ro", "nosuid", "nodev", "noexec"] },

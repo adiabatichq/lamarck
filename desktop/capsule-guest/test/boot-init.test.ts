@@ -24,7 +24,7 @@ describe("read-only Guest boot contract", () => {
     expect(init).not.toMatch(/\bfstrim\b/);
   });
 
-  test("mounts the single Host D1 share read-only before workloads start", async () => {
+  test("mounts Host D1 and immutable App-version shares read-only before workloads start", async () => {
     const kernel = await readFile(resolve(board, "kernel.fragment"), "utf8");
     const postBuild = await readFile(resolve(board, "post-build.sh"), "utf8");
     const init = await readFile(
@@ -34,9 +34,13 @@ describe("read-only Guest boot contract", () => {
     expect(kernel).toContain("CONFIG_FUSE_FS=y");
     expect(kernel).toContain("CONFIG_VIRTIO_FS=y");
     expect(postBuild).toContain('"$root/mnt/lamarck-files"');
+    expect(postBuild).toContain('"$root/mnt/lamarck-apps-lower"');
     expect(postBuild).toContain('mkdir -p "$target/mnt/lamarck-files"');
+    expect(postBuild).toContain('mkdir -p "$target/mnt/lamarck-apps-lower"');
     expect(init).toContain("mount -t virtiofs -o ro,nosuid,nodev,noexec");
     expect(init).toContain("tag=lamarck-files");
+    expect(init).toContain("apps_tag=lamarck-app-versions");
+    expect(init).toContain("apps_mountpoint=/mnt/lamarck-apps-lower");
     expect(init).toContain("$3 == \"virtiofs\"");
   });
 
@@ -86,6 +90,8 @@ describe("read-only Guest boot contract", () => {
     expect(postBuild).toContain(': > "$root/etc/hosts"');
     expect(postBuild).toContain('"$root/run/app" "$root/run/lamarck"');
     expect(postBuild).toContain('"$root/mnt/lamarck-files"');
+    expect(postBuild).toContain('"$root/mnt/lamarck-apps"');
+    expect(postBuild).toContain('"$root/mnt/lamarck-apps-lower"');
     expect(postBuild.indexOf(': > "$root/etc/resolv.conf"')).toBeLessThan(
       postBuild.indexOf('runtime_root="$target/opt/lamarck/rootfs/node24"'),
     );

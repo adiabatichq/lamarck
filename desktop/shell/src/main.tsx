@@ -51,6 +51,7 @@ if (import.meta.env.DEV && !window.lamarckHost) {
     setAppViewerBounds: () => {},
     closeAppViewer: async () => ({ ok: true as const }),
     reloadAppRuntime: async () => ({ active: false }),
+    getAppRuntimeStates: async () => [],
     archiveApp: async (appId: string) => {
       const response = await fetch(`${base}/api/apps/${encodeURIComponent(appId)}/archive`, {
         method: "POST",

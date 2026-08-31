@@ -162,7 +162,7 @@ async function ensurePhysicalDirectory(path: string, label: string): Promise<voi
  * External editors and coding agents may replace an App manifest while Core
  * is scanning the Workspace. Read one stable file identity and give a brief
  * in-place write a bounded chance to settle; only a complete validated
- * snapshot can become a new authority generation.
+ * snapshot can become registry authoring state.
  */
 async function loadSettledManifest(
   path: string,
@@ -288,8 +288,7 @@ async function delay(milliseconds: number): Promise<void> {
 
 // Archive (not delete): retire an app by moving its folder — git history and
 // all — out of apps/ into the archive root. It drops out of the active
-// registry and the app-commits watcher naturally (both only look at apps/),
-// and stays fully recoverable by moving the folder back. Returns the archive
+// registry and stays fully recoverable by moving the folder back. Returns the archive
 // path; on id collision a timestamp suffix keeps prior archives intact.
 export async function archiveApp(
   appsDir: string,

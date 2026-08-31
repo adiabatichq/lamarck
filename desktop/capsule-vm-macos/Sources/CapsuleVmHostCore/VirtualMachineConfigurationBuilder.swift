@@ -35,6 +35,7 @@ public enum CapsuleVmConfigurationBuilder {
     public static let stateDevicePath = "/dev/vdb"
     public static let stateFilesystemLabel = "LAMARCK_STATE"
     public static let workspaceFilesShareTag = "lamarck-files"
+    public static let appVersionsShareTag = "lamarck-app-versions"
 
     public static func kernelCommandLine(for image: VerifiedGuestImage) -> String {
         [
@@ -51,6 +52,7 @@ public enum CapsuleVmConfigurationBuilder {
     public static func build(
         image: VerifiedGuestImage,
         workspaceFilesURL: URL,
+        appVersionsURL: URL,
         stateDiskLease: CapsuleVmStateDiskLease,
         cpuCount: Int,
         memorySize: UInt64,
@@ -59,6 +61,7 @@ public enum CapsuleVmConfigurationBuilder {
         let configuration = try makeUnvalidatedConfiguration(
             image: image,
             workspaceFilesURL: workspaceFilesURL,
+            appVersionsURL: appVersionsURL,
             stateDiskLease: stateDiskLease,
             cpuCount: cpuCount,
             memorySize: memorySize,
@@ -79,6 +82,7 @@ public enum CapsuleVmConfigurationBuilder {
     static func makeUnvalidatedConfiguration(
         image: VerifiedGuestImage,
         workspaceFilesURL: URL,
+        appVersionsURL: URL,
         stateDiskLease: CapsuleVmStateDiskLease,
         cpuCount: Int,
         memorySize: UInt64,
@@ -146,12 +150,18 @@ public enum CapsuleVmConfigurationBuilder {
         workspaceShare.share = VZSingleDirectoryShare(
             directory: VZSharedDirectory(url: workspaceFilesURL, readOnly: true)
         )
+        let appVersionsShare = VZVirtioFileSystemDeviceConfiguration(
+            tag: appVersionsShareTag
+        )
+        appVersionsShare.share = VZSingleDirectoryShare(
+            directory: VZSharedDirectory(url: appVersionsURL, readOnly: true)
+        )
 
         // The single directory surface is the selected Workspace's D1 root and
         // Virtualization.framework enforces it read-only. All other Host/Guest
         // traffic is carried only by the virtio socket above.
         configuration.networkDevices = []
-        configuration.directorySharingDevices = [workspaceShare]
+        configuration.directorySharingDevices = [workspaceShare, appVersionsShare]
         configuration.graphicsDevices = []
         configuration.audioDevices = []
         configuration.consoleDevices = []

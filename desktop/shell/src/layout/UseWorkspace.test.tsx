@@ -5,8 +5,13 @@ import { UseWorkspace } from "./UseWorkspace";
 
 function app(id: string, name: string): AppInfo {
   return {
-    manifestVersion: 1,
+    schemaVersion: 1,
     id,
+    path: `/workspace/apps/${id}`,
+    version: null,
+    packageDirty: true,
+    manifestHealth: { status: "valid" },
+    versionHealth: { status: "unversioned" },
     name,
     description: `${name} App`,
     runtime: {

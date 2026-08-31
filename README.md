@@ -66,6 +66,7 @@ life means—then spend your time living it.
 | **Owned history** | Append-only events, Markdown-backed documents, and SQL-derived state |
 | **Core runtime** | Local Node runtime with a dedicated Guard process |
 | **App model** | Host-bound app identity, declared write grants, UI/services/jobs |
+| **App lifecycle** | Explicit save and activation create retained Git-backed versions; restore moves forward, and managed Capsules edit private package materializations through the fixed CLI |
 | **App sandbox** | Apps run in a shared Linux Capsule VM: bytes cross the verified, digest-bound Guest image as immutable blobs and run under the in-guest runc supervisor, with no Host fallback |
 | **Connector runtime** | Install/remove, scheduling, auth plumbing, encrypted credentials, and trust primitives |
 | **Secrets** | Electron safeStorage plus encrypted external credentials |
@@ -149,6 +150,24 @@ After Lamarck opens:
 3. Open one of the example workspace apps.
 4. Look at its `manifest.json` and declared write grants.
 5. Change or build something without replacing the history underneath.
+
+### Editing Apps
+
+On the Host, App paths are ordinary Workspace paths. Managed Capsule workloads
+use the same commands against private writable materializations:
+
+```bash
+lamarck app list --json
+lamarck app save <app-id> -m "Describe the change" --author "Name"
+lamarck app versions <app-id> --json
+lamarck app restore <app-id> <version>
+lamarck app refresh <app-id> --yes  # managed Capsule only; discards unsaved edits
+```
+
+Save validates the manifest and records a version; it does not build, activate,
+or disturb a running App. Activation uses the same manifest-only admission and
+runs the exact retained commit. Restore creates a new forward version. SQL and
+DDL files inside an App remain ordinary package reference files.
 
 ## How it works
 

@@ -109,6 +109,32 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     assert.equal((await unauthorized.json()).error.code, "GUARD_UNAUTHORIZED");
   });
 
+  test("reserves app.version lifecycle events and deduplicates System replay", async () => {
+    const event = {
+      type: "app.version.created",
+      externalId: `example:${"a".repeat(40)}`,
+      startedAt: 1_700_000_000_000,
+      payload: {
+        appId: "example",
+        version: "a".repeat(40),
+        parentVersion: null,
+        trigger: "save",
+      },
+    };
+    await assertRpcRejects("writeEvent", {
+      principal: principal("app:forged-version", []),
+      event,
+    }, /system-reserved namespace/i);
+
+    const first = await rpc("writeEvent", { principal: host, event });
+    const replay = await rpc("writeEvent", { principal: host, event });
+    assert.equal(replay, first);
+    assert.deepEqual(await queryRows(
+      "SELECT count(*) AS count FROM events WHERE source = ? AND external_id = ?",
+      [host.source, event.externalId],
+    ), [{ count: 1 }]);
+  });
+
   test("clamps trusted per-call budgets to the Guard hard ceiling", { skip: DIRECT }, async () => {
     const isolatedWorkspace = mkdtempSync(join(tmpdir(), "lamarck-node-guard-ceiling-"));
     const isolatedDir = join(isolatedWorkspace, ".lamarck");

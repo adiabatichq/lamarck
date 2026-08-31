@@ -824,7 +824,7 @@ auth:
         expect(await state.get()).toBeUndefined();
         expect(config).toEqual({ label: "integration", extra: true });
         await guard.writeEvent({
-          type: "app.commit",
+          type: "sync.probe",
           externalId: "abc123",
           startedAt: 1000,
           payload: { sha: "abc123", label: config.label },
@@ -836,8 +836,8 @@ auth:
     supervisor.register(
       {
         manifestVersion: 1,
-        id: "app-commits",
-        name: "App Commits",
+        id: "sync-probe",
+        name: "Sync Probe",
         description: "Test connector manifest.",
         eventCatalog: "./events.json",
         entry: "./index.ts",
@@ -848,15 +848,15 @@ auth:
       definition,
     );
     const sourceRecord = supervisor.ensureSource({
-      connectorId: "app-commits",
+      connectorId: "sync-probe",
       config: { label: "integration", extra: true },
     });
 
-    expect(sourceRecord.id).not.toBe("app-commits");
+    expect(sourceRecord.id).not.toBe("sync-probe");
     await supervisor.run(sourceRecord.id);
 
-    const event = dataDb.prepare("SELECT * FROM events WHERE type = ?").get("app.commit") as any;
-    expect(event.source).toBe("connector:app-commits");
+    const event = dataDb.prepare("SELECT * FROM events WHERE type = ?").get("sync.probe") as any;
+    expect(event.source).toBe("connector:sync-probe");
     expect(event.external_id).toBe("abc123");
     expect(JSON.parse(event.payload)).toEqual({ sha: "abc123", label: "integration" });
 
@@ -868,7 +868,7 @@ auth:
     expect(listed.recentRuns).toHaveLength(1);
     expect(listed.recentRuns[0]).toMatchObject({
       sourceId: sourceRecord.id,
-      connectorId: "app-commits",
+      connectorId: "sync-probe",
       trigger: "manual",
       status: "success",
       error: undefined,

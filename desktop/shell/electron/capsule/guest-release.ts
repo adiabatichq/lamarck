@@ -286,6 +286,9 @@ function parseDescriptor(source: string): CapsuleGuestReleaseDescriptor {
     /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/,
   );
   const features = canonicalFeatures(object.features);
+  if (!features.includes("app-cli-v1")) {
+    invalid("$.features", "required private App CLI feature app-cli-v1 is missing");
+  }
   if (!features.includes("artifact-adoption-receipt-v1")) {
     invalid(
       "$.features",

@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 const baseUrl = process.env.LAMARCK_CORE_URL ?? `http://localhost:${process.env.PORT ?? "3000"}`;
 const coreToken = process.env.LAMARCK_CORE_TOKEN;
+const jsonMode = process.argv.slice(2).includes("--json");
 
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
@@ -45,7 +46,132 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "app") {
+    await runApp(args);
+    return;
+  }
+
   die(`unknown command: ${command}`);
+}
+
+async function runApp(rawArgs: string[]): Promise<void> {
+  const args = rawArgs.filter((arg) => arg !== "--json");
+  const command = args.shift();
+  if (!command) throw new CliError("APP_COMMAND_UNSUPPORTED", "app requires a command");
+
+  if (command === "list") {
+    if (args.length > 0) throw new CliError("APP_COMMAND_UNSUPPORTED", "app list accepts no arguments");
+    const result = await get<{ apps: Array<{
+      id: string;
+      name: string;
+      path: string;
+      version: string | null;
+    }> }>("/api/apps");
+    const apps = result.apps.map(({ id, name, path, version }) => ({ id, name, path, version }));
+    printResult(apps, apps.length === 0
+      ? "No Apps installed"
+      : apps.map((app) => `${app.id}\t${app.version?.slice(0, 12) ?? "unversioned"}\t${app.path}`).join("\n"));
+    return;
+  }
+
+  if (command === "save") {
+    const appId = args.shift();
+    if (!appId) throw new CliError("APP_COMMAND_UNSUPPORTED", "app save requires an App id");
+    const metadata = parseVersionMetadata(args);
+    const result = await post<{ version: string; created: boolean }>(
+      `/api/apps/${encodeURIComponent(appId)}/save`,
+      metadata,
+    );
+    printResult(result, result.created
+      ? `Saved ${appId} ${result.version.slice(0, 12)}`
+      : `${appId} is unchanged at ${result.version.slice(0, 12)}`);
+    return;
+  }
+
+  if (command === "versions") {
+    const appId = args.shift();
+    if (!appId || args.length > 0) {
+      throw new CliError("APP_COMMAND_UNSUPPORTED", "app versions requires one App id");
+    }
+    const versions: unknown[] = [];
+    let cursor: string | null = null;
+    do {
+      const query = new URLSearchParams({ limit: "100" });
+      if (cursor) query.set("cursor", cursor);
+      const page = await get<{ versions: unknown[]; nextCursor: string | null }>(
+        `/api/apps/${encodeURIComponent(appId)}/versions?${query}`,
+      );
+      versions.push(...page.versions);
+      cursor = page.nextCursor;
+    } while (cursor);
+    printResult(versions, versions.length === 0
+      ? `No versions recorded for ${appId}`
+      : versions.map((value) => formatVersion(value)).join("\n"));
+    return;
+  }
+
+  if (command === "restore") {
+    const appId = args.shift();
+    const version = args.shift();
+    if (!appId || !version) {
+      throw new CliError("APP_COMMAND_UNSUPPORTED", "app restore requires an App id and version");
+    }
+    const metadata = parseVersionMetadata(args);
+    const result = await post<{ version: string; created: boolean }>(
+      `/api/apps/${encodeURIComponent(appId)}/restore`,
+      { version, ...metadata },
+    );
+    printResult(result, result.created
+      ? `Restored ${appId} as ${result.version.slice(0, 12)}`
+      : `${appId} already has that package at ${result.version.slice(0, 12)}`);
+    return;
+  }
+
+  if (command === "refresh") {
+    throw new CliError(
+      "APP_COMMAND_UNSUPPORTED",
+      "app refresh is available only inside a managed Capsule",
+    );
+  }
+  throw new CliError("APP_COMMAND_UNSUPPORTED", `unknown app command: ${command}`);
+}
+
+function parseVersionMetadata(args: string[]): { message?: string; author?: string } {
+  let message: string | undefined;
+  let author: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const option = args[index];
+    if (option === "-m" || option === "--message") {
+      if (message !== undefined) throw new CliError("APP_PACKAGE_INVALID", "message may be supplied once");
+      message = args[++index];
+      if (message === undefined) throw new CliError("APP_PACKAGE_INVALID", `${option} requires a value`);
+      continue;
+    }
+    if (option === "--author") {
+      if (author !== undefined) throw new CliError("APP_PACKAGE_INVALID", "author may be supplied once");
+      author = args[++index];
+      if (author === undefined) throw new CliError("APP_PACKAGE_INVALID", "--author requires a value");
+      continue;
+    }
+    throw new CliError("APP_COMMAND_UNSUPPORTED", `unknown App option: ${option}`);
+  }
+  return {
+    ...(message === undefined ? {} : { message }),
+    ...(author === undefined ? {} : { author }),
+  };
+}
+
+function printResult(value: unknown, human: string): void {
+  console.log(jsonMode ? JSON.stringify(value, null, 2) : human);
+}
+
+function formatVersion(value: unknown): string {
+  if (value === null || typeof value !== "object") return String(value);
+  const record = value as { version?: unknown; trigger?: unknown; createdAt?: unknown; message?: unknown };
+  const version = typeof record.version === "string" ? record.version.slice(0, 12) : "unknown";
+  const trigger = typeof record.trigger === "string" ? record.trigger : "unknown";
+  const time = typeof record.createdAt === "number" ? new Date(record.createdAt).toISOString() : "unknown";
+  return `${version}\t${trigger}\t${time}${typeof record.message === "string" ? `\t${record.message}` : ""}`;
 }
 
 async function runVfs(rawArgs: string[]): Promise<void> {
@@ -177,9 +303,29 @@ function authHeaders(): Record<string, string> {
 
 async function readResponse<T>(res: Response): Promise<T> {
   const text = await res.text();
-  const body = text ? JSON.parse(text) : {};
+  let body: unknown;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    throw new CliError("APP_INTERNAL_ERROR", `Core returned invalid JSON (${res.status})`);
+  }
   if (!res.ok) {
-    die(body.error ?? `${res.status} ${res.statusText}`);
+    const error = (body as { error?: unknown }).error;
+    if (
+      error !== null
+      && typeof error === "object"
+      && typeof (error as { code?: unknown }).code === "string"
+      && typeof (error as { message?: unknown }).message === "string"
+    ) {
+      throw new CliError(
+        (error as { code: string }).code,
+        (error as { message: string }).message,
+      );
+    }
+    throw new CliError(
+      "APP_INTERNAL_ERROR",
+      typeof error === "string" ? error : `${res.status} ${res.statusText}`,
+    );
   }
   return body as T;
 }
@@ -189,18 +335,35 @@ function usage(): void {
   lamarck query "<sql>"
   lamarck schema change "<ddl>"
   lamarck schema change --file schema.sql [--author name] [--context text]
+  lamarck app list [--json]
+  lamarck app save <app-id> [-m message] [--author author] [--json]
+  lamarck app versions <app-id> [--json]
+  lamarck app restore <app-id> <version> [-m message] [--author author] [--json]
+  lamarck app refresh <app-id>
   lamarck vfs [--author name] ls -R notes/
   lamarck vfs [--author name] tee -- notes/result.md
   lamarck vfs import <host-source> <d1-destination>
   lamarck vfs export <d1-source> <host-destination>`);
 }
 
-function die(message: string): never {
-  console.error(message);
+function die(error: unknown): never {
+  const value = error instanceof CliError
+    ? error
+    : new CliError("APP_INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
+  console.error(jsonMode
+    ? JSON.stringify({ error: { code: value.code, message: value.message } })
+    : value.message);
   process.exit(1);
 }
 
-main().catch((err) => die(err instanceof Error ? err.message : String(err)));
+main().catch(die);
+
+class CliError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = "CliError";
+  }
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

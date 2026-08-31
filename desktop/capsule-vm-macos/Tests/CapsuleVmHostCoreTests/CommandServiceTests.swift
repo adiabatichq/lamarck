@@ -308,6 +308,7 @@ private func validStartParams() -> [String: Any] {
     [
         "imageBundlePath": "/Applications/Lamarck.app/Contents/Resources/capsule-guest",
         "workspaceFilesPath": "/Users/test/Documents/Lamarck/files",
+        "appVersionsPath": "/Users/test/Documents/Lamarck/.lamarck/cache/app-versions",
         "statePreparationId": "01234567-89ab-4def-8123-456789abcdef",
         "expectedManifestDigest": "sha256:\(String(repeating: "a", count: 64))",
         "manifestPublicKey": Data(repeating: 7, count: 32).base64EncodedString(),

@@ -106,6 +106,8 @@ export interface CapsuleVmGuestImageBase {
 export interface CapsuleVmGuestImage extends CapsuleVmGuestImageBase {
   /** The selected Workspace D1 authority, shared into the VM read-only. */
   workspaceFilesPath: string;
+  /** Core-owned immutable App editing lowers, shared into the VM read-only. */
+  appVersionsPath: string;
   stateDiskBytes: number;
   statePreparationId: string;
 }
@@ -1100,6 +1102,7 @@ function hasCompleteGuestImage(image: CapsuleVmGuestImage): boolean {
   return isAbsolute(image.imageBundlePath)
     && isAbsolute(image.stateDirectory)
     && isAbsolute(image.workspaceFilesPath)
+    && isAbsolute(image.appVersionsPath)
     && /^sha256:[0-9a-f]{64}$/.test(image.expectedManifestDigest)
     && /^[A-Za-z0-9+/]{43}=$/.test(image.manifestPublicKey)
     && Number.isSafeInteger(image.cpuCount)

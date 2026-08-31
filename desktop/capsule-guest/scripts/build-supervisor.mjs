@@ -11,6 +11,7 @@ await build({
     supervisor: resolve(root, "src", "main.ts"),
     "offline-npm": resolve(root, "src", "offline-npm.ts"),
     "release-runc-smoke": resolve(root, "src", "release-runc-smoke.ts"),
+    lamarck: resolve(root, "src", "managed-cli.ts"),
   },
   outdir: outputDirectory,
   bundle: true,

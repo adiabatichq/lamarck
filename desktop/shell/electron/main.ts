@@ -45,6 +45,7 @@ import { MacOsCapsuleBackend } from "./capsule/macos-backend";
 import { isCapsuleRestartRequiredError } from "./capsule/backend";
 import { SystemBroker } from "./capsule/system-broker";
 import { SystemStreamServer } from "./capsule/system-stream";
+import { AppCliStreamServer } from "./capsule/app-cli-broker";
 import { createViewerGateway, type ViewerGatewayBinding } from "./capsule/viewer-gateway";
 import { waitForViewerHttpReady } from "./capsule/viewer-readiness";
 import { clearDisposableAppViewerStorage } from "./capsule/viewer-storage";
@@ -288,6 +289,10 @@ const systemBroker = new SystemBroker({
   },
 });
 const systemStreamServer = new SystemStreamServer(systemBroker, { unbindOnClose: false });
+const appCliStreamServer = new AppCliStreamServer({
+  coreBaseUrl: () => coreBaseUrl(),
+  coreToken: CORE_TOKEN,
+});
 const capsuleCacheNamespace = app.getVersion().includes("-alpha")
   ? "ai.lamarck.desktop.alpha"
   : app.isPackaged
@@ -310,7 +315,9 @@ const capsuleBackend = new MacOsCapsuleBackend({
   cacheDirectory: join(capsuleCacheRoot, "cache"),
   artifactRoot: join(capsuleCacheRoot, "artifacts"),
   workspaceFilesPath: () => validateWorkspaceFilesMountPath(workspace),
+  appVersionsPath: () => join(workspace, ".lamarck", "cache", "app-versions"),
   systemStreamServer,
+  appCliStreamServer,
 });
 const capsuleManager = new CapsuleManager({
   backend: capsuleBackend,
@@ -2976,6 +2983,10 @@ app.whenReady().then(async () => {
   ipcMain.handle("app-runtime:reload", async (event, appId: string) => {
     requireShellIpc(event);
     return reloadAppRuntime(appId);
+  });
+  ipcMain.handle("app-runtime:states", (event) => {
+    requireShellIpc(event);
+    return capsuleManager.appRuntimeStates();
   });
   ipcMain.handle("app-runtime:archive", async (event, appId: string) => {
     requireShellIpc(event);

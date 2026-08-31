@@ -142,6 +142,7 @@ export function parseDataStreamPrelude(value: unknown): DataStreamPrelude {
       object.kind,
       [
         "sdk",
+        "cli",
         "viewer",
         "package-in",
         "dependency-in",
@@ -687,7 +688,7 @@ function parseWorkloadPrepareBody(value: unknown): WorkloadPrepareBody {
   const object = exactObject(
     value,
     "$.body",
-    ["appHandle", "workloadHandle", "workloadKind", "argv", "cwd", "environment", "sdkTicket"],
+    ["appHandle", "workloadHandle", "workloadKind", "argv", "cwd", "environment", "sdkTicket", "cliTicket"],
     ["logsTicket", "uiPort"],
   );
   const workloadKind = stringEnum(
@@ -712,6 +713,7 @@ function parseWorkloadPrepareBody(value: unknown): WorkloadPrepareBody {
     cwd: validateCapsuleCwd(object.cwd, "$.body.cwd"),
     environment: validateEnvironment(object.environment, "$.body.environment"),
     sdkTicket: streamTicket(object.sdkTicket, "$.body.sdkTicket"),
+    cliTicket: streamTicket(object.cliTicket, "$.body.cliTicket"),
     ...(object.logsTicket === undefined
       ? {}
       : { logsTicket: streamTicket(object.logsTicket, "$.body.logsTicket") }),

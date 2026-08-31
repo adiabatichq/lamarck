@@ -7,6 +7,7 @@ import { createServer, createConnection, type Server, type Socket } from "node:n
 import { once } from "node:events";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { PassThrough } from "node:stream";
 import {
   type RuncExecution,
 } from "../../capsule/src/drivers";
@@ -172,6 +173,10 @@ async function runTwoAppIsolation(): Promise<void> {
           source: mismatchedPair.source,
           consumedTicket: issueSdkTicket(appB),
         },
+        cliChannel: {
+          source: new PassThrough(),
+          consumedTicket: issueCliTicket(appA),
+        },
       }),
       /another App/,
     );
@@ -334,26 +339,24 @@ async function runCapsuleCoreGuard(): Promise<void> {
     coreOutput = captureChildOutput(coreProcess);
     await waitForCoreService(coreProcess, coreOrigin, coreToken, coreOutput);
 
-    const appRegistry = await hostJson(
+    const prepared = await hostJson(
       coreOrigin,
       coreToken,
-      "/api/apps",
-      {},
+      "/api/apps/app-a/activation/prepare",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workload: "ui" }),
+      },
     ) as {
-      apps?: Array<{
-        id?: unknown;
-        manifestGeneration?: unknown;
-        manifestDigest?: unknown;
-      }>;
+      activation?: { activationId?: unknown; version?: unknown };
     };
-    const appAuthority = appRegistry.apps?.find((app) => app.id === "app-a");
+    const appAuthority = prepared.activation;
     assert.ok(
       appAuthority
-        && typeof appAuthority.manifestGeneration === "number"
-        && Number.isSafeInteger(appAuthority.manifestGeneration)
-        && appAuthority.manifestGeneration >= 1
-        && typeof appAuthority.manifestDigest === "string",
-      "Core did not publish exact app-a manifest authority",
+        && typeof appAuthority.activationId === "string"
+        && typeof appAuthority.version === "string",
+      "Core did not prepare exact app-a activation authority",
     );
     const capability = await hostJson(
       coreOrigin,
@@ -365,8 +368,7 @@ async function runCapsuleCoreGuard(): Promise<void> {
         body: JSON.stringify({
           appId: "app-a",
           workload: "ui",
-          manifestGeneration: appAuthority.manifestGeneration,
-          manifestDigest: appAuthority.manifestDigest,
+          activationId: appAuthority.activationId,
         }),
       },
     ) as { capability: string; channelId: string };
@@ -533,7 +535,25 @@ async function start(
       source: sdkSocket,
       consumedTicket: consumed,
     },
+    cliChannel: {
+      source: new PassThrough(),
+      consumedTicket: issueCliTicket(spec),
+    },
   });
+}
+
+function issueCliTicket(
+  spec: { expectedIdentity: OciExpectedIdentity },
+): ReturnType<TicketRegistry["consume"]> {
+  const tickets = new TicketRegistry();
+  const issued = tickets.issue({
+    sessionId: SESSION_ID,
+    kind: "cli",
+    appHandle: spec.expectedIdentity.appHandle,
+    subjectHandle: spec.expectedIdentity.workloadHandle,
+    ttlMs: 60_000,
+  });
+  return tickets.consume(issued.ticket, SESSION_ID, "cli");
 }
 
 function issueSdkTicket(

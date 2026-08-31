@@ -39,6 +39,7 @@ const RESERVED_EVENT_TYPE_PREFIXES = [
   "connector.",
   "workspace.",
   "ddl.",
+  "app.version.",
   "app.created",
   "app.archived",
 ];

@@ -31,6 +31,7 @@
   "dependencies": {
     "@lamarck/system": "0.1.2",
     "diff": "^5.2.2",
+    "isomorphic-git": "^1.41.9",
     "node-pty": "^1.0.0"
   },
   "devDependencies": {

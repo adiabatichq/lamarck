@@ -30,8 +30,13 @@ import {
   readCapsuleTreeFile,
   readCapsuleTreeSelection,
   type CapsulePackageSnapshot,
+  type CapsuleTreeSnapshot,
 } from "./package-snapshot";
 import { CapsuleStorageBudget } from "./storage-budget";
+import {
+  collectAppPackageTree,
+  hashAppPackageTree,
+} from "../../../core/src/apps/package-tree";
 
 const temporaryRoots: string[] = [];
 const OWNER_A = "a".repeat(64);
@@ -61,7 +66,11 @@ describe("capsule-tree-v1 package snapshots", () => {
       await writeFile(join(packageDir, excluded, "secret"), excluded);
     }
     await mkdir(join(packageDir, "src", "node_modules", "nested"), { recursive: true });
-    await writeFile(join(packageDir, "src", "node_modules", "nested", "secret"), "nope");
+    await writeFile(join(packageDir, "src", "node_modules", "nested", "reference"), "kept");
+    await mkdir(join(packageDir, "src", ".git"), { recursive: true });
+    await writeFile(join(packageDir, "src", ".git", "config"), "kept");
+    await mkdir(join(packageDir, "src", ".lamarck"), { recursive: true });
+    await writeFile(join(packageDir, "src", ".lamarck", "state"), "kept");
 
     const first = await createCapsulePackageSnapshot({ packageDir, cacheDir });
     // Host executable permission differences do not leak into the sealed format.
@@ -72,11 +81,13 @@ describe("capsule-tree-v1 package snapshots", () => {
 
     expect(first.format).toBe(CAPSULE_TREE_FORMAT);
     expect(first.digest).toBe(`sha256:${createHash("sha256").update(bytes).digest("hex")}`);
+    expect(first.packageDigest).toBe(hashAppPackageTree(await collectAppPackageTree(packageDir)));
     expect(first.bytes).toBe(bytes.byteLength);
     expect(first.entries).toBe(records.length);
     expect(Object.isFrozen(first)).toBe(true);
     expect(second).toMatchObject({
       digest: first.digest,
+      packageDigest: first.packageDigest,
       bytes: first.bytes,
       entries: first.entries,
       path: first.path,
@@ -89,14 +100,21 @@ describe("capsule-tree-v1 package snapshots", () => {
       "bin/run",
       "caf\u00e9.txt",
       "src",
+      "src/.git",
+      "src/.git/config",
+      "src/.lamarck",
+      "src/.lamarck/state",
       "src/components",
       "src/components/empty.ts",
       "src/main.ts",
+      "src/node_modules",
+      "src/node_modules/nested",
+      "src/node_modules/nested/reference",
       "z-last.txt",
     ]);
-    expect(paths.some((path) => path.includes(".git"))).toBe(false);
-    expect(paths.some((path) => path.includes(".lamarck"))).toBe(false);
-    expect(paths.some((path) => path.includes("node_modules"))).toBe(false);
+    for (const excluded of [".git", ".lamarck", "node_modules"]) {
+      expect(paths.some((path) => path === excluded || path.startsWith(`${excluded}/`))).toBe(false);
+    }
 
     expect(record(records, "bin")).toMatchObject({ type: "directory", mode: 0o755, content: "" });
     expect(record(records, "bin/run")).toMatchObject({
@@ -526,7 +544,7 @@ function record(records: readonly TreeRecord[], path: string): TreeRecord {
   return value;
 }
 
-async function readSnapshot(snapshot: CapsulePackageSnapshot): Promise<Buffer> {
+async function readSnapshot(snapshot: CapsuleTreeSnapshot): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of snapshot.createReadStream()) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks);

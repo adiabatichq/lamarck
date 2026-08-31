@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
-import { AppMark } from "../components/AppMark";
 import { WorkspacePanel } from "../components/WorkspacePanel";
 import { ActivityView } from "../content/ActivityView";
 import { ConnectorsView } from "../content/ConnectorsView";
 import { TableView } from "../content/TableView";
-import { appWorkloads } from "../lib/app-visual";
 import {
   addD1HistoryExclusion,
   inspectDataSchema,
@@ -21,6 +19,7 @@ import {
   type LamarckSessionView,
 } from "../lib/api";
 import styles from "./SystemRoom.module.css";
+import { AppsManager } from "./AppsManager";
 
 type SystemSection = "shape" | "sources" | "apps" | "data" | "timeline" | "workspace";
 
@@ -224,7 +223,11 @@ export function SystemRoom({
           </div>
         )}
         {section === "apps" && (
-          <SystemApps apps={apps} onOpenApp={onOpenApp} />
+          <AppsManager
+            seedApps={apps}
+            onOpenApp={onOpenApp}
+            onInventoryChanged={onCoreChanged}
+          />
         )}
         {section === "data" && (
           <SystemData
@@ -296,7 +299,7 @@ function SystemOverview({
   onNavigate: (section: SystemSection) => void;
   onInspectEvent: (eventId: string) => void;
 }) {
-  const uiApps = apps.filter((app) => Boolean(app.runtime.ui)).length;
+  const uiApps = apps.filter((app) => Boolean(app.runtime?.ui)).length;
   const sourceAttention = snapshot.sources.filter(sourceNeedsAttention);
 
   return (
@@ -424,44 +427,6 @@ function Signal({
 
 function AttentionItem({ title, detail, onClick }: { title: string; detail: string; onClick: () => void }) {
   return <button type="button" onClick={onClick}><i>!</i><span><strong>{title}</strong><small>{detail}</small></span><b>→</b></button>;
-}
-
-function SystemApps({ apps, onOpenApp }: { apps: AppInfo[]; onOpenApp: (appId: string) => void }) {
-  return (
-    <div className={styles.inventoryPage}>
-      <header className={styles.pageHeader}>
-        <div>
-          <span className={styles.overline}>Installed system shape</span>
-          <h1>Apps</h1>
-          <p>Every registered App, including background workloads that do not appear in Use.</p>
-        </div>
-        <span className={styles.inventoryCount}>{apps.length.toString().padStart(2, "0")}</span>
-      </header>
-      <div className={styles.inventoryTable}>
-        <div className={styles.inventoryHeader}><span>App</span><span>Workloads</span><span>Data grants</span><span>Use</span></div>
-        {apps.length === 0 ? (
-          <div className={styles.inventoryEmpty}>No registered Apps in this workspace.</div>
-        ) : apps.map((app, index) => (
-          <div key={app.id} className={styles.inventoryRow} style={{ animationDelay: `${index * 24}ms` }}>
-            <div className={styles.inventoryIdentity}>
-              <AppMark appId={app.id} name={app.name} size="medium" />
-              <span><strong>{app.name}</strong><small>{app.id}</small></span>
-            </div>
-            <div className={styles.badges}>{appWorkloads(app).map((workload) => <span key={workload}>{workload}</span>)}</div>
-            <div className={styles.grants}>
-              <span><b>{app.permissions.writes.files.length}</b> files</span>
-              <span><b>{app.permissions.writes.tables.length}</b> tables</span>
-            </div>
-            <div>
-              {app.runtime.ui ? (
-                <button type="button" className={styles.openApp} onClick={() => onOpenApp(app.id)}>Open <span>↗</span></button>
-              ) : <span className={styles.headless}>Background only</span>}
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
 }
 
 function SystemData({

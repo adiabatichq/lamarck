@@ -15,6 +15,7 @@ export const ARCHITECTURE = "arm64";
 export const BUNDLE_NAME = `capsule-guest-${ARCHITECTURE}`;
 export const GUEST_RELEASE_PREFIX = "guest/macos/arm64";
 export const EXPECTED_FEATURES = Object.freeze([
+  "app-cli-v1",
   "artifact-adoption-receipt-v1",
   "artifact-erofs-v1",
   "build-v1",

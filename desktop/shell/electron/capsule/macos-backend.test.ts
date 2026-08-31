@@ -19,9 +19,10 @@ import { parseArtifactAdoptionReceipt } from "../../../capsule/src/protocol/vali
 import type { CapsuleVmHostStream } from "../capsule-vm/launcher";
 import type { LoadedCapsuleGuestRelease } from "./guest-release";
 import { HostArtifactStore, type HostArtifact, type HostArtifactActivation } from "./artifact-store";
-import type { CapsuleTreeSnapshot } from "./package-snapshot";
+import type { CapsulePackageSnapshot } from "./package-snapshot";
 import type { NpmDependencyBundle } from "./dependency-broker";
 import type { SystemStreamServer } from "./system-stream";
+import type { AppCliStreamServer } from "./app-cli-broker";
 import { CapsuleGuestRequestError } from "./guest-session";
 import {
   CapsuleRestartRequiredError,
@@ -44,6 +45,10 @@ const MANIFEST_AUTHORITY: `sha256:${string}` = `sha256:${"a".repeat(64)}`;
 const CHANGED_MANIFEST_AUTHORITY: `sha256:${string}` = `sha256:${"b".repeat(64)}`;
 const SESSION_ID = "S".repeat(43);
 
+function fakeAppCliStreamServer(): AppCliStreamServer {
+  return { attach: () => () => {} } as unknown as AppCliStreamServer;
+}
+
 describe("MacOsCapsuleBackend orchestration", () => {
   test("rejects a package snapshot whose manifest changed after Core issued authority", async () => {
     const harness = createHarness();
@@ -55,6 +60,16 @@ describe("MacOsCapsuleBackend orchestration", () => {
     expect(harness.vm.startCalls).toBe(0);
     expect(harness.session.operations).toEqual([]);
     expect(harness.dependencies).not.toHaveBeenCalled();
+  });
+
+  test("rejects a package snapshot whose logical package digest differs from Core", async () => {
+    const harness = createHarness();
+
+    await expect(harness.backend.startUi(spec("sender-a", PACKAGE_B)))
+      .rejects.toThrow("App package authority changed; refresh and retry");
+
+    expect(harness.vm.startCalls).toBe(0);
+    expect(harness.session.operations).toEqual([]);
   });
 
   test("plans a Replay-sized cold launch into an exact 4 GiB state descriptor", async () => {
@@ -92,7 +107,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.dependencyBytes = 128 * 1024 * 1024;
     harness.session.cacheBlob("dependency", LARGE_DEPENDENCY);
 
-    await harness.backend.startUi(spec("sender-b"));
+    await harness.backend.startUi(spec("sender-b", PACKAGE_B));
     expect(harness.vm.startCalls).toBe(2);
     expect(harness.vm.stopCalls).toBe(1);
     expect(harness.session.operations.filter((operation) => operation === "vm.drain"))
@@ -116,7 +131,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.dependencyBytes = 128 * 1024 * 1024;
     harness.session.cacheBlob("dependency", LARGE_DEPENDENCY);
 
-    await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b")))
+    await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B)))
       .rejects.toThrow("last-known-good runtime remains active");
     expect(harness.vm.startCalls).toBe(1);
     expect(harness.vm.stopCalls).toBe(0);
@@ -211,7 +226,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     const active = await harness.backend.startUi(spec("sender-a"));
     const activationWrites = harness.store.activationWrites;
     harness.packageDigest = PACKAGE_B;
-    const prepared = await harness.backend.prepareUi(spec("sender-b"), active.instanceId);
+    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
     const oldViewer = await harness.backend.openUiStream(active.instanceId);
     const candidateViewer = await harness.backend.openUiStream(prepared.instanceId);
 
@@ -239,7 +254,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     const harness = createHarness();
     const active = await harness.backend.startUi(spec("sender-a"));
     harness.packageDigest = PACKAGE_B;
-    const prepared = await harness.backend.prepareUi(spec("sender-b"), active.instanceId);
+    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
     const oldViewer = await harness.backend.openUiStream(active.instanceId);
     const candidateViewer = await harness.backend.openUiStream(prepared.instanceId);
     const writesBeforeCommit = harness.store.activationWrites;
@@ -260,11 +275,23 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await harness.backend.stopAll();
   });
 
+  test("rejects a stale prepared activation after a newer activation commits", async () => {
+    const harness = createHarness();
+    const stale = await harness.backend.prepareUi(spec("sender-stale", PACKAGE_A, 2));
+    const current = await harness.backend.prepareUi(spec("sender-current", PACKAGE_A, 3));
+
+    await expect(harness.backend.commitPreparedUi(current.preparationId))
+      .resolves.toEqual({ instanceId: current.instanceId });
+    await expect(harness.backend.commitPreparedUi(stale.preparationId))
+      .rejects.toThrow("Prepared App activation is stale");
+    await harness.backend.stopAll();
+  });
+
   test("rolls activation back instead of publishing when the previous UI exits during commit", async () => {
     const harness = createHarness();
     const active = await harness.backend.startUi(spec("sender-a"));
     harness.packageDigest = PACKAGE_B;
-    const prepared = await harness.backend.prepareUi(spec("sender-b"), active.instanceId);
+    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
     harness.store.afterNextActivation = () => harness.session.emitOldestWorkloadExit();
 
     await expect(harness.backend.commitPreparedUi(prepared.preparationId))
@@ -285,7 +312,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.backend.setUiLostHandler(uiLost);
     const active = await harness.backend.startUi(spec("sender-a"));
     harness.packageDigest = PACKAGE_B;
-    const prepared = await harness.backend.prepareUi(spec("sender-b"), active.instanceId);
+    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
 
     harness.session.emitLatestWorkloadExit();
 
@@ -352,7 +379,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     const harness = createHarness();
     const active = await harness.backend.startUi(spec("sender-a"));
     harness.packageDigest = PACKAGE_B;
-    const prepared = await harness.backend.prepareUi(spec("sender-b"), active.instanceId);
+    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
     const oldViewer = await harness.backend.openUiStream(active.instanceId);
     const candidateViewer = await harness.backend.openUiStream(prepared.instanceId);
 
@@ -373,7 +400,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     const first = await harness.backend.startUi(spec("sender-a"));
     harness.packageDigest = PACKAGE_B;
 
-    await harness.backend.replaceUi(first.instanceId, spec("sender-b"));
+    await harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B));
 
     expect(harness.dependencies).toHaveBeenCalledTimes(1);
     expect(harness.session.buildStarts).toBe(2);
@@ -391,22 +418,25 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await harness.backend.stopAll();
   });
 
-  test("cold-migrates an exact legacy V1 activation before allowing dependency reuse", async () => {
+  test("rebuilds an artifact pointer that names a different full App version", async () => {
     const harness = createHarness();
     const artifact = hostArtifact(ARTIFACT_A as `sha256:${string}`, Buffer.alloc(64, 7));
     harness.store.cas.set(artifact.digest, artifact);
     harness.store.activation = {
       artifact,
+      appVersion: "f".repeat(40),
       packageDigest: PACKAGE_A as `sha256:${string}`,
       imageDigest: IMAGE as `sha256:${string}`,
+      installDigest: INSTALL as `sha256:${string}`,
+      dependencyDigest: DEPENDENCY as `sha256:${string}`,
     };
 
     await harness.backend.startUi(spec("sender-a"));
 
-    expect(harness.dependencies).toHaveBeenCalledOnce();
+    expect(harness.dependencies).not.toHaveBeenCalled();
     expect(harness.session.buildStarts).toBe(1);
-    expect(harness.session.buildPrepares.at(-1)).toHaveProperty("dependencyBlobHandle");
-    expect(harness.session.buildPrepares.at(-1)).not.toHaveProperty("baseArtifactBlobHandle");
+    expect(harness.session.buildPrepares.at(-1)).not.toHaveProperty("dependencyBlobHandle");
+    expect(harness.session.buildPrepares.at(-1)).toHaveProperty("baseArtifactBlobHandle");
     expect(harness.store.activation).toMatchObject({
       packageDigest: PACKAGE_A,
       installDigest: INSTALL,
@@ -420,7 +450,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     const first = await changed.backend.startUi(spec("sender-a"));
     changed.packageDigest = PACKAGE_B;
     changed.installDigest = INSTALL_B;
-    await changed.backend.replaceUi(first.instanceId, spec("sender-b"));
+    await changed.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B));
     expect(changed.dependencies).toHaveBeenCalledTimes(2);
     expect(changed.session.buildPrepares.at(-1)).toHaveProperty("dependencyBlobHandle");
     expect(changed.session.buildPrepares.at(-1)).not.toHaveProperty("baseArtifactBlobHandle");
@@ -430,7 +460,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     const active = await fallback.backend.startUi(spec("sender-a"));
     fallback.packageDigest = PACKAGE_B;
     fallback.session.failNextWarmBuild = true;
-    await fallback.backend.replaceUi(active.instanceId, spec("sender-b"));
+    await fallback.backend.replaceUi(active.instanceId, spec("sender-b", PACKAGE_B));
     expect(fallback.dependencies).toHaveBeenCalledTimes(2);
     expect(fallback.session.operations).toContain("build.cancel");
     expect(fallback.session.buildPrepares.slice(-2).map((body) => (
@@ -445,7 +475,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     const first = await ineligible.backend.startUi(spec("sender-a"));
     ineligible.packageDigest = PACKAGE_B;
     ineligible.installWarmEligible = false;
-    await ineligible.backend.replaceUi(first.instanceId, spec("sender-b"));
+    await ineligible.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B));
     expect(ineligible.dependencies).toHaveBeenCalledTimes(2);
     expect(ineligible.session.buildPrepares.at(-1)).toHaveProperty("dependencyBlobHandle");
     expect(ineligible.session.buildPrepares.at(-1)).not.toHaveProperty("baseArtifactBlobHandle");
@@ -458,7 +488,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
       ...imageChanged.store.activation!,
       imageDigest: `sha256:${"9".repeat(64)}`,
     };
-    await imageChanged.backend.replaceUi(active.instanceId, spec("sender-b"));
+    await imageChanged.backend.replaceUi(active.instanceId, spec("sender-b", PACKAGE_B));
     expect(imageChanged.dependencies).toHaveBeenCalledTimes(2);
     expect(imageChanged.session.buildPrepares.at(-1)).toHaveProperty("dependencyBlobHandle");
     expect(imageChanged.session.buildPrepares.at(-1)).not.toHaveProperty("baseArtifactBlobHandle");
@@ -636,8 +666,11 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.store.cas.set(artifact.digest, artifact);
     harness.store.activation = {
       artifact,
+      appVersion: "d".repeat(40),
       packageDigest: PACKAGE_A as `sha256:${string}`,
       imageDigest: IMAGE as `sha256:${string}`,
+      installDigest: INSTALL as `sha256:${string}`,
+      dependencyDigest: DEPENDENCY as `sha256:${string}`,
     };
 
     await expect(harness.backend.startUi(spec("sender-a")))
@@ -654,13 +687,16 @@ describe("MacOsCapsuleBackend orchestration", () => {
 
     harness.packageDigest = PACKAGE_B;
     harness.session.failNextReady = true;
-    await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b")))
+    await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B)))
       .rejects.toThrow("not ready");
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
     const oldViewer = await harness.backend.openUiStream(first.instanceId);
     oldViewer.destroy();
 
-    const replacement = await harness.backend.replaceUi(first.instanceId, spec("sender-c"));
+    const replacement = await harness.backend.replaceUi(
+      first.instanceId,
+      spec("sender-c", PACKAGE_B),
+    );
     expect(replacement.instanceId).not.toBe(first.instanceId);
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_B);
     await expect(harness.backend.openUiStream(first.instanceId)).rejects.toThrow("no longer active");
@@ -681,7 +717,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
 
     harness.packageDigest = PACKAGE_B;
     harness.session.failAppStop = true;
-    await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b")))
+    await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B)))
       .rejects.toThrow("Could not stop UI");
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
   });
@@ -694,7 +730,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.vm.failStop = true;
 
     const failure = await rejectionOf(
-      harness.backend.replaceUi(first.instanceId, spec("sender-b")),
+      harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B)),
     );
     expect(isCapsuleRestartRequiredError(failure)).toBe(true);
     expect(failure.message).toContain("quarantined until Host restart");
@@ -706,7 +742,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.packageDigest = PACKAGE_B;
     harness.store.afterNextActivation = () => harness.session.emitLatestWorkloadExit();
 
-    await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b")))
+    await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B)))
       .rejects.toThrow("exited");
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
     const oldViewer = await harness.backend.openUiStream(first.instanceId);
@@ -1141,6 +1177,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
         Readable.from([activeBytes]),
       );
       await initialStore.activate(ownerKey, activeArtifact, {
+        appVersion: "d".repeat(40),
         packageDigest: PACKAGE_A,
         imageDigest: IMAGE,
         installDigest: INSTALL,
@@ -1175,7 +1212,9 @@ describe("MacOsCapsuleBackend orchestration", () => {
         cacheDirectory,
         artifactRoot,
         workspaceFilesPath: () => join(root, "workspace", "files"),
+        appVersionsPath: () => join(root, "workspace", ".lamarck", "cache", "app-versions"),
         systemStreamServer: system as unknown as SystemStreamServer,
+        appCliStreamServer: fakeAppCliStreamServer(),
         dependencies: {
           hostPlatform: "darwin",
           exists: () => true,
@@ -1272,6 +1311,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
         Readable.from([appArtifactBytes]),
       );
       await initialStore.activate(ownerKey, appArtifact, {
+        appVersion: "d".repeat(40),
         packageDigest: PACKAGE_A,
         imageDigest: IMAGE,
         installDigest: INSTALL,
@@ -1286,6 +1326,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
         Readable.from([otherArtifactBytes]),
       );
       await initialStore.activate(otherOwner, otherArtifact, {
+        appVersion: "e".repeat(40),
         packageDigest: PACKAGE_B,
         imageDigest: IMAGE,
         installDigest: INSTALL,
@@ -1318,7 +1359,9 @@ describe("MacOsCapsuleBackend orchestration", () => {
         cacheDirectory,
         artifactRoot,
         workspaceFilesPath: () => join(workspace, "files"),
+        appVersionsPath: () => join(workspace, ".lamarck", "cache", "app-versions"),
         systemStreamServer: system as unknown as SystemStreamServer,
+        appCliStreamServer: fakeAppCliStreamServer(),
         dependencies: {
           hostPlatform: "darwin",
           exists: () => true,
@@ -1413,11 +1456,14 @@ describe("MacOsCapsuleBackend orchestration", () => {
   });
 });
 
-function spec(sender: string) {
+function spec(sender: string, packageDigest: string = PACKAGE_A, activationSequence = 1) {
   return {
     appId: "weather",
-    manifestGeneration: 1,
+    activationId: `activation_${"e".repeat(32)}`,
+    activationSequence,
+    version: "d".repeat(40),
     manifestDigest: MANIFEST_AUTHORITY,
+    packageDigest: packageDigest as `sha256:${string}`,
     packageDir: "/workspace/apps/weather",
     command: ["npm", "run", "start"],
     port: 3_000,
@@ -1475,7 +1521,9 @@ function createHarness(overrides: { opaqueId?: () => string } = {}) {
     cacheDirectory: "/private/cache/capsule",
     artifactRoot: "/private/artifacts/capsule",
     workspaceFilesPath: () => "/workspace/files",
+    appVersionsPath: () => "/workspace/.lamarck/cache/app-versions",
     systemStreamServer: system as unknown as SystemStreamServer,
+    appCliStreamServer: fakeAppCliStreamServer(),
     dependencies: {
       hostPlatform: "darwin",
       exists: () => true,
@@ -2121,24 +2169,22 @@ class FakeArtifactStore {
     _appKey: string,
     artifact: Pick<HostArtifact, "digest" | "bytes">,
     provenance: {
+      appVersion: string;
       packageDigest: string;
       imageDigest: string;
-      installDigest?: string;
-      dependencyDigest?: string;
+      installDigest: string;
+      dependencyDigest: string;
     },
   ) {
     this.activationWrites += 1;
     const stored = this.cas.get(artifact.digest)!;
     this.activation = {
       artifact: stored,
+      appVersion: provenance.appVersion,
       packageDigest: provenance.packageDigest as `sha256:${string}`,
       imageDigest: provenance.imageDigest as `sha256:${string}`,
-      ...(provenance.installDigest === undefined
-        ? {}
-        : {
-            installDigest: provenance.installDigest as `sha256:${string}`,
-            dependencyDigest: provenance.dependencyDigest as `sha256:${string}`,
-          }),
+      installDigest: provenance.installDigest as `sha256:${string}`,
+      dependencyDigest: provenance.dependencyDigest as `sha256:${string}`,
     };
     const afterActivation = this.afterNextActivation;
     this.afterNextActivation = undefined;
@@ -2178,10 +2224,11 @@ class FakeArtifactStore {
   }
 }
 
-function snapshot(digest: string, bytes: Buffer): CapsuleTreeSnapshot {
+function snapshot(digest: string, bytes: Buffer): CapsulePackageSnapshot {
   return {
     format: "capsule-tree-v1",
     digest: digest as `sha256:${string}`,
+    packageDigest: digest as `sha256:${string}`,
     bytes: bytes.byteLength,
     entries: 1,
     path: `/cas/${digest.slice(7)}`,
@@ -2251,6 +2298,7 @@ function guestRelease(): LoadedCapsuleGuestRelease {
       expectedArchitecture: "arm64",
       expectedSupervisorVersion: "0.1.0",
       expectedFeatures: [
+        "app-cli-v1",
         "artifact-adoption-receipt-v1",
         "artifact-erofs-v1",
         "build-v1",

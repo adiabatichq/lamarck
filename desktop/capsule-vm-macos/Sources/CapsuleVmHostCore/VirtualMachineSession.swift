@@ -93,6 +93,7 @@ public struct CapsuleVmLifecycle: Equatable, Sendable {
 public struct CapsuleVmStartDescriptor: Sendable {
     public let trustedImage: TrustedGuestImageDescriptor
     public let workspaceFilesURL: URL
+    public let appVersionsURL: URL
     public let statePreparationID: String
     public let cpuCount: Int
     public let memorySize: UInt64
@@ -100,12 +101,14 @@ public struct CapsuleVmStartDescriptor: Sendable {
     public init(
         trustedImage: TrustedGuestImageDescriptor,
         workspaceFilesURL: URL,
+        appVersionsURL: URL,
         statePreparationID: String,
         cpuCount: Int,
         memorySize: UInt64
     ) {
         self.trustedImage = trustedImage
         self.workspaceFilesURL = workspaceFilesURL
+        self.appVersionsURL = appVersionsURL
         self.statePreparationID = statePreparationID
         self.cpuCount = cpuCount
         self.memorySize = memorySize
@@ -588,6 +591,7 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
                 configuration = try CapsuleVmConfigurationBuilder.build(
                     image: image,
                     workspaceFilesURL: descriptor.workspaceFilesURL,
+                    appVersionsURL: descriptor.appVersionsURL,
                     stateDiskLease: prepared.stateDiskLease,
                     cpuCount: descriptor.cpuCount,
                     memorySize: descriptor.memorySize,

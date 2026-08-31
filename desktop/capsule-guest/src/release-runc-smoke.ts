@@ -7,6 +7,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createServer, connect, type Server, type Socket } from "node:net";
+import { PassThrough } from "node:stream";
 import {
   createOciBundlePlan,
   createCapsuleRuntimeStoragePlan,
@@ -228,6 +229,14 @@ export async function runReleaseRuncSmoke(): Promise<void> {
       ttlMs: 60_000,
     });
     const consumedTicket = tickets.consume(issued.ticket, sessionId, "sdk");
+    const cliIssued = tickets.issue({
+      sessionId,
+      kind: "cli",
+      appHandle,
+      subjectHandle: workloadHandle,
+      ttlMs: 60_000,
+    });
+    const consumedCliTicket = tickets.consume(cliIssued.ticket, sessionId, "cli");
     const { plan, expectedIdentity } = createReleaseRuncSmokePlan({
       appHandle,
       workloadHandle,
@@ -243,6 +252,10 @@ export async function runReleaseRuncSmoke(): Promise<void> {
       sdkChannel: {
         source: sockets.inherited,
         consumedTicket,
+      },
+      cliChannel: {
+        source: new PassThrough(),
+        consumedTicket: consumedCliTicket,
       },
     });
     const [exit, marker] = await Promise.all([

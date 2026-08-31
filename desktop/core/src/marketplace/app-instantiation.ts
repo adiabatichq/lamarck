@@ -16,7 +16,7 @@ export interface InstantiateMarketplaceAppOptions {
   readonly packageId: string;
   readonly releaseId: string;
   readonly localId?: string;
-  readonly initializeGit: (appDir: string) => Promise<void>;
+  readonly initializeRepository: (appDir: string) => Promise<void>;
 }
 
 export interface InstantiatedMarketplaceApp {
@@ -27,8 +27,8 @@ export interface InstantiatedMarketplaceApp {
 
 /**
  * Materialize a verified App template as an independent local App. The target
- * directory is reserved first and manifest.json is published last, so a
- * failed copy never becomes a loadable App.
+ * directory is reserved first. Repository initialization follows complete
+ * package publication and any failure rolls the newly owned target back.
  */
 export async function instantiateMarketplaceApp(
   options: InstantiateMarketplaceAppOptions,
@@ -65,16 +65,12 @@ export async function instantiateMarketplaceApp(
     ownsTarget = true;
     await chmod(target, 0o755);
     await copyVerifiedAppTree(options.verifiedSourceDir, target, true);
-    try {
-      await options.initializeGit(target);
-    } catch (error) {
-      console.warn(`[marketplace-app] Could not initialize git for ${localId}:`, error);
-    }
     await writeNewFile(
       join(target, "manifest.json"),
       Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8"),
       0o644,
     );
+    await options.initializeRepository(target);
 
     const loaded = (await loadApps(options.appsDir)).apps.get(localId);
     if (!loaded || loaded.dir !== target) {

@@ -295,6 +295,7 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
         let expectedKeys: Set<String> = [
             "imageBundlePath",
             "workspaceFilesPath",
+            "appVersionsPath",
             "statePreparationId",
             "expectedManifestDigest",
             "manifestPublicKey",
@@ -309,6 +310,7 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
         }
         guard let imagePath = absolutePath(params["imageBundlePath"]),
               let workspaceFilesPath = absolutePath(params["workspaceFilesPath"]),
+              let appVersionsPath = absolutePath(params["appVersionsPath"]),
               let statePreparationID = canonicalPreparationID(params["statePreparationId"]) else {
             throw CapsuleVmCommandError(
                 code: "guest_image_required",
@@ -347,6 +349,7 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
                 pinnedPublicKey: publicKey
             ),
             workspaceFilesURL: URL(fileURLWithPath: workspaceFilesPath, isDirectory: true),
+            appVersionsURL: URL(fileURLWithPath: appVersionsPath, isDirectory: true),
             statePreparationID: statePreparationID,
             cpuCount: cpuCount,
             memorySize: memorySize

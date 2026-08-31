@@ -79,6 +79,7 @@ import {
 import {
   createCapsulePackageSnapshot,
   readCapsuleTreeSelection,
+  type CapsulePackageSnapshot,
   type CapsuleTreeSnapshot,
 } from "./package-snapshot";
 import {
@@ -92,6 +93,7 @@ import {
   type HostArtifactRetention,
 } from "./artifact-store";
 import type { SystemStreamServer } from "./system-stream";
+import type { AppCliStreamServer } from "./app-cli-broker";
 import { CapsuleStorageBudget, type CapsuleStorageBudgetLike } from "./storage-budget";
 import {
   correlateBlobExportedEvent,
@@ -153,8 +155,12 @@ export interface MacOsCapsuleBackendOptions {
   artifactRoot: string;
   /** The selected Workspace's canonical D1 root. */
   workspaceFilesPath: () => string;
+  /** Core-owned immutable App-version/edit-base cache. */
+  appVersionsPath: () => string;
   /** Host terminator for the workload's ticket-bound System SDK stream. */
   systemStreamServer: SystemStreamServer;
+  /** Host terminator for the workload-bound private App lifecycle CLI. */
+  appCliStreamServer: AppCliStreamServer;
   /** Narrow seams used by deterministic orchestration tests. */
   dependencies?: Partial<MacOsCapsuleBackendDependencies>;
 }
@@ -225,10 +231,11 @@ interface ArtifactStoreLike {
     appKey: string,
     artifact: Pick<HostArtifact, "digest" | "bytes">,
     provenance: {
+      appVersion: string;
       packageDigest: string;
       imageDigest: string;
-      installDigest?: string;
-      dependencyDigest?: string;
+      installDigest: string;
+      dependencyDigest: string;
     },
   ): Promise<void>;
   deactivate(appKey: string): Promise<void>;
@@ -247,7 +254,7 @@ export interface MacOsCapsuleBackendDependencies {
     cacheDir: string;
     ownerKey?: string;
     storageBudget?: CapsuleStorageBudgetLike;
-  }): Promise<CapsuleTreeSnapshot>;
+  }): Promise<CapsulePackageSnapshot>;
   manifestDigest(snapshot: CapsuleTreeSnapshot): Promise<AppManifestDigest>;
   installInput(snapshot: CapsuleTreeSnapshot): ReturnType<typeof inspectSnapshotInstallInput>;
   dependencies(options: {
@@ -279,8 +286,8 @@ interface UiRecord {
   readonly workloadHandle: string;
   readonly userNamespaceBase: number;
   readonly artifact: HostArtifact;
-  readonly installDigest?: string;
-  readonly dependencyDigest?: string;
+  readonly installDigest: string;
+  readonly dependencyDigest: string;
   readonly spec: CapsuleUiSpec;
   readonly bootGeneration: number;
   readonly detachSystemStream: () => void;
@@ -295,8 +302,8 @@ interface Candidate extends UiRecord {
 
 interface ResolvedArtifact {
   readonly artifact: HostArtifact;
-  readonly installDigest?: string;
-  readonly dependencyDigest?: string;
+  readonly installDigest: string;
+  readonly dependencyDigest: string;
 }
 
 type ArtifactBuildInput =
@@ -370,6 +377,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   readonly #preparedInstances = new Map<string, PreparedUiRecord>();
   readonly #preparedOutcomes = new Map<string, PreparedUiOutcome>();
   readonly #workloads = new Map<string, UiRecord>();
+  readonly #latestActivationSequenceByApp = new Map<string, number>();
   readonly #namespaceBases = new Set<number>();
   readonly #launchControllers = new Map<string, Set<AbortController>>();
   readonly #shuttingDownBoots = new Map<BootBoundary, number>();
@@ -520,7 +528,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           prepared = {
             preparationId,
             candidate,
-            packageDigest: snapshot.digest,
+            packageDigest: snapshot.packageDigest,
             ...(previousInstanceId === undefined ? {} : { previousInstanceId }),
             retention: candidateRetention,
             state: "prepared",
@@ -1046,6 +1054,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       const started = await helper.startGuest({
         ...release.vmImage,
         workspaceFilesPath: this.#options.workspaceFilesPath(),
+        appVersionsPath: this.#options.appVersionsPath(),
         stateDiskBytes,
         statePreparationId: statePreparation.preparationId,
       });
@@ -1133,10 +1142,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     const active = await this.#artifacts.active(appKey);
     if (
       active
-      && active.packageDigest === snapshot.digest
+      && active.appVersion === spec.version
+      && active.packageDigest === spec.packageDigest
       && active.imageDigest === release.handshake.expectedImageDigest
-      && active.installDigest !== undefined
-      && active.dependencyDigest !== undefined
     ) {
       return {
         artifact: active.artifact,
@@ -1151,7 +1159,6 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       installInput.warmEligible
       && active?.imageDigest === release.handshake.expectedImageDigest
       && active.installDigest === installInput.digest
-      && active.dependencyDigest !== undefined
     ) {
       const input = { mode: "warm" as const, base: active };
       try {
@@ -1203,15 +1210,23 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   async #assertSnapshotManifestAuthority(
-    snapshot: CapsuleTreeSnapshot,
+    snapshot: CapsulePackageSnapshot,
     spec: CapsuleUiSpec,
   ): Promise<void> {
     if (
-      !Number.isSafeInteger(spec.manifestGeneration)
-      || spec.manifestGeneration < 1
+      !/^activation_[A-Za-z0-9_-]{32}$/.test(spec.activationId)
+      || !Number.isSafeInteger(spec.activationSequence)
+      || spec.activationSequence < 1
+      || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(spec.version)
       || !APP_MANIFEST_DIGEST_PATTERN.test(spec.manifestDigest)
+      || !APP_MANIFEST_DIGEST_PATTERN.test(spec.packageDigest)
     ) {
-      throw new Error("Capsule UI manifest authority is invalid");
+      throw new Error("Capsule UI activation authority is invalid");
+    }
+    if (snapshot.packageDigest !== spec.packageDigest) {
+      throw new CapsuleManifestAuthorityChangedError(
+        "App package authority changed; refresh and retry",
+      );
     }
     const capturedDigest = await this.#dependencies.manifestDigest(snapshot);
     if (capturedDigest !== spec.manifestDigest) {
@@ -1700,6 +1715,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     const instanceId = this.#dependencies.opaqueId();
     const namespaceBase = this.#allocateNamespace();
     let detachSystemStream: (() => void) | undefined;
+    let detachAppCliStream: (() => void) | undefined;
     const candidate: Candidate = {
       instanceId,
       appId: spec.appId,
@@ -1707,15 +1723,14 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       workloadHandle,
       userNamespaceBase: namespaceBase,
       artifact,
-      ...(resolved.installDigest === undefined
-        ? {}
-        : {
-            installDigest: resolved.installDigest,
-            dependencyDigest: resolved.dependencyDigest,
-          }),
+      installDigest: resolved.installDigest,
+      dependencyDigest: resolved.dependencyDigest,
       spec: Object.freeze({ ...spec, command: Object.freeze([...spec.command]) as unknown as string[] }),
       bootGeneration: boot.generation,
-      detachSystemStream: () => detachSystemStream?.(),
+      detachSystemStream: () => {
+        detachSystemStream?.();
+        detachAppCliStream?.();
+      },
       viewerStreams: new Set(),
       lifecycle: "launching",
       activated: false,
@@ -1759,6 +1774,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         subjectHandle: workloadHandle,
         ttlMs: TICKET_TTL_MS,
       });
+      const cliTicket = boot.session.issueTicket({
+        kind: "cli",
+        appHandle,
+        subjectHandle: workloadHandle,
+        ttlMs: TICKET_TTL_MS,
+      });
       const workloadPrepareBody: RequestBodyFor<"workload.prepare"> = {
         appHandle,
         workloadHandle,
@@ -1767,12 +1788,13 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         cwd: "/app",
         environment: {},
         sdkTicket: sdkTicket.ticket,
+        cliTicket: cliTicket.ticket,
         uiPort: spec.port,
       };
       const workloadResult = await boot.session.request(
         "workload.prepare",
         workloadPrepareBody,
-        { revokeTicketsOnFailure: [sdkTicket.ticket] },
+        { revokeTicketsOnFailure: [sdkTicket.ticket, cliTicket.ticket] },
       );
       const initialPrepare = this.#parseGuestResult(
         boot,
@@ -1785,6 +1807,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         throw error;
       }
       const sdk = await boot.session.openDataStream(sdkTicket.ticket, "sdk");
+      const cli = await boot.session.openDataStream(cliTicket.ticket, "cli");
+      detachAppCliStream = this.#options.appCliStreamServer.attach({
+        schemaVersion: 1,
+        appId: spec.appId,
+        workloadHandle,
+      }, cli.stream);
       let sdkClosed: Error | undefined;
       const sdkClosure = new Promise<never>((_resolve, reject) => {
         detachSystemStream = this.#options.systemStreamServer.attach(
@@ -1829,6 +1857,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       return candidate;
     } catch (error) {
       detachSystemStream?.();
+      detachAppCliStream?.();
       candidate.lifecycle = "stopping";
       if (!appPrepared) {
         let releasedBeforePrepare = false;
@@ -1911,6 +1940,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     if (!previous) {
       try {
         this.#publishCandidate(candidate);
+        this.#latestActivationSequenceByApp.set(
+          candidate.appId,
+          candidate.spec.activationSequence,
+        );
         this.#completePreparation(prepared, {
           decision: "committed",
           instanceId: candidate.instanceId,
@@ -1963,6 +1996,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       if (candidate.terminalError) throw candidate.terminalError;
       this.#instances.delete(previous.instanceId);
       this.#publishCandidate(candidate);
+      this.#latestActivationSequenceByApp.set(
+        candidate.appId,
+        candidate.spec.activationSequence,
+      );
       this.#completePreparation(prepared, {
         decision: "committed",
         instanceId: candidate.instanceId,
@@ -2113,6 +2150,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     boot: BootBoundary,
   ): Promise<ActivationCheckpoint> {
     if (candidate.terminalError) throw candidate.terminalError;
+    const latestSequence = this.#latestActivationSequenceByApp.get(candidate.appId) ?? 0;
+    if (candidate.spec.activationSequence < latestSequence) {
+      throw new Error("Prepared App activation is stale");
+    }
     await this.#assertBoot(boot);
     const checkpoint: ActivationCheckpoint = {
       appKey: hashAppId(candidate.appId),
@@ -2120,14 +2161,11 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     };
     try {
       await this.#artifacts.activate(checkpoint.appKey, candidate.artifact, {
+        appVersion: candidate.spec.version,
         packageDigest,
         imageDigest: boot.release.handshake.expectedImageDigest,
-        ...(candidate.installDigest === undefined
-          ? {}
-          : {
-              installDigest: candidate.installDigest,
-              dependencyDigest: candidate.dependencyDigest,
-            }),
+        installDigest: candidate.installDigest,
+        dependencyDigest: candidate.dependencyDigest,
       });
       candidate.activated = true;
       if (candidate.terminalError) throw candidate.terminalError;
@@ -2171,14 +2209,11 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   async #restoreActivation(checkpoint: ActivationCheckpoint): Promise<void> {
     if (checkpoint.previous) {
       await this.#artifacts.activate(checkpoint.appKey, checkpoint.previous.artifact, {
+        appVersion: checkpoint.previous.appVersion,
         packageDigest: checkpoint.previous.packageDigest,
         imageDigest: checkpoint.previous.imageDigest,
-        ...(checkpoint.previous.installDigest === undefined
-          ? {}
-          : {
-              installDigest: checkpoint.previous.installDigest,
-              dependencyDigest: checkpoint.previous.dependencyDigest,
-            }),
+        installDigest: checkpoint.previous.installDigest,
+        dependencyDigest: checkpoint.previous.dependencyDigest,
       });
       return;
     }

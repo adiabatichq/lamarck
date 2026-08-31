@@ -39,6 +39,11 @@ export interface RuncLaunchRequest {
     readonly source: Duplex;
     readonly consumedTicket: ConsumedTicketBinding;
   };
+  readonly cliChannel: {
+    /** Already ticket-authenticated Host stream for fixed private App CLI operations. */
+    readonly source: Duplex;
+    readonly consumedTicket: ConsumedTicketBinding;
+  };
   readonly logsChannel?: {
     /** Authenticated raw stdout/stderr sink; the driver never interprets it. */
     readonly source: Duplex;
@@ -113,6 +118,20 @@ export function assertRuncLaunchRequest(
   if (ticket.subjectHandle !== request.expectedIdentity.workloadHandle) {
     throw new Error("SDK bridge belongs to another workload");
   }
+  assertConsumedTicketBinding(request.cliChannel.consumedTicket);
+  if (
+    typeof request.cliChannel.source !== "object"
+    || request.cliChannel.source === null
+    || typeof request.cliChannel.source.pipe !== "function"
+    || request.cliChannel.source.destroyed
+  ) throw new Error("App CLI channel source must be an open authenticated stream");
+  const cliTicket = request.cliChannel.consumedTicket;
+  if (
+    cliTicket.kind !== "cli"
+    || cliTicket.sessionId !== request.sessionId
+    || cliTicket.appHandle !== request.expectedIdentity.appHandle
+    || cliTicket.subjectHandle !== request.expectedIdentity.workloadHandle
+  ) throw new Error("App CLI bridge belongs to another launch identity");
   if (request.logsChannel) {
     assertConsumedTicketBinding(request.logsChannel.consumedTicket);
     if (

@@ -24,6 +24,7 @@ let testRoot = "";
 let workspace = "";
 let coreEntry = "";
 let guardEntry = "";
+let cliEntry = "";
 let manifestFaultControl = "";
 let coreOrigin = "";
 let coreProcess: ChildProcess | undefined;
@@ -37,6 +38,7 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     workspace = join(testRoot, "workspace");
     coreEntry = fileURLToPath(new URL("../dist/core.mjs", import.meta.url));
     guardEntry = fileURLToPath(new URL("../dist/guard-service.cjs", import.meta.url));
+    cliEntry = fileURLToPath(new URL("../dist/cli.mjs", import.meta.url));
     manifestFaultControl = join(testRoot, "manifest-read-fault");
     await Promise.all([
       mkdir(join(workspace, ".lamarck"), { recursive: true }),
@@ -197,13 +199,9 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
   }, 30_000);
 
   test.each(["EIO", "EACCES"] as const)(
-    "preserves the prior registry generation and capability when manifest refresh fails with %s",
+    "preserves a running activation capability when authoring refresh fails with %s",
     async (code) => {
       const existing = await issueCapability("app-a");
-      const authority = {
-        manifestGeneration: existing.manifestGeneration,
-        manifestDigest: existing.manifestDigest,
-      };
 
       try {
         await writeFile(manifestFaultControl, code, "utf8");
@@ -215,14 +213,17 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
           error: `injected manifest ${code}`,
         });
 
-        // The failed candidate scan must not retire the generation that was
-        // already published or revoke capabilities issued from it.
+        // Authoring-state failure cannot rewrite the immutable activation
+        // snapshot or revoke its running capability.
         expect((await appQuery(existing.capability, "SELECT 1 AS ok")).status).toBe(200);
-        await expect(appAuthority("app-a")).resolves.toEqual(authority);
-        await expect(issueCapability("app-a")).resolves.toMatchObject(authority);
       } finally {
         await rm(manifestFaultControl, { force: true });
       }
+      await expect(issueCapability("app-a")).resolves.toMatchObject({
+        appCommit: existing.appCommit,
+        manifestDigest: existing.manifestDigest,
+        packageDigest: existing.packageDigest,
+      });
     },
   );
 
@@ -230,8 +231,7 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     await expect(hostRequest("/api/health")).resolves.toEqual({ ok: true });
     const existing = await issueCapability("app-a");
 
-    // An unchanged Shell poll must not retire the currently issued manifest
-    // generation.
+    // An unchanged Shell poll must not retire the running activation.
     await hostRequest("/api/apps");
     const beforeChange = await appQuery(existing.capability, "SELECT 1 AS ok");
     expect(beforeChange.status).toBe(200);
@@ -240,35 +240,83 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     const refreshed = await hostRequest("/api/apps") as { apps: Array<{ id: string }> };
     expect(refreshed.apps.map(({ id }) => id)).toContain("app-c");
 
-    // Publishing a changed registry retires the old authority snapshot.
+    // Inventory changes do not rewrite a running activation.
     const afterChange = await appQuery(existing.capability, "SELECT 1 AS ok");
-    expect(afterChange.status).toBe(401);
+    expect(afterChange.status).toBe(200);
     await expect(issueCapability("app-c")).resolves.toMatchObject({
       capability: expect.any(String),
       channelId: expect.any(String),
     });
   });
 
-  test("rejects stale authority when manifest changes between discovery and issuance", async () => {
-    const stale = await appAuthority("app-a");
+  test("Host CLI lists, saves, pages versions, restores forward, and emits stable JSON errors", async () => {
+    const running = await issueCapability("app-a");
+    const listed = JSON.parse(runCli("app", "list", "--json")) as Array<{
+      id: string;
+      path: string;
+      version: string | null;
+    }>;
+    expect(listed.find((app) => app.id === "app-a")).toMatchObject({
+      path: join(workspace, "apps", "app-a"),
+      version: running.appCommit,
+    });
+
+    const unchanged = JSON.parse(runCli("app", "save", "app-a", "--json")) as {
+      created: boolean;
+      version: string;
+    };
+    expect(unchanged).toMatchObject({ created: false, version: running.appCommit });
+    const beforeEvents = await appVersionEventCount("app-a");
+
+    await writeFile(join(workspace, "apps", "app-a", "reference.sql"), "SELECT 1;\n");
+    const saved = JSON.parse(runCli(
+      "app", "save", "app-a", "-m", "Add reference SQL", "--author", "Ada", "--json",
+    )) as { created: boolean; version: string };
+    expect(saved.created).toBe(true);
+    expect((await appQuery(running.capability, "SELECT 1 AS ok")).status).toBe(200);
+
+    const versions = JSON.parse(runCli("app", "versions", "app-a", "--json")) as Array<{
+      version: string;
+      trigger: string;
+      message?: string;
+      author?: string;
+    }>;
+    expect(versions[0]).toMatchObject({
+      version: saved.version,
+      trigger: "save",
+      message: "Add reference SQL",
+      author: "Ada",
+    });
+    const restored = JSON.parse(runCli(
+      "app", "restore", "app-a", running.appCommit.slice(0, 12), "--json",
+    )) as { created: boolean; version: string };
+    expect(restored.created).toBe(true);
+    expect(restored.version).not.toBe(running.appCommit);
+    expect(await appVersionEventCount("app-a")).toBe(beforeEvents + 2);
+    expect((await appQuery(running.capability, "SELECT 1 AS ok")).status).toBe(200);
+
+    expect(runCliFailure("app", "restore", "app-a", "deadbeef", "--json")).toEqual({
+      error: {
+        code: "APP_NOT_FOUND",
+        message: "Unknown App version: deadbeef",
+      },
+    });
+  });
+
+  test("uses prepared immutable authority when source changes before channel issuance", async () => {
+    const stale = await prepareActivation("app-a");
     await writeAppManifest("app-a", ["app_a_items", "app_b_items"]);
 
-    const response = await fetch(`${coreOrigin}/api/app-runtime/channels`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${CORE_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ appId: "app-a", workload: "ui", ...stale }),
+    const issued = await issueCapability("app-a", stale);
+    expect(issued).toMatchObject({
+      appCommit: stale.version,
+      manifestDigest: stale.manifestDigest,
+      packageDigest: stale.packageDigest,
     });
-
-    expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({
-      error: "App manifest authority changed; refresh and retry",
-    });
-    const current = await appAuthority("app-a");
+    const current = await prepareActivation("app-a");
+    expect(current.version).not.toBe(stale.version);
     expect(current.manifestDigest).not.toBe(stale.manifestDigest);
-    await expect(issueCapability("app-a")).resolves.toMatchObject(current);
+    await releaseActivation(current.activationId);
   });
 });
 
@@ -328,42 +376,56 @@ function seedDataDatabase(): void {
   }
 }
 
-async function issueCapability(appId: string): Promise<{
+async function issueCapability(appId: string, prepared?: PreparedActivation): Promise<{
   capability: string;
   channelId: string;
-  manifestGeneration: number;
+  activationId: string;
+  appCommit: string;
   manifestDigest: string;
+  packageDigest: string;
 }> {
-  const authority = await appAuthority(appId);
-  return await hostRequest("/api/app-runtime/channels", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ appId, workload: "ui", ...authority }),
-  }) as {
-    capability: string;
-    channelId: string;
-    manifestGeneration: number;
-    manifestDigest: string;
-  };
+  const authority = prepared ?? await prepareActivation(appId);
+  try {
+    return await hostRequest("/api/app-runtime/channels", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ appId, workload: "ui", activationId: authority.activationId }),
+    }) as {
+      capability: string;
+      channelId: string;
+      activationId: string;
+      appCommit: string;
+      manifestDigest: string;
+      packageDigest: string;
+    };
+  } finally {
+    await releaseActivation(authority.activationId);
+  }
 }
 
-async function appAuthority(appId: string): Promise<{
-  manifestGeneration: number;
+interface PreparedActivation {
+  activationId: string;
+  version: string;
   manifestDigest: string;
-}> {
-  const body = await hostRequest("/api/apps") as {
-    apps: Array<{
-      id: string;
-      manifestGeneration: number;
-      manifestDigest: string;
-    }>;
-  };
-  const app = body.apps.find((candidate) => candidate.id === appId);
-  if (!app) throw new Error(`App not found: ${appId}`);
-  return {
-    manifestGeneration: app.manifestGeneration,
-    manifestDigest: app.manifestDigest,
-  };
+  packageDigest: string;
+}
+
+async function prepareActivation(appId: string): Promise<PreparedActivation> {
+  const body = await hostRequest(
+    `/api/apps/${encodeURIComponent(appId)}/activation/prepare`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workload: "ui" }),
+    },
+  ) as { activation: PreparedActivation };
+  return body.activation;
+}
+
+async function releaseActivation(activationId: string): Promise<void> {
+  await hostRequest(`/api/apps/activation/${encodeURIComponent(activationId)}`, {
+    method: "DELETE",
+  });
 }
 
 async function appQuery(capability: string, sql: string): Promise<Response> {
@@ -375,6 +437,39 @@ async function appQuery(capability: string, sql: string): Promise<Response> {
     },
     body: JSON.stringify({ sql, params: [] }),
   });
+}
+
+async function appVersionEventCount(appId: string): Promise<number> {
+  const body = await hostRequest("/api/query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sql: "SELECT COUNT(*) AS count FROM events WHERE type = 'app.version.created' AND source = 'system:apps' AND json_extract(payload, '$.appId') = ?",
+      params: [appId],
+    }),
+  }) as { rows: Array<{ count: number }> };
+  return body.rows[0]?.count ?? 0;
+}
+
+function runCli(...args: string[]): string {
+  return execFileSync(process.execPath, [cliEntry, ...args], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      LAMARCK_CORE_URL: coreOrigin,
+      LAMARCK_CORE_TOKEN: CORE_TOKEN,
+    },
+  });
+}
+
+function runCliFailure(...args: string[]): unknown {
+  try {
+    runCli(...args);
+  } catch (error) {
+    const stderr = (error as { stderr?: string | Buffer }).stderr;
+    return JSON.parse(String(stderr).trim());
+  }
+  throw new Error("Expected CLI command to fail");
 }
 
 async function hostRequest(path: string, init: RequestInit = {}): Promise<unknown> {
