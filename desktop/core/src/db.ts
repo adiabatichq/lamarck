@@ -137,6 +137,14 @@ CREATE TABLE IF NOT EXISTS connector_official_release_hashes (
   verified_at    INTEGER NOT NULL,
   PRIMARY KEY (connector_id, content_hash)
 );
+
+CREATE TABLE IF NOT EXISTS connector_installations (
+  connector_id           TEXT PRIMARY KEY,
+  package_hash           TEXT NOT NULL,
+  marketplace_release_id TEXT NOT NULL,
+  installed_at           INTEGER NOT NULL,
+  updated_at             INTEGER NOT NULL
+);
 `;
 
 export const SYSTEM_SCHEMA = SYSTEM_SCHEMA_V1;

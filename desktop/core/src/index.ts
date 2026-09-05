@@ -34,6 +34,7 @@ import {
   removeConnectorFromWorkspace,
   resolveWorkspaceConnectorDir,
   updateConnectorFromSource,
+  type InstalledConnectorPackageView,
 } from "./connectors";
 import {
   ConnectorAuthManager,
@@ -84,7 +85,24 @@ import {
 import { systemIdentityFromBuild } from "./system-identity";
 import { instantiateMarketplaceApp } from "./marketplace/app-instantiation";
 import { loadMarketplaceTrustRootsFile } from "./marketplace/client";
-import { MarketplaceService } from "./marketplace/service";
+import { ConnectorMarketplaceError, MarketplaceService } from "./marketplace/service";
+import {
+  MANAGED_APP_EDIT_ROOT,
+  parseCliRequest,
+  type CliErrorCode,
+  type CliRequest,
+  type CliResponse,
+  type FileCommandResult,
+} from "@lamarck/cli";
+import {
+  projectAppShape,
+  projectAppSummary,
+  projectConnectorInspect,
+  projectConnectorSummary,
+  projectSourceShape,
+  projectSourceSummary,
+  type SourceProjectionInput,
+} from "./cli-projectors";
 
 // Lamarck — HTTP server entry point
 // All routes go through here. Guard is the only write path.
@@ -131,14 +149,25 @@ const appVersionGuard = guard.withSource("system:apps", {
   schemaGrant: false,
   deadlineMs: HOST_GUARD_DEADLINE_MS,
 });
-const appRepository = new AppRepositoryService({ eventWriter: appVersionGuard });
+const appRepository = new AppRepositoryService({
+  eventWriter: appVersionGuard,
+  eventWriterForAuthority(authority) {
+    return guard.withSource(authority.source, {
+      producerRef: authority.producerRef,
+      prepareProducer: () => { producerDescriptorStore.resolve(authority.producerRef); },
+      writeTables: [],
+      schemaGrant: false,
+      deadlineMs: HOST_GUARD_DEADLINE_MS,
+    });
+  },
+});
 const appActivationCoordinator = new AppActivationCoordinator(
   appRepository,
   join(lamarckDir, "cache", "app-versions"),
 );
 const appEditMaterializations = new AppEditMaterializationCoordinator(
   appRepository,
-  join(lamarckDir, "cache", "app-versions"),
+  join(lamarckDir, "cache", "app-edit-bases"),
 );
 const appLifecycle = new AppLifecycleService(
   appsDir,
@@ -214,25 +243,43 @@ const marketplaceService = await MarketplaceService.initialize({
       if (!connectorSupervisor.isRegistered(packageId)) return undefined;
       return hashConnectorPackage(resolveWorkspaceConnectorDir(workspacePath, packageId));
     },
+    async connectorState(packageId) {
+      const installed = await connectorSupervisor.currentInstalledConnectorPackage(packageId);
+      if (
+        !installed?.packageHash
+        || !["official", "custom", "modified", "untrusted"].includes(installed.packageTrust)
+      ) return undefined;
+      const installation = connectorSupervisor.marketplaceInstallation(packageId);
+      return {
+        hash: installed.packageHash,
+        trust: installed.packageTrust as "official" | "custom" | "modified" | "untrusted",
+        marketplaceManaged: installed.packageTrust === "official"
+          && installation?.packageHash === installed.packageHash,
+      };
+    },
     recordOfficialConnectorRelease(packageId, contentHash) {
       connectorSupervisor.recordOfficialMarketplaceRelease(packageId, contentHash);
     },
-    async installConnector(verifiedSourceDir, packageId) {
+    recordConnectorInstallation(packageId, contentHash, releaseId) {
+      connectorSupervisor.recordMarketplaceInstallation(packageId, contentHash, releaseId);
+    },
+    async installConnector(verifiedSourceDir, packageId, eventGuard = guard) {
+      await connectorSupervisor.clearInactiveConnectorRemnants(packageId);
       await installConnectorFromSource({
         sourceDir: verifiedSourceDir,
         workspacePath,
         connectorId: packageId,
         supervisor: connectorSupervisor,
-        guard,
+        guard: eventGuard,
       });
     },
-    async updateConnector(verifiedSourceDir, packageId) {
+    async updateConnector(verifiedSourceDir, packageId, eventGuard = guard) {
       const updated = await updateConnectorFromSource({
         sourceDir: verifiedSourceDir,
         workspacePath,
         connectorId: packageId,
         supervisor: connectorSupervisor,
-        guard,
+        guard: eventGuard,
       });
       return { updated: updated.updated };
     },
@@ -304,8 +351,14 @@ interface SchemaRequest {
   error?: string;
 }
 
+interface SchemaEventAuthority {
+  readonly source: string;
+  readonly producerRef: string;
+}
+
 const schemaRequests = new Map<string, SchemaRequest>();
 const schemaApprovals = new Map<string, Promise<SchemaRequest>>();
+const schemaRequestAuthorities = new Map<string, SchemaEventAuthority>();
 
 console.log(`[lamarck] Workspace: ${workspacePath}`);
 console.log(`[lamarck] Apps loaded: ${[...registry.apps.keys()].join(", ") || "(none)"}`);
@@ -455,7 +508,7 @@ function parseAppWorkload(workload: AppWorkload): AppWorkloadIdentity {
 async function createSchemaRequest(
   ddl: string | string[],
   metadata: { author?: string; context?: string },
-  requestGuard: RemoteGuard = guard,
+  eventAuthority?: SchemaEventAuthority,
 ): Promise<{ status: "pending"; request: SchemaRequest }> {
   const author = normalizeSchemaChangeMetadata(
     metadata.author,
@@ -467,7 +520,7 @@ async function createSchemaRequest(
     SCHEMA_CHANGE_CONTEXT_MAX_CHARS,
     "context",
   );
-  const plan = await requestGuard.schemaPlan(ddl);
+  const plan = await guard.schemaPlan(ddl);
   const request: SchemaRequest = {
     id: ulid(),
     ddl: plan.ddl,
@@ -479,12 +532,12 @@ async function createSchemaRequest(
     status: "pending",
   };
   schemaRequests.set(request.id, request);
+  if (eventAuthority) schemaRequestAuthorities.set(request.id, eventAuthority);
   return { status: "pending", request };
 }
 
 async function approveSchemaRequest(
   id: string,
-  requestGuard: RemoteGuard = guard,
 ): Promise<SchemaRequest> {
   const request = schemaRequests.get(id);
   if (!request) throw new Error(`Schema request not found: ${id}`);
@@ -494,7 +547,7 @@ async function approveSchemaRequest(
 
   const operation = (async () => {
     try {
-      await requestGuard.applySchemaPlan({
+      await guard.applySchemaPlan({
         ddl: request.ddl,
         beforeSchema: request.beforeSchema,
         afterSchema: request.afterSchema,
@@ -502,12 +555,14 @@ async function approveSchemaRequest(
         approved: true,
         author: request.author,
         context: request.context,
+        eventPrincipal: schemaRequestAuthorities.get(id),
       });
       request.status = "applied";
     } catch (err) {
       request.status = errorCode(err) === "GUARD_SCHEMA_STALE" ? "stale" : "failed";
       request.error = err instanceof Error ? err.message : String(err);
     }
+    schemaRequestAuthorities.delete(id);
     return request;
   })();
   schemaApprovals.set(id, operation);
@@ -543,6 +598,7 @@ function rejectSchemaRequest(id: string): SchemaRequest {
   if (!request) throw new Error(`Schema request not found: ${id}`);
   if (schemaApprovals.has(id)) throw new Error(`Schema request is currently being applied: ${id}`);
   if (request.status === "pending") request.status = "rejected";
+  schemaRequestAuthorities.delete(id);
   return request;
 }
 
@@ -605,7 +661,7 @@ async function instantiateVerifiedMarketplaceApp(input: {
   });
   try {
     await reloadAppRegistry();
-    await guard.writeEvent({
+    await guard.writeLifecycleEvent({
       type: "app.created",
       startedAt: Date.now(),
       payload: { appId: created.id },
@@ -656,6 +712,469 @@ function appLifecycleErrorResponse(
   }
   const message = error instanceof Error ? error.message : String(error);
   return json({ error: { code: "APP_INTERNAL_ERROR", message } }, 500);
+}
+
+type CliCorePrincipal =
+  | { readonly kind: "system" }
+  | {
+      readonly kind: "app";
+      readonly appId: string;
+      readonly workload: AppWorkload;
+      readonly appCommit: string;
+      readonly writeTables: readonly string[];
+      readonly fileGrants: readonly string[];
+      readonly workloadHandle: string;
+    };
+
+function parseCliCorePrincipal(value: unknown): CliCorePrincipal {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("CLI principal is invalid");
+  }
+  const raw = value as Record<string, unknown>;
+  if (raw.kind === "system" && Object.keys(raw).length === 1) return { kind: "system" };
+  const keys = Object.keys(raw).sort().join(",");
+  if (
+    raw.kind !== "app"
+    || keys !== "appCommit,appId,fileGrants,kind,workload,workloadHandle,writeTables"
+    || typeof raw.appId !== "string"
+    || !PACKAGE_ID_PATTERN.test(raw.appId)
+    || typeof raw.workload !== "string"
+    || !parseRequestedWorkload(raw.workload)
+    || typeof raw.appCommit !== "string"
+    || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(raw.appCommit)
+    || typeof raw.workloadHandle !== "string"
+    || !raw.workloadHandle
+    || !Array.isArray(raw.writeTables)
+    || raw.writeTables.some((item) => typeof item !== "string")
+    || !Array.isArray(raw.fileGrants)
+    || raw.fileGrants.some((item) => typeof item !== "string")
+  ) throw new Error("CLI App principal is invalid");
+  return Object.freeze({
+    kind: "app",
+    appId: raw.appId,
+    workload: raw.workload as AppWorkload,
+    appCommit: raw.appCommit,
+    workloadHandle: raw.workloadHandle,
+    writeTables: Object.freeze([...(raw.writeTables as string[])]),
+    fileGrants: Object.freeze([...(raw.fileGrants as string[])]),
+  });
+}
+
+function cliGuardForPrincipal(principal: CliCorePrincipal, signal: AbortSignal): RemoteGuard {
+  if (principal.kind === "system") {
+    return guard.withSource("system:cli", {
+      producerRef: systemProducer.producerRef,
+      prepareProducer: systemProducer.prepareProducer,
+      writeTables: null,
+      schemaGrant: false,
+      signal,
+      deadlineMs: HOST_GUARD_DEADLINE_MS,
+    });
+  }
+  const producer = createProducerBinding(
+    producerDescriptorStore,
+    createAppProducerDescriptor(principal.appId, principal.appCommit, systemIdentity),
+  );
+  return guard.withSource(sourceForAppWorkload(principal.appId, parseAppWorkload(principal.workload)), {
+    producerRef: producer.producerRef,
+    prepareProducer: producer.prepareProducer,
+    writeTables: [...principal.writeTables],
+    schemaGrant: false,
+    signal,
+    deadlineMs: APP_GUARD_DEADLINE_MS,
+  });
+}
+
+async function cliVersionEventContext(principal: CliCorePrincipal, eventWriter: RemoteGuard) {
+  const source = principal.kind === "system"
+    ? "system:cli"
+    : sourceForAppWorkload(principal.appId, parseAppWorkload(principal.workload));
+  const binding = principal.kind === "system"
+    ? systemProducer
+    : createProducerBinding(
+        producerDescriptorStore,
+        createAppProducerDescriptor(principal.appId, principal.appCommit, systemIdentity),
+      );
+  await binding.prepareProducer();
+  return {
+    eventWriter,
+    eventAuthority: { source, producerRef: binding.producerRef },
+  };
+}
+
+async function materializeCliPrincipal(principal: CliCorePrincipal): Promise<SchemaEventAuthority> {
+  const binding = principal.kind === "system"
+    ? systemProducer
+    : createProducerBinding(
+        producerDescriptorStore,
+        createAppProducerDescriptor(principal.appId, principal.appCommit, systemIdentity),
+      );
+  await binding.prepareProducer();
+  return {
+    source: principal.kind === "system"
+      ? "system:cli"
+      : sourceForAppWorkload(principal.appId, parseAppWorkload(principal.workload)),
+    producerRef: binding.producerRef,
+  };
+}
+
+function cliVfsCaller(
+  principal: CliCorePrincipal,
+  requestGuard: RemoteGuard,
+): VfsCaller {
+  return principal.kind === "system"
+    ? { guard: requestGuard, fileGrants: null, trustedHost: true }
+    : {
+        guard: requestGuard,
+        fileGrants: [...principal.fileGrants],
+        trustedHost: false,
+        workloadId: principal.workloadHandle,
+      };
+}
+
+async function cliSourceViews(): Promise<SourceProjectionInput[]> {
+  connectorSupervisor.resumeExpiredPauses();
+  const { packages: packageValues, sources } = await connectorSupervisor.currentCliShape();
+  const packages = new Map(
+    packageValues.map((value) => [value.connectorId, value] as const),
+  );
+  return sources.flatMap((source) => {
+    const pkg = packages.get(source.connectorId);
+    return pkg === undefined ? [] : [{
+      ...source,
+      packageHash: pkg.packageHash,
+      packageTrust: pkg.packageTrust,
+    } as SourceProjectionInput];
+  });
+}
+
+interface CliConnectorSnapshot {
+  readonly packages: ReadonlyMap<string, InstalledConnectorPackageView>;
+  readonly sources: readonly SourceProjectionInput[];
+  readonly sourceCounts: ReadonlyMap<string, number>;
+}
+
+async function cliConnectorSnapshot(): Promise<CliConnectorSnapshot> {
+  connectorSupervisor.resumeExpiredPauses();
+  const shape = await connectorSupervisor.currentCliShape();
+  const packages = new Map(shape.packages.map((value) => [value.connectorId, value] as const));
+  const sourceCounts = new Map<string, number>();
+  const sources = shape.sources.flatMap((source) => {
+    const pkg = packages.get(source.connectorId);
+    if (!pkg) return [];
+    sourceCounts.set(source.connectorId, (sourceCounts.get(source.connectorId) ?? 0) + 1);
+    return [{
+      ...source,
+      packageHash: pkg.packageHash,
+      packageTrust: pkg.packageTrust,
+    } as SourceProjectionInput];
+  });
+  return Object.freeze({ packages, sources: Object.freeze(sources), sourceCounts });
+}
+
+async function cliObservedOutputs(source: string | null) {
+  if (!source) return [];
+  return await guard.query(
+    `SELECT type,
+            MIN(started_at) AS firstObservedAt,
+            MAX(COALESCE(ended_at, started_at)) AS lastObservedAt
+       FROM events
+      WHERE source = ?
+      GROUP BY type
+      ORDER BY type`,
+    [source],
+  ) as Array<{ type: string; firstObservedAt: number; lastObservedAt: number }>;
+}
+
+function cliConnectorSummary(snapshot: CliConnectorSnapshot, connectorId: string) {
+  const connector = snapshot.packages.get(connectorId);
+  if (!connector) throw cliCoded("CONNECTOR_NOT_FOUND", `Connector ${connectorId} is not installed.`);
+  const installation = connectorSupervisor.marketplaceInstallation(connectorId);
+  const releaseId = connector.packageTrust === "official"
+    && installation !== undefined
+    && installation.packageHash === connector.packageHash
+    ? installation.releaseId
+    : null;
+  const latest = latestOfficialConnectorReleases.get(connectorId);
+  return projectConnectorSummary(connector, {
+    releaseId,
+    updateAvailable: connector.packageTrust === "official"
+      && latest !== undefined
+      && connector.packageHash !== latest.contentHash,
+    sourceCount: snapshot.sourceCounts.get(connectorId) ?? 0,
+  });
+}
+
+async function cliAppShapes(principal: CliCorePrincipal) {
+  await refreshAppRegistryIfChanged();
+  const inventory = await appLifecycle.inventory();
+  return inventory.map((item) => projectAppShape(
+    item,
+    false,
+    principal.kind === "system" ? item.path : `${MANAGED_APP_EDIT_ROOT}/${item.id}`,
+  ));
+}
+
+async function executeCoreCliOperation(
+  request: CliRequest,
+  principal: CliCorePrincipal,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const input = request.input as Record<string, unknown>;
+  const requestGuard = cliGuardForPrincipal(principal, signal);
+  switch (request.operation) {
+    case "query":
+      return requestGuard.query(input.sql as string);
+    case "schema.change": {
+      try {
+        const eventAuthority = await materializeCliPrincipal(principal);
+        const pending = await createSchemaRequest(input.ddl as string, {
+          ...(input.author === undefined ? {} : { author: input.author as string }),
+          ...(input.context === undefined ? {} : { context: input.context as string }),
+        }, eventAuthority);
+        return { id: pending.request.id, status: "pending" };
+      } catch (error) {
+        throw cliCoded(
+          "SCHEMA_REQUEST_REJECTED",
+          `Schema request was rejected: ${coreErrorMessage(error)} Fix the DDL and rerun lamarck schema.`,
+        );
+      }
+    }
+    case "file.command":
+    case "file.import":
+    case "file.export": {
+      const argv = input.argv as string[];
+      const expected = request.operation === "file.import"
+        ? "import"
+        : request.operation === "file.export"
+          ? "export"
+          : null;
+      if ((expected && argv[0] !== expected) || (!expected && (argv[0] === "import" || argv[0] === "export"))) {
+        throw cliCoded("CLI_UNSUPPORTED_COMMAND", "The file operation does not match its typed command.");
+      }
+      const result = await vfs.command(
+        cliVfsCaller(principal, requestGuard),
+        argv.map(quoteCliWord).join(" "),
+        {
+          ...(input.author === undefined ? {} : { author: input.author as string }),
+          ...(input.stdinBase64 === undefined ? {} : {
+            stdin: { encoding: "base64" as const, data: input.stdinBase64 as string },
+          }),
+        },
+      );
+      return result satisfies FileCommandResult;
+    }
+    case "source.list":
+      return (await cliSourceViews()).map(projectSourceSummary);
+    case "source.inspect": {
+      const source = (await cliSourceViews()).find((item) => item.id === input.sourceId);
+      if (!source) throw cliCoded("SOURCE_NOT_FOUND", `Source ${String(input.sourceId)} was not found.`);
+      const connector = await connectorSupervisor.currentInstalledConnectorPackage(source.connectorId);
+      if (!connector) throw cliCoded("CONNECTOR_NOT_FOUND", `Connector ${source.connectorId} is not installed.`);
+      return projectSourceShape(source, connector.eventCatalog, await cliObservedOutputs(source.source));
+    }
+    case "source.run": {
+      requireCliSource(input.sourceId as string);
+      try {
+        const handle = connectorSupervisor.start(input.sourceId as string, { trigger: "manual" });
+        return { sourceId: input.sourceId, runId: handle.runId, status: "accepted" };
+      } catch (error) {
+        throw cliCoded(
+          "SOURCE_RUN_REJECTED",
+          `Source run was rejected: ${coreErrorMessage(error)} Inspect the Source and complete its setup before rerunning source run.`,
+        );
+      }
+    }
+    case "source.run.status": {
+      const run = connectorSupervisor.sourceRun(input.sourceId as string, input.runId as string);
+      if (!run) throw cliCoded("SOURCE_NOT_FOUND", `Source run ${String(input.runId)} was not found.`);
+      return run.status === "running"
+        ? { sourceId: run.sourceId, runId: run.id, status: "running", startedAt: run.startedAt }
+        : {
+            sourceId: run.sourceId,
+            runId: run.id,
+            status: run.status,
+            outcome: run.status,
+            startedAt: run.startedAt,
+            endedAt: run.endedAt!,
+          };
+    }
+    case "source.pause": {
+      requireCliSource(input.sourceId as string);
+      await connectorSupervisor.pauseSource(input.sourceId as string);
+      return { sourceId: input.sourceId, lifecycle: "paused" };
+    }
+    case "source.resume": {
+      requireCliSource(input.sourceId as string);
+      connectorSupervisor.resumeSource(input.sourceId as string);
+      void connectorScheduler.tick().catch(() => {});
+      return { sourceId: input.sourceId, lifecycle: "active" };
+    }
+    case "connector.list": {
+      const snapshot = await cliConnectorSnapshot();
+      return [...snapshot.packages.keys()].map((connectorId) => cliConnectorSummary(snapshot, connectorId));
+    }
+    case "connector.inspect": {
+      const connectorId = input.connectorId as string;
+      const snapshot = await cliConnectorSnapshot();
+      const connector = snapshot.packages.get(connectorId);
+      if (!connector) throw cliCoded("CONNECTOR_NOT_FOUND", `Connector ${connectorId} is not installed.`);
+      const summary = cliConnectorSummary(snapshot, connectorId);
+      const sources = snapshot.sources
+        .filter((source) => source.connectorId === connectorId)
+        .map(projectSourceSummary);
+      return projectConnectorInspect(summary, connector.manifest, connector.eventCatalog, sources);
+    }
+    case "connector.install":
+    case "connector.update": {
+      const expectedAction = request.operation === "connector.install" ? "install" : "update";
+      const id = request.operation === "connector.install" ? input.packageId as string : input.connectorId as string;
+      try {
+        const prepared = await marketplaceService.prepare("connector", id, expectedAction);
+        const applied = await marketplaceService.apply(prepared.stageId, undefined, requestGuard);
+        return {
+          id: applied.id,
+          releaseId: prepared.releaseId,
+          packageHash: prepared.contentHash,
+          changed: applied.disposition !== "already-installed",
+        };
+      } catch (error) {
+        if (error instanceof ConnectorMarketplaceError) {
+          throw cliCoded(error.code, error.message);
+        }
+        if (error instanceof ConnectorLifecycleConflictError) {
+          throw cliCoded(
+            error.code,
+            `${error.message}; resolve the conflicting Sources before rerunning connector update.`,
+          );
+        }
+        throw cliCoded(
+          "CONNECTOR_VERIFICATION_FAILED",
+          `Connector ${id} could not be admitted; inspect the package and retry the Marketplace command.`,
+        );
+      }
+    }
+    case "connector.remove": {
+      const id = input.connectorId as string;
+      const removed = await removeConnectorFromWorkspace({
+        workspacePath,
+        connectorId: id,
+        supervisor: connectorSupervisor,
+        guard: requestGuard,
+      });
+      if (!removed) throw cliCoded("CONNECTOR_NOT_FOUND", `Connector ${id} is not installed.`);
+      return { id, removed: true };
+    }
+    case "app.list":
+      return (await cliAppShapes(principal)).map(projectAppSummary);
+    case "app.inspect": {
+      const app = (await cliAppShapes(principal)).find((item) => item.id === input.appId);
+      if (!app) throw cliCoded("APP_NOT_FOUND", `App not found: ${String(input.appId)}`);
+      return app;
+    }
+    case "app.create": {
+      const id = input.appId as string;
+      const name = input.name as string;
+      const description = input.description as string;
+      if (!PACKAGE_ID_PATTERN.test(id) || !name || name.trim() !== name
+        || !description || description.trim() !== description) {
+        throw cliCoded("APP_INVALID", "The App id, name, or description is invalid.");
+      }
+      if (registry.apps.has(id)) throw cliCoded("APP_INVALID", `App ${id} already exists.`);
+      await instantiateBlankApp({
+        appsDir,
+        scaffoldDir: appScaffoldDir,
+        id,
+        name,
+        description,
+        initializeRepository: (dir) => appRepository.initializeRepository(id, dir),
+      });
+      await reloadAppRegistry();
+      await requestGuard.writeLifecycleEvent({ type: "app.created", startedAt: Date.now(), payload: { appId: id } });
+      return { id, created: true };
+    }
+    case "app.save": {
+      const result = await appLifecycle.save(input.appId as string, {
+        ...(input.message === undefined ? {} : { message: input.message as string }),
+        ...(input.author === undefined ? {} : { author: input.author as string }),
+        ...await cliVersionEventContext(principal, requestGuard),
+      });
+      await refreshAppRegistryIfChanged();
+      return { version: result.version, created: result.created };
+    }
+    case "app.versions": {
+      const page = await appLifecycle.versions(input.appId as string, { limit: 100 });
+      return page.versions.map(({ schemaVersion: _schemaVersion, ...record }) => record);
+    }
+    case "app.restore": {
+      const result = await appLifecycle.restore(input.appId as string, input.version as string, {
+        ...(input.message === undefined ? {} : { message: input.message as string }),
+        ...(input.author === undefined ? {} : { author: input.author as string }),
+        ...await cliVersionEventContext(principal, requestGuard),
+      });
+      await refreshAppRegistryIfChanged();
+      return { version: result.version, created: result.created };
+    }
+    case "app.refresh":
+      if (principal.kind !== "app") throw cliCoded("CLI_UNSUPPORTED_COMMAND", "app refresh is managed-only.");
+      if (!registry.apps.has(input.appId as string)) {
+        throw cliCoded("APP_NOT_FOUND", `App not found: ${String(input.appId)}`);
+      }
+      return { id: input.appId as string, refreshed: true };
+    case "app.archive": {
+      const appId = input.appId as string;
+      const app = registry.apps.get(appId);
+      if (!app) throw cliCoded("APP_NOT_FOUND", `App not found: ${appId}`);
+      await appCapabilities.revokeApp(appId);
+      await appRepository.verifyRetainedVersions(appId, app.dir);
+      await archiveApp(appsDir, join(lamarckDir, "archived-apps"), appId);
+      await reloadAppRegistry();
+      await requestGuard.writeLifecycleEvent({ type: "app.archived", startedAt: Date.now(), payload: { appId } });
+      return { id: appId, archived: true };
+    }
+  }
+}
+
+function quoteCliWord(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+class CoreCliError extends Error {
+  constructor(readonly code: CliErrorCode, message: string) { super(message); }
+}
+
+function cliCoded(code: CliErrorCode, message: string): CoreCliError {
+  return new CoreCliError(code, message);
+}
+
+function requireCliSource(sourceId: string): void {
+  const source = connectorSupervisor.getSource(sourceId);
+  if (!source || !connectorSupervisor.isRegistered(source.connectorId)) {
+    throw cliCoded("SOURCE_NOT_FOUND", `Source ${sourceId} was not found.`);
+  }
+}
+
+function cliFailure(requestId: string, error: unknown): CliResponse {
+  if (error instanceof CoreCliError) {
+    return { requestId, ok: false, error: { code: error.code, message: error.message } } as CliResponse;
+  }
+  if (error instanceof AppLifecycleError) {
+    const code = error.code === "APP_PACKAGE_INVALID"
+      ? "APP_INVALID"
+      : error.code === "APP_COMMAND_UNSUPPORTED"
+        ? "CLI_UNSUPPORTED_COMMAND"
+        : error.code;
+    return { requestId, ok: false, error: { code, message: error.message } } as CliResponse;
+  }
+  return {
+    requestId,
+    ok: false,
+    error: { code: "CLI_INTERNAL", message: "Lamarck could not complete the command." },
+  } as CliResponse;
+}
+
+function coreErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function staticContentType(path: string): string | undefined {
@@ -803,6 +1322,25 @@ const server = await serve<{ cwd: string }>({
       if (path === "/api/health" && method === "GET") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         return json({ ok: true });
+      }
+
+      if (path === "/api/cli/execute" && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readJsonBody<Record<string, unknown>>(req, 28 * 1024 * 1024);
+        assertAllowedRequestFields(body, ["principal", "request"]);
+        let request: CliRequest;
+        try {
+          request = parseCliRequest(body.request, { allowInlineFileBytes: true });
+        } catch {
+          return json({ error: "invalid typed CLI request" }, 400);
+        }
+        try {
+          const principal = parseCliCorePrincipal(body.principal);
+          const result = await executeCoreCliOperation(request, principal, requestGuardSignal);
+          return json({ requestId: request.requestId, ok: true, result } as CliResponse);
+        } catch (error) {
+          return json(cliFailure(request.requestId, error));
+        }
       }
 
       // -- Workspace --
@@ -990,7 +1528,6 @@ const server = await serve<{ cwd: string }>({
               "context",
             ),
           },
-          guardForRequest(auth!, { signal: requestGuardSignal }),
         );
         return json(result);
       }
@@ -1015,7 +1552,6 @@ const server = await serve<{ cwd: string }>({
         assertAllowedRequestFields(body, []);
         const request = await approveSchemaRequest(
           decodeURIComponent(approveMatch[1]),
-          guardForRequest(auth!, { signal: requestGuardSignal }),
         );
         return json({ request });
       }
@@ -1085,8 +1621,6 @@ const server = await serve<{ cwd: string }>({
         });
         return json({
           sources,
-          // Compatibility alias while callers migrate to the ownership model.
-          connectors: sources,
           packages,
         });
       }
@@ -1333,6 +1867,15 @@ const server = await serve<{ cwd: string }>({
       }
 
       // -- Apps --
+      if (path === "/api/apps/edit-bases" && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        try {
+          return json({ editBases: await appLifecycle.prepareEditBases() });
+        } catch (error) {
+          return appLifecycleErrorResponse(error, json);
+        }
+      }
+
       const editBaseMatch = path.match(/^\/api\/apps\/([^/]+)\/edit-base$/);
       if (editBaseMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
@@ -1356,11 +1899,24 @@ const server = await serve<{ cwd: string }>({
             req,
             join(lamarckDir, "staging", "app-edits"),
           );
+          const encodedPrincipal = req.headers.get("x-lamarck-cli-principal");
+          const managedPrincipal = encodedPrincipal === null
+            ? undefined
+            : parseCliCorePrincipal(JSON.parse(Buffer.from(encodedPrincipal, "base64url").toString("utf8")));
+          if (managedPrincipal?.kind !== "app") {
+            if (encodedPrincipal !== null) throw new Error("Managed App CLI principal is required");
+          }
           const result = await appLifecycle.savePackage(appId, upload.entries, {
             baseVersion: upload.metadata.baseVersion,
             basePackageDigest: upload.metadata.basePackageDigest,
             ...(upload.metadata.message === undefined ? {} : { message: upload.metadata.message }),
             ...(upload.metadata.author === undefined ? {} : { author: upload.metadata.author }),
+            ...(managedPrincipal?.kind === "app"
+              ? await cliVersionEventContext(
+                  managedPrincipal,
+                  cliGuardForPrincipal(managedPrincipal, requestGuardSignal),
+                )
+              : {}),
           });
           await refreshAppRegistryIfChanged();
           return json({ result, editBase: await appLifecycle.prepareEditBase(appId) });
@@ -1581,7 +2137,7 @@ const server = await serve<{ cwd: string }>({
         await guard.withExecution({
           signal: requestGuardSignal,
           deadlineMs: HOST_GUARD_DEADLINE_MS,
-        }).writeEvent({
+        }).writeLifecycleEvent({
           type: "app.created",
           startedAt: Date.now(),
           payload: { appId: id },
@@ -1608,7 +2164,7 @@ const server = await serve<{ cwd: string }>({
         await guard.withExecution({
           signal: requestGuardSignal,
           deadlineMs: HOST_GUARD_DEADLINE_MS,
-        }).writeEvent({
+        }).writeLifecycleEvent({
           type: "app.archived",
           startedAt: Date.now(),
           payload: { appId },

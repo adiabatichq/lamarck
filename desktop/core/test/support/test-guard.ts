@@ -63,4 +63,8 @@ export class TestGuard {
     );
     return id;
   }
+
+  writeLifecycleEvent(event: EventInput): string {
+    return this.writeEvent(event);
+  }
 }

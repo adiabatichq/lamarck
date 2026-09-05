@@ -1,6 +1,7 @@
 import type { JsonValue } from "./json";
 import type { EventInput } from "./guard-types";
 import type {
+  GuardEventPrincipal,
   GuardMutationResult,
   GuardPrincipal,
   GuardSchemaPlan,
@@ -241,6 +242,11 @@ export class RemoteGuard {
     return this.call<string>("writeEvent", { principal: this.principal(), event });
   }
 
+  async writeLifecycleEvent(event: EventInput): Promise<string> {
+    await this.prepareProducer();
+    return this.call<string>("writeLifecycleEvent", { principal: this.principal(), event });
+  }
+
   async writeWorkspaceEvent(event: EventInput): Promise<string> {
     await this.prepareProducer();
     return this.call<string>("writeWorkspaceEvent", { principal: this.principal(), event });
@@ -261,7 +267,7 @@ export class RemoteGuard {
 
   async applySchemaPlan(
     plan: SchemaPlan,
-    opts?: { approved?: boolean; author?: string; context?: string },
+    opts?: { approved?: boolean; author?: string; context?: string; eventPrincipal?: GuardEventPrincipal },
   ): Promise<void> {
     await this.prepareProducer();
     await this.call("schema.apply", {
@@ -270,6 +276,7 @@ export class RemoteGuard {
       approved: opts?.approved === true,
       author: opts?.author,
       context: opts?.context,
+      eventPrincipal: opts?.eventPrincipal,
     });
   }
 

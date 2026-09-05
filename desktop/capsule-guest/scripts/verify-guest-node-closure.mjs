@@ -5,8 +5,8 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 export const GUEST_NODE_VERSION = "24.18.0";
-export const GUEST_NODE_ENGINE = ">=24.10.0";
 const GUEST_WORKSPACE = "desktop/capsule-guest";
+const NODE_FLOOR_PATTERN = /^>=(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 /**
  * Proves that every Lamarck workspace in the selected Guest dependency
@@ -54,8 +54,8 @@ export async function verifyGuestNodeClosure(
     if (!isObject(locked)
       || locked.name !== manifest.name
       || locked.version !== manifest.version
-      || manifest.engines?.node !== GUEST_NODE_ENGINE
-      || locked.engines?.node !== GUEST_NODE_ENGINE) {
+      || locked.engines?.node !== manifest.engines?.node
+      || !acceptsPinnedNode(manifest.engines?.node, runtimeVersion)) {
       throw new Error(
         `Guest closure workspace ${workspace} does not accept pinned Node ${GUEST_NODE_VERSION}`,
       );
@@ -85,6 +85,18 @@ async function readJson(path, description) {
 
 function isObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function acceptsPinnedNode(engine, runtimeVersion) {
+  if (typeof engine !== "string") return false;
+  const floor = NODE_FLOOR_PATTERN.exec(engine);
+  const runtime = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(runtimeVersion);
+  if (!floor || !runtime) return false;
+  for (let index = 1; index <= 3; index += 1) {
+    const difference = Number(runtime[index]) - Number(floor[index]);
+    if (difference !== 0) return difference > 0;
+  }
+  return true;
 }
 
 if (process.argv[1]

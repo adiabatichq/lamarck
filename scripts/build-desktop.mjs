@@ -41,6 +41,7 @@ const APP_SCAFFOLD_FILES = [
 
 export async function buildDesktop(options = {}) {
   const context = buildContext(options);
+  buildCli(context);
   await cleanHostOutputs(context);
   await rm(join(context.shellDir, "dist"), { recursive: true, force: true });
   buildSystemSdk(context);
@@ -60,6 +61,7 @@ export async function buildDesktop(options = {}) {
 
 export async function buildDesktopHost(options = {}) {
   const context = buildContext(options);
+  buildCli(context);
   await cleanHostOutputs(context);
   buildSystemSdk(context);
   buildElectronHost(context);
@@ -71,6 +73,7 @@ function buildContext(options) {
   const root = resolve(options.root ?? defaultRoot);
   return {
     root,
+    cliDir: join(root, "desktop", "cli"),
     shellDir: join(root, "desktop", "shell"),
     systemSdkDir: join(root, "desktop", "system-sdk"),
     env: options.env ?? process.env,
@@ -93,6 +96,16 @@ async function cleanHostOutputs(context) {
   ));
   // Do not remove dist-electron/native: it may contain a separately staged,
   // verified Capsule helper and Guest release used by local production runs.
+}
+
+function buildCli(context) {
+  runNode(
+    context,
+    join(context.cliDir, "scripts", "build.mjs"),
+    [],
+    context.root,
+    "Public CLI prerequisite",
+  );
 }
 
 function buildSystemSdk(context) {

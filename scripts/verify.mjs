@@ -17,7 +17,10 @@ const env = {
 
 const gates = [
   ["Toolchain alignment", ["run", "verify:toolchain"]],
+  ["CLI build prerequisite", ["run", "cli:build"]],
   ["Repository module boundaries", ["run", "verify:module-boundaries"]],
+  ["CLI typecheck", ["--workspace", "@lamarck/cli", "run", "typecheck"]],
+  ["CLI tests", ["--workspace", "@lamarck/cli", "test"]],
   ["System SDK consumer alignment", ["run", "verify:system-sdk-consumers"]],
   ["System SDK consumer sync tests", ["run", "test:system-sdk-consumer-sync"]],
   ["Marketplace blind publisher tests", ["run", "test:marketplace-publisher"]],
@@ -33,6 +36,7 @@ const gates = [
   ["Capsule tests", ["--workspace", "@lamarck/capsule", "run", "test"]],
   ["Capsule Guest typecheck", ["--workspace", "@lamarck/capsule-guest", "run", "typecheck"]],
   ["Capsule Guest tests", ["--workspace", "@lamarck/capsule-guest", "run", "test"]],
+  ["CLI reproducible package and clean-consumer smoke", ["run", "cli:pack"]],
   ["macOS release contract tests", ["run", "package:macos:test"]],
 ];
 

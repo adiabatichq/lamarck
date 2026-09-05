@@ -170,6 +170,11 @@ try {
     supervisorBuild.includes('"release-runc-smoke": resolve(root, "src", "release-runc-smoke.ts")'),
     "signed Guest build omits the production runc smoke bundle",
   );
+  assert(
+    supervisorBuild.includes('"cli", "dist", "lamarck-managed.mjs"')
+      && !supervisorBuild.includes('"cli", "src"'),
+    "signed Guest build does not consume the built managed CLI artifact",
+  );
   const javascriptBuild = await readFile(join(scripts, "build-js-inside.sh"), "utf8");
   assert(
     javascriptBuild.includes("verify-guest-node-closure.mjs")
@@ -183,13 +188,26 @@ try {
     "Guest JavaScript build still compiles or exports the App System SDK",
   );
   assert(
+    javascriptBuild.indexOf("desktop/cli/scripts/build.mjs")
+      < javascriptBuild.indexOf("desktop/capsule-guest/scripts/build-supervisor.mjs"),
+    "Guest JavaScript build does not build the CLI before the Capsule Guest bundle",
+  );
+  assert(
     !BUILD_SNAPSHOT_FILES.some((path) => path.startsWith("desktop/system-sdk/"))
       && !BUILD_SNAPSHOT_DIRECTORIES.some((path) => path.startsWith("desktop/system-sdk/")),
     "Guest build snapshot still includes App System SDK source",
   );
   assert(
+    BUILD_SNAPSHOT_FILES.includes("LICENSE")
+      && BUILD_SNAPSHOT_FILES.includes("desktop/cli/package.json")
+      && BUILD_SNAPSHOT_FILES.includes("desktop/cli/tsconfig.build.json")
+      && BUILD_SNAPSHOT_DIRECTORIES.includes("desktop/cli/scripts")
+      && BUILD_SNAPSHOT_DIRECTORIES.includes("desktop/cli/src"),
+    "Guest build snapshot omits a required CLI build input",
+  );
+  assert(
     JSON.stringify(await verifyGuestNodeClosure(repo, { runtimeVersion: "24.18.0" }))
-      === JSON.stringify(["desktop/capsule", "desktop/capsule-guest"]),
+      === JSON.stringify(["desktop/capsule", "desktop/capsule-guest", "desktop/cli"]),
     "current Guest workspace closure is not exact",
   );
   const nodeClosureFixture = join(root, "guest-node-closure");
@@ -198,12 +216,12 @@ try {
     JSON.stringify(await verifyGuestNodeClosure(
       nodeClosureFixture,
       { runtimeVersion: "24.18.0" },
-    )) === JSON.stringify(["desktop/capsule", "desktop/capsule-guest"]),
+    )) === JSON.stringify(["desktop/capsule", "desktop/capsule-guest", "desktop/cli"]),
     "valid Guest Node closure fixture was rejected",
   );
   const capsuleManifestPath = join(nodeClosureFixture, "desktop/capsule/package.json");
   const capsuleManifest = JSON.parse(await readFile(capsuleManifestPath, "utf8"));
-  capsuleManifest.engines.node = ">=24.12.0";
+  capsuleManifest.engines.node = ">=99.0.0";
   await writeFile(capsuleManifestPath, `${JSON.stringify(capsuleManifest)}\n`);
   await expectReject(
     verifyGuestNodeClosure(nodeClosureFixture, { runtimeVersion: "24.18.0" }),
@@ -648,12 +666,18 @@ async function createGuestNodeClosureFixture(root) {
       name: "@lamarck/capsule",
       version: "0.1.0",
       engines: { node: ">=24.10.0" },
+      dependencies: { "@lamarck/cli": "0.1.0" },
     },
     "desktop/capsule-guest": {
       name: "@lamarck/capsule-guest",
       version: "0.1.0",
       engines: { node: ">=24.10.0" },
-      dependencies: { "@lamarck/capsule": "0.1.0" },
+      dependencies: { "@lamarck/capsule": "0.1.0", "@lamarck/cli": "0.1.0" },
+    },
+    "desktop/cli": {
+      name: "@lamarck/cli",
+      version: "0.1.0",
+      engines: { node: ">=24.12.0" },
     },
     "desktop/core": {
       name: "@lamarck/core",

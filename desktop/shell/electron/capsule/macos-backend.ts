@@ -155,7 +155,7 @@ export interface MacOsCapsuleBackendOptions {
   artifactRoot: string;
   /** The selected Workspace's canonical D1 root. */
   workspaceFilesPath: () => string;
-  /** Core-owned immutable App-version/edit-base cache. */
+  /** Core-owned immutable App editing-base cache. */
   appVersionsPath: () => string;
   /** Host terminator for the workload's ticket-bound System SDK stream. */
   systemStreamServer: SystemStreamServer;
@@ -1809,8 +1809,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       const sdk = await boot.session.openDataStream(sdkTicket.ticket, "sdk");
       const cli = await boot.session.openDataStream(cliTicket.ticket, "cli");
       detachAppCliStream = this.#options.appCliStreamServer.attach({
-        schemaVersion: 1,
+        kind: "app",
         appId: spec.appId,
+        workload: "ui",
+        appCommit: spec.version,
+        writeTables: [...spec.writeTables],
+        fileGrants: [...spec.fileGrants],
         workloadHandle,
       }, cli.stream);
       let sdkClosed: Error | undefined;

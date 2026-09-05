@@ -1,20 +1,26 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
+import fs, { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { Duplex } from "node:stream";
+import { Duplex, PassThrough } from "node:stream";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { HostCliTransport, runCli as runSharedCli, type CliIo } from "@lamarck/cli";
 import { SystemBroker } from "../../shell/electron/capsule/system-broker";
 import { SystemStreamServer } from "../../shell/electron/capsule/system-stream";
+import { CliOperationDispatcher } from "../../shell/electron/cli-dispatcher";
+import { DesktopCliGateway } from "../../shell/electron/cli-gateway";
 import { createSystem } from "@lamarck/system";
 import { FramedRpcClient } from "../../system-sdk/src/node-transport";
 import { DATA_SCHEMA } from "../src/data-schema";
+import { canonicalizeAppVersionRecordV1 } from "../src/apps/version-record";
+import { hashConnectorPackage } from "../src/connectors";
+import git from "isomorphic-git";
 
 const START_TIMEOUT_MS = 15_000;
 const CORE_TOKEN = "capsule-core-e2e-host-token";
@@ -24,11 +30,12 @@ let testRoot = "";
 let workspace = "";
 let coreEntry = "";
 let guardEntry = "";
-let cliEntry = "";
+let cliDescriptor = "";
 let manifestFaultControl = "";
 let coreOrigin = "";
 let coreProcess: ChildProcess | undefined;
 let guardProcess: ChildProcess | undefined;
+let cliGateway: DesktopCliGateway | undefined;
 let coreOutput = "";
 let guardOutput = "";
 
@@ -38,12 +45,14 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     workspace = join(testRoot, "workspace");
     coreEntry = fileURLToPath(new URL("../dist/core.mjs", import.meta.url));
     guardEntry = fileURLToPath(new URL("../dist/guard-service.cjs", import.meta.url));
-    cliEntry = fileURLToPath(new URL("../dist/cli.mjs", import.meta.url));
     manifestFaultControl = join(testRoot, "manifest-read-fault");
     await Promise.all([
       mkdir(join(workspace, ".lamarck"), { recursive: true }),
       writeAppManifest("app-a", ["app_a_items"]),
       writeAppManifest("app-b", ["app_b_items"]),
+      writeAppManifest("history-app", []),
+      writeAppManifest("archive-app", []),
+      writeConnectorPackage("lamarck.cli-fixture"),
     ]);
     seedDataDatabase();
 
@@ -84,9 +93,21 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     });
     coreOutput = captureOutput(coreProcess);
     await waitForCore();
+    const cliRuntimeDirectory = join(testRoot, "cli");
+    cliDescriptor = join(cliRuntimeDirectory, "runtime.json");
+    cliGateway = new DesktopCliGateway({
+      dispatcher: new CliOperationDispatcher({
+        coreBaseUrl: () => coreOrigin,
+        coreToken: CORE_TOKEN,
+        runtimeStates: () => [],
+      }),
+      runtimeDirectory: cliRuntimeDirectory,
+    });
+    await cliGateway.start();
   }, 30_000);
 
   afterAll(async () => {
+    await cliGateway?.stop();
     await stopProcess(coreProcess);
     await stopProcess(guardProcess);
     if (testRoot) await rm(testRoot, { recursive: true, force: true });
@@ -251,17 +272,17 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
 
   test("Host CLI lists, saves, pages versions, restores forward, and emits stable JSON errors", async () => {
     const running = await issueCapability("app-a");
-    const listed = JSON.parse(runCli("app", "list", "--json")) as Array<{
+    const listed = JSON.parse(await runCli("app", "list", "--json")) as Array<{
       id: string;
       path: string;
-      version: string | null;
+      lifecycle: { version: string | null };
     }>;
     expect(listed.find((app) => app.id === "app-a")).toMatchObject({
       path: join(workspace, "apps", "app-a"),
-      version: running.appCommit,
+      lifecycle: { version: running.appCommit },
     });
 
-    const unchanged = JSON.parse(runCli("app", "save", "app-a", "--json")) as {
+    const unchanged = JSON.parse(await runCli("app", "save", "app-a", "--json")) as {
       created: boolean;
       version: string;
     };
@@ -269,13 +290,13 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     const beforeEvents = await appVersionEventCount("app-a");
 
     await writeFile(join(workspace, "apps", "app-a", "reference.sql"), "SELECT 1;\n");
-    const saved = JSON.parse(runCli(
+    const saved = JSON.parse(await runCli(
       "app", "save", "app-a", "-m", "Add reference SQL", "--author", "Ada", "--json",
     )) as { created: boolean; version: string };
     expect(saved.created).toBe(true);
     expect((await appQuery(running.capability, "SELECT 1 AS ok")).status).toBe(200);
 
-    const versions = JSON.parse(runCli("app", "versions", "app-a", "--json")) as Array<{
+    const versions = JSON.parse(await runCli("app", "versions", "app-a", "--json")) as Array<{
       version: string;
       trigger: string;
       message?: string;
@@ -287,7 +308,7 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
       message: "Add reference SQL",
       author: "Ada",
     });
-    const restored = JSON.parse(runCli(
+    const restored = JSON.parse(await runCli(
       "app", "restore", "app-a", running.appCommit.slice(0, 12), "--json",
     )) as { created: boolean; version: string };
     expect(restored.created).toBe(true);
@@ -295,12 +316,95 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     expect(await appVersionEventCount("app-a")).toBe(beforeEvents + 2);
     expect((await appQuery(running.capability, "SELECT 1 AS ok")).status).toBe(200);
 
-    expect(runCliFailure("app", "restore", "app-a", "deadbeef", "--json")).toEqual({
+    expect(await runCliFailure("app", "restore", "app-a", "deadbeef", "--json")).toEqual({
       error: {
-        code: "APP_NOT_FOUND",
+        code: "APP_VERSION_NOT_FOUND",
         message: "Unknown App version: deadbeef",
       },
     });
+  });
+
+  test("Host CLI app versions returns only the newest 100 full commit IDs", async () => {
+    const initial = JSON.parse(await runCli("app", "save", "history-app", "--json")) as {
+      version: string;
+    };
+    const expectedNewestFirst = [initial.version];
+    let parentVersion = initial.version;
+    for (let sequence = 1; sequence <= 104; sequence += 1) {
+      parentVersion = await appendFinalizedVersion("history-app", parentVersion, sequence);
+      expectedNewestFirst.unshift(parentVersion);
+    }
+
+    const versions = JSON.parse(await runCli("app", "versions", "history-app", "--json")) as Array<{
+      version: string;
+      createdAt: number;
+    }>;
+    expect(versions).toHaveLength(100);
+    expect(versions.map(({ version }) => version)).toEqual(expectedNewestFirst.slice(0, 100));
+    expect(versions.every(({ version }) => /^[0-9a-f]{40}$/.test(version))).toBe(true);
+  }, 30_000);
+
+  test("Host CLI preserves typed schema, App, and Source domain errors", async () => {
+    await expect(runCliFailure("app", "inspect", "missing-app", "--json")).resolves.toEqual({
+      error: { code: "APP_NOT_FOUND", message: "App not found: missing-app" },
+    });
+    await expect(runCliFailure("source", "inspect", "missing-source", "--json")).resolves.toEqual({
+      error: { code: "SOURCE_NOT_FOUND", message: "Source missing-source was not found." },
+    });
+    const schema = await runCliFailure("schema", "change", "SELECT 1", "--json") as {
+      error: { code: string; message: string };
+    };
+    expect(schema.error.code).toBe("SCHEMA_REQUEST_REJECTED");
+    expect(schema.error.message).toContain("rerun lamarck schema");
+  });
+
+  test("Host CLI list and inspect immediately report a Connector modified after Core startup", async () => {
+    const connectorId = "lamarck.cli-fixture";
+    const connectorDir = join(workspace, "connectors", connectorId);
+    const before = JSON.parse(await runCli("connector", "inspect", connectorId, "--json")) as {
+      packageHash: string;
+      trust: string;
+    };
+    await writeFile(join(connectorDir, "index.mjs"), "export default { async run() { return 'modified'; } };\n");
+    const currentHash = await hashConnectorPackage(connectorDir);
+    expect(currentHash).not.toBe(before.packageHash);
+
+    const listed = JSON.parse(await runCli("connector", "list", "--json")) as Array<{
+      id: string;
+      packageHash: string;
+      trust: string;
+      releaseId: string | null;
+    }>;
+    expect(listed.find(({ id }) => id === connectorId)).toMatchObject({
+      packageHash: currentHash,
+      trust: "modified",
+      releaseId: null,
+    });
+    expect(JSON.parse(await runCli("connector", "inspect", connectorId, "--json"))).toMatchObject({
+      packageHash: currentHash,
+      trust: "modified",
+      releaseId: null,
+    });
+  });
+
+  test("Host-side App archive returns its result after Core state, D0, and Current Shape commit", async () => {
+    await runCli("app", "save", "archive-app", "--json");
+    const archived = JSON.parse(await runCli("app", "archive", "archive-app", "--yes", "--json"));
+    expect(archived).toEqual({ id: "archive-app", archived: true });
+    expect(existsSync(join(workspace, "apps", "archive-app"))).toBe(false);
+    expect(existsSync(join(workspace, ".lamarck", "archived-apps", "archive-app"))).toBe(true);
+    const current = JSON.parse(await runCli("app", "list", "--json")) as Array<{ id: string }>;
+    expect(current.some(({ id }) => id === "archive-app")).toBe(false);
+    const audit = await hostRequest("/api/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sql: "SELECT source, payload FROM events WHERE type = 'app.archived' ORDER BY rowid DESC LIMIT 1",
+        params: [],
+      }),
+    }) as { rows: Array<{ source: string; payload: string }> };
+    expect(audit.rows[0]?.source).toBe("system:cli");
+    expect(JSON.parse(audit.rows[0]!.payload)).toEqual({ appId: "archive-app" });
   });
 
   test("uses prepared immutable authority when source changes before channel issuance", async () => {
@@ -349,11 +453,99 @@ async function writeAppManifest(appId: string, tables: string[]): Promise<void> 
   );
 }
 
+async function writeConnectorPackage(connectorId: string): Promise<void> {
+  const dir = join(workspace || join(testRoot, "workspace"), "connectors", connectorId);
+  await mkdir(dir, { recursive: true });
+  await Promise.all([
+    writeFile(join(dir, "connector.yaml"), `manifestVersion: 1
+id: ${connectorId}
+name: CLI Fixture
+description: Connector modified-detection fixture.
+eventCatalog: ./events.json
+entry: ./index.mjs
+runtime:
+  mode: manual
+source:
+  identity: single
+auth:
+  type: none
+`),
+    writeFile(join(dir, "events.json"), `${JSON.stringify({
+      catalogVersion: 1,
+      eventTypes: {
+        "cli.fixture": { description: "CLI fixture event", payloadSchema: true },
+      },
+    })}\n`),
+    writeFile(join(dir, "index.mjs"), "export default { async run() {} };\n"),
+  ]);
+}
+
 function runAppGit(appDir: string, ...args: string[]): string {
   return execFileSync("git", ["-C", appDir, ...args], {
     encoding: "utf8",
     maxBuffer: 1024 * 1024,
   });
+}
+
+async function appendFinalizedVersion(
+  appId: string,
+  parentVersion: string,
+  sequence: number,
+): Promise<string> {
+  const appDir = join(workspace, "apps", appId);
+  const { commit } = await git.readCommit({ fs, dir: appDir, oid: parentVersion });
+  const { tree } = await git.readTree({ fs, dir: appDir, oid: commit.tree });
+  const historyBlob = await git.writeBlob({
+    fs,
+    dir: appDir,
+    blob: Buffer.from(`history ${sequence}\n`),
+  });
+  const historyIndex = tree.findIndex((entry) => entry.path === "history.txt");
+  const nextEntries = historyIndex < 0
+    ? [...tree, { mode: "100644" as const, path: "history.txt", oid: historyBlob, type: "blob" as const }]
+    : tree.map((entry, index) => index === historyIndex ? { ...entry, oid: historyBlob } : entry);
+  const nextTree = await git.writeTree({ fs, dir: appDir, tree: nextEntries });
+  const person = {
+    name: "Lamarck Test",
+    email: "lamarck-test@example.invalid",
+    timestamp: 1_800_000_000 + sequence,
+    timezoneOffset: 0,
+  };
+  const version = await git.writeCommit({
+    fs,
+    dir: appDir,
+    commit: {
+      tree: nextTree,
+      parent: [parentVersion],
+      message: `History fixture ${sequence}`,
+      author: person,
+      committer: person,
+    },
+  });
+  const record = {
+    schemaVersion: 1 as const,
+    appId,
+    version,
+    parentVersion,
+    trigger: "save" as const,
+    createdAt: 1_800_000_000_000 + sequence,
+    message: `History fixture ${sequence}`,
+  };
+  const tagOid = await git.writeTag({
+    fs,
+    dir: appDir,
+    tag: {
+      object: version,
+      type: "commit",
+      tag: `lamarck-version-${version}`,
+      tagger: person,
+      message: canonicalizeAppVersionRecordV1(record),
+    },
+  });
+  await git.writeRef({ fs, dir: appDir, ref: `refs/lamarck/versions/${version}`, value: tagOid });
+  await git.writeRef({ fs, dir: appDir, ref: `refs/lamarck/current/${appId}`, value: version, force: true });
+  await git.writeRef({ fs, dir: appDir, ref: "refs/heads/main", value: version, force: true });
+  return version;
 }
 
 function seedDataDatabase(): void {
@@ -444,27 +636,38 @@ async function appVersionEventCount(appId: string): Promise<number> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      sql: "SELECT COUNT(*) AS count FROM events WHERE type = 'app.version.created' AND source = 'system:apps' AND json_extract(payload, '$.appId') = ?",
+      sql: "SELECT COUNT(*) AS count FROM events WHERE type = 'app.version.created' AND source = 'system:cli' AND json_extract(payload, '$.appId') = ?",
       params: [appId],
     }),
   }) as { rows: Array<{ count: number }> };
   return body.rows[0]?.count ?? 0;
 }
 
-function runCli(...args: string[]): string {
-  return execFileSync(process.execPath, [cliEntry, ...args], {
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      LAMARCK_CORE_URL: coreOrigin,
-      LAMARCK_CORE_TOKEN: CORE_TOKEN,
-    },
+async function runCli(...args: string[]): Promise<string> {
+  const stdin = new PassThrough() as unknown as NodeJS.ReadStream;
+  const stdout = new PassThrough() as unknown as NodeJS.WriteStream;
+  const stderr = new PassThrough() as unknown as NodeJS.WriteStream;
+  Object.assign(stdin, { isTTY: false });
+  Object.assign(stdout, { isTTY: false });
+  stdin.end();
+  const output: Buffer[] = [];
+  const errors: Buffer[] = [];
+  stdout.on("data", (chunk) => output.push(Buffer.from(chunk)));
+  stderr.on("data", (chunk) => errors.push(Buffer.from(chunk)));
+  const exitCode = await runSharedCli({
+    environment: "host",
+    argv: args,
+    transport: new HostCliTransport({ descriptorPath: cliDescriptor }),
+    io: { stdin, stdout, stderr } as CliIo,
   });
+  const error = Buffer.concat(errors).toString("utf8");
+  if (exitCode !== 0) throw Object.assign(new Error(error), { stderr: error });
+  return Buffer.concat(output).toString("utf8");
 }
 
-function runCliFailure(...args: string[]): unknown {
+async function runCliFailure(...args: string[]): Promise<unknown> {
   try {
-    runCli(...args);
+    await runCli(...args);
   } catch (error) {
     const stderr = (error as { stderr?: string | Buffer }).stderr;
     return JSON.parse(String(stderr).trim());

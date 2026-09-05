@@ -81,6 +81,9 @@ export async function removeInstalledConnector(
   const targetDir = resolveWorkspaceConnectorDir(workspacePath, connectorId);
   if (!(await pathExists(targetDir))) return false;
   await rm(targetDir, { recursive: true, force: true });
+  if (await pathExists(targetDir)) {
+    throw new Error(`Connector package directory still exists after removal: ${connectorId}`);
+  }
   return true;
 }
 
@@ -88,13 +91,12 @@ export async function removeConnectorFromWorkspace(opts: {
   workspacePath: string;
   connectorId: string;
   supervisor: ConnectorSupervisor;
+  guard?: ConnectorHostGuard;
 }): Promise<boolean> {
-  // This is the user-facing removal coordinator. Source cleanup happens while
-  // the package is still registered; the low-level folder helper remains only
-  // for filesystem recovery/tests.
   return opts.supervisor.removeConnector(
     opts.connectorId,
     () => removeInstalledConnector(opts.workspacePath, opts.connectorId),
+    opts.guard,
   );
 }
 
@@ -136,6 +138,7 @@ export async function installConnectorFromSource(
   opts: InstallConnectorFromSourceOptions,
 ): Promise<InstalledConnector> {
   const { sourceDir, manifest, connectorsDir, targetDir } = await prepareConnectorMaterialization(opts);
+  await opts.supervisor.clearInactiveConnectorRemnants(manifest.id);
   await mkdir(connectorsDir, { recursive: true });
   if (await pathExists(targetDir)) {
     throw new Error(`Connector already installed: ${manifest.id}`);
@@ -150,7 +153,7 @@ export async function installConnectorFromSource(
     await normalizeConnectorMaterializationModes(stagingDir);
     await rename(stagingDir, targetDir);
     const registeredManifest = await opts.supervisor.registerDirectory(targetDir);
-    await opts.guard.writeEvent({
+    await opts.guard.writeLifecycleEvent({
       type: "connector.installed",
       startedAt: Date.now(),
       payload: {
@@ -232,7 +235,7 @@ export async function updateConnectorFromSource(
           candidateInstalled = true;
 
           const manifest = await opts.supervisor.registerDirectory(targetDir);
-          await opts.guard.writeEvent({
+          await opts.guard.writeLifecycleEvent({
             type: "connector.updated",
             startedAt: Date.now(),
             payload: {

@@ -27,6 +27,12 @@ export interface GuardPrincipal {
   schemaGrant?: boolean;
 }
 
+/** D0 attribution retained by a trusted coordinator across delayed work. */
+export interface GuardEventPrincipal {
+  source: string;
+  producerRef: string;
+}
+
 export type GuardSqlScalar = SqlScalar;
 
 /** JSON-safe representation of a SQLite BLOB parameter or result value. */
@@ -92,6 +98,10 @@ export interface GuardRpcMethods {
     params: { principal: GuardPrincipal; event: GuardEventInput };
     result: string;
   };
+  writeLifecycleEvent: {
+    params: { principal: GuardPrincipal; event: GuardEventInput };
+    result: string;
+  };
   writeWorkspaceEvent: {
     params: { principal: GuardPrincipal; event: GuardEventInput };
     result: string;
@@ -111,6 +121,7 @@ export interface GuardRpcMethods {
       approved: true;
       author?: string;
       context?: string;
+      eventPrincipal?: GuardEventPrincipal;
     };
     result: { ok: true };
   };
@@ -177,6 +188,7 @@ export const GUARD_RPC_DESCRIPTOR = Object.freeze({
     "mutate",
     "transaction",
     "writeEvent",
+    "writeLifecycleEvent",
     "writeWorkspaceEvent",
     "schema.inspect",
     "schema.plan",

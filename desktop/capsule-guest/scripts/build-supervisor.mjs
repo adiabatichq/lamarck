@@ -1,5 +1,5 @@
 import { build } from "esbuild";
-import { mkdir } from "node:fs/promises";
+import { copyFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,7 +11,6 @@ await build({
     supervisor: resolve(root, "src", "main.ts"),
     "offline-npm": resolve(root, "src", "offline-npm.ts"),
     "release-runc-smoke": resolve(root, "src", "release-runc-smoke.ts"),
-    lamarck: resolve(root, "src", "managed-cli.ts"),
   },
   outdir: outputDirectory,
   bundle: true,
@@ -21,3 +20,7 @@ await build({
   sourcemap: false,
   legalComments: "none",
 });
+await copyFile(
+  resolve(root, "..", "cli", "dist", "lamarck-managed.mjs"),
+  resolve(outputDirectory, "lamarck.js"),
+);

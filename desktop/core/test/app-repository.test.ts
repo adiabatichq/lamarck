@@ -10,6 +10,7 @@ import { AppRepositoryService } from "../src/apps/repository";
 import { collectAppPackageTree, hashAppPackageTree } from "../src/apps/package-tree";
 import { canonicalizeAppVersionRecordV1 } from "../src/apps/version-record";
 import type {
+  AppVersionEventAuthority,
   AppVersionEventWriter,
   AppVersionTransactionBoundary,
 } from "../src/apps/version-transaction";
@@ -354,6 +355,44 @@ describe("AppRepositoryService", () => {
     expect((await service.listVersions({ appId: "example", appDir })).versions).toHaveLength(1);
   });
 
+  test("retains the initiating App event authority through pending-version crash recovery", async () => {
+    const appDir = await fixture();
+    const appEvents = new IdempotentEvents();
+    const systemEvents = new IdempotentEvents();
+    const authority: AppVersionEventAuthority = {
+      source: "app:initiator:ui",
+      producerRef: `producer:v1:sha256:${"a".repeat(64)}`,
+    };
+    const crashing = new AppRepositoryService({
+      eventWriter: systemEvents,
+      transactionHooks: {
+        afterBoundary(boundary) {
+          if (boundary === "after-pending-ref") throw new Error("crash:after-pending-ref");
+        },
+      },
+    });
+    await expect(crashing.save({
+      appId: "example",
+      appDir,
+      eventWriter: appEvents,
+      eventAuthority: authority,
+    })).rejects.toThrow("crash:after-pending-ref");
+
+    const resolved: AppVersionEventAuthority[] = [];
+    const recovered = new AppRepositoryService({
+      eventWriter: systemEvents,
+      eventWriterForAuthority(value) {
+        resolved.push(value);
+        return appEvents;
+      },
+    });
+    await recovered.save({ appId: "example", appDir });
+
+    expect(resolved).toEqual([authority]);
+    expect(appEvents.values()).toHaveLength(1);
+    expect(systemEvents.values()).toHaveLength(0);
+  });
+
   test("paginates newest-first and retains every finalized commit through explicit refs", async () => {
     const appDir = await fixture();
     const events = new IdempotentEvents();
@@ -487,7 +526,7 @@ class IdempotentEvents implements AppVersionEventWriter {
   readonly events = new Map<string, EventInput>();
   failNext = false;
 
-  writeEvent(event: EventInput): string {
+  writeLifecycleEvent(event: EventInput): string {
     if (this.failNext) {
       this.failNext = false;
       throw new Error("D0 unavailable");

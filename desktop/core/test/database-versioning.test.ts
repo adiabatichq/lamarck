@@ -12,6 +12,7 @@ import {
   SYSTEM_DB_FILENAME,
   SYSTEM_SCHEMA_V1,
 } from "../src/db";
+import { ConnectorInstallationStore } from "../src/connectors/installations";
 import { readDatabaseVersion } from "../src/database-migrations";
 import { GuardEngine } from "../src/guard-service/engine";
 import { TEST_PRODUCER_REF } from "./support/test-guard";
@@ -41,6 +42,7 @@ describe("greenfield data.db and system.db V1 schemas", () => {
     expect(schemaObject(systemDb, "d1_observer_cursor")).toBeTruthy();
     expect(schemaObject(systemDb, "d1_history_exclusions")).toBeTruthy();
     expect(schemaObject(systemDb, "connector_official_release_hashes")).toBeTruthy();
+    expect(schemaObject(systemDb, "connector_installations")).toBeTruthy();
     expect(schemaObject(systemDb, "connector_marketplace_approvals")).toBeUndefined();
     systemDb.close();
 
@@ -56,7 +58,26 @@ describe("greenfield data.db and system.db V1 schemas", () => {
     expect(sha256(DATA_SCHEMA_V1))
       .toBe("0dad836ef5969c2dc2eb71202881ca802281de079ec73866a62dfa19c5ed0979");
     expect(sha256(SYSTEM_SCHEMA_V1))
-      .toBe("d1645aa52007ac3412a9ddfe8aa11ec0bbc9f6bc6fa8506925b920edf5fe3105");
+      .toBe("46622e4fb3b0700737c90ea17e4044798842bc0396bc1928cbec2dd4b3046079");
+  });
+
+  test("persists current Marketplace Connector release metadata across restart", () => {
+    const packageHash = `sha256:${"a".repeat(64)}`;
+    const first = openSystemDatabase(workspace);
+    const firstStore = new ConnectorInstallationStore(first);
+    expect(firstStore.record("lamarck.oura", packageHash, "release-7", 100)).toEqual({
+      connectorId: "lamarck.oura",
+      packageHash,
+      releaseId: "release-7",
+      installedAt: 100,
+      updatedAt: 100,
+    });
+    first.close();
+
+    const reopened = openSystemDatabase(workspace);
+    expect(new ConnectorInstallationStore(reopened).get("lamarck.oura"))
+      .toMatchObject({ packageHash, releaseId: "release-7" });
+    reopened.close();
   });
 
   test("D2 schema changes do not change the greenfield V1 data database version", () => {

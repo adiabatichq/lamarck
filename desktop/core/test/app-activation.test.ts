@@ -83,7 +83,7 @@ describe("AppActivationCoordinator", () => {
 class Events implements AppVersionEventWriter {
   readonly values: EventInput[] = [];
 
-  writeEvent(event: EventInput): string {
+  writeLifecycleEvent(event: EventInput): string {
     if (!this.values.some((value) => value.externalId === event.externalId)) {
       this.values.push(structuredClone(event));
     }

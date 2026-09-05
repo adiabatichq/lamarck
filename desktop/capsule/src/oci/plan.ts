@@ -8,15 +8,13 @@ import {
   validateOpaqueId,
 } from "../protocol/validate";
 import type { WorkloadKind } from "../protocol/types";
-import {
-  APP_EDIT_LOWER_ROOT_PATH,
-  APP_EDIT_ROOT_PATH,
-} from "../app-edit/protocol";
+import { MANAGED_APP_EDIT_ROOT } from "@lamarck/cli";
 
 export const OCI_POLICY_VERSION = 1;
 export const LAMARCK_SDK_SOCKET_ENV = "LAMARCK_SDK_SOCKET" as const;
 export const LAMARCK_SDK_SOCKET_PATH = "/run/lamarck/system.sock" as const;
 export const LAMARCK_FILES_ROOT_PATH = "/mnt/lamarck-files" as const;
+export const APP_EDIT_LOWER_ROOT_PATH = "/mnt/lamarck-apps-lower" as const;
 
 const NODE_ROOTFS = "/opt/lamarck/rootfs/node24";
 const ARTIFACT_ROOT = "/var/lib/lamarck/artifacts/sha256";
@@ -583,7 +581,7 @@ function fixedMounts(runtimeRoot: string, sdkBridgeRoot: string, appEditRoot: st
     { destination: "/home/app", type: "bind", source: `${runtimeRoot}/home`, options: ["rbind", "rw", "nosuid", "nodev"] },
     { destination: "/run/app", type: "bind", source: `${runtimeRoot}/run`, options: ["rbind", "rw", "nosuid", "nodev"] },
     { destination: "/run/lamarck", type: "bind", source: sdkBridgeRoot, options: ["rbind", "ro", "nosuid", "nodev", "noexec"] },
-    { destination: APP_EDIT_ROOT_PATH, type: "bind", source: appEditRoot, options: ["rbind", "rw", "nosuid", "nodev"] },
+    { destination: MANAGED_APP_EDIT_ROOT, type: "bind", source: appEditRoot, options: ["rbind", "rw", "nosuid", "nodev"] },
     { destination: APP_EDIT_LOWER_ROOT_PATH, type: "bind", source: APP_EDIT_LOWER_ROOT_PATH, options: ["rbind", "ro", "nosuid", "nodev", "noexec"] },
     { destination: LAMARCK_FILES_ROOT_PATH, type: "bind", source: LAMARCK_FILES_ROOT_PATH, options: ["rbind", "ro", "nosuid", "nodev", "noexec"] },
     { destination: "/tmp", type: "tmpfs", source: "tmpfs", options: ["nosuid", "nodev", "mode=1777", "size=262144k"] },

@@ -13,6 +13,9 @@
   },
   "packageManager": "npm@11.16.0",
   "scripts": {
+    "cli:build": "npm --workspace @lamarck/cli run build",
+    "cli:pack": "node scripts/pack-cli.mjs",
+    "cli:registry-check": "node scripts/check-cli-registry.mjs",
     "build": "node scripts/build-desktop.mjs",
     "start": "node scripts/start-desktop.mjs",
     "dev": "npm --workspace @lamarck/shell run dev",
@@ -38,6 +41,7 @@
     "package:patch": "node scripts/package-os-patch.mjs"
   },
   "workspaces": [
+    "desktop/cli",
     "desktop/capsule",
     "desktop/capsule-guest",
     "desktop/core",

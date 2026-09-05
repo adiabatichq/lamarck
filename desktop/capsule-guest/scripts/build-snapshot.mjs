@@ -15,6 +15,7 @@ import { copyAndHashSparse, sha256File } from "./release-contract.mjs";
 export const BUILD_SNAPSHOT_MANIFEST = "build-input-manifest.json";
 
 export const BUILD_SNAPSHOT_FILES = Object.freeze([
+  "LICENSE",
   "package.json",
   "package-lock.json",
   "tsconfig.json",
@@ -22,6 +23,8 @@ export const BUILD_SNAPSHOT_FILES = Object.freeze([
   "desktop/capsule/tsconfig.json",
   "desktop/capsule-guest/package.json",
   "desktop/capsule-guest/tsconfig.json",
+  "desktop/cli/package.json",
+  "desktop/cli/tsconfig.build.json",
   "desktop/core/package.json",
   "desktop/shell/package.json",
   "scripts/macos-release-publication.mjs",
@@ -35,6 +38,8 @@ export const BUILD_SNAPSHOT_DIRECTORIES = Object.freeze([
   "desktop/capsule-guest/scripts",
   "desktop/capsule-guest/src",
   "desktop/capsule-guest/test-boot",
+  "desktop/cli/scripts",
+  "desktop/cli/src",
 ]);
 
 export async function createBuildSnapshot(repositoryValue, destinationValue, options = {}) {

@@ -28,6 +28,12 @@ interface PreparedActivation {
     runtime: {
       ui?: { command: string[]; port: number };
     };
+    permissions: {
+      writes: {
+        files: string[];
+        tables: string[];
+      };
+    };
   };
 }
 
@@ -375,6 +381,11 @@ export class CapsuleManager {
         packageDir: activation.immutablePackagePath,
         command: [...ui.command],
         port: ui.port,
+        writeTables: [...activation.manifest.permissions.writes.tables],
+        fileGrants: [
+          `apps/${appId}/`,
+          ...activation.manifest.permissions.writes.files,
+        ],
         sdkSenderId: runtimeSenderId,
       });
       pending.preparationId = prepared.preparationId;
@@ -640,6 +651,11 @@ export class CapsuleManager {
         packageDir: activation.immutablePackagePath,
         command: [...ui.command],
         port: ui.port,
+        writeTables: [...activation.manifest.permissions.writes.tables],
+        fileGrants: [
+          `apps/${viewer.appId}/`,
+          ...activation.manifest.permissions.writes.files,
+        ],
         sdkSenderId: runtimeSenderId,
       }, viewer.instanceId);
       pending.preparationId = prepared.preparationId;

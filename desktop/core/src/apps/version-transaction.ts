@@ -12,6 +12,12 @@ import {
 export const APP_VERSION_REF_ROOT = "refs/lamarck/versions";
 export const APP_PENDING_REF_ROOT = "refs/lamarck/pending";
 export const APP_EXTERNAL_REF_ROOT = "refs/lamarck/external";
+export const APP_PENDING_AUTHORITY_REF_ROOT = "refs/lamarck/pending-authorities";
+
+export interface AppVersionEventAuthority {
+  readonly source: string;
+  readonly producerRef: string;
+}
 
 export type AppVersionTransactionBoundary =
   | "after-commit-object"
@@ -24,7 +30,7 @@ export type AppVersionTransactionBoundary =
   | "after-pending-delete";
 
 export interface AppVersionEventWriter {
-  writeEvent(event: EventInput): Promise<string> | string;
+  writeLifecycleEvent(event: EventInput): Promise<string> | string;
 }
 
 export interface AppVersionTransactionHooks {
@@ -66,6 +72,45 @@ export async function writePendingVersion(options: {
   await options.hooks?.afterBoundary?.("after-pending-ref", record);
 }
 
+export async function writePendingVersionAuthority(
+  dir: string,
+  version: string,
+  authority: AppVersionEventAuthority,
+): Promise<void> {
+  const value = validateAuthority(authority);
+  const oid = await git.writeBlob({
+    fs,
+    dir,
+    blob: Buffer.from(JSON.stringify(value), "utf8"),
+  });
+  await git.writeRef({
+    fs,
+    dir,
+    ref: `${APP_PENDING_AUTHORITY_REF_ROOT}/${version}`,
+    value: oid,
+    force: true,
+  });
+}
+
+export async function readPendingVersionAuthority(
+  dir: string,
+  version: string,
+): Promise<AppVersionEventAuthority | undefined> {
+  let oid: string;
+  try {
+    oid = await git.resolveRef({ fs, dir, ref: `${APP_PENDING_AUTHORITY_REF_ROOT}/${version}` });
+  } catch (error) {
+    if (isMissingRef(error)) return undefined;
+    throw unavailable(error);
+  }
+  try {
+    const { blob } = await git.readBlob({ fs, dir, oid });
+    return validateAuthority(JSON.parse(Buffer.from(blob).toString("utf8")));
+  } catch (error) {
+    throw unavailable(error);
+  }
+}
+
 export async function finalizePendingVersion(options: {
   readonly dir: string;
   readonly record: AppVersionRecordV1;
@@ -79,7 +124,7 @@ export async function finalizePendingVersion(options: {
   if (!pending) throw unavailable(new Error(`Pending App version is missing: ${record.version}`));
   assertSameRecord(pending.record, record);
 
-  await options.writer.writeEvent(versionCreatedEvent(record));
+  await options.writer.writeLifecycleEvent(versionCreatedEvent(record));
   await options.hooks?.afterBoundary?.("after-d0", record);
 
   await writeRecordRef(options.dir, APP_VERSION_REF_ROOT, pending.tagOid, record);
@@ -115,7 +160,21 @@ export async function finalizePendingVersion(options: {
   await options.hooks?.afterBoundary?.("after-publication", record);
 
   await deleteRefIfPresent(options.dir, `${APP_PENDING_REF_ROOT}/${record.version}`);
+  await deleteRefIfPresent(options.dir, `${APP_PENDING_AUTHORITY_REF_ROOT}/${record.version}`);
   await options.hooks?.afterBoundary?.("after-pending-delete", record);
+}
+
+function validateAuthority(value: unknown): AppVersionEventAuthority {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("App version event authority is invalid");
+  const raw = value as Record<string, unknown>;
+  if (
+    Object.keys(raw).sort().join(",") !== "producerRef,source"
+    || typeof raw.source !== "string"
+    || !/^(?:system:[a-z0-9:_-]+|app:[a-z0-9.-]+:(?:ui|service:[a-z0-9-]+|job:[a-z0-9-]+))$/.test(raw.source)
+    || typeof raw.producerRef !== "string"
+    || !/^producer:v1:sha256:[0-9a-f]{64}$/.test(raw.producerRef)
+  ) throw new Error("App version event authority is invalid");
+  return Object.freeze({ source: raw.source, producerRef: raw.producerRef });
 }
 
 export async function listPendingVersionRecords(dir: string): Promise<AppVersionRecordV1[]> {

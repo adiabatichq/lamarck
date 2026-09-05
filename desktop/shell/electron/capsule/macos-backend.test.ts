@@ -1212,7 +1212,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
         cacheDirectory,
         artifactRoot,
         workspaceFilesPath: () => join(root, "workspace", "files"),
-        appVersionsPath: () => join(root, "workspace", ".lamarck", "cache", "app-versions"),
+        appVersionsPath: () => join(root, "workspace", ".lamarck", "cache", "app-edit-bases"),
         systemStreamServer: system as unknown as SystemStreamServer,
         appCliStreamServer: fakeAppCliStreamServer(),
         dependencies: {
@@ -1359,7 +1359,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
         cacheDirectory,
         artifactRoot,
         workspaceFilesPath: () => join(workspace, "files"),
-        appVersionsPath: () => join(workspace, ".lamarck", "cache", "app-versions"),
+        appVersionsPath: () => join(workspace, ".lamarck", "cache", "app-edit-bases"),
         systemStreamServer: system as unknown as SystemStreamServer,
         appCliStreamServer: fakeAppCliStreamServer(),
         dependencies: {
@@ -1468,6 +1468,8 @@ function spec(sender: string, packageDigest: string = PACKAGE_A, activationSeque
     command: ["npm", "run", "start"],
     port: 3_000,
     sdkSenderId: sender,
+    writeTables: [],
+    fileGrants: ["/data/app/weather"],
   };
 }
 
@@ -1521,7 +1523,7 @@ function createHarness(overrides: { opaqueId?: () => string } = {}) {
     cacheDirectory: "/private/cache/capsule",
     artifactRoot: "/private/artifacts/capsule",
     workspaceFilesPath: () => "/workspace/files",
-    appVersionsPath: () => "/workspace/.lamarck/cache/app-versions",
+    appVersionsPath: () => "/workspace/.lamarck/cache/app-edit-bases",
     systemStreamServer: system as unknown as SystemStreamServer,
     appCliStreamServer: fakeAppCliStreamServer(),
     dependencies: {

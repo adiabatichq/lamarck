@@ -377,6 +377,7 @@ export interface InstalledConnectorView {
 
 export interface ConnectorRunHandle {
   instanceId: string;
+  runId: string;
   signal: AbortSignal;
   promise: Promise<void>;
   abort(): void;

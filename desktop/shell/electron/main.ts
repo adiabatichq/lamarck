@@ -21,7 +21,7 @@ import {
   type WebContents,
 } from "electron";
 import { spawn, type ChildProcess } from "child_process";
-import { randomBytes } from "crypto";
+import { randomBytes, randomUUID } from "crypto";
 import {
   existsSync,
   mkdirSync,
@@ -92,6 +92,9 @@ import {
   type MarketplaceDeepLink,
 } from "./marketplace-deep-link";
 import { PACKAGE_ID_PATTERN } from "./package-id";
+import { CliOperationDispatcher, type CliDispatchContext, type CliDispatchResult } from "./cli-dispatcher";
+import { DesktopCliGateway } from "./cli-gateway";
+import type { CliRequest, CliResponse } from "@lamarck/cli";
 
 app.setName("Lamarck");
 
@@ -289,9 +292,10 @@ const systemBroker = new SystemBroker({
   },
 });
 const systemStreamServer = new SystemStreamServer(systemBroker, { unbindOnClose: false });
+let cliDispatcher!: CliOperationDispatcher;
 const appCliStreamServer = new AppCliStreamServer({
-  coreBaseUrl: () => coreBaseUrl(),
-  coreToken: CORE_TOKEN,
+  dispatcher: () => cliDispatcher,
+  appsRoot: () => join(workspace, "apps"),
 });
 const capsuleCacheNamespace = app.getVersion().includes("-alpha")
   ? "ai.lamarck.desktop.alpha"
@@ -315,7 +319,7 @@ const capsuleBackend = new MacOsCapsuleBackend({
   cacheDirectory: join(capsuleCacheRoot, "cache"),
   artifactRoot: join(capsuleCacheRoot, "artifacts"),
   workspaceFilesPath: () => validateWorkspaceFilesMountPath(workspace),
-  appVersionsPath: () => join(workspace, ".lamarck", "cache", "app-versions"),
+  appVersionsPath: () => join(workspace, ".lamarck", "cache", "app-edit-bases"),
   systemStreamServer,
   appCliStreamServer,
 });
@@ -347,6 +351,15 @@ const capsuleManager = new CapsuleManager({
     });
   },
 });
+cliDispatcher = new CliOperationDispatcher({
+  coreBaseUrl: () => coreBaseUrl(),
+  coreToken: CORE_TOKEN,
+  runtimeStates: () => capsuleManager.appRuntimeStates(),
+  archive: coordinateCliArchive,
+  onAppCanonicalChange: (appId, editBase) =>
+    appCliStreamServer.reconcileAppWorkspaces(appId, editBase),
+});
+const cliGateway = new DesktopCliGateway({ dispatcher: cliDispatcher });
 
 interface GuardReadyMessage {
   type: "ready";
@@ -1289,10 +1302,12 @@ async function startRuntime(opts?: {
     if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
     startCore(generation);
     await waitForCore(generation);
+    await cliGateway.start();
     return generation;
   } catch (error) {
     markRuntimeFailed(error, generation);
     try {
+      await cliGateway.stop();
       await stopControlPlaneProcesses();
     } catch (cleanupError) {
       throw new AggregateError(
@@ -1306,6 +1321,7 @@ async function startRuntime(opts?: {
 
 async function stopRuntime(): Promise<void> {
   runtimeSupervisor.prepareRestart();
+  await cliGateway.stop();
   // Intentional replacement keeps Core alive while Capsule revokes its issued
   // channels, then releases Core before Guard's exclusive data.db ownership.
   await stopAllAppViewers();
@@ -1314,6 +1330,11 @@ async function stopRuntime(): Promise<void> {
 
 async function stopRuntimeAfterFailure(controlPlaneLost: boolean): Promise<void> {
   const failures: unknown[] = [];
+  try {
+    await cliGateway.stop();
+  } catch (error) {
+    failures.push(error);
+  }
   if (controlPlaneLost) {
     // Core can no longer revoke remote channels, so local authority collapse
     // above is final. Stop Capsule and the exact Core/Guard pair concurrently.
@@ -2526,36 +2547,42 @@ async function stopAppViewers(appId: string): Promise<void> {
   if (failures.length > 0) throw new AggregateError(failures, `Could not stop App "${appId}"`);
 }
 
+async function coordinateCliArchive(
+  request: CliRequest<"app.archive">,
+  _context: CliDispatchContext,
+  executeCore: () => Promise<CliResponse<"app.archive">>,
+): Promise<CliDispatchResult> {
+  const appId = request.input.appId;
+  if (!PACKAGE_ID_PATTERN.test(appId)) {
+    return { response: { requestId: request.requestId, ok: false, error: { code: "APP_NOT_FOUND", message: `App not found: ${appId}` } } };
+  }
+  capsuleManager.beginAppRetirement(appId);
+  try {
+    const response = await executeCore();
+    if (!response.ok) return { response };
+    await stopAppViewers(appId);
+    await capsuleManager.retireApp(appId);
+    return { response };
+  } finally {
+    capsuleManager.finishAppRetirement(appId);
+  }
+}
+
 function archiveAppFromHost(appId: string): Promise<{ ok: true; id: string }> {
   if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
   const existing = appArchiveOperations.get(appId);
   if (existing) return existing;
-
-  // This fence is established synchronously and remains active through the
-  // Core move, so an open/reload cannot race the retirement boundary.
-  capsuleManager.beginAppRetirement(appId);
   let tracked!: Promise<{ ok: true; id: string }>;
   const operation = (async () => {
-    try {
-      await stopAppViewers(appId);
-      await capsuleManager.retireApp(appId);
-      const response = await fetch(`${coreBaseUrl()}/api/apps/${encodeURIComponent(appId)}/archive`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${CORE_TOKEN}` },
-      });
-      const body = await response.json().catch(() => ({})) as {
-        ok?: boolean;
-        id?: string;
-        error?: string;
-      };
-      if (!response.ok) throw new Error(body.error ?? `Core returned HTTP ${response.status}`);
-      if (body.ok !== true || body.id !== appId) {
-        throw new Error("Core returned an invalid archive response");
-      }
-      return { ok: true as const, id: body.id };
-    } finally {
-      capsuleManager.finishAppRetirement(appId);
+    const dispatched = await cliDispatcher.dispatch({
+      requestId: randomUUID(),
+      operation: "app.archive",
+      input: { appId },
+    }, { environment: "host", principal: { kind: "system" } });
+    if (!dispatched.response.ok) {
+      throw new Error(dispatched.response.error.message);
     }
+    return { ok: true as const, id: appId };
   });
   tracked = operation().finally(() => {
     if (appArchiveOperations.get(appId) === tracked) appArchiveOperations.delete(appId);

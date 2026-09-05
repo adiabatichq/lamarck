@@ -585,7 +585,7 @@ export class ConnectorSourceStore {
     ).run(stringifyJson(warnings.length ? warnings : undefined), Date.now(), id);
   }
 
-  private getRun(id: string): ConnectorRunRecord | undefined {
+  getRun(id: string): ConnectorRunRecord | undefined {
     const row = this.systemDb.prepare("SELECT * FROM connector_runs WHERE id = ?").get(id) as unknown as RunRow | undefined;
     return row ? rowToRun(row) : undefined;
   }

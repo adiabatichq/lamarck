@@ -9,8 +9,13 @@
   "engines": {
     "node": ">=24.10.0"
   },
+  "dependencies": {
+    "@lamarck/cli": "0.1.0"
+  },
   "scripts": {
+    "pretest": "npm --workspace @lamarck/cli run build",
     "test": "vitest run",
+    "pretypecheck": "npm --workspace @lamarck/cli run build",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {

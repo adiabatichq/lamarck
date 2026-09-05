@@ -28,7 +28,7 @@ class FakeRpc {
     this.calls.push({ method, params });
     this.executionOptions.push(options);
     if (method === "query") return [{ id: "first" }] as T;
-    if (method === "writeEvent" || method === "writeWorkspaceEvent") return "event-id" as T;
+    if (method === "writeEvent" || method === "writeLifecycleEvent" || method === "writeWorkspaceEvent") return "event-id" as T;
     if (method === "schema.plan") {
       return {
         ddl: ["CREATE TABLE focus (id TEXT PRIMARY KEY NOT NULL)"],
@@ -176,6 +176,7 @@ describe("RemoteGuard capability binding", () => {
       approved: true,
       author: "codex",
       context: "Add focus storage.",
+      eventPrincipal: { source: "app:focus:ui", producerRef: APP_PRODUCER_REF },
     });
 
     expect(rpc.calls).toEqual([
@@ -204,6 +205,7 @@ describe("RemoteGuard capability binding", () => {
           approved: true,
           author: "codex",
           context: "Add focus storage.",
+          eventPrincipal: { source: "app:focus:ui", producerRef: APP_PRODUCER_REF },
         },
       },
     ]);

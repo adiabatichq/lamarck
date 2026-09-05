@@ -19,10 +19,13 @@ import {
   APP_VERSION_REF_ROOT,
   finalizePendingVersion,
   listPendingVersionRecords,
+  readPendingVersionAuthority,
   readFinalVersionRecord,
   verifyFinalVersionRef,
   writePendingVersion,
+  writePendingVersionAuthority,
   type AppVersionEventWriter,
+  type AppVersionEventAuthority,
   type AppVersionTransactionHooks,
 } from "./version-transaction";
 import {
@@ -51,6 +54,7 @@ export interface AppVersionHistoryRebuildResultV1 {
 
 export interface AppRepositoryServiceOptions {
   readonly eventWriter: AppVersionEventWriter;
+  readonly eventWriterForAuthority?: (authority: AppVersionEventAuthority) => AppVersionEventWriter;
   readonly now?: () => number;
   readonly transactionHooks?: AppVersionTransactionHooks;
 }
@@ -88,6 +92,8 @@ export class AppRepositoryService {
     readonly appDir: string;
     readonly message?: string;
     readonly author?: string;
+    readonly eventWriter?: AppVersionEventWriter;
+    readonly eventAuthority?: AppVersionEventAuthority;
   }): Promise<AppVersionResult> {
     return this.admitCurrent({ ...options, trigger: "save" });
   }
@@ -101,6 +107,8 @@ export class AppRepositoryService {
     readonly basePackageDigest: `sha256:${string}`;
     readonly message?: string;
     readonly author?: string;
+    readonly eventWriter?: AppVersionEventWriter;
+    readonly eventAuthority?: AppVersionEventAuthority;
   }): Promise<AppVersionResult> {
     validateAppId(options.appId);
     validateMetadata(options.message, options.author);
@@ -204,7 +212,7 @@ export class AppRepositoryService {
       await this.commitVersion(options.appDir, record, async () => {
         await replaceAppPackageTree(options.appDir, candidate.entries);
         await reconcileIndex(options.appDir, candidate.entries);
-      });
+      }, options);
       await deleteWritebackMarker(options.appDir, version);
       return { version, created: true, record, packageDigest: candidate.digest };
     });
@@ -216,6 +224,8 @@ export class AppRepositoryService {
     readonly message?: string;
     readonly author?: string;
     readonly validateCandidate?: (candidate: ValidatedAppPackage) => void;
+    readonly eventWriter?: AppVersionEventWriter;
+    readonly eventAuthority?: AppVersionEventAuthority;
   }): Promise<AppVersionResult> {
     return this.admitCurrent({ ...options, trigger: "activate" });
   }
@@ -226,6 +236,8 @@ export class AppRepositoryService {
     readonly version: string;
     readonly message?: string;
     readonly author?: string;
+    readonly eventWriter?: AppVersionEventWriter;
+    readonly eventAuthority?: AppVersionEventAuthority;
   }): Promise<AppVersionResult> {
     validateAppId(options.appId);
     validateMetadata(options.message, options.author);
@@ -291,7 +303,7 @@ export class AppRepositoryService {
       await this.commitVersion(options.appDir, record, async () => {
         await replaceAppPackageTree(options.appDir, selectedPackage.entries);
         await reconcileIndex(options.appDir, selectedPackage.entries);
-      });
+      }, options);
       return {
         version: commit,
         created: true,
@@ -495,6 +507,8 @@ export class AppRepositoryService {
     readonly message?: string;
     readonly author?: string;
     readonly validateCandidate?: (candidate: ValidatedAppPackage) => void;
+    readonly eventWriter?: AppVersionEventWriter;
+    readonly eventAuthority?: AppVersionEventAuthority;
   }): Promise<AppVersionResult> {
     validateAppId(options.appId);
     validateMetadata(options.message, options.author);
@@ -572,7 +586,7 @@ export class AppRepositoryService {
       await this.options.transactionHooks?.afterBoundary?.("after-commit-object", record);
       await this.commitVersion(options.appDir, record, async () => {
         await reconcileIndex(options.appDir, candidate.entries);
-      });
+      }, options);
       return {
         version,
         created: true,
@@ -586,7 +600,17 @@ export class AppRepositoryService {
     appDir: string,
     record: AppVersionRecordV1,
     publish?: () => Promise<void>,
+    event?: {
+      readonly eventWriter?: AppVersionEventWriter;
+      readonly eventAuthority?: AppVersionEventAuthority;
+    },
   ): Promise<void> {
+    if ((event?.eventWriter === undefined) !== (event?.eventAuthority === undefined)) {
+      throw new Error("App version event writer and authority must be supplied together");
+    }
+    if (event?.eventAuthority) {
+      await writePendingVersionAuthority(appDir, record.version, event.eventAuthority);
+    }
     await writePendingVersion({
       dir: appDir,
       record,
@@ -595,7 +619,7 @@ export class AppRepositoryService {
     await finalizePendingVersion({
       dir: appDir,
       record,
-      writer: this.options.eventWriter,
+      writer: event?.eventWriter ?? this.options.eventWriter,
       currentRef: currentRef(record.appId),
       publish,
       hooks: this.options.transactionHooks,
@@ -614,10 +638,15 @@ export class AppRepositoryService {
       if (index < 0) throw new AppVersionHistoryUnavailableError();
       const [record] = remaining.splice(index, 1);
       const writeback = await readWritebackMarker(appDir, record.version);
+      const authority = await readPendingVersionAuthority(appDir, record.version);
+      const writer = authority === undefined
+        ? this.options.eventWriter
+        : this.options.eventWriterForAuthority?.(authority);
+      if (!writer) throw new AppVersionHistoryUnavailableError();
       await finalizePendingVersion({
         dir: appDir,
         record,
-        writer: this.options.eventWriter,
+        writer,
         currentRef: currentRef(appId),
         ...(record.trigger !== "restore" && !writeback ? {} : {
           publish: async () => {
@@ -1154,11 +1183,11 @@ function resolveRecordedVersion(
   value: string,
 ): AppVersionRecordV1 {
   if (!/^[0-9a-f]{4,64}$/.test(value)) {
-    throw new AppLifecycleError("APP_NOT_FOUND", `Unknown App version: ${value}`);
+    throw new AppLifecycleError("APP_VERSION_NOT_FOUND", `Unknown App version: ${value}`);
   }
   const matches = records.filter((record) => record.version.startsWith(value));
   if (matches.length === 0) {
-    throw new AppLifecycleError("APP_NOT_FOUND", `Unknown App version: ${value}`);
+    throw new AppLifecycleError("APP_VERSION_NOT_FOUND", `Unknown App version: ${value}`);
   }
   if (matches.length > 1) {
     throw new AppLifecycleError("APP_VERSION_AMBIGUOUS", `Ambiguous App version: ${value}`);

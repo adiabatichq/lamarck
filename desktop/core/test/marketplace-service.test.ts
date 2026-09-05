@@ -36,7 +36,9 @@ describe("Marketplace lifecycle staging service", () => {
         appExists: vi.fn().mockResolvedValue(false),
         instantiateApp: vi.fn(),
         connectorHash: vi.fn().mockResolvedValue(undefined),
+        connectorState: vi.fn().mockResolvedValue(undefined),
         recordOfficialConnectorRelease: vi.fn(),
+        recordConnectorInstallation: vi.fn(),
         installConnector: vi.fn(),
         updateConnector: vi.fn(),
       },
@@ -106,9 +108,11 @@ describe("Marketplace lifecycle staging service", () => {
     expect(installPrepared.action).toBe("install");
     expect((await install.service.apply(installPrepared.stageId)).disposition).toBe("install");
     expect(install.recordOfficialConnectorRelease).toHaveBeenCalledWith(release.packageId, release.contentHash);
+    expect(install.recordConnectorInstallation).toHaveBeenCalledWith(release.packageId, release.contentHash, release.releaseId);
     expect(install.installConnector).toHaveBeenCalledWith(
       expect.stringContaining(installPrepared.stageId),
       release.packageId,
+      undefined,
     );
     expect(install.recordOfficialConnectorRelease.mock.invocationCallOrder[0])
       .toBeLessThan(install.installConnector.mock.invocationCallOrder[0]);
@@ -124,6 +128,7 @@ describe("Marketplace lifecycle staging service", () => {
     expect(update.updateConnector).toHaveBeenCalledWith(
       expect.stringContaining(updatePrepared.stageId),
       release.packageId,
+      undefined,
     );
     expect(update.recordOfficialConnectorRelease.mock.invocationCallOrder[0])
       .toBeLessThan(update.updateConnector.mock.invocationCallOrder[0]);
@@ -135,6 +140,7 @@ describe("Marketplace lifecycle staging service", () => {
     expect(samePrepared.action).toBe("already-installed");
     expect((await same.service.apply(samePrepared.stageId)).disposition).toBe("already-installed");
     expect(same.recordOfficialConnectorRelease).toHaveBeenCalledWith(release.packageId, release.contentHash);
+    expect(same.recordConnectorInstallation).toHaveBeenCalledWith(release.packageId, release.contentHash, release.releaseId);
     expect(same.installConnector).not.toHaveBeenCalled();
     expect(same.updateConnector).not.toHaveBeenCalled();
     expect(await readdir(same.stagingRoot)).toEqual([]);
@@ -167,11 +173,99 @@ describe("Marketplace lifecycle staging service", () => {
     ]);
     const prepared = await changed.service.prepare("connector", release.packageId);
     expect(prepared.action).toBe("update");
-    await expect(changed.service.apply(prepared.stageId)).rejects.toThrow("state changed");
+    await expect(changed.service.apply(prepared.stageId)).rejects.toMatchObject({
+      code: "CONNECTOR_UPDATE_INCOMPATIBLE",
+    });
     expect(changed.recordOfficialConnectorRelease).not.toHaveBeenCalled();
     expect(changed.installConnector).not.toHaveBeenCalled();
     expect(changed.updateConnector).not.toHaveBeenCalled();
     expect(await readdir(changed.stagingRoot)).toEqual([]);
+  });
+
+  test("enforces strict typed install and update preconditions server-side", async () => {
+    const release = connectorRelease("lamarck.calendar");
+    const currentHash = `sha256:${"b".repeat(64)}`;
+
+    const installed = await serviceForRelease(release, {
+      ...baseLifecycle(),
+      connectorHash: async () => currentHash,
+      connectorState: async () => ({ hash: currentHash, trust: "official", marketplaceManaged: true }),
+    });
+    await expect(installed.service.prepare("connector", release.packageId, "install"))
+      .rejects.toMatchObject({ code: "CONNECTOR_ALREADY_INSTALLED" });
+    expect(installed.requests).toEqual([]);
+    expect(await readdir(installed.stagingRoot)).toEqual([]);
+
+    const absent = await serviceForRelease(release, baseLifecycle());
+    await expect(absent.service.prepare("connector", release.packageId, "update"))
+      .rejects.toMatchObject({ code: "CONNECTOR_NOT_INSTALLED" });
+    expect(absent.requests).toEqual([]);
+    expect(await readdir(absent.stagingRoot)).toEqual([]);
+
+    const modified = await serviceForRelease(release, {
+      ...baseLifecycle(),
+      connectorHash: async () => currentHash,
+      connectorState: async () => ({ hash: currentHash, trust: "modified", marketplaceManaged: false }),
+    });
+    await expect(modified.service.prepare("connector", release.packageId, "update"))
+      .rejects.toMatchObject({ code: "CONNECTOR_MODIFIED" });
+    expect(modified.requests).toEqual([]);
+    expect(await readdir(modified.stagingRoot)).toEqual([]);
+
+    const recordConnectorInstallation = vi.fn();
+    const current = await serviceForRelease(release, {
+      ...baseLifecycle(),
+      connectorHash: async () => release.contentHash,
+      connectorState: async () => ({ hash: release.contentHash, trust: "official", marketplaceManaged: true }),
+      recordConnectorInstallation,
+    });
+    const prepared = await current.service.prepare("connector", release.packageId, "update");
+    expect((await current.service.apply(prepared.stageId)).disposition).toBe("already-installed");
+    expect(recordConnectorInstallation).toHaveBeenCalledWith(release.packageId, release.contentHash, release.releaseId);
+  });
+
+  test("rechecks current Connector trust at the apply boundary and refuses modified packages", async () => {
+    const release = connectorRelease("lamarck.calendar");
+    const currentHash = `sha256:${"b".repeat(64)}`;
+    const connectorState = vi.fn()
+      .mockResolvedValueOnce({ hash: currentHash, trust: "official", marketplaceManaged: true })
+      .mockResolvedValueOnce({ hash: currentHash, trust: "official", marketplaceManaged: true })
+      .mockResolvedValueOnce({ hash: currentHash, trust: "modified", marketplaceManaged: false });
+    const updateConnector = vi.fn().mockResolvedValue({ updated: true });
+    const { service } = await serviceForRelease(release, {
+      ...baseLifecycle(),
+      connectorHash: async () => currentHash,
+      connectorState,
+      updateConnector,
+    });
+
+    const prepared = await service.prepare("connector", release.packageId, "update");
+    await expect(service.apply(prepared.stageId)).rejects.toMatchObject({
+      code: "CONNECTOR_MODIFIED",
+    });
+    expect(connectorState).toHaveBeenCalledTimes(3);
+    expect(updateConnector).not.toHaveBeenCalled();
+  });
+
+  test("rechecks a stale typed install immediately before apply", async () => {
+    const release = connectorRelease("lamarck.calendar");
+    let installedHash: string | undefined;
+    const installConnector = vi.fn(async () => { installedHash = release.contentHash; });
+    const { service } = await serviceForRelease(release, {
+      ...baseLifecycle(),
+      connectorHash: async () => installedHash,
+      connectorState: async () => installedHash === undefined
+        ? undefined
+        : { hash: installedHash, trust: "official", marketplaceManaged: true },
+      installConnector,
+    });
+    const first = await service.prepare("connector", release.packageId, "install");
+    const second = await service.prepare("connector", release.packageId, "install");
+    await expect(service.apply(first.stageId)).resolves.toMatchObject({ disposition: "install" });
+    await expect(service.apply(second.stageId)).rejects.toMatchObject({
+      code: "CONNECTOR_ALREADY_INSTALLED",
+    });
+    expect(installConnector).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -188,7 +282,9 @@ function baseLifecycle(): MarketplaceLifecycleAdapters {
     appExists: async () => false,
     instantiateApp: async (input) => ({ id: input.localId ?? input.packageId }),
     connectorHash: async () => undefined,
+    connectorState: async () => undefined,
     recordOfficialConnectorRelease: () => {},
+    recordConnectorInstallation: () => {},
     installConnector: async () => {},
     updateConnector: async () => ({ updated: true }),
   };
@@ -258,6 +354,7 @@ async function connectorService(release: TestRelease, hashes: Array<string | und
   const connectorHash = vi.fn();
   for (const hash of hashes) connectorHash.mockResolvedValueOnce(hash);
   const recordOfficialConnectorRelease = vi.fn();
+  const recordConnectorInstallation = vi.fn();
   const installConnector = vi.fn().mockResolvedValue(undefined);
   const updateConnector = vi.fn().mockResolvedValue({ updated: true });
   return {
@@ -265,10 +362,12 @@ async function connectorService(release: TestRelease, hashes: Array<string | und
       ...baseLifecycle(),
       connectorHash,
       recordOfficialConnectorRelease,
+      recordConnectorInstallation,
       installConnector,
       updateConnector,
     }),
     recordOfficialConnectorRelease,
+    recordConnectorInstallation,
     installConnector,
     updateConnector,
   };

@@ -43,6 +43,15 @@ const RESERVED_EVENT_TYPE_PREFIXES = [
   "app.created",
   "app.archived",
 ];
+const LIFECYCLE_EVENT_TYPES = new Set([
+  "connector.approved",
+  "connector.installed",
+  "connector.updated",
+  "connector.removed",
+  "app.created",
+  "app.version.created",
+  "app.archived",
+]);
 
 const CDC_TABLE = "_lamarck_cdc_rows";
 const CDC_TRIGGER_PREFIX = "_lamarck_cdc_";
@@ -414,11 +423,24 @@ export class GuardEngine {
     return this.appendEvent(principal, event);
   }
 
+  writeLifecycleEvent(principalInput: GuardPrincipal, event: GuardEventInput): string {
+    this.assertOpen();
+    const principal = normalizePrincipal(principalInput);
+    validateEventInput(event);
+    if (!LIFECYCLE_EVENT_TYPES.has(event.type)) {
+      throw new GuardServiceError(
+        "GUARD_EVENT_NAMESPACE",
+        `Guard: event type "${event.type}" is not a lifecycle event`,
+      );
+    }
+    return this.appendEvent(principal, event);
+  }
+
   writeWorkspaceEvent(principalInput: GuardPrincipal, event: GuardEventInput): string {
     this.assertOpen();
     const principal = normalizePrincipal(principalInput);
     validateEventInput(event);
-    if (!event.type.startsWith("workspace.") || event.externalId !== undefined) {
+    if (event.type !== "workspace.files.changed" || event.externalId !== undefined) {
       throw new GuardServiceError(
         "GUARD_EVENT_NAMESPACE",
         "Guard: Host workspace events require workspace.* and external_id = null",
@@ -508,10 +530,19 @@ export class GuardEngine {
     approved: boolean,
     author?: string,
     context?: string,
+    eventPrincipalInput?: Pick<GuardPrincipal, "source" | "producerRef">,
   ): { ok: true } {
     this.assertOpen();
     const principal = normalizePrincipal(principalInput);
     assertSchemaGrant(principal);
+    const eventPrincipal = eventPrincipalInput === undefined
+      ? principal
+      : normalizePrincipal({
+          source: eventPrincipalInput.source,
+          producerRef: eventPrincipalInput.producerRef,
+          tableGrants: [],
+          schemaGrant: false,
+        });
     if (approved !== true) {
       throw new GuardServiceError("GUARD_SCHEMA_APPROVAL", "Guard: schema change requires approval");
     }
@@ -556,7 +587,7 @@ export class GuardEngine {
       // or altered table that cannot be captured never becomes durable.
       if (schemaChanged) {
         this.refreshCdcCapture(new Set([...targets.tableObjects, ...targets.indexTables]));
-        this.logD0(principal, "workspace.schema.changed", {
+        this.logD0(eventPrincipal, "workspace.schema.changed", {
           ddl: statements,
           before_schema: before,
           after_schema: after,
@@ -598,6 +629,8 @@ export class GuardEngine {
         );
       case "writeEvent":
         return this.writeEvent(params.principal as GuardPrincipal, params.event as GuardEventInput);
+      case "writeLifecycleEvent":
+        return this.writeLifecycleEvent(params.principal as GuardPrincipal, params.event as GuardEventInput);
       case "writeWorkspaceEvent":
         return this.writeWorkspaceEvent(
           params.principal as GuardPrincipal,
@@ -621,6 +654,9 @@ export class GuardEngine {
           params.context === undefined
             ? undefined
             : requireStringValue(params.context, "params.context"),
+          params.eventPrincipal === undefined
+            ? undefined
+            : requireEventPrincipal(params.eventPrincipal),
         );
       default:
         throw new GuardServiceError("GUARD_METHOD_NOT_FOUND", `Unknown Guard RPC method: ${method}`);
@@ -1700,7 +1736,6 @@ function validateEventInput(event: GuardEventInput): void {
 }
 
 function assertEventTypeAllowed(source: string, type: string): void {
-  if (source.startsWith("system:")) return;
   if (RESERVED_EVENT_TYPE_PREFIXES.some((prefix) => type.startsWith(prefix))) {
     throw new GuardServiceError(
       "GUARD_EVENT_NAMESPACE",
@@ -1920,6 +1955,17 @@ function requireStringValue(value: unknown, label: string): string {
 
 function requireSchemaPlan(value: unknown): GuardSchemaPlan {
   return normalizeSchemaPlan(value as GuardSchemaPlan);
+}
+
+function requireEventPrincipal(value: unknown): Pick<GuardPrincipal, "source" | "producerRef"> {
+  const raw = requireObject(value, "schema event principal");
+  if (Object.keys(raw).sort().join(",") !== "producerRef,source") {
+    throw new GuardServiceError("GUARD_INVALID_REQUEST", "Guard: schema event principal is invalid");
+  }
+  return {
+    source: requireString(raw.source, "schema event principal.source"),
+    producerRef: requireString(raw.producerRef, "schema event principal.producerRef"),
+  };
 }
 
 function normalizeSchemaPlan(value: GuardSchemaPlan): GuardSchemaPlan {

@@ -79,6 +79,7 @@ export interface ConnectorHostGuard {
   }): ConnectorHostGuard;
   queryOne(sql: string, params?: GuardSqlParams): unknown | null | Promise<unknown | null>;
   writeEvent(event: EventInput): string | Promise<string>;
+  writeLifecycleEvent(event: EventInput): string | Promise<string>;
 }
 
 function isUniqueConstraintError(err: unknown): boolean {

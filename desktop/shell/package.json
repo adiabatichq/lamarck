@@ -13,16 +13,17 @@
     "dev:renderer": "vite",
     "build": "node ../../scripts/build-desktop.mjs",
     "build:electron": "node ../../scripts/build-desktop.mjs --host-only",
-    "pretest": "npm --workspace @lamarck/system run build",
+    "pretest": "npm --workspace @lamarck/cli run build && npm --workspace @lamarck/system run build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "pretypecheck": "npm --workspace @lamarck/system run build",
+    "pretypecheck": "npm --workspace @lamarck/cli run build && npm --workspace @lamarck/system run build",
     "typecheck": "tsc -p tsconfig.json",
     "start": "node ../../scripts/start-desktop.mjs",
     "electron": "npm run start",
     "electron:dev": "npm run dev"
   },
   "dependencies": {
+    "@lamarck/cli": "0.1.0",
     "@lamarck/system": "0.1.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

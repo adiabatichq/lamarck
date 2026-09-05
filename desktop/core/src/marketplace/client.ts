@@ -12,6 +12,13 @@ import {
 export const MARKETPLACE_RESOLVE_TIMEOUT_MS = 15_000;
 const MARKETPLACE_RESOLVE_MAX_BYTES = 64 * 1024;
 
+export class MarketplaceUnavailableError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "MarketplaceUnavailableError";
+  }
+}
+
 export interface ResolveMarketplacePackageOptions {
   readonly apiOrigin: string;
   readonly kind: MarketplacePackageKind;
@@ -57,22 +64,38 @@ export async function resolveMarketplacePackage(
   options.signal?.addEventListener("abort", abortFromCaller, { once: true });
   if (options.signal?.aborted) abortFromCaller();
   try {
-    const response = await (options.fetchImpl ?? fetch)(resolveUrl, {
-      method: "GET",
-      redirect: "error",
-      cache: "no-store",
-      signal: controller.signal,
-      headers: { Accept: "application/json" },
-    });
-    if (!response.ok || response.status !== 200 || !response.body) {
-      throw new Error(`Marketplace resolve returned HTTP ${response.status}`);
+    let response: Response;
+    try {
+      response = await (options.fetchImpl ?? fetch)(resolveUrl, {
+        method: "GET",
+        redirect: "error",
+        cache: "no-store",
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? `: ${error.message}` : "";
+      throw new MarketplaceUnavailableError(`Marketplace could not be reached${reason}`, {
+        cause: error instanceof Error ? error : undefined,
+      });
     }
-    const bytes = await readBoundedBody(response.body, MARKETPLACE_RESOLVE_MAX_BYTES);
+    if (!response.ok || response.status !== 200 || !response.body) {
+      throw new MarketplaceUnavailableError(`Marketplace resolve returned HTTP ${response.status}`);
+    }
+    let bytes: Buffer;
+    try {
+      bytes = await readBoundedBody(response.body, MARKETPLACE_RESOLVE_MAX_BYTES);
+    } catch (error) {
+      const reason = error instanceof Error ? `: ${error.message}` : "";
+      throw new MarketplaceUnavailableError(`Marketplace resolve response could not be read${reason}`, {
+        cause: error instanceof Error ? error : undefined,
+      });
+    }
     let value: unknown;
     try {
       value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     } catch (error) {
-      throw new Error("Marketplace resolve response is malformed", { cause: error });
+      throw new MarketplaceUnavailableError("Marketplace resolve response is malformed", { cause: error });
     }
     return verifyMarketplaceResolvePayload(
       value,

@@ -2635,6 +2635,8 @@ auth:
     const sourceRecord = supervisor.ensureSource({ connectorId: "terminal" });
 
     const handle = supervisor.start(sourceRecord.id);
+    expect(handle.runId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    expect(supervisor.sourceRun(sourceRecord.id, handle.runId)?.id).toBe(handle.runId);
     expect((await supervisor.list())[0].running).toBe(true);
     handle.abort();
     await handle.promise;
@@ -9101,7 +9103,7 @@ auth:
     expect(await authManager.hasToken(sourceRecord.authRef!)).toBe(false);
     expect(
       dataDb.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'connector.removed'").get(),
-    ).toMatchObject({ n: 1 });
+    ).toMatchObject({ n: 0 });
   });
 
   function writeBuiltIn(
@@ -9192,8 +9194,12 @@ auth:
       .prepare("SELECT payload FROM events WHERE type = ?")
       .get("connector.installed") as any;
     const payload = JSON.parse(event.payload);
-    expect(payload.connector_id).toBe("seed");
-    expect(typeof payload.package_hash).toBe("string");
+    expect(payload).toEqual({
+      connector_id: "seed",
+      package_hash: expect.stringMatching(/^sha256:/),
+    });
+    expect(payload).not.toHaveProperty("releaseId");
+    expect(payload).not.toHaveProperty("release_id");
 
     // Double-install is rejected and leaves no extra D0 record.
     await expect(
@@ -9309,6 +9315,8 @@ auth:
       from_hash: oldHash,
       to_hash: newHash,
     });
+    expect(JSON.parse(event.payload)).not.toHaveProperty("releaseId");
+    expect(JSON.parse(event.payload)).not.toHaveProperty("release_id");
 
     const noOp = await updateConnectorFromSource({
       sourceDir: candidateDir,
@@ -9493,9 +9501,10 @@ export default {
         producer: { producerRef: string; prepareProducer?: () => void | Promise<void> },
       ) => guard.withSource(sourceName, producer),
       queryOne: (sql: string, params?: any) => guard.queryOne(sql, params),
-      writeEvent: (event: any) => {
+      writeEvent: (event: any) => guard.writeEvent(event),
+      writeLifecycleEvent: (event: any) => {
         if (event.type === "connector.updated") throw new Error("D0 unavailable");
-        return guard.writeEvent(event);
+        return guard.writeLifecycleEvent(event);
       },
     };
     await expect(updateConnectorFromSource({
@@ -9529,13 +9538,18 @@ export default {
     await installOnce();
     expect(supervisor.isRegistered("seed")).toBe(true);
 
-    // The remove-connector flow cascades Sources before deleting the package,
-    // then unregisters and records connector.removed in D0.
+    // The remove-connector flow first removes the boot-visible package, then
+    // retires package authority and clears inactive Source remnants later.
     expect(await removeConnectorFromWorkspace({
       workspacePath: workspace,
       connectorId: "seed",
       supervisor,
     })).toBe(true);
+    expect(supervisor.isRegistered("seed")).toBe(false);
+    expect(await listInstalledConnectorDirs(workspace)).toEqual([]);
+
+    // A new Workspace bootstrap cannot resurrect the removed Connector.
+    expect(await registerWorkspaceConnectors(supervisor, workspace)).toEqual([]);
     expect(supervisor.isRegistered("seed")).toBe(false);
 
     // Nothing restores it implicitly — reinstalling is an explicit action.
@@ -9557,7 +9571,8 @@ export default {
     const guard = new Guard({ db: dataDb, source: "system:test" });
     const builtins = join(workspace, "builtins");
     const seedDir = writeBuiltIn(builtins, "seed", "connector");
-    useOfficialPackages([{ id: "seed", hash: await hashConnectorPackage(seedDir) }]);
+    const seedHash = await hashConnectorPackage(seedDir);
+    useOfficialPackages([{ id: "seed", hash: seedHash }]);
     const installOnce = () =>
       installConnectorFromSource({
         sourceDir: join(builtins, "seed"),
@@ -9578,7 +9593,7 @@ export default {
       connectorId: "seed",
       supervisor,
     })).toBe(true);
-    expect(supervisor.getSource(work.id)).toBeUndefined();
+    expect(supervisor.getSource(work.id)).toBeDefined();
 
     await installOnce();
     expect((await supervisor.list()).filter((row) => row.connectorId === "seed")).toEqual([]);
@@ -9588,6 +9603,38 @@ export default {
       config: { accountId: "work" },
     });
     expect(replacement.id).not.toBe(work.id);
+  });
+
+  test("keeps admission and omits the removed event when package deletion fails", async () => {
+    const guard = new Guard({ db: dataDb, source: "system:test" });
+    const builtins = join(workspace, "builtins");
+    const seedDir = writeBuiltIn(builtins, "seed", "connector");
+    const seedHash = await hashConnectorPackage(seedDir);
+    useOfficialPackages([{ id: "seed", hash: seedHash }]);
+    await installConnectorFromSource({
+      sourceDir: seedDir,
+      workspacePath: workspace,
+      connectorId: "seed",
+      guard,
+      supervisor,
+    });
+    supervisor.recordMarketplaceInstallation("seed", seedHash, "release-seed");
+    const sourceRecord = await supervisor.addSource({ connectorId: "seed" });
+    const before = dataDb.prepare("SELECT COUNT(*) AS count FROM events WHERE type = 'connector.removed'").get() as { count: number };
+
+    await expect(supervisor.removeConnector("seed", async () => {
+      throw new Error("package deletion failed");
+    })).rejects.toThrow("package deletion failed");
+
+    expect(supervisor.isRegistered("seed")).toBe(true);
+    expect(supervisor.marketplaceInstallation("seed")).toMatchObject({
+      packageHash: seedHash,
+      releaseId: "release-seed",
+    });
+    expect(supervisor.getSource(sourceRecord.id)).toBeDefined();
+    expect(dataDb.prepare("SELECT COUNT(*) AS count FROM events WHERE type = 'connector.removed'").get())
+      .toEqual({ count: before.count });
+    expect(existsSync(join(workspace, "connectors", "seed", "index.mjs"))).toBe(true);
   });
 
   test("loads connector runtime from directory entry", async () => {
@@ -9712,32 +9759,46 @@ auth:
   });
 
   test("Remove Connector cascades active Sources, credentials, and run history", async () => {
-    supervisor.register(
-      {
-        manifestVersion: 1,
-        id: "cascade-feed",
-        name: "Cascade Feed",
-        description: "Test connector manifest.",
-        eventCatalog: "./events.json",
-        entry: "./index.ts",
-        runtime: { mode: "watch" },
-        source: { identity: "connector" },
-        auth: { type: "apiKey" },
-      },
-      {
-        async resolveSourceIdentity({ auth }) {
-          if (auth.type === "none") throw new Error("expected auth");
-          const token = await auth.getToken();
-          return { key: token.startsWith("work-") ? "work" : "personal" };
-        },
-        async run({ signal }) {
-          await new Promise<void>((resolve) => {
-            if (signal.aborted) resolve();
-            else signal.addEventListener("abort", () => resolve(), { once: true });
-          });
-        },
-      },
+    const guard = new Guard({ db: dataDb, source: "system:test" });
+    const packages = join(workspace, "packages");
+    const packageDir = writeBuiltIn(packages, "cascade-feed", "connector");
+    writeConnectorManifestFixture(
+      join(packageDir, "connector.yaml"),
+      `manifestVersion: 1
+id: cascade-feed
+name: Cascade Feed
+description: Test connector manifest.
+eventCatalog: ./events.json
+entry: ./index.mjs
+runtime:
+  mode: watch
+source:
+  identity: connector
+auth:
+  type: apiKey
+`,
     );
+    writeFileSync(join(packageDir, "index.mjs"), `export default {
+  async resolveSourceIdentity({ auth }) {
+    const token = await auth.getToken();
+    return { key: token.startsWith("work-") ? "work" : "personal" };
+  },
+  async run({ signal }) {
+    await new Promise((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", resolve, { once: true });
+    });
+  },
+};
+`);
+    useOfficialPackages([{ id: "cascade-feed", hash: await hashConnectorPackage(packageDir) }]);
+    await installConnectorFromSource({
+      sourceDir: packageDir,
+      workspacePath: workspace,
+      connectorId: "cascade-feed",
+      guard,
+      supervisor,
+    });
     const work = supervisor.ensureSource({ connectorId: "cascade-feed" });
     const personal = supervisor.ensureSource({ connectorId: "cascade-feed" });
     const connectedWork = await supervisor.connectSourceWithToken(work.id, "work-token");
@@ -9747,8 +9808,13 @@ auth:
     supervisor.start(work.id, { trigger: "watch" });
     expect((await supervisor.list()).find((sourceRecord) => sourceRecord.id === work.id)?.running).toBe(true);
 
-    expect(await supervisor.unregister("cascade-feed")).toBe(true);
+    expect(await removeConnectorFromWorkspace({
+      workspacePath: workspace,
+      connectorId: "cascade-feed",
+      supervisor,
+    })).toBe(true);
     expect(supervisor.isRegistered("cascade-feed")).toBe(false);
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect((await supervisor.list()).filter((sourceRecord) => sourceRecord.connectorId === "cascade-feed")).toEqual([]);
     expect(await supervisor.getAuthManager().hasToken(connectedWork.authRef!)).toBe(false);
     expect(await supervisor.getAuthManager().hasToken(connectedPersonal.authRef!)).toBe(false);
@@ -10735,7 +10801,7 @@ auth:
     writeFileSync(join(dir, "index.mjs"), "export default { async run() {} };\n");
 
     await supervisor.registerDirectory(dir);
-    supervisor.ensureSource({ connectorId: "audited" });
+    const orphanSource = supervisor.ensureSource({ connectorId: "audited" });
     await supervisor.approveCurrentPackage("audited");
 
     const approved = dataDb
@@ -10750,7 +10816,7 @@ auth:
       .get("audited") as { approved_hash: string };
     expect(approvalState.approved_hash).toBe(approvedPayload.approved_hash);
 
-    expect(await supervisor.unregister("audited")).toBe(true);
+    expect(await supervisor.removeConnector("audited", async () => true)).toBe(true);
     expect(
       systemDb.prepare(
         "SELECT approved_hash FROM connector_custom_approvals WHERE connector_id = ?",
@@ -10762,7 +10828,12 @@ auth:
     expect(removed.source).toBe("system:test");
     expect(JSON.parse(removed.payload)).toEqual({ connector_id: "audited" });
 
-    // Connector removal cascades its Sources; no missing-package row survives.
+    // Current Shape drops orphan rows immediately, before best-effort cleanup.
+    expect(supervisor.getSource(orphanSource.id)).toBeDefined();
+    expect(await supervisor.listAdmitted()).toEqual([]);
+
+    // Logical removal returns before the best-effort remnant cleanup.
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect((await supervisor.list()).find((c) => c.connectorId === "audited")).toBeUndefined();
 
     await supervisor.registerDirectory(dir);

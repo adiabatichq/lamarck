@@ -33,6 +33,8 @@ HOME="$work/home" npm ci \
 	--cache="$work/npm-cache" \
 	--userconfig=/dev/null
 HOME="$work/home" node \
+	"$work/source/desktop/cli/scripts/build.mjs"
+HOME="$work/home" node \
 	"$work/source/desktop/capsule-guest/scripts/build-supervisor.mjs"
 
 mkdir -p "$export_root/capsule-guest"

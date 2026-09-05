@@ -27,6 +27,20 @@ const sourceConsumerDebt = new Map([
 const violations = [];
 const observedDebt = new Set();
 
+for (const removed of [
+  "desktop/core/src/cli.ts",
+  "desktop/capsule-guest/src/managed-cli.ts",
+  "desktop/capsule/src/app-edit/protocol.ts",
+  "desktop/capsule/src/app-edit/stream.ts",
+]) {
+  try {
+    await readFile(join(root, removed));
+    violations.push(`${removed}: obsolete CLI implementation still exists`);
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+  }
+}
+
 await walk(desktopRoot, async (path) => {
   const repositoryPath = relative(root, path).split(sep).join("/");
   if (repositoryPath.startsWith("desktop/system-sdk/")) return;
@@ -42,6 +56,10 @@ await walk(desktopRoot, async (path) => {
   }
   if (source.includes("LAMARCK_SYSTEM_DTS")) {
     violations.push(`${repositoryPath}: legacy copied SDK declaration marker`);
+  }
+  if (!repositoryPath.startsWith("desktop/cli/")
+    && /(?:\.\.\/)+cli\/src\//.test(source)) {
+    violations.push(`${repositoryPath}: imports CLI implementation source`);
   }
   if (source.includes("system-sdk/src/")) {
     const reason = sourceConsumerDebt.get(repositoryPath);

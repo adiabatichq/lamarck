@@ -12,6 +12,14 @@ import {
   type AppPackageEntry,
 } from "./package-tree";
 import { AppRepositoryService } from "./repository";
+import type { AppVersionEventAuthority, AppVersionEventWriter } from "./version-transaction";
+
+export interface AppVersionOperationContext {
+  readonly message?: string;
+  readonly author?: string;
+  readonly eventWriter?: AppVersionEventWriter;
+  readonly eventAuthority?: AppVersionEventAuthority;
+}
 
 export interface AppInventoryItemV1 {
   readonly schemaVersion: 1;
@@ -42,7 +50,7 @@ export class AppLifecycleService {
     readonly editMaterializations: AppEditMaterializationCoordinator,
   ) {}
 
-  async save(appId: string, metadata: { message?: string; author?: string } = {}) {
+  async save(appId: string, metadata: AppVersionOperationContext = {}) {
     return this.repository.save({
       appId,
       appDir: await this.resolveAppDir(appId),
@@ -61,7 +69,7 @@ export class AppLifecycleService {
   async restore(
     appId: string,
     version: string,
-    metadata: { message?: string; author?: string } = {},
+    metadata: AppVersionOperationContext = {},
   ) {
     return this.repository.restore({
       appId,
@@ -83,6 +91,15 @@ export class AppLifecycleService {
     return this.editMaterializations.prepare(appId, await this.resolveAppDir(appId));
   }
 
+  async prepareEditBases() {
+    const apps = await this.currentAppDirectories();
+    const bases = await Promise.all(
+      apps.map((app) => this.editMaterializations.prepare(app.id, app.path)),
+    );
+    await this.editMaterializations.retainApps(apps.map((app) => app.id));
+    return Object.freeze(bases);
+  }
+
   async savePackage(
     appId: string,
     entries: readonly AppPackageEntry[],
@@ -91,6 +108,8 @@ export class AppLifecycleService {
       basePackageDigest: `sha256:${string}`;
       message?: string;
       author?: string;
+      eventWriter?: AppVersionEventWriter;
+      eventAuthority?: AppVersionEventAuthority;
     },
   ) {
     return this.repository.savePackage({
@@ -110,21 +129,8 @@ export class AppLifecycleService {
   }
 
   async inventory(): Promise<readonly AppInventoryItemV1[]> {
-    let entries;
-    try {
-      entries = await readdir(this.appsDir, { withFileTypes: true });
-    } catch (error) {
-      if (isNodeError(error, "ENOENT")) return [];
-      throw error;
-    }
     const apps: AppInventoryItemV1[] = [];
-    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-      if (!entry.isDirectory() || !PACKAGE_ID_PATTERN.test(entry.name)) continue;
-      const id = entry.name;
-      const path = join(this.appsDir, id);
-      const info = await lstat(path);
-      if (!info.isDirectory() || info.isSymbolicLink()) continue;
-
+    for (const { id, path } of await this.currentAppDirectories()) {
       let draft: ReturnType<typeof validateAppPackageTree> | undefined;
       let draftError: string | undefined;
       try {
@@ -161,12 +167,30 @@ export class AppLifecycleService {
           : version === null
             ? Object.freeze({ status: "unversioned" as const })
             : Object.freeze({ status: "healthy" as const }),
-        name: details?.name ?? id,
-        description: details?.description ?? (draftError ?? "App manifest is unavailable"),
+        name: details?.name ?? "Unavailable",
+        description: details?.description ?? "N/A",
         ...(details?.runtime === undefined ? {} : { runtime: details.runtime }),
         ...(details?.permissions === undefined ? {} : { permissions: details.permissions }),
         ...(details?.createdFrom === undefined ? {} : { createdFrom: details.createdFrom }),
       }));
+    }
+    return Object.freeze(apps);
+  }
+
+  private async currentAppDirectories(): Promise<readonly { id: string; path: string }[]> {
+    let entries;
+    try {
+      entries = await readdir(this.appsDir, { withFileTypes: true });
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) return [];
+      throw error;
+    }
+    const apps: Array<{ id: string; path: string }> = [];
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!entry.isDirectory() || !PACKAGE_ID_PATTERN.test(entry.name)) continue;
+      const path = join(this.appsDir, entry.name);
+      const info = await lstat(path);
+      if (info.isDirectory() && !info.isSymbolicLink()) apps.push({ id: entry.name, path });
     }
     return Object.freeze(apps);
   }

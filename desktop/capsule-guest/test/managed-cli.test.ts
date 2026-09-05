@@ -5,36 +5,32 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { build, type Plugin } from "esbuild";
 import { afterEach, expect, test } from "vitest";
+import { MANAGED_CLI_OPERATIONS } from "@lamarck/cli";
 
 const execute = promisify(execFile);
 const roots: string[] = [];
 const records = [
-  { schemaVersion: 1, appId: "example", version: "a".repeat(40), parentVersion: "b".repeat(40), trigger: "save", createdAt: 2 },
-  { schemaVersion: 1, appId: "example", version: "b".repeat(40), parentVersion: null, trigger: "activate", createdAt: 1 },
+  { appId: "example", version: "a".repeat(40), parentVersion: "b".repeat(40), trigger: "save", createdAt: 2 },
+  { appId: "example", version: "b".repeat(40), parentVersion: null, trigger: "activate", createdAt: 1 },
 ];
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-test("managed app versions exposes no pagination flags and prints the version-record array", async () => {
+test("Guest artifact uses the shared managed command surface and protocol", async () => {
   const cli = await buildCli();
+  const help = await execute(process.execPath, [cli, "--help"]);
+  expect(help.stdout).toContain("lamarck app refresh");
+  expect(help.stdout).not.toContain("file import");
+  expect(help.stdout).not.toContain("file export");
+
   const success = await execute(process.execPath, [cli, "app", "versions", "example", "--json"]);
   expect(success.stderr).toBe("");
   expect(JSON.parse(success.stdout)).toEqual(records);
 
-  await expect(execute(process.execPath, [
-    cli,
-    "app",
-    "versions",
-    "example",
-    "--cursor",
-    "private-page",
-    "--json",
-  ])).rejects.toMatchObject({
-    code: 1,
-    stderr: expect.stringContaining("APP_COMMAND_UNSUPPORTED"),
-  });
+  await expect(execute(process.execPath, [cli, "file", "import", "host", "workspace", "--json"]))
+    .rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("CLI_UNSUPPORTED_COMMAND") });
 });
 
 async function buildCli(): Promise<string> {
@@ -42,7 +38,7 @@ async function buildCli(): Promise<string> {
   roots.push(root);
   const outfile = join(root, "lamarck.mjs");
   await build({
-    entryPoints: [join(import.meta.dirname, "..", "src", "managed-cli.ts")],
+    entryPoints: [join(import.meta.dirname, "..", "..", "cli", "src", "managed-entry.ts")],
     outfile,
     bundle: true,
     platform: "node",
@@ -62,25 +58,30 @@ function mockSocketPlugin(): Plugin {
         loader: "js",
         contents: `
           import { Duplex } from "node:stream";
+          const operations = ${JSON.stringify(MANAGED_CLI_OPERATIONS)};
           const result = ${JSON.stringify(records)};
+          function frame(value) {
+            const payload = Buffer.from(JSON.stringify(value));
+            const output = Buffer.alloc(4 + payload.byteLength);
+            output.writeUInt32BE(payload.byteLength, 0);
+            payload.copy(output, 4);
+            return output;
+          }
           class TestSocket extends Duplex {
             _read() {}
-            _write(_chunk, _encoding, callback) { callback(); }
+            _write(chunk, _encoding, callback) {
+              const request = JSON.parse(Buffer.from(chunk).subarray(4).toString("utf8"));
+              queueMicrotask(() => this.push(frame({ requestId: request.requestId, ok: true, result })));
+              callback();
+            }
           }
           export function createConnection() {
             const socket = new TestSocket();
             queueMicrotask(() => {
               socket.emit("connect");
-              const payload = Buffer.from(JSON.stringify({ version: 1, requestId: 1, ok: true, result }));
-              const frame = Buffer.alloc(4 + payload.byteLength);
-              frame.writeUInt32BE(payload.byteLength, 0);
-              payload.copy(frame, 4);
-              socket.push(frame);
+              socket.push(frame({ protocolVersion: 1, environment: "managed", supportedOperations: operations }));
             });
             return socket;
-          }
-          export function createServer() {
-            throw new Error("unexpected server creation in managed CLI test");
           }
         `,
       }));

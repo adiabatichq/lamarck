@@ -165,8 +165,15 @@ function createFetch(
           manifestDigest: MANIFEST_DIGEST,
           packageDigest: PACKAGE_DIGEST,
           immutablePackagePath: `/immutable/apps/${appId}/${APP_VERSION}`,
-          manifest: { runtime: runtimeByApp[appId]
-            ?? { ui: { command: ["npm", "run", "start"], port: 3000 } },
+          manifest: {
+            runtime: runtimeByApp[appId]
+              ?? { ui: { command: ["npm", "run", "start"], port: 3000 } },
+            permissions: {
+              writes: {
+                files: [`shared/${appId}/`],
+                tables: [`${appId.replaceAll("-", "_")}_records`],
+              },
+            },
           },
         },
       });
@@ -336,6 +343,8 @@ describe("CapsuleManager", () => {
       packageDir: `/immutable/apps/app-a/${APP_VERSION}`,
       command: ["npm", "run", "start"],
       port: 3000,
+      writeTables: ["app_a_records"],
+      fileGrants: ["apps/app-a/", "shared/app-a/"],
       sdkSenderId: expect.stringMatching(/^capsule_/),
     }]);
     expect(JSON.stringify(backend.starts)).not.toContain("secret-capability");
@@ -1599,6 +1608,8 @@ describe("CapsuleManager", () => {
         packageDir: `/immutable/apps/app-a/${APP_VERSION}`,
         command: ["npm", "run", "start"],
         port: 3000,
+        writeTables: ["app_a_records"],
+        fileGrants: ["apps/app-a/", "shared/app-a/"],
         sdkSenderId: expect.stringMatching(/^capsule_/),
       },
     }]);

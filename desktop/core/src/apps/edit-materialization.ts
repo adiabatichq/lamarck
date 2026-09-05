@@ -12,18 +12,46 @@ export interface AppEditBaseV1 {
   readonly appId: string;
   readonly version: string | null;
   readonly packageDigest: `sha256:${string}`;
-  /** Relative to the Host's read-only app-version share; never a Host path. */
+  /** Relative to the Host's read-only app-edit-bases share; never a Host path. */
   readonly lowerPath: string;
 }
 
 /** Creates immutable, reconstructable lowers for private Capsule editing. */
 export class AppEditMaterializationCoordinator {
+  private readonly preparations = new Map<string, Promise<AppEditBaseV1>>();
+
   constructor(
     private readonly repository: AppRepositoryService,
     private readonly cacheRoot: string,
   ) {}
 
-  async prepare(appId: string, appDir: string): Promise<AppEditBaseV1> {
+  prepare(appId: string, appDir: string): Promise<AppEditBaseV1> {
+    const previous = this.preparations.get(appId);
+    const operation = (previous?.catch(() => undefined) ?? Promise.resolve())
+      .then(() => this.prepareExclusive(appId, appDir));
+    this.preparations.set(appId, operation);
+    void operation.finally(() => {
+      if (this.preparations.get(appId) === operation) this.preparations.delete(appId);
+    }).catch(() => {});
+    return operation;
+  }
+
+  async retainApps(appIds: Iterable<string>): Promise<void> {
+    const retained = new Set(appIds);
+    let entries;
+    try {
+      entries = await readdir(this.cacheRoot, { withFileTypes: true });
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) return;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (retained.has(entry.name)) continue;
+      await removeOwnedPath(join(this.cacheRoot, entry.name), entry.isDirectory());
+    }
+  }
+
+  private async prepareExclusive(appId: string, appDir: string): Promise<AppEditBaseV1> {
     const canonicalEntries = await collectAppPackageTree(appDir);
     const canonicalDigest = hashAppPackageTree(canonicalEntries);
     const version = await this.repository.currentVersion(appId, appDir);
@@ -43,11 +71,25 @@ export class AppEditMaterializationCoordinator {
       const stage = await mkdtemp(join(appRoot, ".edit-base-"));
       try {
         await materializeAppPackageTree(entries, stage);
+        const stagedDigest = hashAppPackageTree(await collectAppPackageTree(stage));
+        if (stagedDigest !== canonicalDigest) {
+          throw new Error("Staged App editing base digest mismatch");
+        }
+        let published = false;
         try {
           await rename(stage, destination);
-          await makeTreeReadonly(destination);
+          published = true;
         } catch (error) {
           if (!isNodeError(error, "EEXIST") && !isNodeError(error, "ENOTEMPTY")) throw error;
+        }
+        if (published) {
+          try {
+            await makeTreeReadonly(destination);
+          } catch (error) {
+            await makeTreeWritable(destination).catch(() => undefined);
+            await rm(destination, { recursive: true, force: true }).catch(() => undefined);
+            throw error;
+          }
         }
       } finally {
         await makeTreeWritable(stage).catch(() => undefined);
@@ -58,6 +100,7 @@ export class AppEditMaterializationCoordinator {
     if (reread !== canonicalDigest) {
       throw new Error("Immutable App editing base digest mismatch");
     }
+    await retainOnlyCurrentLower(appRoot, key);
     return Object.freeze({
       schemaVersion: 1,
       appId,
@@ -66,6 +109,20 @@ export class AppEditMaterializationCoordinator {
       lowerPath: `${appId}/${key}`,
     });
   }
+}
+
+async function retainOnlyCurrentLower(appRoot: string, currentKey: string): Promise<void> {
+  for (const entry of await readdir(appRoot, { withFileTypes: true })) {
+    if (entry.name === currentKey) continue;
+    await removeOwnedPath(join(appRoot, entry.name), entry.isDirectory());
+  }
+}
+
+async function removeOwnedPath(path: string, directory: boolean): Promise<void> {
+  if (directory) await makeTreeWritable(path).catch((error) => {
+    if (!isNodeError(error, "ENOENT")) throw error;
+  });
+  await rm(path, { recursive: directory, force: true });
 }
 
 async function makeTreeReadonly(directory: string): Promise<void> {

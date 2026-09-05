@@ -34,10 +34,15 @@ import {
   validateConnectorId,
   validateConnectorManifest,
 } from "./manifest";
-import { WorkspaceConnectorRegistry, trustStatusForSource } from "./registry";
+import {
+  WorkspaceConnectorRegistry,
+  hashConnectorPackage,
+  trustStatusForSource,
+} from "./registry";
 import {
   ConnectorPackageArchiveStore,
 } from "./connector-package-archive";
+import { ConnectorInstallationStore } from "./installations";
 import { validateConnectorDefinition } from "./runtime";
 import {
   ConnectorSourceStore,
@@ -91,6 +96,11 @@ export interface ConnectorRequirementView {
   lastCheckedAt?: number;
 }
 
+export interface InstalledConnectorPackageView extends InstalledConnectorView {
+  readonly manifest: ConnectorManifest;
+  readonly eventCatalog: ConnectorPackageRecord["eventCatalog"];
+}
+
 export type ConnectorSetupPendingReason = "identity" | "auth" | "requirements" | "config";
 export type ConnectorRuntimeReconcileReason =
   | "config_changed"
@@ -99,7 +109,10 @@ export type ConnectorRuntimeReconcileReason =
   | "readiness_changed";
 
 export class ConnectorLifecycleConflictError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly code: "CONNECTOR_UPDATE_INCOMPATIBLE" = "CONNECTOR_UPDATE_INCOMPATIBLE",
+  ) {
     super(message);
     this.name = "ConnectorLifecycleConflictError";
   }
@@ -121,6 +134,7 @@ interface OpenedTrustedSession {
 
 interface ActiveRunIntent {
   instanceId: string;
+  runId: string;
   trigger: ConnectorRunTrigger;
   controller: AbortController;
   attemptController: AbortController | undefined;
@@ -180,6 +194,30 @@ export interface ConnectorSupervisorOptions {
   deviceDisplayName?: string;
 }
 
+export interface ConnectorSourceView extends ConnectorSource {
+  name: string;
+  connectorName: string;
+  description?: string;
+  mode: string;
+  identityKind: ConnectorSourceIdentityKind;
+  ownership: ConnectorOwnership;
+  ownershipReason?: string;
+  conflictSourceId?: string;
+  source: string | null;
+  running: boolean;
+  supported: boolean;
+  packageTrust: ConnectorPackageTrust["status"];
+  authType: string;
+  authStatus?: string;
+  authAttention?: "refresh_failed" | "redirect_uri_changed";
+  authReady: boolean;
+  setupPending: ConnectorSetupPendingReason[];
+  requirements: ConnectorRequirementView[];
+  recentRuns: ConnectorRunRecord[];
+  configSchema?: Record<string, ConnectorConfigField>;
+  configPanels?: Record<string, ConnectorConfigPanel>;
+}
+
 export interface ConnectSourceInput {
   authRef?: string;
 }
@@ -223,6 +261,7 @@ export class ConnectorSupervisor {
     "publish" | "requireExists"
   >;
   private inProcessProducer: ProducerBinding | undefined;
+  private installationStore: ConnectorInstallationStore;
 
   constructor(opts: ConnectorSupervisorOptions) {
     this.guard = opts.guard;
@@ -234,6 +273,7 @@ export class ConnectorSupervisor {
       ?? new ConnectorPackageArchiveStore(opts.workspacePath);
     this.inProcessProducer = opts.inProcessProducer;
     this.store = new ConnectorSourceStore(opts.systemDb);
+    this.installationStore = new ConnectorInstallationStore(opts.systemDb);
     this.store.recoverInterruptedRuns();
     this.authManager = opts.authManager ?? new ConnectorAuthManager();
     this.platform = opts.platform ?? currentConnectorPlatform();
@@ -323,6 +363,14 @@ export class ConnectorSupervisor {
       trustStatusForSource(trust),
       contentHash,
     );
+  }
+
+  recordMarketplaceInstallation(connectorId: string, contentHash: string, releaseId: string): void {
+    this.installationStore.record(connectorId, contentHash, releaseId);
+  }
+
+  marketplaceInstallation(connectorId: string) {
+    return this.installationStore.get(connectorId);
   }
 
   async publishPackageArchive(connectorDir: string, contentHash: string): Promise<void> {
@@ -428,7 +476,7 @@ export class ConnectorSupervisor {
         approved.contentHash,
       );
       // D0 audit: the trust decision — who approved which exact package content.
-      await this.guard.writeEvent({
+      await this.guard.writeLifecycleEvent({
         type: "connector.approved",
         startedAt: Date.now(),
         payload: { connector_id: connectorId, approved_hash: approved.contentHash },
@@ -437,31 +485,51 @@ export class ConnectorSupervisor {
     });
   }
 
-  // The single Connector removal authority. Sources are cascaded before the
-  // caller-provided package operation; registration, approval authority, and
-  // audit state are finalized only after that operation succeeds.
+  // The single Connector removal authority. The visible package directory is
+  // part of remove itself because Workspace bootstrap admits it again. Source,
+  // credential, checkpoint, and run remnants are reconstructable best-effort
+  // cleanup after package removal, admission retirement, and the D0 event.
   async removeConnector(
     connectorId: string,
-    removePackage: () => Promise<boolean> = async () => false,
+    removePackage: () => Promise<boolean>,
+    eventWriter: ConnectorHostGuard = this.guard,
   ): Promise<boolean> {
     validateConnectorId(connectorId);
     const registration = this.registrations.get(connectorId);
-    await this.removeSourcesForConnector(connectorId);
-    const removedPackage = await removePackage();
-    this.registry.removeApprovals(connectorId);
-    if (registration) this.registrations.delete(connectorId);
-    if (!registration && !removedPackage) return false;
-    await this.guard.writeEvent({
-      type: "connector.removed",
-      startedAt: Date.now(),
-      payload: { connector_id: connectorId },
-    });
-    return true;
-  }
-
-  // Registration-only connectors (tests/embedding) still use the same cascade.
-  async unregister(connectorId: string): Promise<boolean> {
-    return this.removeConnector(connectorId);
+    if (!registration?.package) return false;
+    if (this.updatingConnectorIds.has(connectorId)) {
+      throw new ConnectorLifecycleConflictError(`Connector ${connectorId} has a lifecycle operation in progress`);
+    }
+    this.updatingConnectorIds.add(connectorId);
+    try {
+      const sources = this.store.listForConnector(connectorId);
+      for (const sourceRecord of sources) {
+        const active = this.activeRuns.get(sourceRecord.id);
+        active?.releaseIdentityBarrier();
+        active?.abort();
+        await active?.promise.catch(() => {});
+        await this.stopConfigUiSessionsForSource(sourceRecord.id);
+      }
+      // Failure is authoritative: keep the Connector admitted and do not emit
+      // connector.removed when its boot-visible package could not be removed.
+      await removePackage();
+      this.registrations.delete(connectorId);
+      this.registry.removeApprovals(connectorId);
+      this.installationStore.remove(connectorId);
+      await eventWriter.writeLifecycleEvent({
+        type: "connector.removed",
+        startedAt: Date.now(),
+        payload: { connector_id: connectorId },
+      });
+      setImmediate(() => {
+        void this.clearInactiveConnectorRemnants(connectorId).catch((error) => {
+          console.warn(`[connectors] best-effort cleanup for ${connectorId} failed:`, error);
+        });
+      });
+      return true;
+    } finally {
+      this.updatingConnectorIds.delete(connectorId);
+    }
   }
 
   private async removeSourcesForConnector(connectorId: string): Promise<number> {
@@ -471,6 +539,12 @@ export class ConnectorSupervisor {
       await this.removeSource(sourceRecord.id);
     }
     return sources.length;
+  }
+
+  async clearInactiveConnectorRemnants(connectorId: string): Promise<number> {
+    validateConnectorId(connectorId);
+    if (this.registrations.has(connectorId)) return 0;
+    return this.removeSourcesForConnector(connectorId);
   }
 
   async reconcileInstalledConnectorIds(installedConnectorIds: Iterable<string>): Promise<string[]> {
@@ -483,11 +557,7 @@ export class ConnectorSupervisor {
     for (const connectorId of orphaned) {
       await this.removeSourcesForConnector(connectorId);
       this.registry.removeApprovals(connectorId);
-      await this.guard.writeEvent({
-        type: "connector.removed",
-        startedAt: Date.now(),
-        payload: { connector_id: connectorId },
-      });
+      this.installationStore.remove(connectorId);
     }
     return [...orphaned].sort();
   }
@@ -1037,30 +1107,95 @@ export class ConnectorSupervisor {
       .sort((a, b) => a.name.localeCompare(b.name) || a.connectorId.localeCompare(b.connectorId));
   }
 
-  async list(): Promise<Array<ConnectorSource & {
-    name: string;
-    connectorName: string;
-    description?: string;
-    mode: string;
-    identityKind: ConnectorSourceIdentityKind;
-    ownership: ConnectorOwnership;
-    ownershipReason?: string;
-    conflictSourceId?: string;
-    source: string | null;
-    running: boolean;
-    supported: boolean;
-    packageTrust: ConnectorPackageTrust["status"];
-    authType: string;
-    authStatus?: string;
-    authAttention?: "refresh_failed" | "redirect_uri_changed";
-    authReady: boolean;
-    setupPending: ConnectorSetupPendingReason[];
-	    requirements: ConnectorRequirementView[];
-	    recentRuns: ConnectorRunRecord[];
-	    configSchema?: Record<string, ConnectorConfigField>;
-	    configPanels?: Record<string, ConnectorConfigPanel>;
-	  }>> {
-    return Promise.all(this.store.list().map(async (sourceRecord) => {
+  installedConnectorPackage(connectorId: string): InstalledConnectorPackageView | undefined {
+    validateConnectorId(connectorId);
+    const registration = this.registrations.get(connectorId);
+    if (!registration?.package) return undefined;
+    return Object.freeze({
+      connectorId: registration.manifest.id,
+      name: registration.manifest.name,
+      description: registration.manifest.description,
+      mode: registration.manifest.runtime.mode,
+      identityKind: registration.manifest.source.identity,
+      supported: isPlatformSupported(registration.manifest, this.platform),
+      packageTrust: registration.trust.status,
+      packageHash: registration.package.contentHash,
+      manifest: registration.manifest,
+      eventCatalog: registration.package.eventCatalog,
+    });
+  }
+
+  /** Re-reads package identity for Public CLI/control-plane decisions. */
+  async currentInstalledConnectorPackage(
+    connectorId: string,
+  ): Promise<InstalledConnectorPackageView | undefined> {
+    validateConnectorId(connectorId);
+    const registration = this.registrations.get(connectorId);
+    if (!registration?.package) return undefined;
+    const packageHash = await hashConnectorPackage(registration.package.dir);
+    const installation = this.installationStore.get(connectorId);
+    const packageTrust = packageHash !== registration.package.contentHash
+      || (installation !== undefined && installation.packageHash !== packageHash)
+      ? "modified" as const
+      : this.registry.classify(connectorId, packageHash).status;
+    return Object.freeze({
+      connectorId: registration.manifest.id,
+      name: registration.manifest.name,
+      description: registration.manifest.description,
+      mode: registration.manifest.runtime.mode,
+      identityKind: registration.manifest.source.identity,
+      supported: isPlatformSupported(registration.manifest, this.platform),
+      packageTrust,
+      packageHash,
+      manifest: registration.manifest,
+      eventCatalog: registration.package.eventCatalog,
+    });
+  }
+
+  listInstalledConnectorPackages(): InstalledConnectorPackageView[] {
+    return this.listInstalledConnectors()
+      .map((value) => this.installedConnectorPackage(value.connectorId))
+      .filter((value): value is InstalledConnectorPackageView => value !== undefined);
+  }
+
+  async listCurrentInstalledConnectorPackages(): Promise<InstalledConnectorPackageView[]> {
+    const packages = await Promise.all(this.listInstalledConnectors()
+      .map((value) => this.currentInstalledConnectorPackage(value.connectorId)));
+    return packages.filter((value): value is InstalledConnectorPackageView => value !== undefined);
+  }
+
+  /** One command-local Public CLI snapshot; no persistent Shape cache. */
+  async currentCliShape(): Promise<{
+    readonly packages: readonly InstalledConnectorPackageView[];
+    readonly sources: readonly ConnectorSourceView[];
+  }> {
+    const [packages, sources] = await Promise.all([
+      this.listCurrentInstalledConnectorPackages(),
+      this.listAdmitted(),
+    ]);
+    return Object.freeze({ packages: Object.freeze(packages), sources: Object.freeze(sources) });
+  }
+
+  sourceRun(sourceId: string, runId: string): ConnectorRunRecord | undefined {
+    const record = this.store.getRun(runId);
+    return record?.sourceId === sourceId ? record : undefined;
+  }
+
+  async list(): Promise<ConnectorSourceView[]> {
+    return this.projectSourceViews(this.store.list());
+  }
+
+  /** Current Shape projection excludes Sources whose Connector is no longer admitted. */
+  async listAdmitted(): Promise<ConnectorSourceView[]> {
+    return this.projectSourceViews(
+      this.store.list().filter((source) => this.registrations.has(source.connectorId)),
+    );
+  }
+
+  private async projectSourceViews(
+    records: readonly ConnectorSource[],
+  ): Promise<ConnectorSourceView[]> {
+    return Promise.all(records.map(async (sourceRecord) => {
       const registration = this.registrations.get(sourceRecord.connectorId);
       const identityKind = registration?.manifest.source.identity ?? "single";
       const identityReady = registration
@@ -1930,6 +2065,7 @@ export class ConnectorSupervisor {
     let resolveIdentityBarrier: (() => void) | undefined;
     const active: ActiveRunIntent = {
       instanceId,
+      runId: runRecord.id,
       trigger,
       controller,
       attemptController: undefined,

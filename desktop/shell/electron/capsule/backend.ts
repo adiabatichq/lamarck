@@ -14,6 +14,9 @@ export interface CapsuleUiSpec {
   packageDir: string;
   command: string[];
   port: number;
+  /** Immutable CLI grants captured by the same admitted activation. */
+  writeTables: string[];
+  fileGrants: string[];
   /** Host-private SystemBroker sender. It is never serialized into the Guest. */
   sdkSenderId: string;
 }

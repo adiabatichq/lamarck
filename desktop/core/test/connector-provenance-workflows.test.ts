@@ -108,6 +108,11 @@ class PreparingGuard implements ConnectorHostGuard {
     await this.prepareProducer?.();
     return this.guard.writeEvent(event);
   }
+
+  async writeLifecycleEvent(event: EventInput): Promise<string> {
+    await this.prepareProducer?.();
+    return this.guard.writeLifecycleEvent(event);
+  }
 }
 
 describe("Connector package provenance workflows", () => {
@@ -228,6 +233,56 @@ describe("Connector package provenance workflows", () => {
     expect(supervisor.isRegistered(connectorId)).toBe(true);
     expect(eventCount("connector.installed")).toBe(1);
     await expect(archiveStore.resolve(digest)).resolves.toMatchObject({ digest });
+  });
+
+  test("re-reads the installed package hash after startup and reports local modifications", async () => {
+    const connectorId = "modified-after-start";
+    const connectorDir = writePackage(
+      join(workspace, "connectors", connectorId),
+      connectorId,
+      "official-v1",
+    );
+    const recordedHash = await hashConnectorPackage(connectorDir);
+    const supervisor = createSupervisor([{ id: connectorId, hash: recordedHash }]);
+    await supervisor.registerDirectory(connectorDir);
+    supervisor.recordMarketplaceInstallation(connectorId, recordedHash, "release-1");
+
+    await expect(supervisor.currentInstalledConnectorPackage(connectorId)).resolves.toMatchObject({
+      packageHash: recordedHash,
+      packageTrust: "official",
+    });
+
+    writeFileSync(join(connectorDir, "index.mjs"), "export default { async run() { return 'modified'; } };\n");
+    const currentHash = await hashConnectorPackage(connectorDir);
+    expect(currentHash).not.toBe(recordedHash);
+    await expect(supervisor.currentInstalledConnectorPackage(connectorId)).resolves.toMatchObject({
+      packageHash: currentHash,
+      packageTrust: "modified",
+    });
+    await expect(supervisor.listCurrentInstalledConnectorPackages()).resolves.toEqual([
+      expect.objectContaining({ packageHash: currentHash, packageTrust: "modified" }),
+    ]);
+  });
+
+  test("builds one command-local CLI Shape from one package read and one Source projection", async () => {
+    const connectorId = "single-cli-snapshot";
+    const connectorDir = writePackage(
+      join(workspace, "connectors", connectorId),
+      connectorId,
+      "official-v1",
+    );
+    const recordedHash = await hashConnectorPackage(connectorDir);
+    const supervisor = createSupervisor([{ id: connectorId, hash: recordedHash }]);
+    await supervisor.registerDirectory(connectorDir);
+    const packages = vi.spyOn(supervisor, "listCurrentInstalledConnectorPackages");
+    const sources = vi.spyOn(supervisor, "listAdmitted");
+
+    await expect(supervisor.currentCliShape()).resolves.toMatchObject({
+      packages: [expect.objectContaining({ connectorId, packageHash: recordedHash })],
+      sources: [],
+    });
+    expect(packages).toHaveBeenCalledTimes(1);
+    expect(sources).toHaveBeenCalledTimes(1);
   });
 
   test("materializes the verified macos-ax helper as executable without changing package identity", async () => {
@@ -472,9 +527,10 @@ describe("Connector package provenance workflows", () => {
     const failingGuard: ConnectorHostGuard = {
       withSource: (source, producer) => guard.withSource(source, producer),
       queryOne: (sql, params) => guard.queryOne(sql, params),
-      writeEvent: (event) => {
+      writeEvent: (event) => guard.writeEvent(event),
+      writeLifecycleEvent: (event) => {
         if (event.type === "connector.updated") throw new Error("injected audit failure");
-        return guard.writeEvent(event);
+        return guard.writeLifecycleEvent(event);
       },
     };
     await expect(updateConnectorFromSource({

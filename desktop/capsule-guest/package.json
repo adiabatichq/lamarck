@@ -7,11 +7,15 @@
     "node": ">=24.10.0"
   },
   "scripts": {
+    "prebuild": "npm --workspace @lamarck/cli run build",
     "build": "node scripts/build-supervisor.mjs",
+    "pretest": "npm --workspace @lamarck/cli run build",
     "test": "vitest run",
+    "pretypecheck": "npm --workspace @lamarck/cli run build",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@lamarck/cli": "0.1.0",
     "@lamarck/capsule": "0.1.0"
   },
   "devDependencies": {

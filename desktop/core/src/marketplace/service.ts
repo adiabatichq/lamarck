@@ -11,19 +11,40 @@ import {
   extractVerifiedMarketplaceArtifact,
   verifyMarketplaceArtifact,
 } from "./artifact";
-import { resolveMarketplacePackage } from "./client";
+import { MarketplaceUnavailableError, resolveMarketplacePackage } from "./client";
 import { downloadMarketplaceArtifact } from "./download";
 import type {
   MarketplacePackageKind,
   MarketplaceResolvePayload,
   MarketplaceTrustRoot,
 } from "./resolve";
+import type { ConnectorHostGuard } from "../connectors/guard";
 
 export type MarketplaceLifecycleAction =
   | "create"
   | "install"
   | "update"
   | "already-installed";
+
+export type ConnectorMarketplaceErrorCode =
+  | "CONNECTOR_ALREADY_INSTALLED"
+  | "CONNECTOR_NOT_INSTALLED"
+  | "CONNECTOR_NOT_MARKETPLACE_MANAGED"
+  | "CONNECTOR_MODIFIED"
+  | "CONNECTOR_UPDATE_INCOMPATIBLE"
+  | "CONNECTOR_MARKETPLACE_UNAVAILABLE"
+  | "CONNECTOR_VERIFICATION_FAILED";
+
+export class ConnectorMarketplaceError extends Error {
+  constructor(
+    readonly code: ConnectorMarketplaceErrorCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "ConnectorMarketplaceError";
+  }
+}
 
 export interface MarketplacePreparedPackage {
   readonly stageId: string;
@@ -45,6 +66,12 @@ export interface MarketplaceAppliedPackage {
   readonly disposition: MarketplaceLifecycleAction;
 }
 
+interface ConnectorLocalState {
+  readonly hash: string;
+  readonly trust: "official" | "custom" | "modified" | "untrusted";
+  readonly marketplaceManaged: boolean;
+}
+
 export interface MarketplaceLifecycleAdapters {
   appExists(localId: string): Promise<boolean>;
   instantiateApp(input: {
@@ -54,9 +81,11 @@ export interface MarketplaceLifecycleAdapters {
     localId?: string;
   }): Promise<{ id: string }>;
   connectorHash(packageId: string): Promise<string | undefined>;
+  connectorState(packageId: string): Promise<ConnectorLocalState | undefined>;
   recordOfficialConnectorRelease(packageId: string, contentHash: string): void;
-  installConnector(verifiedSourceDir: string, packageId: string): Promise<void>;
-  updateConnector(verifiedSourceDir: string, packageId: string): Promise<{ updated: boolean }>;
+  recordConnectorInstallation(packageId: string, contentHash: string, releaseId: string): void;
+  installConnector(verifiedSourceDir: string, packageId: string, guard?: ConnectorHostGuard): Promise<void>;
+  updateConnector(verifiedSourceDir: string, packageId: string, guard?: ConnectorHostGuard): Promise<{ updated: boolean }>;
 }
 
 export interface MarketplaceServiceOptions {
@@ -73,6 +102,7 @@ interface MarketplaceStage {
   readonly extractedPath: string;
   readonly prepared: MarketplacePreparedPackage;
   readonly connectorHashAtPrepare: string | null;
+  readonly expectedAction?: "install" | "update";
   applying: boolean;
 }
 
@@ -111,12 +141,24 @@ export class MarketplaceService {
     });
   }
 
-  async prepare(kind: MarketplacePackageKind, packageId: string): Promise<MarketplacePreparedPackage> {
+  async prepare(
+    kind: MarketplacePackageKind,
+    packageId: string,
+    expectedAction?: "install" | "update",
+  ): Promise<MarketplacePreparedPackage> {
     if (
       (kind !== "app" && kind !== "connector")
       || !SCOPED_PACKAGE_ID_PATTERN.test(packageId)
     ) {
       throw new Error("Marketplace package identity is invalid");
+    }
+    if (kind === "app" && expectedAction !== undefined) {
+      throw new Error("Marketplace App prepare does not accept a Connector action");
+    }
+    // Strict verbs are local preconditions. Do not contact Marketplace when
+    // the installed state already determines that the command is invalid.
+    if (kind === "connector" && expectedAction !== undefined) {
+      await this.assertExpectedConnectorAction(packageId, expectedAction);
     }
     if (this.stages.size >= MAX_ACTIVE_MARKETPLACE_STAGES) {
       throw new Error("Too many Marketplace packages are awaiting confirmation");
@@ -128,37 +170,90 @@ export class MarketplaceService {
     await mkdir(root, { recursive: false, mode: 0o700 });
     await chmod(root, 0o700);
     try {
-      const resolution = await resolveMarketplacePackage({
-        apiOrigin: this.options.apiOrigin,
-        kind,
-        packageId,
-        trustRoots: this.options.trustRoots,
-        fetchImpl: this.options.fetchImpl,
-      });
-      await downloadMarketplaceArtifact({
-        artifactPath: resolution.artifactPath,
-        artifactBytes: resolution.artifactBytes,
-        destinationPath: archivePath,
-        fetchImpl: this.options.fetchImpl,
-      });
-      const archiveBytes = await readFile(archivePath);
-      if (archiveBytes.byteLength !== resolution.artifactBytes) {
-        throw new Error("Marketplace staged artifact size changed before verification");
+      let resolution: MarketplaceResolvePayload;
+      try {
+        resolution = await resolveMarketplacePackage({
+          apiOrigin: this.options.apiOrigin,
+          kind,
+          packageId,
+          trustRoots: this.options.trustRoots,
+          fetchImpl: this.options.fetchImpl,
+        });
+      } catch (error) {
+        if (kind !== "connector") throw error;
+        throw error instanceof MarketplaceUnavailableError
+          ? new ConnectorMarketplaceError(
+              "CONNECTOR_MARKETPLACE_UNAVAILABLE",
+              "Marketplace is unavailable; retry the Connector command when it is reachable.",
+              { cause: error },
+            )
+          : new ConnectorMarketplaceError(
+              "CONNECTOR_VERIFICATION_FAILED",
+              "Marketplace release verification failed; retry the Connector command with a valid Official release.",
+              { cause: error instanceof Error ? error : undefined },
+            );
       }
-      const artifact = verifyMarketplaceArtifact({
-        kind,
-        packageId,
-        contentHash: resolution.contentHash,
-        archiveBytes,
-      });
-      await extractVerifiedMarketplaceArtifact(artifact, extractedPath);
+      try {
+        await downloadMarketplaceArtifact({
+          artifactPath: resolution.artifactPath,
+          artifactBytes: resolution.artifactBytes,
+          destinationPath: archivePath,
+          fetchImpl: this.options.fetchImpl,
+        });
+      } catch (error) {
+        if (kind !== "connector") throw error;
+        throw new ConnectorMarketplaceError(
+          "CONNECTOR_MARKETPLACE_UNAVAILABLE",
+          "Marketplace release download failed; retry the Connector command when Marketplace is reachable.",
+          { cause: error instanceof Error ? error : undefined },
+        );
+      }
+      let artifact;
+      try {
+        const archiveBytes = await readFile(archivePath);
+        if (archiveBytes.byteLength !== resolution.artifactBytes) {
+          throw new Error("Marketplace staged artifact size changed before verification");
+        }
+        artifact = verifyMarketplaceArtifact({
+          kind,
+          packageId,
+          contentHash: resolution.contentHash,
+          archiveBytes,
+        });
+        await extractVerifiedMarketplaceArtifact(artifact, extractedPath);
+      } catch (error) {
+        if (kind !== "connector") throw error;
+        throw new ConnectorMarketplaceError(
+          "CONNECTOR_VERIFICATION_FAILED",
+          "Marketplace release verification failed; retry the Connector command with a valid Official release.",
+          { cause: error instanceof Error ? error : undefined },
+        );
+      }
       await rm(archivePath, { force: true });
 
+      const deriveDisposition = async () => {
+        let disposition;
+        if (kind === "connector" && expectedAction !== undefined) {
+          const state = await this.assertExpectedConnectorAction(packageId, expectedAction);
+          disposition = connectorDisposition(state?.hash, resolution.contentHash);
+          if (expectedAction === "install" && disposition.action !== "install") {
+            throw alreadyInstalled(packageId);
+          }
+          if (expectedAction === "update"
+            && disposition.action !== "update"
+            && disposition.action !== "already-installed") {
+            throw notInstalled(packageId);
+          }
+        } else {
+          disposition = await this.disposition(kind, packageId, resolution.contentHash);
+        }
+        return disposition;
+      };
       const {
         action,
         localIdConflict,
         connectorHashAtPrepare,
-      } = await this.disposition(kind, packageId, resolution.contentHash);
+      } = await deriveDisposition();
       const prepared: MarketplacePreparedPackage = Object.freeze({
         stageId,
         kind,
@@ -177,6 +272,7 @@ export class MarketplaceService {
         extractedPath,
         prepared,
         connectorHashAtPrepare,
+        ...(expectedAction === undefined ? {} : { expectedAction }),
         applying: false,
       });
       return prepared;
@@ -186,7 +282,11 @@ export class MarketplaceService {
     }
   }
 
-  async apply(stageId: string, localId?: string): Promise<MarketplaceAppliedPackage> {
+  async apply(
+    stageId: string,
+    localId?: string,
+    guard?: ConnectorHostGuard,
+  ): Promise<MarketplaceAppliedPackage> {
     const stage = this.requireStage(stageId);
     if (stage.applying) throw new Error("Marketplace package is already being applied");
     stage.applying = true;
@@ -206,29 +306,83 @@ export class MarketplaceService {
         });
       }
 
-      if (localId !== undefined) {
-        throw new Error("Connector Marketplace apply does not accept a local App ID");
-      }
+      {
+        if (localId !== undefined) {
+          throw new Error("Connector Marketplace apply does not accept a local App ID");
+        }
 
-      const current = await this.options.lifecycle.connectorHash(stage.prepared.packageId);
-      if ((current ?? null) !== stage.connectorHashAtPrepare) {
-        throw new Error("Connector installation state changed; confirm the Marketplace package again");
-      }
-      const action: MarketplaceLifecycleAction = current === stage.prepared.contentHash
-        ? "already-installed"
-        : current === undefined
-          ? "install"
-          : "update";
-      if (action !== stage.prepared.action) {
-        throw new Error("Connector installation state changed; confirm the Marketplace package again");
-      }
-      if (action === "already-installed") {
-        // The bytes may have arrived through a local/custom path and still be
-        // untrusted. Confirmation of the signed Official release grants only
-        // this exact logical hash; it does not rewrite or reinstall the tree.
+        let expectedState: ConnectorLocalState | undefined;
+        if (stage.expectedAction !== undefined) {
+          expectedState = await this.assertExpectedConnectorAction(
+            stage.prepared.packageId,
+            stage.expectedAction,
+          );
+        }
+        const current = stage.expectedAction === undefined
+          ? await this.options.lifecycle.connectorHash(stage.prepared.packageId)
+          : expectedState?.hash;
+        if ((current ?? null) !== stage.connectorHashAtPrepare) {
+          throw stateChanged(stage.prepared.packageId, stage.expectedAction);
+        }
+        const action: MarketplaceLifecycleAction = current === stage.prepared.contentHash
+          ? "already-installed"
+          : current === undefined
+            ? "install"
+            : "update";
+        if (action !== stage.prepared.action) {
+          throw stateChanged(stage.prepared.packageId, stage.expectedAction);
+        }
+        if (stage.expectedAction !== undefined) {
+          if (stage.expectedAction === "install" && action !== "install") {
+            throw alreadyInstalled(stage.prepared.packageId);
+          }
+          if (stage.expectedAction === "update" && action !== "update" && action !== "already-installed") {
+            throw notInstalled(stage.prepared.packageId);
+          }
+        }
+        if (action === "already-installed") {
+          // The bytes may have arrived through a local/custom path and still be
+          // untrusted. Confirmation of the signed Official release grants only
+          // this exact logical hash; it does not rewrite or reinstall the tree.
+          this.options.lifecycle.recordOfficialConnectorRelease(
+            stage.prepared.packageId,
+            stage.prepared.contentHash,
+          );
+          this.options.lifecycle.recordConnectorInstallation(
+            stage.prepared.packageId,
+            stage.prepared.contentHash,
+            stage.prepared.releaseId,
+          );
+          return Object.freeze({
+            ok: true,
+            kind: "connector",
+            id: stage.prepared.packageId,
+            disposition: action,
+          });
+        }
         this.options.lifecycle.recordOfficialConnectorRelease(
           stage.prepared.packageId,
           stage.prepared.contentHash,
+        );
+        if (action === "install") {
+          await this.options.lifecycle.installConnector(stage.extractedPath, stage.prepared.packageId, guard);
+        } else {
+          const result = await this.options.lifecycle.updateConnector(
+            stage.extractedPath,
+            stage.prepared.packageId,
+            guard,
+          );
+          if (!result.updated) {
+            throw new ConnectorMarketplaceError(
+              "CONNECTOR_UPDATE_INCOMPATIBLE",
+              `Connector ${stage.prepared.packageId} could not install the confirmed release; inspect it before retrying connector update.`,
+            );
+          }
+        }
+        this.options.lifecycle.recordConnectorInstallation(
+          stage.prepared.packageId,
+          stage.prepared.contentHash,
+          stage.prepared.releaseId,
         );
         return Object.freeze({
           ok: true,
@@ -237,31 +391,35 @@ export class MarketplaceService {
           disposition: action,
         });
       }
-      this.options.lifecycle.recordOfficialConnectorRelease(
-        stage.prepared.packageId,
-        stage.prepared.contentHash,
-      );
-      if (action === "install") {
-        await this.options.lifecycle.installConnector(stage.extractedPath, stage.prepared.packageId);
-      } else {
-        const result = await this.options.lifecycle.updateConnector(
-          stage.extractedPath,
-          stage.prepared.packageId,
-        );
-        if (!result.updated) {
-          throw new Error("Connector update did not install the confirmed release");
-        }
-      }
-      return Object.freeze({
-        ok: true,
-        kind: "connector",
-        id: stage.prepared.packageId,
-        disposition: action,
-      });
     } finally {
       this.stages.delete(stageId);
       await rm(stage.root, { recursive: true, force: true }).catch(() => {});
     }
+  }
+
+  private async assertExpectedConnectorAction(
+    packageId: string,
+    expectedAction: "install" | "update",
+  ): Promise<ConnectorLocalState | undefined> {
+    const state = await this.options.lifecycle.connectorState(packageId);
+    if (expectedAction === "install") {
+      if (state) throw alreadyInstalled(packageId);
+      return undefined;
+    }
+    if (!state) throw notInstalled(packageId);
+    if (state.trust === "modified") {
+      throw new ConnectorMarketplaceError(
+        "CONNECTOR_MODIFIED",
+        `Connector ${packageId} has local package modifications; restore the installed package before running connector update.`,
+      );
+    }
+    if (state.trust !== "official" || !state.marketplaceManaged) {
+      throw new ConnectorMarketplaceError(
+        "CONNECTOR_NOT_MARKETPLACE_MANAGED",
+        `Connector ${packageId} is not Marketplace-managed; install the Official Connector before running connector update.`,
+      );
+    }
+    return state;
   }
 
   async cancel(stageId: string): Promise<void> {
@@ -297,14 +455,49 @@ export class MarketplaceService {
       };
     }
     const installedHash = await this.options.lifecycle.connectorHash(packageId);
-    return {
-      action: installedHash === contentHash
-        ? "already-installed"
-        : installedHash === undefined
-          ? "install"
-          : "update",
-      localIdConflict: false,
-      connectorHashAtPrepare: installedHash ?? null,
-    };
+    return connectorDisposition(installedHash, contentHash);
   }
+}
+
+function connectorDisposition(
+  installedHash: string | undefined,
+  contentHash: string,
+): {
+  action: MarketplaceLifecycleAction;
+  localIdConflict: false;
+  connectorHashAtPrepare: string | null;
+} {
+  return {
+    action: installedHash === contentHash
+      ? "already-installed"
+      : installedHash === undefined
+        ? "install"
+        : "update",
+    localIdConflict: false,
+    connectorHashAtPrepare: installedHash ?? null,
+  };
+}
+
+function alreadyInstalled(packageId: string): ConnectorMarketplaceError {
+  return new ConnectorMarketplaceError(
+    "CONNECTOR_ALREADY_INSTALLED",
+    `Connector ${packageId} is already installed; use lamarck connector update ${packageId}.`,
+  );
+}
+
+function notInstalled(packageId: string): ConnectorMarketplaceError {
+  return new ConnectorMarketplaceError(
+    "CONNECTOR_NOT_INSTALLED",
+    `Connector ${packageId} is not installed; use lamarck connector install ${packageId}.`,
+  );
+}
+
+function stateChanged(
+  packageId: string,
+  expectedAction?: "install" | "update",
+): ConnectorMarketplaceError {
+  return new ConnectorMarketplaceError(
+    "CONNECTOR_UPDATE_INCOMPATIBLE",
+    `Connector ${packageId} changed after confirmation; inspect it and rerun connector ${expectedAction ?? "update"}.`,
+  );
 }

@@ -1,54 +1,40 @@
 import { describe, expect, test } from "vitest";
 import {
-  APP_PACKAGE_ID_PATTERN,
-  encodeAppCliFrame,
-  isCanonicalAppPackageId,
-  parseAppCliRequest,
-  type AppCliRequestV1,
-} from "../src/app-edit/protocol";
+  encodeCliFrame,
+  parseCliRequest,
+  type CliRequest,
+} from "@lamarck/cli";
 
-describe("private App CLI V1 protocol", () => {
-  test("matches the canonical V1 App id grammar", () => {
-    for (const id of ["x", "7zip", "market.place", "a-b.c-1"]) {
-      expect(isCanonicalAppPackageId(id)).toBe(true);
-      expect(APP_PACKAGE_ID_PATTERN.test(id)).toBe(true);
-    }
-    for (const id of ["", "Upper", "-leading", ".leading", "two..dots", "slash/id"]) {
-      expect(isCanonicalAppPackageId(id)).toBe(false);
-    }
-  });
-
-  test("accepts only the fixed lifecycle operations and rejects arbitrary Core proxying", () => {
-    const valid: AppCliRequestV1 = {
-      version: 1,
-      requestId: 1,
+describe("managed CLI V1 protocol", () => {
+  test("accepts only typed operations and rejects arbitrary Core proxying", () => {
+    const valid: CliRequest<"app.list"> = {
+      requestId: "request-1",
       operation: "app.list",
       input: {},
     };
-    expect(parseAppCliRequest(encodeAppCliFrame(valid).subarray(4), false)).toEqual(valid);
+    expect(parseCliRequest(JSON.parse(encodeCliFrame(valid).subarray(4).toString("utf8")), false)).toEqual(valid);
 
-    const arbitrary = Buffer.from(JSON.stringify({
-      version: 1,
-      requestId: 2,
+    const arbitrary = {
+      requestId: "request-2",
       operation: "core.request",
       input: { method: "DELETE", path: "/api/apps/example" },
-    }));
-    expect(() => parseAppCliRequest(arbitrary, false)).toThrow("Malformed App CLI request");
+    };
+    expect(() => parseCliRequest(arbitrary, false)).toThrow("CLI operation is invalid");
   });
 
   test("rejects caller-supplied upload authority on local workload connections", () => {
-    const forged = Buffer.from(JSON.stringify({
-      version: 1,
-      requestId: 3,
+    const forged = {
+      requestId: "request-3",
       operation: "app.save",
       input: { appId: "example" },
       upload: {
+        kind: "app-package",
         archiveDigest: `sha256:${"a".repeat(64)}`,
         archiveBytes: 1,
         baseVersion: null,
         basePackageDigest: `sha256:${"b".repeat(64)}`,
       },
-    }));
-    expect(() => parseAppCliRequest(forged, false)).toThrow("Malformed App CLI request");
+    };
+    expect(() => parseCliRequest(forged, false)).toThrow("CLI request upload is not allowed");
   });
 });

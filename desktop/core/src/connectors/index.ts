@@ -12,3 +12,4 @@ export * from "./install";
 export * from "./registry";
 export * from "./source-identity";
 export * from "./connector-package-archive";
+export * from "./installations";
