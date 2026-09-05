@@ -16,22 +16,7 @@ const packageDocument = JSON.parse(await readFile(join(cliDirectory, "package.js
 const EXPECTED_FILES = [
   "LICENSE",
   "README.md",
-  "dist/command-registry.d.ts", "dist/command-registry.js",
-  "dist/errors.d.ts", "dist/errors.js",
-  "dist/host-entry.d.ts", "dist/host-entry.js",
-  "dist/host-transport.d.ts", "dist/host-transport.js",
-  "dist/index.d.ts", "dist/index.js",
-  "dist/lamarck-managed.mjs", "dist/lamarck.mjs",
-  "dist/managed-entry.d.ts", "dist/managed-entry.js",
-  "dist/managed-transport.d.ts", "dist/managed-transport.js",
-  "dist/operations.d.ts", "dist/operations.js",
-  "dist/parser.d.ts", "dist/parser.js",
-  "dist/protocol.d.ts", "dist/protocol.js",
-  "dist/render-human.d.ts", "dist/render-human.js",
-  "dist/render-json.d.ts", "dist/render-json.js",
-  "dist/runtime.d.ts", "dist/runtime.js",
-  "dist/stream.d.ts", "dist/stream.js",
-  "dist/wire.d.ts", "dist/wire.js",
+  "dist/lamarck.mjs",
   "package.json",
 ];
 if (packageDocument.name !== "@lamarck/cli" || !/^\d+\.\d+\.\d+$/.test(packageDocument.version)) {
@@ -76,11 +61,19 @@ try {
 
 async function stagePackage() {
   const stage = await mkdtemp(join(tmpdir(), "lamarck-cli-pack-"));
+  const publishedPackage = {
+    ...packageDocument,
+    exports: {},
+    files: ["dist/lamarck.mjs", "LICENSE", "README.md"],
+  };
+  delete publishedPackage.scripts;
+  delete publishedPackage.devDependencies;
+  await mkdir(join(stage, "dist"), { recursive: true });
   await Promise.all([
-    cp(join(cliDirectory, "dist"), join(stage, "dist"), { recursive: true }),
+    cp(join(cliDirectory, "dist", "lamarck.mjs"), join(stage, "dist", "lamarck.mjs")),
     cp(join(cliDirectory, "LICENSE"), join(stage, "LICENSE")),
     cp(join(cliDirectory, "README.md"), join(stage, "README.md")),
-    cp(join(cliDirectory, "package.json"), join(stage, "package.json")),
+    writeFile(join(stage, "package.json"), `${JSON.stringify(publishedPackage, null, 2)}\n`),
   ]);
   return stage;
 }
@@ -115,6 +108,16 @@ async function verifyConsumer(tarballPath) {
     const help = await runCaptured(cli, ["--help"], consumer, cleanEnvironment(consumer, "stopped"));
     if (!help.stdout.includes("lamarck app list") || help.stdout.includes("lamarck app refresh")) {
       throw new Error("Clean consumer received an invalid Host help surface");
+    }
+    for (const specifier of ["@lamarck/cli", "@lamarck/cli/dist/lamarck.mjs"]) {
+      const imported = await runCaptured(process.execPath, [
+        "--input-type=module",
+        "--eval",
+        `import(${JSON.stringify(specifier)})`,
+      ], consumer, cleanEnvironment(consumer, "import"), true);
+      if (imported.code === 0 || !imported.stderr.includes("ERR_PACKAGE_PATH_NOT_EXPORTED")) {
+        throw new Error(`Clean consumer could import private CLI entry: ${specifier}`);
+      }
     }
     const stopped = await runCaptured(cli, ["app", "list"], consumer, cleanEnvironment(consumer, "stopped"), true);
     if (stopped.code !== 1 || stopped.stdout !== "" || stopped.stderr !== "Lamarck is not running.\n") {
