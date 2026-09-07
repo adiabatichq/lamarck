@@ -18,6 +18,7 @@ export const CLI_OPERATIONS = [
   "source.run.status",
   "source.pause",
   "source.resume",
+  "marketplace.list",
   "connector.list",
   "connector.inspect",
   "connector.install",
@@ -175,6 +176,7 @@ export interface CliOperationInputMap {
   "source.run.status": { readonly sourceId: string; readonly runId: string };
   "source.pause": { readonly sourceId: string };
   "source.resume": { readonly sourceId: string };
+  "marketplace.list": { readonly kind?: "app" | "connector" };
   "connector.list": Record<string, never>;
   "connector.inspect": { readonly connectorId: string };
   "connector.install": { readonly packageId: string };
@@ -182,7 +184,9 @@ export interface CliOperationInputMap {
   "connector.remove": { readonly connectorId: string };
   "app.list": Record<string, never>;
   "app.inspect": { readonly appId: string };
-  "app.create": { readonly appId: string; readonly name: string; readonly description: string };
+  "app.create":
+    | { readonly appId: string; readonly name: string; readonly description: string }
+    | { readonly fromPackageId: string; readonly localId?: string };
   "app.save": { readonly appId: string; readonly message?: string; readonly author?: string };
   "app.versions": { readonly appId: string };
   "app.restore": { readonly appId: string; readonly version: string; readonly message?: string; readonly author?: string };
@@ -227,6 +231,7 @@ export interface CliOperationResultMap {
   "source.run.status": SourceRunStatus;
   "source.pause": { readonly sourceId: string; readonly lifecycle: "paused" };
   "source.resume": { readonly sourceId: string; readonly lifecycle: "active" };
+  "marketplace.list": readonly JsonObject[];
   "connector.list": readonly ConnectorSummary[];
   "connector.inspect": ConnectorInspect;
   "connector.install": ConnectorMutationResult;

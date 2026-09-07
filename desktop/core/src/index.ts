@@ -34,6 +34,7 @@ import {
   removeConnectorFromWorkspace,
   resolveWorkspaceConnectorDir,
   updateConnectorFromSource,
+  type ConnectorHostGuard,
   type InstalledConnectorPackageView,
 } from "./connectors";
 import {
@@ -650,7 +651,7 @@ async function instantiateVerifiedMarketplaceApp(input: {
   packageId: string;
   releaseId: string;
   localId?: string;
-}): Promise<{ id: string }> {
+}, eventWriter: ConnectorHostGuard = guard): Promise<{ id: string }> {
   const created = await instantiateMarketplaceApp({
     verifiedSourceDir: input.verifiedSourceDir,
     appsDir,
@@ -661,7 +662,7 @@ async function instantiateVerifiedMarketplaceApp(input: {
   });
   try {
     await reloadAppRegistry();
-    await guard.writeLifecycleEvent({
+    await eventWriter.writeLifecycleEvent({
       type: "app.created",
       startedAt: Date.now(),
       payload: { appId: created.id },
@@ -1010,6 +1011,17 @@ async function executeCoreCliOperation(
       void connectorScheduler.tick().catch(() => {});
       return { sourceId: input.sourceId, lifecycle: "active" };
     }
+    case "marketplace.list": {
+      const kinds = input.kind === undefined ? ["app", "connector"] : [input.kind];
+      return (await Promise.all(kinds.map(async (kind) => {
+        const response = await fetch(new URL(`/marketplace/packages?kind=${kind}`, lamarckApiOrigin), {
+          signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+        });
+        if (!response.ok) throw cliCoded("CLI_INTERNAL", `Marketplace returned HTTP ${response.status}.`);
+        const catalog = await response.json() as { packages: unknown[] };
+        return catalog.packages;
+      }))).flat();
+    }
     case "connector.list": {
       const snapshot = await cliConnectorSnapshot();
       return [...snapshot.packages.keys()].map((connectorId) => cliConnectorSummary(snapshot, connectorId));
@@ -1073,6 +1085,11 @@ async function executeCoreCliOperation(
       return app;
     }
     case "app.create": {
+      if ("fromPackageId" in input) {
+        const prepared = await marketplaceService.prepare("app", input.fromPackageId as string);
+        const created = await marketplaceService.apply(prepared.stageId, input.localId as string | undefined, requestGuard);
+        return { id: created.id, created: true };
+      }
       const id = input.appId as string;
       const name = input.name as string;
       const description = input.description as string;

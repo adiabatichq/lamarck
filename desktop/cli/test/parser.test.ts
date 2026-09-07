@@ -13,6 +13,7 @@ describe("shared CLI parser", () => {
     [["source", "run", "source-1", "--wait"], "source.run", { sourceId: "source-1" }],
     [["source", "pause", "source-1"], "source.pause", { sourceId: "source-1" }],
     [["source", "resume", "source-1"], "source.resume", { sourceId: "source-1" }],
+    [["marketplace", "list", "--kind", "connector"], "marketplace.list", { kind: "connector" }],
     [["connector", "list"], "connector.list", {}],
     [["connector", "inspect", "lamarck.oura"], "connector.inspect", { connectorId: "lamarck.oura" }],
     [["connector", "install", "lamarck.oura"], "connector.install", { packageId: "lamarck.oura" }],
@@ -21,6 +22,7 @@ describe("shared CLI parser", () => {
     [["app", "list"], "app.list", {}],
     [["app", "inspect", "focus"], "app.inspect", { appId: "focus" }],
     [["app", "create", "focus", "--description", "Focus", "--name", "Focus App"], "app.create", { appId: "focus", name: "Focus App", description: "Focus" }],
+    [["app", "create", "--from", "lamarck.focus", "--as", "my-focus"], "app.create", { fromPackageId: "lamarck.focus", localId: "my-focus" }],
     [["app", "save", "focus", "--author", "Ada", "-m", "First"], "app.save", { appId: "focus", message: "First", author: "Ada" }],
     [["app", "versions", "focus"], "app.versions", { appId: "focus" }],
     [["app", "restore", "focus", "abc123", "--message", "Restore"], "app.restore", { appId: "focus", version: "abc123", message: "Restore" }],
@@ -53,6 +55,10 @@ describe("shared CLI parser", () => {
       .toMatchObject({ input: { argv: ["tee", "notes"], author: "Ada" }, readsStdin: true });
     expect(parseCliArgs(["connector", "remove", "--yes", "lamarck.oura"], "host"))
       .toMatchObject({ input: { connectorId: "lamarck.oura" }, confirmed: true });
+    expect(parseCliArgs(["marketplace", "list", "--kind", "app", "--json"], "managed"))
+      .toMatchObject({ operation: "marketplace.list", input: { kind: "app" }, json: true });
+    expect(parseCliArgs(["app", "create", "--as", "notes", "--from", "lamarck.notes"], "host"))
+      .toMatchObject({ operation: "app.create", input: { fromPackageId: "lamarck.notes", localId: "notes" } });
     expect(parseCliArgs(["app", "archive", "--yes", "focus"], "managed"))
       .toMatchObject({ input: { appId: "focus" }, confirmed: true });
     expect(() => parseCliArgs(["file", "--author", "Ada", "export", "notes", "host"], "host"))
@@ -70,6 +76,18 @@ describe("shared CLI parser", () => {
     expect(() => parseCliArgs(["file", "export", "a", "b"], "managed"))
       .toThrowError(expect.objectContaining({ code: "CLI_UNSUPPORTED_COMMAND" }));
     expect(() => parseCliArgs(["vfs", "ls"], "host"))
+      .toThrowError(expect.objectContaining({ code: "CLI_USAGE" }));
+  });
+
+  test("keeps blank and Marketplace App creation grammars disjoint", () => {
+    expect(parseCliArgs(["app", "create", "--from", "lamarck.notes"], "host"))
+      .toMatchObject({ operation: "app.create", input: { fromPackageId: "lamarck.notes" } });
+    expect(() => parseCliArgs([
+      "app", "create", "--from", "lamarck.notes", "--description", "Notes",
+    ], "host")).toThrowError(expect.objectContaining({ code: "CLI_USAGE" }));
+    expect(() => parseCliArgs(["app", "create", "notes", "--as", "other", "--description", "Notes"], "host"))
+      .toThrowError(expect.objectContaining({ code: "CLI_USAGE" }));
+    expect(() => parseCliArgs(["marketplace", "list", "--kind", "service"], "host"))
       .toThrowError(expect.objectContaining({ code: "CLI_USAGE" }));
   });
 });

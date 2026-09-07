@@ -79,7 +79,7 @@ export interface MarketplaceLifecycleAdapters {
     packageId: string;
     releaseId: string;
     localId?: string;
-  }): Promise<{ id: string }>;
+  }, guard?: ConnectorHostGuard): Promise<{ id: string }>;
   connectorHash(packageId: string): Promise<string | undefined>;
   connectorState(packageId: string): Promise<ConnectorLocalState | undefined>;
   recordOfficialConnectorRelease(packageId: string, contentHash: string): void;
@@ -297,7 +297,7 @@ export class MarketplaceService {
           packageId: stage.prepared.packageId,
           releaseId: stage.prepared.releaseId,
           ...(localId === undefined ? {} : { localId }),
-        });
+        }, guard);
         return Object.freeze({
           ok: true,
           kind: "app",

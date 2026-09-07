@@ -126,6 +126,10 @@ function validateInput(
   };
   switch (operation) {
     case "source.list": case "connector.list": case "app.list": empty(); break;
+    case "marketplace.list":
+      exactOptionalKeys(input, [], ["kind"], `CLI ${operation} input`);
+      if (input.kind !== undefined && input.kind !== "app" && input.kind !== "connector") throw new Error("CLI Marketplace kind is invalid");
+      break;
     case "query": id("sql"); break;
     case "source.inspect": case "source.run": case "source.pause": case "source.resume": id("sourceId"); break;
     case "source.run.status":
@@ -143,6 +147,10 @@ function validateInput(
       exactOptionalKeys(input, ["argv"], ["author"], `CLI ${operation} input`); argv(input.argv); optionalText(input.author, "author"); break;
     case "file.export": exactKeys(input, ["argv"], `CLI ${operation} input`); argv(input.argv); break;
     case "app.create":
+      if ("fromPackageId" in input) {
+        exactOptionalKeys(input, ["fromPackageId"], ["localId"], `CLI ${operation} input`);
+        text(input.fromPackageId, "fromPackageId"); optionalText(input.localId, "localId"); break;
+      }
       exactKeys(input, ["appId", "description", "name"], `CLI ${operation} input`); text(input.appId, "appId"); text(input.name, "name"); text(input.description, "description"); break;
     case "app.save":
       exactOptionalKeys(input, ["appId"], ["author", "message"], `CLI ${operation} input`); text(input.appId, "appId"); optionalText(input.author, "author"); optionalText(input.message, "message"); break;

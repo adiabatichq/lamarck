@@ -63,6 +63,12 @@ export function parseCliArgs(argv: readonly string[], environment: CliEnvironmen
       if (verb === "run") wait = removeBooleanFlag(args, "--wait");
       operation = `source.${verb}` as CliOperation; input = { sourceId: oneArg(args, `source ${verb}`) };
     } else usage("source requires list, inspect, run, pause, or resume");
+  } else if (top === "marketplace") {
+    if (args.shift() !== "list") usage("marketplace requires list");
+    const kind = removeValueFlag(args, "--kind");
+    if (kind !== undefined && kind !== "app" && kind !== "connector") usage("marketplace list --kind must be app or connector");
+    noArgs(args, "marketplace list");
+    operation = "marketplace.list"; input = kind === undefined ? {} : { kind };
   } else if (top === "connector") {
     const verb = args.shift();
     if (verb === "list") {
@@ -79,6 +85,11 @@ export function parseCliArgs(argv: readonly string[], environment: CliEnvironmen
       noArgs(args, "app list"); operation = "app.list"; input = {};
     } else if (verb === "inspect" || verb === "versions") {
       operation = `app.${verb}` as CliOperation; input = { appId: oneArg(args, `app ${verb}`) };
+    } else if (verb === "create" && args.includes("--from")) {
+      const fromPackageId = removeValueFlag(args, "--from")!;
+      const localId = removeValueFlag(args, "--as");
+      noArgs(args, "app create --from");
+      operation = "app.create"; input = { fromPackageId, ...(localId === undefined ? {} : { localId }) };
     } else if (verb === "create") {
       const appId = args.shift();
       if (!appId) usage("app create requires an App id");

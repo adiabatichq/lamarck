@@ -10,7 +10,7 @@
     "node": ">=24.10.0"
   },
   "dependencies": {
-    "@lamarck/cli": "0.1.1"
+    "@lamarck/cli": "0.1.2"
   },
   "scripts": {
     "pretest": "npm --workspace @lamarck/cli run build",

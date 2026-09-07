@@ -90,7 +90,7 @@ describe("Marketplace lifecycle staging service", () => {
       packageId: release.packageId,
       releaseId: release.releaseId,
       localId: "my-notes",
-    });
+    }, undefined);
     await expect(stat(extractedDuringApply)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readdir(stagingRoot)).toEqual([]);
 
