@@ -7,7 +7,8 @@
 // and publication) deliberately remains outside it.
 
 import { spawnSync } from "node:child_process";
-import { rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -57,6 +58,7 @@ export async function buildDesktop(options = {}) {
     join(context.shellDir, "dist", "index.html"),
     ...hostOutputPaths(context),
   ]);
+  await verifyCoreBundleStarts(context);
 }
 
 export async function buildDesktopHost(options = {}) {
@@ -66,6 +68,7 @@ export async function buildDesktopHost(options = {}) {
   buildSystemSdk(context);
   buildElectronHost(context);
   await verifyOutputs(context, hostOutputPaths(context));
+  await verifyCoreBundleStarts(context);
 }
 
 function buildContext(options) {
@@ -159,6 +162,33 @@ async function verifyOutputs(context, outputs) {
     }
   }
   console.log(`[desktop-build] Production outputs verified under ${context.shellDir}`);
+}
+
+async function verifyCoreBundleStarts(context) {
+  const workspace = await mkdtemp(join(tmpdir(), "lamarck-desktop-core-smoke-"));
+  const env = {
+    ...context.env,
+    LAMARCK_CORE_TOKEN: "desktop-core-smoke-token",
+  };
+  delete env.LAMARCK_GUARD_ORIGIN;
+  delete env.LAMARCK_GUARD_TOKEN;
+  try {
+    const result = spawnSync(process.execPath, [
+      join(context.shellDir, "dist-electron", "core.mjs"),
+      workspace,
+    ], {
+      cwd: context.root,
+      env,
+      encoding: "utf8",
+    });
+    if (result.error) throw result.error;
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    if (result.status !== 1 || !output.includes("Guard service configuration is missing")) {
+      throw new Error(`Desktop Core bundle failed its startup smoke test: ${output.trim()}`);
+    }
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
 }
 
 function assertSupportedNode() {

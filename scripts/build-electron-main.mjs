@@ -48,6 +48,14 @@ await esbuild.build({
   format: "esm",
   target: "node24",
   external: ["node:sqlite"],
+  // isomorphic-git's package export otherwise selects its CJS build, whose
+  // dynamic requires cannot execute inside Core's ESM bundle.
+  alias: {
+    "isomorphic-git": resolve(root, "node_modules/isomorphic-git/index.js"),
+  },
+  banner: {
+    js: 'import { createRequire as __lamarckCreateRequire } from "node:module"; const require = __lamarckCreateRequire(import.meta.url);',
+  },
   define: buildIdentityDefine,
 });
 await esbuild.build({
