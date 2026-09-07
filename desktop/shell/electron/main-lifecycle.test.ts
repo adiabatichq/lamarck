@@ -4,6 +4,17 @@ import { describe, expect, test } from "vitest";
 const mainSource = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
 
 describe("Shell window lifecycle", () => {
+  test("runs cache maintenance once at Desktop startup before exposing App lifecycle IPC", () => {
+    const ready = mainSource.match(/app\.whenReady\(\)\.then\(async \(\) => \{[\s\S]*?\n\}\);/)?.[0];
+    if (!ready) throw new Error("Desktop ready lifecycle is missing");
+    const maintenance = ready.indexOf("await capsuleBackend.initializeCache()");
+    expect(maintenance).toBeGreaterThan(ready.indexOf("if (!ownsSingleInstance) return"));
+    expect(maintenance).toBeLessThan(ready.indexOf('ipcMain.handle("app-viewer:open"'));
+    expect(maintenance).toBeLessThan(ready.indexOf("await createWindow()"));
+    expect(ready).toContain('console.warn("[electron] Capsule startup cache maintenance failed:", error)');
+    expect(mainSource.match(/capsuleBackend\.initializeCache\(/g)).toHaveLength(1);
+  });
+
   test("validates the selected Workspace files directory at the VM mount boundary", () => {
     expect(mainSource).toContain("workspaceFilesPath: () => validateWorkspaceFilesMountPath(workspace)");
     expect(mainSource).not.toContain('workspaceFilesPath: () => join(workspace, "files")');

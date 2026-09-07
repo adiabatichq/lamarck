@@ -2800,6 +2800,13 @@ async function createWindow(): Promise<void> {
 
 app.whenReady().then(async () => {
   if (!ownsSingleInstance) return;
+  try {
+    await capsuleBackend.initializeCache();
+  } catch (error) {
+    // Cache maintenance is not Core/Workspace readiness. A launch still
+    // validates its own artifact and enforces the normal storage limits.
+    console.warn("[electron] Capsule startup cache maintenance failed:", error);
+  }
   powerMonitor.on("suspend", () => {
     guardHeartbeat.suspend();
   });

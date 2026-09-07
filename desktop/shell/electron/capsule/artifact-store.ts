@@ -30,6 +30,8 @@ const APP_KEY_PATTERN = /^[a-f0-9]{64}$/;
 const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024 * 1024;
 const MAX_ACTIVATION_BYTES = 4 * 1024;
 
+class InvalidArtifactActivationError extends Error {}
+
 export interface HostArtifactIdentity {
   readonly digest: `sha256:${string}`;
   readonly bytes: number;
@@ -99,6 +101,11 @@ export class HostArtifactStore {
       ...DEFAULT_ARTIFACT_WRITER_DEPENDENCIES,
       ...options.artifactWriter,
     };
+  }
+
+  /** Desktop startup only: discard unusable cache pointers, then reclaim residue. */
+  async initialize(): Promise<void> {
+    await this.pruneUnreferenced();
   }
 
   /**
@@ -474,7 +481,7 @@ export class HostArtifactStore {
     } catch (error) {
       if (isNodeError(error, "ENOENT")) return undefined;
       if (isNodeError(error, "ELOOP")) {
-        throw new Error("Host artifact activation pointer is invalid", { cause: error });
+        throw new InvalidArtifactActivationError("Host artifact activation pointer is invalid", { cause: error });
       }
       throw error;
     }
@@ -488,47 +495,22 @@ export class HostArtifactStore {
         || details.size > BigInt(MAX_ACTIVATION_BYTES)
         || (Number(details.mode) & 0o777) !== 0o600
       ) {
-        throw new Error("Host artifact activation pointer is invalid");
+        throw new InvalidArtifactActivationError("Host artifact activation pointer is invalid");
       }
       bytes = await input.readFile();
       const after = await input.stat({ bigint: true });
       assertSameFile(details, after, "Host artifact activation pointer changed while reading");
       if (bytes.byteLength !== Number(details.size)) {
-        throw new Error("Host artifact activation pointer was truncated while reading");
+        throw new InvalidArtifactActivationError("Host artifact activation pointer was truncated while reading");
       }
     } finally {
       await input.close();
     }
-    let value: unknown;
-    try {
-      value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
-    } catch {
-      throw new Error("Host artifact activation pointer is not valid UTF-8 JSON");
+    const { digest, bytes: artifactBytes, ...provenance } = parseActivation(bytes);
+    const artifact = await this.find(digest, artifactBytes);
+    if (!artifact) {
+      throw new InvalidArtifactActivationError("Host artifact is missing or failed integrity verification");
     }
-    if (!isPlainObject(value)) {
-      throw new Error("Host artifact activation pointer has an invalid schema");
-    }
-    const current = value.schemaVersion === 1 && hasExactKeys(value, [
-      "schemaVersion",
-      "appVersion",
-      "digest",
-      "bytes",
-      "packageDigest",
-      "imageDigest",
-      "installDigest",
-      "dependencyDigest",
-    ]);
-    if (!current) {
-      throw new Error("Unsupported Host artifact activation version or schema");
-    }
-    const appVersion = validateAppVersion(value.appVersion);
-    const digest = validateDigest(value.digest);
-    const packageDigest = validateDigest(value.packageDigest);
-    const imageDigest = validateDigest(value.imageDigest);
-    const installDigest = validateDigest(value.installDigest);
-    const dependencyDigest = validateDigest(value.dependencyDigest);
-    validateArtifactBytes(value.bytes);
-    const artifact = await this.require(digest, value.bytes);
     await this.#storageBudget?.claim({
       owner: appKey,
       scope: "artifact-cas",
@@ -537,15 +519,11 @@ export class HostArtifactStore {
     });
     return Object.freeze({
       artifact,
-      appVersion,
-      packageDigest,
-      imageDigest,
-      installDigest,
-      dependencyDigest,
+      ...provenance,
     });
   }
 
-  /** Keeps every activation/LKG pointer and evicts all reconstructable CAS residue. */
+  /** Startup GC; keeps every valid activation/LKG and evicts unreferenced CAS residue. */
   async pruneUnreferenced(): Promise<number> {
     const root = await this.#prepare();
     const pinned = new Set<string>();
@@ -562,9 +540,18 @@ export class HostArtifactStore {
         }
         throw new Error("Host artifact activation directory contains an invalid entry");
       }
-      const activation = await this.active(match[1]!);
-      if (activation) pinned.add(activation.artifact.path);
+      try {
+        const activation = await this.active(match[1]!);
+        if (activation) pinned.add(activation.artifact.path);
+      } catch (error) {
+        // Invalid metadata or missing/corrupt artifacts are cache misses, not
+        // a migration. I/O, accounting and filesystem-boundary errors still
+        // surface to startup; never turn them into recursive cache deletion.
+        if (!(error instanceof InvalidArtifactActivationError)) throw error;
+        await rm(join(activeDirectory, entry.name));
+      }
     }
+    await syncDirectory(activeDirectory);
 
     let removedBytes = 0;
     const casRoot = join(root, "cas", "sha256");
@@ -738,7 +725,7 @@ export class HostArtifactStore {
         || (Number(before.mode) & 0o777) !== 0o400
         || (expectedBytes !== undefined && before.size !== BigInt(expectedBytes))
       ) {
-        throw new Error("Host artifact CAS entry is invalid");
+        throw new InvalidArtifactActivationError("Host artifact CAS entry is invalid");
       }
       const hash = createHash("sha256");
       const buffer = Buffer.allocUnsafe(1024 * 1024);
@@ -752,7 +739,7 @@ export class HostArtifactStore {
       const after = await input.stat({ bigint: true });
       assertSameFile(before, after, "Host artifact CAS entry changed while hashing");
       if (`sha256:${hash.digest("hex")}` !== digest) {
-        throw new Error("Host artifact CAS digest verification failed");
+        throw new InvalidArtifactActivationError("Host artifact CAS digest verification failed");
       }
       const bytes = Number(before.size);
       return Object.freeze({
@@ -875,6 +862,35 @@ function openVerifiedReadStream(path: string, expected: BigIntStats): ReturnType
   } catch (error) {
     closeSync(descriptor);
     throw error;
+  }
+}
+
+function parseActivation(bytes: Buffer) {
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+  } catch {
+    throw new InvalidArtifactActivationError("Host artifact activation pointer is not valid UTF-8 JSON");
+  }
+  if (!isPlainObject(value) || value.schemaVersion !== 1 || !hasExactKeys(value, [
+    "schemaVersion", "appVersion", "digest", "bytes", "packageDigest",
+    "imageDigest", "installDigest", "dependencyDigest",
+  ])) {
+    throw new InvalidArtifactActivationError("Unsupported Host artifact activation version or schema");
+  }
+  try {
+    validateArtifactBytes(value.bytes);
+    return {
+      bytes: value.bytes,
+      digest: validateDigest(value.digest),
+      appVersion: validateAppVersion(value.appVersion),
+      packageDigest: validateDigest(value.packageDigest),
+      imageDigest: validateDigest(value.imageDigest),
+      installDigest: validateDigest(value.installDigest),
+      dependencyDigest: validateDigest(value.dependencyDigest),
+    };
+  } catch (error) {
+    throw new InvalidArtifactActivationError("Host artifact activation pointer has invalid provenance", { cause: error });
   }
 }
 

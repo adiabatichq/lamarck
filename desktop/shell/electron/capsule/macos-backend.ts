@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Duplex } from "node:stream";
 import {
@@ -219,6 +220,7 @@ interface GuestSessionLike {
 }
 
 interface ArtifactStoreLike {
+  initialize(): Promise<void>;
   active(appKey: string): Promise<HostArtifactActivation | undefined>;
   find(digest: string, bytes?: number): Promise<HostArtifact | undefined>;
   receive(
@@ -240,7 +242,6 @@ interface ArtifactStoreLike {
   ): Promise<void>;
   deactivate(appKey: string): Promise<void>;
   retain(artifact: HostArtifact): HostArtifactRetention;
-  pruneUnreferenced(): Promise<number>;
 }
 
 export interface MacOsCapsuleBackendDependencies {
@@ -404,6 +405,22 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     this.#artifacts = this.#dependencies.artifactStore(options.artifactRoot, this.#storageBudget);
   }
 
+  /** Called by Desktop startup before App lifecycle IPC is available; never boots the VM. */
+  async initializeCache(): Promise<void> {
+    if (this.#dependencies.hostPlatform !== "darwin") return;
+    for (const kind of ["packages", "dependencies"]) {
+      const root = join(this.#options.cacheDirectory, kind);
+      const entries = await readdir(root).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return [];
+        throw error;
+      });
+      for (const name of entries) {
+        await this.#storageBudget.remove(join(root, name), { recursive: true });
+      }
+    }
+    await this.#artifacts.initialize();
+  }
+
   setBoundaryLostHandler(handler: (error: unknown) => void): void {
     this.#boundaryLostHandler = handler;
   }
@@ -476,9 +493,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     return this.#withLaunch(spec.appId, (signal) => this.#serial.run(async () => {
       this.#assertAcceptingWork();
       const ownerKey = hashAppId(spec.appId);
-      let prepared: PreparedUiRecord | undefined;
       let launchedCandidate: Candidate | undefined;
-      let candidateRetention: HostArtifactRetention | undefined;
       try {
         return await this.#withTransientStorage(ownerKey, async () => {
           let previous: UiRecord | undefined;
@@ -524,13 +539,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           launchedCandidate = candidate;
           candidate.lifecycle = "prepared";
           const preparationId = this.#allocatePreparationId();
-          candidateRetention = this.#artifacts.retain(candidate.artifact);
-          prepared = {
+          const prepared: PreparedUiRecord = {
             preparationId,
             candidate,
             packageDigest: snapshot.packageDigest,
             ...(previousInstanceId === undefined ? {} : { previousInstanceId }),
-            retention: candidateRetention,
+            retention: this.#artifacts.retain(candidate.artifact),
             state: "prepared",
           };
           this.#preparedUi.set(preparationId, prepared);
@@ -541,7 +555,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           });
         });
       } catch (error) {
-        const candidate = prepared?.candidate ?? launchedCandidate;
+        const candidate = launchedCandidate;
         if (!candidate) throw error;
         const failures: unknown[] = [error];
         try {
@@ -550,17 +564,11 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         } catch (cleanupError) {
           failures.push(cleanupError);
           await this.#loseBoundary(cleanupError);
-        } finally {
-          if (prepared) {
-            this.#completePreparation(prepared, { decision: "aborted" });
-          } else {
-            candidateRetention?.release();
-          }
         }
         if (failures.length > 1) {
           throw new AggregateError(
             failures,
-            "Prepared UI cleanup after storage GC failure failed",
+            "Failed App preparation cleanup failed",
           );
         }
         throw error;
@@ -596,7 +604,6 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     return this.#serial.runCritical(async () => {
       const outcome = this.#preparedOutcomes.get(preparationId);
       if (outcome?.decision === "aborted") {
-        await this.#artifacts.pruneUnreferenced();
         return;
       }
       if (outcome?.decision === "committed") {
@@ -608,7 +615,6 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         throw new Error("App Capsule UI preparation is already committing");
       }
       await this.#abortPreparation(prepared);
-      await this.#artifacts.pruneUnreferenced();
     });
   }
 
@@ -670,7 +676,6 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       const prepared = this.#preparedInstances.get(instanceId);
       if (prepared) {
         await this.#abortPreparation(prepared);
-        await this.#artifacts.pruneUnreferenced();
         return;
       }
       const instance = this.#instances.get(instanceId);
@@ -705,7 +710,6 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           }
         }
       }
-      if (preparations.length > 0) await this.#artifacts.pruneUnreferenced();
     });
   }
 
@@ -743,16 +747,21 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       const ownerKey = hashAppId(appId);
       // These are the complete App-owned reconstructable Host targets. The
       // physical Workspace and D0/D1/D2 are deliberately unreachable here.
-      await this.#artifacts.deactivate(ownerKey);
-      await this.#storageBudget.remove(
-        join(this.#options.cacheDirectory, "packages", ownerKey),
-        { recursive: true },
-      );
-      await this.#storageBudget.remove(
-        join(this.#options.cacheDirectory, "dependencies", ownerKey),
-        { recursive: true },
-      );
-      await this.#artifacts.pruneUnreferenced();
+      try {
+        await this.#artifacts.deactivate(ownerKey);
+        await this.#storageBudget.remove(
+          join(this.#options.cacheDirectory, "packages", ownerKey),
+          { recursive: true },
+        );
+        await this.#storageBudget.remove(
+          join(this.#options.cacheDirectory, "dependencies", ownerKey),
+          { recursive: true },
+        );
+      } catch (error) {
+        // Runtime retirement is already confirmed. Reconstructable cache
+        // residue must not turn a completed archive into a failed command.
+        console.warn(`[capsule] Retired App cache cleanup failed (${appId}):`, error);
+      }
     });
   }
 
@@ -2338,7 +2347,6 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       void this.#serial.runCritical(async () => {
         if (this.#preparedUi.get(prepared.preparationId) !== prepared) return;
         await this.#abortPreparation(prepared, terminalError);
-        await this.#artifacts.pruneUnreferenced();
       }).catch((error) => this.#loseBoundaryInBackground(error, boot));
       return;
     }
@@ -2759,26 +2767,17 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     const reclaim = async () => {
       await this.#storageBudget.remove(packageCache, { recursive: true });
       await this.#storageBudget.remove(dependencyCache, { recursive: true });
-      await this.#artifacts.pruneUnreferenced();
     };
     await reclaim();
-    let result: T | undefined;
-    let failure: unknown;
     try {
-      result = await operation();
-    } catch (error) {
-      failure = error;
-    }
-    try {
-      await reclaim();
-    } catch (cleanupError) {
-      if (failure !== undefined) {
-        throw new AggregateError([failure, cleanupError], "Capsule operation and storage GC failed");
+      return await operation();
+    } finally {
+      try {
+        await reclaim();
+      } catch (error) {
+        console.warn(`[capsule] App build cache cleanup failed (${ownerKey}):`, error);
       }
-      throw cleanupError;
     }
-    if (failure !== undefined) throw failure;
-    return result!;
   }
 
   async #reconcileStateDiskResidueBeforeStorageAdmission(): Promise<void> {

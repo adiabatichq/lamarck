@@ -43,6 +43,76 @@ function storageBudget(root: string): CapsuleStorageBudget {
 }
 
 describe("HostArtifactStore", () => {
+  test("startup discards old and malformed pointers without migrating or losing valid artifacts", async () => {
+    const { root, store } = fixture();
+    const bytes = Buffer.from("valid reusable artifact");
+    const expected = identity(bytes);
+    const artifact = await store.receive(OWNER, expected.digest, expected.bytes, Readable.from([bytes]));
+    await store.activate(OWNER, artifact, {
+      appVersion: APP_VERSION,
+      packageDigest: `sha256:${"1".repeat(64)}`,
+      imageDigest: `sha256:${"2".repeat(64)}`,
+      installDigest: `sha256:${"3".repeat(64)}`,
+      dependencyDigest: `sha256:${"4".repeat(64)}`,
+    });
+    const staleBytes = Buffer.from("old unreferenced artifact");
+    const stale = identity(staleBytes);
+    const staleArtifact = await store.receive(OWNER, stale.digest, stale.bytes, Readable.from([staleBytes]));
+    const pointer = JSON.parse(await readFile(join(root, "active", `${OWNER}.json`), "utf8"));
+    const oldOwner = "c".repeat(64);
+    const malformedOwner = "d".repeat(64);
+    const { schemaVersion: _schema, appVersion, ...oldFields } = pointer;
+    await writeFile(join(root, "active", `${oldOwner}.json`), JSON.stringify({
+      version: appVersion, ...oldFields, ...stale,
+    }), { mode: 0o600 });
+    await writeFile(join(root, "active", `${malformedOwner}.json`), "{broken", { mode: 0o600 });
+    await expect(store.active(oldOwner)).rejects.toThrow("Unsupported Host artifact activation");
+
+    // Simulate the next Desktop process, before any App is launched.
+    const fresh = new HostArtifactStore(root);
+    await fresh.initialize();
+    expect(await readdir(join(root, "active"))).toEqual([`${OWNER}.json`]);
+    expect(await fresh.active(OWNER)).toMatchObject({ artifact: expected });
+    expect(await readFile(artifact.path)).toEqual(bytes);
+    await expect(readFile(staleArtifact.path)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fresh.initialize()).resolves.toBeUndefined();
+  });
+
+  test.each(["missing", "corrupt"])("startup discards a pointer to a %s artifact", async (kind) => {
+    const { root, store } = fixture();
+    const bytes = Buffer.from("valid artifact");
+    const expected = identity(bytes);
+    const artifact = await store.receive(OWNER, expected.digest, expected.bytes, Readable.from([bytes]));
+    await store.activate(OWNER, artifact, {
+      appVersion: APP_VERSION,
+      packageDigest: `sha256:${"1".repeat(64)}`,
+      imageDigest: `sha256:${"2".repeat(64)}`,
+      installDigest: `sha256:${"3".repeat(64)}`,
+      dependencyDigest: `sha256:${"4".repeat(64)}`,
+    });
+    if (kind === "missing") await rm(artifact.path);
+    else {
+      await chmod(artifact.path, 0o600);
+      await writeFile(artifact.path, Buffer.alloc(bytes.byteLength));
+      await chmod(artifact.path, 0o400);
+    }
+    await expect(store.active(OWNER)).rejects.toThrow(/verification/);
+    await new HostArtifactStore(root).initialize();
+    expect(await store.active(OWNER)).toBeUndefined();
+    await expect(readFile(artifact.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("startup does not mistake an I/O failure for invalid cache metadata", async () => {
+    const { root, store } = fixture();
+    await mkdir(join(root, "active"), { recursive: true, mode: 0o700 });
+    const path = join(root, "active", `${OWNER}.json`);
+    await writeFile(path, "keep this pointer", { mode: 0o600 });
+    const failure = Object.assign(new Error("I/O unavailable"), { code: "EIO" });
+    vi.spyOn(store, "active").mockRejectedValue(failure);
+    await expect(store.initialize()).rejects.toBe(failure);
+    expect(await readFile(path, "utf8")).toBe("keep this pointer");
+  });
+
   test("verifies Guest bytes, seals CAS, and atomically activates an App", async () => {
     const { root, store } = fixture();
     const bytes = Buffer.from("sealed erofs fixture");

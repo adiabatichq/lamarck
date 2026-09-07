@@ -50,6 +50,76 @@ function fakeAppCliStreamServer(): AppCliStreamServer {
 }
 
 describe("MacOsCapsuleBackend orchestration", () => {
+  test("initializes shared cache at Desktop startup without booting a VM or requiring a Workspace", async () => {
+    const harness = createHarness();
+    const initialize = vi.spyOn(harness.store, "initialize");
+    await harness.backend.initializeCache();
+    expect(initialize).toHaveBeenCalledOnce();
+    expect(harness.store.pruneCalls).toBe(1);
+    expect(harness.vm.startCalls).toBe(0);
+    expect(harness.session.operations).toEqual([]);
+    expect(harness.dependencies).not.toHaveBeenCalled();
+  });
+
+  test("App launch, replacement, abort, stop and retirement never scan the global artifact cache", async () => {
+    const harness = createHarness();
+    await harness.backend.initializeCache();
+    const prune = vi.spyOn(harness.store, "pruneUnreferenced")
+      .mockRejectedValue(new Error("unrelated stale global cache"));
+    const first = await harness.backend.startUi(spec("sender-a"));
+    harness.packageDigest = PACKAGE_B;
+    const second = await harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B));
+    const candidate = await harness.backend.prepareUi(spec("sender-c", PACKAGE_B));
+    await harness.backend.abortPreparedUi(candidate.preparationId);
+    await harness.backend.abortPreparedUi(candidate.preparationId);
+    await harness.backend.stopUi(second.instanceId);
+    await harness.backend.stopApp("weather");
+    await harness.backend.retireApp("weather");
+    await harness.backend.stopAll();
+    expect(prune).not.toHaveBeenCalled();
+  });
+
+  test("cache maintenance failure does not prevent an unrelated App from launching", async () => {
+    const harness = createHarness();
+    vi.spyOn(harness.store, "initialize").mockRejectedValue(new Error("cache maintenance unavailable"));
+    await expect(harness.backend.initializeCache()).rejects.toThrow("cache maintenance unavailable");
+    const running = await harness.backend.startUi(spec("sender-a"));
+    expect(running.instanceId).toBeTruthy();
+    await harness.backend.stopAll();
+  });
+
+  test("cache cleanup failure does not turn confirmed runtime retirement into archive failure", async () => {
+    const harness = createHarness();
+    await harness.backend.startUi(spec("sender-a"));
+    vi.spyOn(harness.store, "deactivate").mockRejectedValue(new Error("cache pointer is unwritable"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(harness.backend.retireApp("weather")).resolves.toBeUndefined();
+      expect(harness.session.stoppedApps).toHaveLength(1);
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("Retired App cache cleanup failed"), expect.any(Error));
+    } finally {
+      warning.mockRestore();
+      await harness.backend.stopAll();
+    }
+  });
+
+  test.each([false, true])("post-build cache cleanup preserves the operation result (build fails: %s)", async (buildFails) => {
+    const harness = createHarness();
+    if (buildFails) harness.manifestDigest = CHANGED_MANIFEST_AUTHORITY;
+    harness.removeStorage.mockResolvedValueOnce(0).mockResolvedValueOnce(0)
+      .mockRejectedValueOnce(new Error("temporary cache is unwritable"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const launch = harness.backend.startUi(spec("sender-a"));
+      if (buildFails) await expect(launch).rejects.toThrow("App manifest authority changed");
+      else await expect(launch).resolves.toMatchObject({ instanceId: expect.any(String) });
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("App build cache cleanup failed"), expect.any(Error));
+    } finally {
+      warning.mockRestore();
+      await harness.backend.stopAll();
+    }
+  });
+
   test("rejects a package snapshot whose manifest changed after Core issued authority", async () => {
     const harness = createHarness();
     harness.manifestDigest = CHANGED_MANIFEST_AUTHORITY;
@@ -1073,13 +1143,12 @@ describe("MacOsCapsuleBackend orchestration", () => {
       { path: `/private/cache/capsule/packages/${ownerKey}`, recursive: true },
       { path: `/private/cache/capsule/dependencies/${ownerKey}`, recursive: true },
     ]);
-    expect(harness.store.pruneCalls).toBe(1);
+    expect(harness.store.pruneCalls).toBe(0);
     expect(harness.lifecycleEvents).toEqual([
       "guest.app.stopped",
       "artifact.deactivated",
       "cache.removed",
       "cache.removed",
-      "artifact.pruned",
     ]);
     await harness.backend.stopAll();
   });
@@ -1262,6 +1331,8 @@ describe("MacOsCapsuleBackend orchestration", () => {
         },
       });
 
+      await backend.initializeCache();
+      expect(await exists(staleArtifact.path)).toBe(false);
       await expect(backend.startUi({
         ...spec("sender-a"),
         packageDir: join(root, "workspace", "apps", "weather"),
@@ -1396,6 +1467,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
           nonce: () => 42,
         },
       });
+      await backend.initializeCache();
       await backend.startUi({
         ...spec("sender-a"),
         packageDir: join(workspace, "apps", "weather"),
@@ -1425,7 +1497,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
       expect(await exists(appDependencyCache)).toBe(false);
       expect(await freshStore.active(ownerKey)).toBeUndefined();
       expect(await freshStore.find(appArtifactIdentity.digest, appArtifactIdentity.bytes))
-        .toBeUndefined();
+        .toMatchObject(appArtifactIdentity);
       expect(await readFile(otherPackageCache)).toEqual(Buffer.from("keep package cache"));
       expect(await readFile(otherDependencyCache)).toEqual(Buffer.from("keep dependency cache"));
       expect(await freshStore.active(otherOwner)).toMatchObject({
@@ -1435,6 +1507,12 @@ describe("MacOsCapsuleBackend orchestration", () => {
       for (const [path, bytes] of immutableSentinels) {
         expect(await readFile(path)).toEqual(bytes);
       }
+      // Archive only removes this App's pointer; CAS reclamation belongs to
+      // the next Desktop initialization, not the archive response.
+      await backend.initializeCache();
+      expect(await freshStore.find(appArtifactIdentity.digest, appArtifactIdentity.bytes)).toBeUndefined();
+      expect(await freshStore.active(otherOwner)).toMatchObject({ artifact: otherArtifactIdentity });
+      for (const [path, bytes] of immutableSentinels) expect(await readFile(path)).toEqual(bytes);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1496,6 +1574,14 @@ function createHarness(overrides: { opaqueId?: () => string } = {}) {
   const system = new FakeSystemStreamServer();
   const session = new FakeSession(system, lifecycleEvents);
   const store = new FakeArtifactStore(lifecycleEvents);
+  const removeStorage = vi.fn(async (path: string, removeOptions?: { recursive?: boolean }) => {
+    if (staleStateResiduePresent) {
+      throw new Error("stale state residue reached non-state storage admission");
+    }
+    storageRemovals.push({ path, recursive: removeOptions?.recursive === true });
+    if (store.trackRetirementLifecycle) lifecycleEvents.push("cache.removed");
+    return 0;
+  });
   let packageDigest: string = PACKAGE_A;
   let installDigest: string = INSTALL;
   let installWarmEligible = true;
@@ -1562,14 +1648,7 @@ function createHarness(overrides: { opaqueId?: () => string } = {}) {
         },
         claim: async () => {},
         unclaim: async () => {},
-        remove: async (path, removeOptions) => {
-          if (staleStateResiduePresent) {
-            throw new Error("stale state residue reached non-state storage admission");
-          }
-          storageRemovals.push({ path, recursive: removeOptions?.recursive === true });
-          if (store.trackRetirementLifecycle) lifecycleEvents.push("cache.removed");
-          return 0;
-        },
+        remove: removeStorage,
       }),
       opaqueId: overrides.opaqueId
         ?? (() => `${"A".repeat(20)}${String(id++).padStart(2, "0")}`),
@@ -1584,6 +1663,7 @@ function createHarness(overrides: { opaqueId?: () => string } = {}) {
     system,
     store,
     dependencies,
+    removeStorage,
     storageEvents,
     storageRemovals,
     lifecycleEvents,
@@ -2137,6 +2217,8 @@ class FakeArtifactStore {
   trackRetirementLifecycle = false;
 
   constructor(private readonly lifecycleEvents: string[]) {}
+
+  async initialize() { await this.pruneUnreferenced(); }
 
   async active() { return this.activation; }
   async find(digest: string) {
