@@ -8,6 +8,7 @@ import {
 } from "node:fs/promises";
 import { createServer, connect, type Server, type Socket } from "node:net";
 import { PassThrough } from "node:stream";
+import { encodeCliFrame, MANAGED_CLI_OPERATIONS } from "@lamarck/cli";
 import {
   createOciBundlePlan,
   createCapsuleRuntimeStoragePlan,
@@ -39,6 +40,24 @@ export const RELEASE_RUNC_SMOKE_PACKAGE_SOURCE = `${JSON.stringify({
 
 export function generateReleaseRuncSmokeSessionId(): string {
   return randomBytes(32).toString("base64url");
+}
+
+export function createReleaseRuncSmokeCliChannel(): PassThrough {
+  const channel = new PassThrough();
+  // Workload startup waits for Host capabilities and the initial App inventory,
+  // even though this smoke workload only uses the SDK socket.
+  channel.write(encodeCliFrame({
+    protocolVersion: 1,
+    environment: "managed",
+    supportedOperations: MANAGED_CLI_OPERATIONS,
+  }));
+  channel.write(encodeCliFrame({
+    type: "app-workspaces.sync",
+    schemaVersion: 1,
+    complete: true,
+    editBases: [],
+  }));
+  return channel;
 }
 
 export function formatReleaseRuncSmokeError(error: unknown): string {
@@ -254,7 +273,7 @@ export async function runReleaseRuncSmoke(): Promise<void> {
         consumedTicket,
       },
       cliChannel: {
-        source: new PassThrough(),
+        source: createReleaseRuncSmokeCliChannel(),
         consumedTicket: consumedCliTicket,
       },
     });

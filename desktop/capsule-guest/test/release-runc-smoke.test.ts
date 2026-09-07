@@ -1,6 +1,12 @@
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { createConnection } from "node:net";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { assertOciSecurityInvariants } from "@lamarck/capsule";
+import { CliStreamReader, MANAGED_CLI_OPERATIONS, parseCliCapabilities, parseCliFrame } from "@lamarck/cli";
+import { openWorkloadAppCliBridge } from "../../capsule/src/app-edit/guest-bridge";
 import {
+  createReleaseRuncSmokeCliChannel,
   createReleaseRuncSmokePlan,
   formatReleaseRuncSmokeError,
   generateReleaseRuncSmokeSessionId,
@@ -11,6 +17,40 @@ import {
 } from "../src/release-runc-smoke";
 
 describe("signed Guest release runc smoke", () => {
+  test("initializes the real Guest CLI bridge without a live Host", async () => {
+    const root = await mkdtemp("/tmp/lamarck-release-cli-");
+    const upstream = createReleaseRuncSmokeCliChannel();
+    const socketPath = join(root, "cli.sock");
+    const editRoot = join(root, "apps");
+    const opening = openWorkloadAppCliBridge({
+      socketPath,
+      upstream,
+      editRoot,
+      lowerRoot: join(root, "lower"),
+      uid: process.getuid!(),
+      gid: process.getgid!(),
+    });
+    // A missing startup frame must fail here rather than wait for the
+    // signed-image boot test's three-minute timeout.
+    const timeout = setTimeout(() => upstream.destroy(), 2_000);
+    let bridge: Awaited<typeof opening> | undefined;
+    let client: ReturnType<typeof createConnection> | undefined;
+    try {
+      bridge = await opening;
+      expect(await readdir(editRoot)).toEqual([]);
+      client = createConnection(socketPath);
+      const reader = new CliStreamReader(client);
+      const hello = parseCliCapabilities(parseCliFrame(await reader.readFrame()), "managed");
+      expect(hello.supportedOperations).toEqual(MANAGED_CLI_OPERATIONS);
+    } finally {
+      clearTimeout(timeout);
+      client?.destroy();
+      await bridge?.close();
+      upstream.destroy();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("reports every nested release-gate failure", () => {
     const failure = new AggregateError([
       new Error("primary runc failure", { cause: new Error("runc stderr") }),
