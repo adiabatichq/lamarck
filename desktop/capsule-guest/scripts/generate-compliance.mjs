@@ -68,13 +68,24 @@ for (const kind of ["target", "host"]) {
   await requireNonemptyTree(join(legalRoot, `${prefix}sources`), `Buildroot ${kind} sources`);
   for (const component of manifestPackages) {
     if (!component.licenseFiles) throw new Error(`Buildroot ${kind} ${component.name} has no retained license files`);
+    // Buildroot's own synthetic Host row says "not saved"; our pinned native
+    // build retains its archive separately from legal-info/host-sources.
+    if (kind === "host" && component.name === "buildroot") {
+      if (component.version !== "2026.05" || basename(buildrootArchive) !== "buildroot-2026.05.tar.xz") {
+        throw new Error("Buildroot manifest version does not match its retained source archive");
+      }
+      packages.push({ ...component, buildrootKind: kind,
+        sourcePath: `corresponding-source/buildroot/${basename(buildrootArchive)}` });
+      continue;
+    }
     if (!component.sourceArchive || component.sourceArchive === "not saved") throw new Error(`Buildroot ${kind} ${component.name} has no retained source archive`);
     const sourceName = safeFileName(component.sourceArchive, `${component.name} source archive`);
     const sourceDirectory = safeFileName(`${component.name}-${buildrootSanitize(component.version)}`, `${component.name} source directory`);
     const sourceArchivePath = `${sourceDirectory}/${sourceName}`;
     await requireRegularFile(join(legalRoot, `${prefix}sources`, sourceArchivePath), `${component.name} source archive`);
     if (!legalInfoFiles.has(`${prefix}sources/${sourceArchivePath}`)) throw new Error(`${component.name} source archive is not covered by legal-info.sha256`);
-    packages.push({ ...component, buildrootKind: kind, sourceArchivePath });
+    packages.push({ ...component, buildrootKind: kind,
+      sourcePath: `corresponding-source/${kind}-packages/${sourceArchivePath}` });
   }
 }
 
@@ -133,11 +144,9 @@ for (const output of osBase.manifest.outputs) {
 }
 
 const packageRecords = await Promise.all(packages.map(async (component) => {
-  const sourcePath = `corresponding-source/${component.buildrootKind}-packages/${component.sourceArchivePath}`;
-  const sourceFile = join(outputRoot, sourcePath);
+  const sourceFile = join(outputRoot, component.sourcePath);
   return {
     ...component,
-    sourcePath,
     sourceSha256: `sha256:${await sha256File(sourceFile)}`,
   };
 }));

@@ -430,9 +430,15 @@ try {
   assert(builderEnvironment.osBase.manifestDigest === basePin, "compliance omitted the reused OS base pin");
   const sbom = JSON.parse(await readFile(join(compliance, "sbom.spdx.json"), "utf8"));
   assert(sbom.spdxVersion === "SPDX-2.3", "SPDX version was not generated");
-  assert(sbom.packages.length === 5, "SPDX package inventory is incomplete");
+  assert(sbom.packages.length === 6, "SPDX package inventory is incomplete");
+  assert(sbom.packages.some(item => item.name === "buildroot"), "Buildroot is missing from the SBOM");
   assert(sbom.packages.some(item => item.name === "gcc-final"), "Build-root compiler is missing from the SBOM");
   const offer = JSON.parse(await readFile(join(compliance, "corresponding-source-offer.json"), "utf8"));
+  const buildrootSource = offer.components.find(component => component.name === "buildroot");
+  assert(buildrootSource?.sourcePath === "corresponding-source/buildroot/buildroot-2026.05.tar.xz",
+    "Buildroot's synthetic not-saved row must use the separately retained source archive");
+  assert(buildrootSource.sourceSha256 === `sha256:${createHash("sha256").update(await readFile(buildrootArchive)).digest("hex")}`,
+    "Buildroot's source record must bind the retained archive bytes");
   assert(
     offer.fulfillment.kind === "prepared-corresponding-source",
     "source offer is not prepared for detached release packaging",
@@ -473,6 +479,15 @@ try {
     /source archive/.test(flatCompliance.stderr || flatCompliance.stdout),
     "flat Buildroot source layout failed for an unrelated reason",
   );
+
+  const missingHostLegal = join(work, "missing-host-source");
+  await createLegalFixture(missingHostLegal, { missingHostSource: true });
+  const missingHostCompliance = spawnNode(join(scripts, "generate-compliance.mjs"), [
+    missingHostLegal, buildrootArchive, sourceSnapshot, join(work, "missing-host-compliance"),
+    "0.1.0", builderImageId, base, basePin, "4",
+  ]);
+  assert(missingHostCompliance.status !== 0 && /host gcc-final has no retained source archive/.test(missingHostCompliance.stderr),
+    "Buildroot's synthetic row must not exempt ordinary Host packages from source retention");
 
   const extraLegal = join(work, "extra-legal-info");
   await createLegalFixture(extraLegal);
@@ -761,7 +776,7 @@ async function createJavaScriptBuilderFixture(work, snapshotRoot, manifestDigest
   await writeFile(join(work, "image-input", "js-builder-environment.json"), inventoryBytes);
 }
 
-async function createLegalFixture(root, { nestedSources = true } = {}) {
+async function createLegalFixture(root, { nestedSources = true, missingHostSource = false } = {}) {
   await mkdir(join(root, "licenses", "linux-6.18.39"), { recursive: true });
   await mkdir(join(root, "licenses", "node24-bin-24.18.0"), { recursive: true });
   await mkdir(join(root, "licenses", "busybox-1.38.0"), { recursive: true });
@@ -793,12 +808,15 @@ async function createLegalFixture(root, { nestedSources = true } = {}) {
     "",
   ].join("\n"));
   await mkdir(join(root, "host-licenses", "gcc-final-15.2.0"), { recursive: true });
+  await mkdir(join(root, "host-licenses", "buildroot"), { recursive: true });
+  await writeFile(join(root, "host-licenses", "buildroot", "COPYING"), "GPL-2.0+\n");
   await mkdir(join(root, "host-sources", "gcc-final-15.2.0"), { recursive: true });
   await writeFile(join(root, "host-licenses", "gcc-final-15.2.0", "COPYING"), "GPL-3.0-or-later\n");
   await writeFile(join(root, "host-sources", "gcc-final-15.2.0", "gcc-15.2.0.tar.xz"), "compiler corresponding source\n");
   await writeFile(join(root, "host-manifest.csv"), [
     '"PACKAGE","VERSION","LICENSE","LICENSE FILES","SOURCE ARCHIVE","SOURCE SITE","DEPENDENCIES WITH LICENSES"',
-    '"gcc-final","15.2.0","GPL-3.0-or-later","COPYING","gcc-15.2.0.tar.xz","https://gcc.gnu.org",""', "",
+    '"buildroot","2026.05","GPL-2.0+","COPYING","not saved","not saved",""',
+    `"gcc-final","15.2.0","GPL-3.0-or-later","COPYING","${missingHostSource ? "not saved" : "gcc-15.2.0.tar.xz"}","https://gcc.gnu.org",""`, "",
   ].join("\n"));
   const files = await listFiles(root);
   const lines = [];
