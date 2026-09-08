@@ -3,7 +3,6 @@
 set -eu
 
 repo=/src
-prebuilt="${LAMARCK_PREBUILT_ROOT:-/prebuilt}"
 work=/work
 version=2026.05
 archive="buildroot-$version.tar.xz"
@@ -43,8 +42,6 @@ if [ -n "$download_cache" ]; then
 fi
 
 node "$repo/desktop/capsule-guest/scripts/prepare-build-snapshot.mjs" verify "$repo"
-node "$repo/desktop/capsule-guest/scripts/verify-js-builder-output.mjs" \
-	"$prebuilt" "$repo"
 
 mkdir -p "$work/src" "$download_root" "$work/output"
 archive_path="$work/src/$archive"
@@ -95,7 +92,6 @@ export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
 # The isolated builder runs as root against container-private /work. Outputs are
 # exported only after the complete image and legal-info targets succeed.
 export FORCE_UNSAFE_CONFIGURE=1
-export LAMARCK_PREBUILT_ROOT="$prebuilt"
 make -C "$source" O="$work/output" \
 	BR2_EXTERNAL="$external" \
 	lamarck_capsule_arm64_defconfig
@@ -142,7 +138,7 @@ if [ -n "${LAMARCK_BUILD_EXPORT:-}" ]; then
 		exit 73
 	}
 	mkdir -p "$export_root/output/legal-info" "$export_root/src" \
-		"$export_root/image-input" "$export_root/prebuilt-verification"
+		"$export_root/image-input"
 	cp -R --no-preserve=mode,ownership,timestamps \
 		"$work/output/legal-info/." "$export_root/output/legal-info/"
 	cp --no-preserve=mode,ownership,timestamps \
@@ -150,11 +146,5 @@ if [ -n "${LAMARCK_BUILD_EXPORT:-}" ]; then
 	cp --sparse=always --no-preserve=mode,ownership,timestamps \
 		"$work/image-input/Image" "$work/image-input/rootfs.ext4" \
 		"$work/image-input/builder-packages.tsv" "$export_root/image-input/"
-	cp --no-preserve=mode,ownership,timestamps \
-		"$prebuilt/js-builder-environment.json" \
-		"$repo/build-input-manifest.json" "$export_root/image-input/"
-	cp -R --no-preserve=mode,ownership,timestamps \
-		"$prebuilt/." "$export_root/prebuilt-verification/"
+
 fi
-node "$repo/desktop/capsule-guest/scripts/verify-js-builder-output.mjs" \
-	"$prebuilt" "$repo"

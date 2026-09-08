@@ -7,7 +7,6 @@
     "node": ">=24.10.0"
   },
   "scripts": {
-    "prebuild": "npm --workspace @lamarck/cli run build",
     "build": "node scripts/build-supervisor.mjs",
     "pretest": "npm --workspace @lamarck/cli run build",
     "test": "vitest run",

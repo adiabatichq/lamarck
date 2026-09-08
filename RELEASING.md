@@ -5,6 +5,13 @@ release never triggers a Desktop release automatically: merging the generated
 Guest pin pull request only selects the Guest consumed by future Desktop
 packages.
 
+Desktop also ships the managed CLI executable and its digest descriptor. App
+Capsules receive that artifact over their authenticated Host channel and mount
+it read-only. The npm package continues to default to the Host entry point.
+Ordinary CLI/Host business-command changes can ship with Desktop while retaining
+the same Guest pin. See [CLI transport](desktop/cli/README.md) and
+[Guest build stages](desktop/capsule-guest/BUILD-STAGES.md).
+
 ## Release infrastructure
 
 Create one publicly readable Cloudflare R2 bucket and expose it through an
@@ -144,6 +151,15 @@ Web enablement remain explicit manual deployment actions.
 
 ## Guest Release workflow
 
+The build produces a pinned OS base, then builds current Guest JavaScript and
+assembles the complete image before compliance generation, signing, and boot
+smoke. The tag workflow restores the reviewed OS base and its exact builder
+from the existing R2 bucket when native inputs match `os-base-pin.json`.
+An initial release or changed native inputs builds a new base; missing or
+tampered pinned artifacts fail the release. Reuse commands, retained source,
+and pin custody are documented in
+[Guest build stages](desktop/capsule-guest/BUILD-STAGES.md).
+
 Guest releases are low-frequency and tag-driven:
 
 1. Create and publish a GitHub Release whose protected tag is
@@ -155,10 +171,13 @@ Guest releases are low-frequency and tag-driven:
    archive. The runtime retains licenses, notices, SBOM, and a signed offer
    that binds the archive URL, size, and SHA-256.
 5. It uploads every release file under a digest-addressed immutable R2 prefix.
+   A newly built OS base and its exact Docker builder are also saved together
+   under an immutable prefix and verified through the public domain.
 6. It downloads the runtime and source archive through the public domain and
    verifies the pinned inventory, every file digest, and both signed manifests.
-7. It opens a pull request that changes only
-   `desktop/capsule-guest/release-pin.json`.
+7. It opens a pull request limited to `desktop/capsule-guest/release-pin.json`
+   and `desktop/capsule-guest/os-base-pin.json`. Review both: the latter binds
+   the native input identity, base manifest, builder image ID, and archive bytes.
 8. Review and merge that pull request when future Desktop releases should use
    the new Guest.
 
@@ -172,6 +191,7 @@ Guest R2 objects:
 guest/macos/arm64/<manifest-digest-first-16>/<every release-tree file>
 guest/macos/arm64/<manifest-digest-first-16>/Lamarck-Capsule-Guest-<version>-Open-Source.tar.gz
 guest/macos/arm64/<manifest-digest-first-16>/files.json
+guest/os-base/arm64/<full-base-manifest-digest>/<full-archive-digest>.tar.gz
 ```
 
 `files.json` is written last on the first publication. Uploads are retry-safe:

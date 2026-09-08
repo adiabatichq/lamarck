@@ -1,7 +1,28 @@
 import { spawnSync } from "node:child_process";
-import { lstatSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { constants, lstatSync, realpathSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+
+export async function validatePackagedManagedCli(electronResources) {
+  const descriptor = JSON.parse(await readBounded("managed-cli.json", 4096));
+  const bytes = await readBounded("lamarck-managed.mjs", 16 * 1024 * 1024);
+  if (!descriptor || Object.keys(descriptor).sort().join(",") !== "bytes,digest,schemaVersion,type"
+    || descriptor.type !== "cli.artifact" || descriptor.schemaVersion !== 1
+    || descriptor.bytes !== bytes.length
+    || descriptor.digest !== `sha256:${createHash("sha256").update(bytes).digest("hex")}`) {
+    throw new Error("Packaged managed CLI artifact integrity verification failed");
+  }
+  async function readBounded(name, maximum) {
+    const file = await open(join(electronResources, name), constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || info.size < 1 || info.size > maximum) throw new Error(`Invalid packaged managed CLI file: ${name}`);
+      return await file.readFile();
+    } finally { await file.close(); }
+  }
+}
 
 const NODE_PTY_SMOKE_SOURCE = String.raw`
 const { realpathSync, writeSync } = require("node:fs");

@@ -19,7 +19,7 @@ describe("managed CLI V1 protocol", () => {
       operation: "core.request",
       input: { method: "DELETE", path: "/api/apps/example" },
     };
-    expect(() => parseCliRequest(arbitrary, false)).toThrow("CLI operation is invalid");
+    expect(() => parseCliRequest(arbitrary, false)).toThrow("is not supported by this Host/CLI");
   });
 
   test("rejects caller-supplied upload authority on local workload connections", () => {

@@ -1,3 +1,6 @@
+import { parseCliRequestEnvelope } from "@lamarck/cli/transport";
+import { createHash } from "node:crypto";
+import { writeManagedCliArtifact } from "../src/app-edit/cli-artifact";
 import { createConnection } from "node:net";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -318,6 +321,7 @@ function startHost(
   stream: Duplex,
   initial: readonly EditBase[],
   handler: (request: CliRequest, upload?: Buffer) => Promise<CliResponse>,
+  operations: readonly string[] = MANAGED_CLI_OPERATIONS,
 ) {
   const reader = new CliStreamReader(stream);
   const requests: CliRequest[] = [];
@@ -335,10 +339,11 @@ function startHost(
     editBases,
   });
   const run = (async () => {
-    await write({ protocolVersion: 1, environment: "managed", supportedOperations: MANAGED_CLI_OPERATIONS });
+    await writeManagedCliArtifact(stream, await managedCliArtifact());
+    await write({ protocolVersion: 1, environment: "managed", supportedOperations: operations });
     await push(initial, true);
     while (!closing && !stream.destroyed) {
-      const request = parseCliRequest(parseCliFrame(await reader.readFrame()), true);
+      const request = parseCliRequestEnvelope(parseCliFrame(await reader.readFrame()), true) as CliRequest;
       requests.push(request);
       const upload = request.upload?.kind === "app-package"
         ? await reader.readExact(request.upload.archiveBytes)
@@ -348,6 +353,7 @@ function startHost(
       await write(await handler(request, upload));
     }
   })();
+  void run.catch(() => {});
   return {
     requests,
     push,
@@ -402,3 +408,23 @@ class MemoryDuplex extends Duplex {
     callback(error);
   }
 }
+
+const cliFixtureBytes = Buffer.from("#!/usr/local/bin/node\nprocess.exit(0);\n");
+const managedCliArtifact = async () => ({
+  descriptor: { type: "cli.artifact" as const, schemaVersion: 1 as const,
+    digest: `sha256:${createHash("sha256").update(cliFixtureBytes).digest("hex")}`, bytes: cliFixtureBytes.length },
+  bytes: cliFixtureBytes,
+});
+
+test("forwards a new Host operation through the unchanged bridge and rejects unadvertised commands", async () => {
+  const fixture = await workspaceFixture();
+  const host = startHost(fixture.pair.server, [], async request => success(request, { forwarded: request.input }), ["future.command", "query"]);
+  const bridge = await openBridge(fixture);
+  try {
+    const future = { requestId: "new", operation: "future.command", input: { value: 42 } } as unknown as CliRequest;
+    expect(await invoke(fixture.socketPath, future)).toMatchObject({ ok: true, result: { forwarded: { value: 42 } } });
+    expect(await invoke(fixture.socketPath, { requestId: "existing", operation: "query", input: { sql: "SELECT 1" } })).toMatchObject({ ok: true });
+    expect(await invoke(fixture.socketPath, { requestId: "unsupported", operation: "source.list", input: {} })).toMatchObject({ ok: false, error: { code: "CLI_UNSUPPORTED_COMMAND" } });
+    expect(host.requests.map(request => request.operation)).toEqual(["future.command", "query"]);
+  } finally { await bridge.close(); await host.close(); }
+});

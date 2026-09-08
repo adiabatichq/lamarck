@@ -1,5 +1,5 @@
 import type { Readable, Writable } from "node:stream";
-import { CLI_MAX_CONTROL_BYTES } from "./operations.js";
+import { CLI_MAX_CONTROL_BYTES } from "./transport.js";
 
 export class CliStreamReader {
   readonly #iterator: AsyncIterator<unknown>;

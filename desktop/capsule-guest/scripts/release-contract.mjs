@@ -117,6 +117,7 @@ export async function validateGuestRelease(rootValue, options = {}) {
     "compliance/THIRD_PARTY_NOTICES.txt",
     "compliance/corresponding-source-offer.json",
     "compliance/builder-environment.json",
+    "compliance/os-base-manifest.json",
     "compliance/build-input-manifest.json",
     "compliance/js-builder-environment.json",
     "compliance/compliance-index.json",

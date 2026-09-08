@@ -8,7 +8,7 @@ import {
 } from "node:fs/promises";
 import { createServer, connect, type Server, type Socket } from "node:net";
 import { PassThrough } from "node:stream";
-import { encodeCliFrame, MANAGED_CLI_OPERATIONS } from "@lamarck/cli";
+import { encodeCliFrame } from "@lamarck/cli/transport";
 import {
   createOciBundlePlan,
   createCapsuleRuntimeStoragePlan,
@@ -46,10 +46,14 @@ export function createReleaseRuncSmokeCliChannel(): PassThrough {
   const channel = new PassThrough();
   // Workload startup waits for Host capabilities and the initial App inventory,
   // even though this smoke workload only uses the SDK socket.
+  const bytes = Buffer.from("#!/usr/local/bin/node\nprocess.stdout.write('managed-cli-mount-smoke-ok');\n");
+  channel.write(encodeCliFrame({ type: "cli.artifact", schemaVersion: 1,
+    digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, bytes: bytes.length }));
+  channel.write(bytes);
   channel.write(encodeCliFrame({
     protocolVersion: 1,
     environment: "managed",
-    supportedOperations: MANAGED_CLI_OPERATIONS,
+    supportedOperations: [],
   }));
   channel.write(encodeCliFrame({
     type: "app-workspaces.sync",
@@ -97,8 +101,15 @@ const ARTIFACT_REFERENCE = "release-runc-smoke:artifact";
 
 export const RELEASE_RUNC_SMOKE_WORKLOAD_SOURCE = `
 import { writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createConnection } from "node:net";
 
+if (execFileSync("/usr/bin/lamarck", [], { encoding: "utf8" }) !== "managed-cli-mount-smoke-ok") throw new Error("Host CLI mount is not executable");
+for (const path of ["/usr/bin/lamarck", "/run/lamarck/lamarck-managed.mjs"]) {
+  let denied = false;
+  try { writeFileSync(path, "tamper"); } catch (error) { denied = ["EROFS", "EACCES", "EPERM"].includes(error.code); }
+  if (!denied) throw new Error("App could modify the Host CLI");
+}
 const header = process.report.getReport().header;
 if (
   process.version !== ${JSON.stringify(EXPECTED_NODE_VERSION)}

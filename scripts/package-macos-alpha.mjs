@@ -25,7 +25,7 @@ import {
   assertDeviceIdentityNativeResourceLayout,
   deviceIdentityNativeAddonPath,
 } from "../desktop/core/src/device-identity/native/resource-path.mjs";
-import { runPackagedNodePtySmoke } from "./macos-release-runtime.mjs";
+import { runPackagedNodePtySmoke, validatePackagedManagedCli } from "./macos-release-runtime.mjs";
 import {
   requireMarketplaceTrustRoot,
   validateMarketplaceTrustRootResource,
@@ -86,6 +86,8 @@ const FIXED_ELECTRON_FILES = [
   "core.mjs",
   "guard-service.cjs",
   "main.cjs",
+  "lamarck-managed.mjs",
+  "managed-cli.json",
   "marketplace-trust-roots.json",
   "preload.cjs",
   "pty-helper.cjs",
@@ -182,6 +184,7 @@ try {
     electronResources,
     join(electronResources, "native"),
   );
+  await validatePackagedManagedCli(electronResources);
   await validateMarketplaceTrustRootResource(
     join(electronResources, "marketplace-trust-roots.json"),
     process.env,

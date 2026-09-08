@@ -1,3 +1,4 @@
+import { loadManagedCliArtifact } from "./capsule/managed-cli-artifact";
 // Electron main process
 // - Launches the isolated Node Guard utility before the Node Core
 // - Keeps Workspace creation and opening as explicit user actions
@@ -295,6 +296,7 @@ const systemStreamServer = new SystemStreamServer(systemBroker, { unbindOnClose:
 let cliDispatcher!: CliOperationDispatcher;
 const appCliStreamServer = new AppCliStreamServer({
   dispatcher: () => cliDispatcher,
+  managedCliArtifact: () => loadManagedCliArtifact(__dirname),
   appsRoot: () => join(workspace, "apps"),
 });
 const capsuleCacheNamespace = app.getVersion().includes("-alpha")

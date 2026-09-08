@@ -14,3 +14,5 @@ export * from "./protocol/types";
 export * from "./protocol/validate";
 export * from "./state/supervisor-state";
 export * from "./storage-plan";
+
+export * from "./app-edit/cli-artifact";

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { parseManagedCliArtifact } from "@lamarck/capsule";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Duplex, PassThrough, Readable } from "node:stream";
@@ -32,7 +34,7 @@ test("binds every managed request to the launch identity and maps App paths priv
     return success(request, [{ id: "example", name: "Example", version: null }]);
   });
   const pair = duplexPair();
-  const detach = new AppCliStreamServer({
+  const detach = new AppCliStreamServer({ managedCliArtifact,
     dispatcher: () => dispatcher,
   }).attach(identity(), pair.server);
   const response = await invoke(pair.client, {
@@ -61,7 +63,7 @@ test("forwards common lifecycle operations through the shared dispatcher", async
   const records = [{ appId: "example", version: "a".repeat(40), parentVersion: null, trigger: "save", createdAt: 2 }];
   const dispatcher = fakeDispatcher(async (request) => success(request, records));
   const pair = duplexPair();
-  const detach = new AppCliStreamServer({
+  const detach = new AppCliStreamServer({ managedCliArtifact,
     dispatcher: () => dispatcher,
   }).attach(identity(), pair.server);
   const response = await invoke(pair.client, {
@@ -104,7 +106,7 @@ test("streams a complete App save upload with the bound principal", async () => 
     fetch: fetchImpl,
     runtimeStates: () => [],
   });
-  const broker = new AppCliStreamServer({
+  const broker = new AppCliStreamServer({ managedCliArtifact,
     dispatcher: () => dispatcher,
   });
   const detach = broker.attach(identity(), pair.server);
@@ -121,6 +123,8 @@ test("streams a complete App save upload with the bound principal", async () => 
     },
   };
   const reader = new CliStreamReader(pair.client);
+  const artifact = parseManagedCliArtifact(parseCliFrame(await reader.readFrame()));
+  await reader.readExact(artifact.bytes);
   parseCliCapabilities(parseCliFrame(await reader.readFrame()), "managed");
   expect(parseCliFrame(await reader.readFrame())).toMatchObject({
     type: "app-workspaces.sync",
@@ -165,7 +169,7 @@ test("streams managed file stdin and native output outside control frames", asyn
     });
   });
   const pair = duplexPair();
-  const detach = new AppCliStreamServer({
+  const detach = new AppCliStreamServer({ managedCliArtifact,
     dispatcher: () => dispatcher,
   }).attach(identity(), pair.server);
   const request = {
@@ -175,6 +179,8 @@ test("streams managed file stdin and native output outside control frames", asyn
     upload: { kind: "file-stdin", bytes: stdin.byteLength },
   } as const;
   const reader = new CliStreamReader(pair.client);
+  const artifact = parseManagedCliArtifact(parseCliFrame(await reader.readFrame()));
+  await reader.readExact(artifact.bytes);
   parseCliCapabilities(parseCliFrame(await reader.readFrame()), "managed");
   expect(parseCliFrame(await reader.readFrame())).toMatchObject({
     type: "app-workspaces.sync",
@@ -205,7 +211,7 @@ test("carries a large schema change in the normal typed control request", async 
     return success(request, { id: "schema-1", status: "pending" });
   });
   const pair = duplexPair();
-  const detach = new AppCliStreamServer({ dispatcher: () => dispatcher }).attach(identity(), pair.server);
+  const detach = new AppCliStreamServer({ managedCliArtifact, dispatcher: () => dispatcher }).attach(identity(), pair.server);
   const response = await invoke(pair.client, {
     requestId: "schema-1",
     operation: "schema.change",
@@ -243,7 +249,7 @@ test("keeps idle sessions passive and debounces one App without overwriting loca
   };
   const watched = fakeWatchFactory();
   const pair = duplexPair();
-  const broker = new AppCliStreamServer({
+  const broker = new AppCliStreamServer({ managedCliArtifact,
     dispatcher: () => dispatcher,
     appsRoot,
     watch: watched.factory,
@@ -304,7 +310,7 @@ test("uses full inventory for create/archive notifications and stops the shared 
   };
   const watched = fakeWatchFactory();
   const pair = duplexPair();
-  const detach = new AppCliStreamServer({
+  const detach = new AppCliStreamServer({ managedCliArtifact,
     dispatcher: () => dispatcher,
     appsRoot,
     watch: watched.factory,
@@ -357,7 +363,7 @@ test("watcher failure preserves the editing workspace and CLI bridge while retry
   const watched = fakeWatchFactory();
   const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
   const pair = duplexPair();
-  const broker = new AppCliStreamServer({
+  const broker = new AppCliStreamServer({ managedCliArtifact,
     dispatcher: () => dispatcher,
     appsRoot,
     watch: watched.factory,
@@ -468,7 +474,7 @@ test("allows self-archive teardown to end the stream before a final response", a
     pair.server.destroy();
     return success(request, { id: "initiator", archived: true });
   });
-  const detach = new AppCliStreamServer({
+  const detach = new AppCliStreamServer({ managedCliArtifact,
     dispatcher: () => dispatcher,
   }).attach(identity(), pair.server);
   await expect(invoke(pair.client, {
@@ -482,6 +488,8 @@ test("allows self-archive teardown to end the stream before a final response", a
 
 async function invoke(client: Duplex, request: CliRequest) {
   const reader = new CliStreamReader(client);
+  const artifact = parseManagedCliArtifact(parseCliFrame(await reader.readFrame()));
+  await reader.readExact(artifact.bytes);
   parseCliCapabilities(parseCliFrame(await reader.readFrame()), "managed");
   expect(parseCliFrame(await reader.readFrame())).toMatchObject({
     type: "app-workspaces.sync",
@@ -605,7 +613,7 @@ async function withGuestBridge(
   await mkdir(bridgeRoot, { recursive: true });
   await writeFile(join(lowerRoot, lowerPath, "manifest.json"), "{}\n");
   const pair = duplexPair();
-  const detach = new AppCliStreamServer({
+  const detach = new AppCliStreamServer({ managedCliArtifact,
     dispatcher: () => fakeDispatcher(dispatch),
   }).attach(identity(), pair.server);
   const socketPath = join(bridgeRoot, "cli.sock");
@@ -669,3 +677,10 @@ class MemoryDuplex extends Duplex {
     callback(error);
   }
 }
+
+const cliFixtureBytes = Buffer.from("#!/usr/local/bin/node\nprocess.exit(0);\n");
+const managedCliArtifact = async () => ({
+  descriptor: { type: "cli.artifact" as const, schemaVersion: 1 as const,
+    digest: `sha256:${createHash("sha256").update(cliFixtureBytes).digest("hex")}`, bytes: cliFixtureBytes.length },
+  bytes: cliFixtureBytes,
+});

@@ -13,6 +13,8 @@ run("npm", ["--workspace", "@lamarck/capsule-guest", "test"]);
 run("npm", ["--workspace", "@lamarck/capsule-guest", "run", "typecheck"]);
 run("node", ["desktop/capsule-guest/scripts/test-native-helpers.mjs"]);
 run("node", ["desktop/capsule-guest/scripts/test-build-inputs.mjs"]);
+run("node", ["--test", "desktop/capsule-guest/scripts/test-os-base.mjs"]);
+run("node", ["--test", "scripts/guest-os-base-ci.test.mjs"]);
 run("node", ["desktop/capsule-guest/scripts/test-release-pipeline.mjs"]);
 run("npm", ["--workspace", "@lamarck/core", "run", "build"]);
 run("npm", [

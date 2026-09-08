@@ -28,6 +28,8 @@ const GENERATED_HOST_PATHS = [
   "connector-runner.cjs",
   "preload.cjs",
   "app-preload.cjs",
+  "lamarck-managed.mjs",
+  "managed-cli.json",
   "pty-helper.cjs",
   "marketplace-trust-roots.json",
 ];

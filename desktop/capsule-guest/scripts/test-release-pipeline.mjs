@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { createOsBase, OS_BASE_SOURCE_FILES } from "./os-base.mjs";
+import { copyTreeNoLinks } from "./release-contract.mjs";
 
 import { createHash, generateKeyPairSync } from "node:crypto";
 import {
@@ -37,11 +39,11 @@ try {
   const buildScript = await readFile(buildScriptPath, "utf8");
   assert(buildScript.includes("--iidfile \"$builder_iid_file\""), "Guest builder does not capture an immutable image ID");
   assert(!buildScript.includes("-t lamarck-capsule-buildroot"), "Guest builder still publishes a mutable Docker tag");
-  assert(
-    buildScript.match(/\"\$builder_image_id\"/g)?.length === 4,
-    "Guest build stages are not all bound to the same immutable builder image ID",
-  );
-  const buildrootRun = buildScript.indexOf('\n"$@"\n');
+  assert(buildScript.includes('"$builder_image_id"')
+    && buildScript.includes('"$os_base:/base:ro"')
+    && buildScript.includes("assemble-guest-programs.mjs")
+    && buildScript.includes("os-base.mjs"), "Guest stages must use verified base and current programs");
+  const buildrootRun = buildScript.indexOf('  "$@"');
   const reclaimCall = buildScript.lastIndexOf("\nreclaim_builder_outputs\n");
   const complianceGeneration = buildScript.indexOf("generate-compliance.mjs");
   assert(
@@ -52,7 +54,7 @@ try {
       && buildScript.includes("--cap-add DAC_READ_SEARCH")
       && buildScript.includes("--security-opt no-new-privileges:true")
       && buildScript.includes("--user 0:0")
-      && buildScript.includes('-R "$host_uid:$host_gid" /prebuilt /export')
+      && buildScript.includes('-R "$host_uid:$host_gid" /prebuilt /os-base /assembly')
       && buildrootRun >= 0
       && reclaimCall > buildrootRun
       && complianceGeneration > reclaimCall,
@@ -171,9 +173,9 @@ try {
     "signed Guest build omits the production runc smoke bundle",
   );
   assert(
-    supervisorBuild.includes('"cli", "dist", "lamarck-managed.mjs"')
-      && !supervisorBuild.includes('"cli", "src"'),
-    "signed Guest build does not consume the built managed CLI artifact",
+    !supervisorBuild.includes('"cli", "dist", "lamarck-managed.mjs"')
+      && supervisorBuild.includes("guest-cli-boundary"),
+    "Guest build must exclude the managed CLI and business catalog",
   );
   const javascriptBuild = await readFile(join(scripts, "build-js-inside.sh"), "utf8");
   assert(
@@ -188,9 +190,9 @@ try {
     "Guest JavaScript build still compiles or exports the App System SDK",
   );
   assert(
-    javascriptBuild.indexOf("desktop/cli/scripts/build.mjs")
-      < javascriptBuild.indexOf("desktop/capsule-guest/scripts/build-supervisor.mjs"),
-    "Guest JavaScript build does not build the CLI before the Capsule Guest bundle",
+    !javascriptBuild.includes("desktop/cli/scripts/build.mjs")
+      && javascriptBuild.includes("desktop/capsule-guest/scripts/build-supervisor.mjs"),
+    "Guest build must not build the CLI executable",
   );
   assert(
     !BUILD_SNAPSHOT_FILES.some((path) => path.startsWith("desktop/system-sdk/"))
@@ -200,9 +202,8 @@ try {
   assert(
     BUILD_SNAPSHOT_FILES.includes("LICENSE")
       && BUILD_SNAPSHOT_FILES.includes("desktop/cli/package.json")
-      && BUILD_SNAPSHOT_FILES.includes("desktop/cli/tsconfig.build.json")
-      && BUILD_SNAPSHOT_DIRECTORIES.includes("desktop/cli/scripts")
-      && BUILD_SNAPSHOT_DIRECTORIES.includes("desktop/cli/src"),
+      && BUILD_SNAPSHOT_FILES.includes("desktop/cli/src/transport.ts")
+      && !BUILD_SNAPSHOT_DIRECTORIES.includes("desktop/cli/src"),
     "Guest build snapshot omits a required CLI build input",
   );
   assert(
@@ -239,7 +240,8 @@ try {
     "desktop/capsule-guest/buildroot/board/lamarck/arm64/post-build.sh",
   ), "utf8");
   assert(
-    postBuild.includes("lamarck-release-runc-smoke.js"),
+    !postBuild.includes("$prebuilt")
+      && (await readFile(join(scripts, "assemble-guest-programs.mjs"), "utf8")).includes("lamarck-release-runc-smoke.js"),
     "signed Guest rootfs omits the production runc smoke bundle",
   );
   assert(
@@ -403,6 +405,12 @@ try {
   await mkdir(dirname(buildrootArchive), { recursive: true });
   await writeFile(buildrootArchive, Buffer.from("pinned-buildroot-source\n"));
 
+  const base = join(root, "os-base");
+  await mkdir(base);
+  for (const path of ["image-input", "output", "src"]) await copyTreeNoLinks(join(work, path), join(base, path));
+  // A base never includes the current JavaScript inventory.
+  await rm(join(base, "image-input/js-builder-environment.json"));
+  const basePin = (await createOsBase(base, sourceSnapshot, builderImageId, "0", "4")).digest;
   const compliance = join(work, "compliance");
   runNode(join(scripts, "generate-compliance.mjs"), [
     legal,
@@ -410,7 +418,7 @@ try {
     sourceSnapshot,
     compliance,
     "0.1.0",
-    builderImageId,
+    builderImageId, base, basePin, "4",
   ]);
   const builderEnvironment = JSON.parse(
     await readFile(join(compliance, "builder-environment.json"), "utf8"),
@@ -419,9 +427,11 @@ try {
     builderEnvironment.builderImageId === builderImageId,
     "signed compliance omitted the exact immutable Docker builder image ID",
   );
+  assert(builderEnvironment.osBase.manifestDigest === basePin, "compliance omitted the reused OS base pin");
   const sbom = JSON.parse(await readFile(join(compliance, "sbom.spdx.json"), "utf8"));
   assert(sbom.spdxVersion === "SPDX-2.3", "SPDX version was not generated");
-  assert(sbom.packages.length === 4, "SPDX package inventory is incomplete");
+  assert(sbom.packages.length === 5, "SPDX package inventory is incomplete");
+  assert(sbom.packages.some(item => item.name === "gcc-final"), "Build-root compiler is missing from the SBOM");
   const offer = JSON.parse(await readFile(join(compliance, "corresponding-source-offer.json"), "utf8"));
   assert(
     offer.fulfillment.kind === "prepared-corresponding-source",
@@ -456,7 +466,7 @@ try {
     sourceSnapshot,
     join(work, "flat-compliance"),
     "0.1.0",
-    builderImageId,
+    builderImageId, base, basePin, "4",
   ]);
   assert(flatCompliance.status !== 0, "flat Buildroot source layout was accepted");
   assert(
@@ -476,7 +486,7 @@ try {
     sourceSnapshot,
     join(work, "extra-compliance"),
     "0.1.0",
-    builderImageId,
+    builderImageId, base, basePin, "4",
   ]);
   assert(extraCompliance.status !== 0, "unlisted Buildroot legal-info file was accepted");
   assert(
@@ -648,7 +658,7 @@ try {
 }
 
 async function createProjectFixture(root) {
-  for (const path of BUILD_SNAPSHOT_FILES) {
+  for (const path of new Set([...BUILD_SNAPSHOT_FILES, ...OS_BASE_SOURCE_FILES])) {
     const destination = join(root, path);
     await mkdir(dirname(destination), { recursive: true });
     await writeFile(destination, `${path}\n`);
@@ -781,6 +791,14 @@ async function createLegalFixture(root, { nestedSources = true } = {}) {
     '"node24-bin","24.18.0","MIT","LICENSE","node-v24.18.0-linux-arm64.tar.xz","https://nodejs.org",""',
     '"versioned","release/1: candidate","MIT","LICENSE","versioned.tar.xz","https://example.invalid",""',
     "",
+  ].join("\n"));
+  await mkdir(join(root, "host-licenses", "gcc-final-15.2.0"), { recursive: true });
+  await mkdir(join(root, "host-sources", "gcc-final-15.2.0"), { recursive: true });
+  await writeFile(join(root, "host-licenses", "gcc-final-15.2.0", "COPYING"), "GPL-3.0-or-later\n");
+  await writeFile(join(root, "host-sources", "gcc-final-15.2.0", "gcc-15.2.0.tar.xz"), "compiler corresponding source\n");
+  await writeFile(join(root, "host-manifest.csv"), [
+    '"PACKAGE","VERSION","LICENSE","LICENSE FILES","SOURCE ARCHIVE","SOURCE SITE","DEPENDENCIES WITH LICENSES"',
+    '"gcc-final","15.2.0","GPL-3.0-or-later","COPYING","gcc-15.2.0.tar.xz","https://gcc.gnu.org",""', "",
   ].join("\n"));
   const files = await listFiles(root);
   const lines = [];

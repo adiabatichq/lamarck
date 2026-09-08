@@ -20,6 +20,7 @@ import {
   BUILD_SNAPSHOT_MANIFEST,
   validateBuildSnapshot,
 } from "./build-snapshot.mjs";
+import { describeOsBaseInputs, verifyOsBase, OS_BASE_MANIFEST } from "./os-base.mjs";
 import { validateJavaScriptBuilderOutput } from "./js-builder-inventory.mjs";
 
 const [
@@ -29,11 +30,14 @@ const [
   outputValue,
   imageVersion = "0.1.0",
   builderImageId,
+  osBaseValue,
+  osBaseDigest,
+  jobs = "4",
 ] =
   process.argv.slice(2);
-if (!legalValue || !buildrootArchiveValue || !repoValue || !outputValue || !builderImageId) {
+if (!legalValue || !buildrootArchiveValue || !repoValue || !outputValue || !builderImageId || !osBaseValue || !osBaseDigest) {
   throw new Error(
-    "usage: generate-compliance.mjs <buildroot-legal-info> <buildroot-archive> <repo-root> <output> [image-version] <builder-image-id>",
+    "usage: generate-compliance.mjs <buildroot-legal-info> <buildroot-archive> <repo-root> <output> [image-version] <builder-image-id> <os-base> <os-base-digest> [jobs]",
   );
 }
 if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(imageVersion)) {
@@ -50,38 +54,28 @@ const outputRoot = resolve(outputValue);
 const sourceDateEpoch = parseSourceDateEpoch(process.env.SOURCE_DATE_EPOCH ?? "0");
 await mkdir(outputRoot, { recursive: false, mode: 0o755 });
 const snapshot = await validateBuildSnapshot(repoRoot);
+const osBaseRoot = await requireDirectory(osBaseValue, "OS base");
+const osBase = await verifyOsBase(osBaseRoot, osBaseDigest,
+  await describeOsBaseInputs(repoRoot, builderImageId, String(sourceDateEpoch), jobs));
 
 const legalInfoFiles = await verifyBuildrootLegalInfo(legalRoot);
-const manifestSource = await readFile(join(legalRoot, "manifest.csv"), "utf8");
-const manifestPackages = parseBuildrootManifest(manifestSource);
-if (manifestPackages.length === 0) throw new Error("Buildroot target manifest contains no packages");
-
-const licensesSource = join(legalRoot, "licenses");
-const sourcesSource = join(legalRoot, "sources");
-await requireNonemptyTree(licensesSource, "Buildroot target licenses");
-await requireNonemptyTree(sourcesSource, "Buildroot target sources");
 const packages = [];
-for (const component of manifestPackages) {
-  if (!component.licenseFiles) {
-    throw new Error(`Buildroot target ${component.name} has no retained license files`);
+for (const kind of ["target", "host"]) {
+  const prefix = kind === "host" ? "host-" : "";
+  const manifestPackages = parseBuildrootManifest(await readFile(join(legalRoot, `${prefix}manifest.csv`), "utf8"));
+  if (manifestPackages.length === 0) throw new Error(`Buildroot ${kind} manifest contains no packages`);
+  await requireNonemptyTree(join(legalRoot, `${prefix}licenses`), `Buildroot ${kind} licenses`);
+  await requireNonemptyTree(join(legalRoot, `${prefix}sources`), `Buildroot ${kind} sources`);
+  for (const component of manifestPackages) {
+    if (!component.licenseFiles) throw new Error(`Buildroot ${kind} ${component.name} has no retained license files`);
+    if (!component.sourceArchive || component.sourceArchive === "not saved") throw new Error(`Buildroot ${kind} ${component.name} has no retained source archive`);
+    const sourceName = safeFileName(component.sourceArchive, `${component.name} source archive`);
+    const sourceDirectory = safeFileName(`${component.name}-${buildrootSanitize(component.version)}`, `${component.name} source directory`);
+    const sourceArchivePath = `${sourceDirectory}/${sourceName}`;
+    await requireRegularFile(join(legalRoot, `${prefix}sources`, sourceArchivePath), `${component.name} source archive`);
+    if (!legalInfoFiles.has(`${prefix}sources/${sourceArchivePath}`)) throw new Error(`${component.name} source archive is not covered by legal-info.sha256`);
+    packages.push({ ...component, buildrootKind: kind, sourceArchivePath });
   }
-  if (!component.sourceArchive || component.sourceArchive === "not saved") {
-    throw new Error(`Buildroot target ${component.name} has no retained source archive`);
-  }
-  const sourceName = safeFileName(component.sourceArchive, `${component.name} source archive`);
-  const sourceDirectory = safeFileName(
-    `${component.name}-${buildrootSanitize(component.version)}`,
-    `${component.name} source directory`,
-  );
-  const sourceArchivePath = `${sourceDirectory}/${sourceName}`;
-  await requireRegularFile(
-    join(sourcesSource, sourceDirectory, sourceName),
-    `${component.name} source archive`,
-  );
-  if (!legalInfoFiles.has(`sources/${sourceArchivePath}`)) {
-    throw new Error(`${component.name} source archive is not covered by legal-info.sha256`);
-  }
-  packages.push({ ...component, sourceArchivePath });
 }
 
 const buildrootMetadata = join(outputRoot, "buildroot");
@@ -93,10 +87,13 @@ await copySelectedFiles(legalRoot, buildrootMetadata, [
   "buildroot.config",
   "legal-info.sha256",
   "manifest.csv",
+  "host-manifest.csv",
 ]);
-await copyTree(licensesSource, licensesOutput);
+await copyTree(join(legalRoot, "licenses"), licensesOutput);
+await copyTree(join(legalRoot, "host-licenses"), join(licensesOutput, "buildroot-host"));
 await mkdir(sourceOutput, { mode: 0o755 });
-await copyTree(sourcesSource, join(sourceOutput, "target-packages"));
+await copyTree(join(legalRoot, "sources"), join(sourceOutput, "target-packages"));
+await copyTree(join(legalRoot, "host-sources"), join(sourceOutput, "host-packages"));
 await copyRegularFile(
   buildrootArchive,
   join(sourceOutput, "buildroot", basename(buildrootArchive)),
@@ -120,8 +117,23 @@ for (const projectPath of projectFiles) {
   else throw new Error(`project source ${projectPath} is not a regular file or directory`);
 }
 
+// Preserve the base's exact native source and identity alongside today's Guest
+// source. The matching input identity above prevents attributing old native
+// binaries to changed source/configuration from the current checkout.
+await copyTree(join(osBaseRoot, "os-source"), join(sourceOutput, "os-base-project"));
+await copyRegularFile(join(osBaseRoot, OS_BASE_MANIFEST), join(outputRoot, OS_BASE_MANIFEST));
+for (const output of osBase.manifest.outputs) {
+  if (!output.path.startsWith("output/legal-info/") && !output.path.startsWith("src/")
+    && output.path !== "image-input/builder-packages.tsv") continue;
+  const exportedPath = output.path.startsWith("output/legal-info/")
+    ? join(legalRoot, output.path.slice("output/legal-info/".length))
+    : output.path.startsWith("src/") ? buildrootArchive
+      : join(dirname(dirname(legalRoot)), output.path);
+  if (`sha256:${await sha256File(exportedPath)}` !== output.sha256) throw new Error(`OS base retained compliance output mismatch: ${output.path}`);
+}
+
 const packageRecords = await Promise.all(packages.map(async (component) => {
-  const sourcePath = `corresponding-source/target-packages/${component.sourceArchivePath}`;
+  const sourcePath = `corresponding-source/${component.buildrootKind}-packages/${component.sourceArchivePath}`;
   const sourceFile = join(outputRoot, sourcePath);
   return {
     ...component,
@@ -131,6 +143,7 @@ const packageRecords = await Promise.all(packages.map(async (component) => {
 }));
 
 const sbomSeed = JSON.stringify(packageRecords.map((component) => [
+  component.buildrootKind,
   component.name,
   component.version,
   component.license,
@@ -139,7 +152,7 @@ const sbomSeed = JSON.stringify(packageRecords.map((component) => [
 const namespaceDigest = createHash("sha256").update(sbomSeed).digest("hex");
 const created = new Date(sourceDateEpoch * 1_000).toISOString().replace(".000Z", "Z");
 const spdxPackages = packageRecords.map((component) => ({
-  SPDXID: spdxId(component.name, component.version),
+  SPDXID: spdxId(`${component.buildrootKind}-${component.name}`, component.version),
   name: component.name,
   versionInfo: component.version,
   downloadLocation: "NOASSERTION",
@@ -176,8 +189,10 @@ await writeJson(join(outputRoot, "sbom.spdx.json"), sbom);
 const notices = [
   "Lamarck Capsule Guest — Third-Party Notices",
   "",
-  "This index is generated from Buildroot legal-info for target packages included in the Guest image.",
+  "This index includes Buildroot target packages and Host tools, including the toolchain copied into the Build root.",
   "The complete retained license texts are in licenses/.",
+  `OS base: ${osBaseDigest}; native source is retained in corresponding-source/os-base-project.`,
+  "Current Lamarck Guest programs and their Apache-2.0 license are retained in corresponding-source/lamarck-project.",
   "Exact corresponding source is available as described in corresponding-source-offer.json.",
   "",
   ...packageRecords.flatMap((component) => [
@@ -208,11 +223,13 @@ const sourceOffer = {
   buildroot: {
     version: "2026.05",
     targetManifest: "buildroot/manifest.csv",
+    hostManifest: "buildroot/host-manifest.csv",
     configuration: "buildroot/buildroot.config",
     legalReport: "buildroot/README",
   },
   components: packageRecords.map((component) => ({
     name: component.name,
+    buildrootKind: component.buildrootKind,
     version: component.version,
     declaredLicense: component.license,
     sourcePath: component.sourcePath,
@@ -250,6 +267,7 @@ await copyRegularFile(
 await writeJson(join(outputRoot, "builder-environment.json"), {
   schemaVersion: 1,
   builderImageId,
+  osBase: { manifestDigest: osBaseDigest, manifest: OS_BASE_MANIFEST, identity: osBase.manifest.identity },
   baseImage:
     "debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df",
   aptSnapshot: "20260624T000000Z",
@@ -353,7 +371,7 @@ async function verifyBuildrootLegalInfo(root) {
       throw new Error(`Buildroot legal-info checksum mismatch for ${path}`);
     }
   }
-  for (const required of ["README", "buildroot.config", "manifest.csv"]) {
+  for (const required of ["README", "buildroot.config", "manifest.csv", "host-manifest.csv"]) {
     if (!listed.has(required)) throw new Error(`Buildroot legal-info does not cover ${required}`);
   }
   const actual = await listRegularFiles(await requireDirectory(root, "Buildroot legal-info"));

@@ -1,7 +1,8 @@
 import { build } from "esbuild";
-import { copyFile, mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import "../../cli/scripts/build-transport.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDirectory = resolve(root, "dist");
@@ -13,6 +14,11 @@ await build({
     "release-runc-smoke": resolve(root, "src", "release-runc-smoke.ts"),
   },
   outdir: outputDirectory,
+  plugins: [{ name: "guest-cli-boundary", setup(build) {
+    build.onResolve({ filter: /^@lamarck\/cli$/ }, () => {
+      throw new Error("Guest programs must not import the CLI business catalog");
+    });
+  } }],
   bundle: true,
   platform: "node",
   target: "node24",
@@ -20,7 +26,5 @@ await build({
   sourcemap: false,
   legalComments: "none",
 });
-await copyFile(
-  resolve(root, "..", "cli", "dist", "lamarck-managed.mjs"),
-  resolve(outputDirectory, "lamarck.js"),
-);
+// An old local output must never be included in a new Guest image.
+await rm(resolve(outputDirectory, "lamarck.js"), { force: true });

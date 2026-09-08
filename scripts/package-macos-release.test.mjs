@@ -42,7 +42,7 @@ import {
   publishDirectoryNoReplace,
 } from "./macos-release-publication.mjs";
 import { loadFrozenOsxSign } from "./macos-release-signer.mjs";
-import { runPackagedNodePtySmoke } from "./macos-release-runtime.mjs";
+import { runPackagedNodePtySmoke, validatePackagedManagedCli } from "./macos-release-runtime.mjs";
 import {
   buildDeviceIdentityNative,
   deviceIdentityNativeRequired,
@@ -77,6 +77,31 @@ const validEnvironment = {
   LAMARCK_MARKETPLACE_SIGNING_KEY_ID: "marketplace-test-1",
   LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: Buffer.alloc(32, 7).toString("base64"),
 };
+
+test("alpha and release packages include and verify the managed CLI before signing", async (t) => {
+  for (const name of ["package-macos-alpha.mjs", "package-macos-release.mjs"]) {
+    const source = await readFile(join(root, "scripts", name), "utf8");
+    assert.match(source, /"lamarck-managed\.mjs"/);
+    assert.match(source, /"managed-cli\.json"/);
+    assert.match(source, /await validatePackagedManagedCli\(electronResources\)/);
+  }
+  const directory = await mkdtemp(join(tmpdir(), "lamarck-packaged-cli-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const bytes = Buffer.from("#!/usr/bin/env node\nconsole.log('managed');\n");
+  const artifact = join(directory, "lamarck-managed.mjs");
+  const descriptor = { type: "cli.artifact", schemaVersion: 1, bytes: bytes.length,
+    digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}` };
+  await assert.rejects(validatePackagedManagedCli(directory), /ENOENT/);
+  await writeFile(join(directory, "managed-cli.json"), JSON.stringify(descriptor));
+  await assert.rejects(validatePackagedManagedCli(directory), /ENOENT/);
+  await writeFile(artifact, bytes);
+  await validatePackagedManagedCli(directory);
+  await writeFile(artifact, "tampered");
+  await assert.rejects(validatePackagedManagedCli(directory), /integrity verification failed/);
+  await rm(artifact);
+  await symlink(join(directory, "managed-cli.json"), artifact);
+  await assert.rejects(validatePackagedManagedCli(directory), /ELOOP/);
+});
 
 test("release credentials fail closed when signing identity is absent or ad-hoc", () => {
   assert.throws(() => distributionIdentity(undefined), /required/);

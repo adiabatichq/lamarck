@@ -38,7 +38,9 @@
     "package:macos:alpha": "node scripts/package-macos-alpha.mjs",
     "package:macos:dry-run": "node scripts/package-macos-release.mjs --dry-run",
     "package:macos:test": "node --test scripts/package-macos-release.test.mjs",
-    "package:patch": "node scripts/package-os-patch.mjs"
+    "package:patch": "node scripts/package-os-patch.mjs",
+    "capsule-guest:os-base": "desktop/capsule-guest/scripts/build-guest-image.sh --os-base-only",
+    "capsule-guest:test-os-base": "node --test desktop/capsule-guest/scripts/test-os-base.mjs"
   },
   "workspaces": [
     "desktop/cli",

@@ -6,18 +6,11 @@ target="${1:?Buildroot target directory is required}"
 external="${BR2_EXTERNAL_LAMARCK_PATH:?BR2_EXTERNAL_LAMARCK_PATH is required}"
 guest="$(CDPATH= cd -- "$external/.." && pwd)"
 repo="$(CDPATH= cd -- "$guest/../.." && pwd)"
-prebuilt="${LAMARCK_PREBUILT_ROOT:?LAMARCK_PREBUILT_ROOT is required}"
 
 # Virtualization.framework attaches the rootfs read-only. Materialize the
 # state-disk mountpoint in the image; early boot must never try to create it.
 install -d -m 0700 "$target/var/lib/lamarck"
 
-for file in "$prebuilt/capsule-guest/dist/supervisor.js" \
-	"$prebuilt/capsule-guest/dist/offline-npm.js" \
-	"$prebuilt/capsule-guest/dist/release-runc-smoke.js" \
-	"$prebuilt/capsule-guest/dist/lamarck.js"; do
-	[ -f "$file" ] || { echo "missing prebuilt Guest input $file" >&2; exit 1; }
-done
 
 compiler="$(find "$HOST_DIR/bin" -maxdepth 1 \( -type f -o -type l \) -name 'aarch64*-gcc' | LC_ALL=C sort | head -n 1)"
 [ -x "$compiler" ] || { echo "Buildroot target compiler was not found" >&2; exit 1; }
@@ -70,8 +63,8 @@ make_oci_root() {
 
 runtime_root="$target/opt/lamarck/rootfs/node24"
 make_oci_root "$runtime_root"
-install -D -m 0755 "$prebuilt/capsule-guest/dist/lamarck.js" \
-	"$runtime_root/usr/bin/lamarck"
+# Fixed file mountpoint; the authenticated Host supplies its contents at launch.
+: > "$runtime_root/usr/bin/lamarck"
 make_oci_root "$target/opt/lamarck/rootfs/build-node24"
 # Python/pkgconf are target packages only because Buildroot does not produce a
 # target-native compiler package.  Their libraries must not leak into the
@@ -196,8 +189,7 @@ rm -f -- "$build_root/usr/bin/python" "$build_root/usr/bin/pkg-config"
 ln -s python3 "$build_root/usr/bin/python"
 ln -s pkgconf "$build_root/usr/bin/pkg-config"
 install_build_toolchain "$build_root"
-install -D -m 0755 "$prebuilt/capsule-guest/dist/offline-npm.js" \
-	"$build_root/usr/libexec/lamarck-offline-npm"
+mkdir -p "$build_root/usr/libexec"
 
 # Projecting BusyBox applet links must not let a later Build-tool override
 # write through one of those links and mutate the shared applet binary.
@@ -217,12 +209,6 @@ for program in make python3 pkgconf cc gcc c++ g++ cpp ar as ld nm objcopy objdu
 	}
 done
 
-install -D -m 0755 "$prebuilt/capsule-guest/dist/supervisor.js" \
-	"$target/usr/libexec/lamarck-supervisor.js"
-install -D -m 0755 "$prebuilt/capsule-guest/dist/offline-npm.js" \
-	"$target/usr/libexec/lamarck-offline-npm"
-install -D -m 0755 "$prebuilt/capsule-guest/dist/release-runc-smoke.js" \
-	"$target/usr/libexec/lamarck-release-runc-smoke.js"
 ln -sf /usr/bin/runc "$target/usr/sbin/runc"
 ln -sf /usr/bin/mkfs.erofs "$target/usr/sbin/mkfs.erofs"
 
@@ -236,8 +222,5 @@ chmod 0755 "$target/etc/init.d/S00lamarck-state" \
 	"$target/etc/init.d/S01lamarck-files" \
 	"$target/etc/init.d/S50lamarck-capsule" \
 	"$target/usr/libexec/lamarck-guest-service" \
-	"$target/usr/libexec/lamarck-supervisor.js" \
-	"$target/usr/libexec/lamarck-offline-npm" \
-	"$target/usr/libexec/lamarck-release-runc-smoke.js" \
 	"$target/usr/libexec/lamarck-vsock-relay" \
 	"$target/usr/libexec/lamarck-net-helper"

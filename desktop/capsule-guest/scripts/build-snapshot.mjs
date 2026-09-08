@@ -24,7 +24,10 @@ export const BUILD_SNAPSHOT_FILES = Object.freeze([
   "desktop/capsule-guest/package.json",
   "desktop/capsule-guest/tsconfig.json",
   "desktop/cli/package.json",
-  "desktop/cli/tsconfig.build.json",
+  "desktop/cli/scripts/build-transport.mjs",
+  "desktop/cli/src/transport.ts",
+  "desktop/cli/src/stream.ts",
+  "desktop/cli/src/errors.ts",
   "desktop/core/package.json",
   "desktop/shell/package.json",
   "scripts/macos-release-publication.mjs",
@@ -38,8 +41,6 @@ export const BUILD_SNAPSHOT_DIRECTORIES = Object.freeze([
   "desktop/capsule-guest/scripts",
   "desktop/capsule-guest/src",
   "desktop/capsule-guest/test-boot",
-  "desktop/cli/scripts",
-  "desktop/cli/src",
 ]);
 
 export async function createBuildSnapshot(repositoryValue, destinationValue, options = {}) {

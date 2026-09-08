@@ -8,7 +8,7 @@ import {
   validateOpaqueId,
 } from "../protocol/validate";
 import type { WorkloadKind } from "../protocol/types";
-import { MANAGED_APP_EDIT_ROOT } from "@lamarck/cli";
+import { MANAGED_APP_EDIT_ROOT } from "@lamarck/cli/transport";
 
 export const OCI_POLICY_VERSION = 1;
 export const LAMARCK_SDK_SOCKET_ENV = "LAMARCK_SDK_SOCKET" as const;
@@ -581,6 +581,7 @@ function fixedMounts(runtimeRoot: string, sdkBridgeRoot: string, appEditRoot: st
     { destination: "/home/app", type: "bind", source: `${runtimeRoot}/home`, options: ["rbind", "rw", "nosuid", "nodev"] },
     { destination: "/run/app", type: "bind", source: `${runtimeRoot}/run`, options: ["rbind", "rw", "nosuid", "nodev"] },
     { destination: "/run/lamarck", type: "bind", source: sdkBridgeRoot, options: ["rbind", "ro", "nosuid", "nodev", "noexec"] },
+    { destination: "/usr/bin/lamarck", type: "bind", source: `${sdkBridgeRoot}/lamarck-managed.mjs`, options: ["bind", "ro", "nosuid", "nodev"] },
     { destination: MANAGED_APP_EDIT_ROOT, type: "bind", source: appEditRoot, options: ["rbind", "rw", "nosuid", "nodev"] },
     { destination: APP_EDIT_LOWER_ROOT_PATH, type: "bind", source: APP_EDIT_LOWER_ROOT_PATH, options: ["rbind", "ro", "nosuid", "nodev", "noexec"] },
     { destination: LAMARCK_FILES_ROOT_PATH, type: "bind", source: LAMARCK_FILES_ROOT_PATH, options: ["rbind", "ro", "nosuid", "nodev", "noexec"] },

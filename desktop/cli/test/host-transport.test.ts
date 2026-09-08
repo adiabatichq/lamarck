@@ -23,7 +23,7 @@ describe("Host runtime discovery", () => {
     await expect(readRuntimeDescriptor(path)).rejects.toThrowError(expect.objectContaining({ code: "LAMARCK_NOT_RUNNING" }));
   });
 
-  test("uses hello as the exact protocol compatibility authority", async () => {
+  test("uses protocol compatibility and checks individual capabilities", async () => {
     const { path } = await fixture();
     const incompatible = new HostCliTransport({
       descriptorPath: path,
@@ -35,7 +35,8 @@ describe("Host runtime discovery", () => {
       descriptorPath: path,
       fetch: vi.fn<typeof fetch>(async () => Response.json({ protocolVersion: 1, environment: "host", supportedOperations: HOST_CLI_OPERATIONS.slice(1) })),
     });
-    await expect(changed.hello()).rejects.toThrowError(expect.objectContaining({ code: "CLI_HOST_INCOMPATIBLE" }));
+    await expect(changed.hello()).resolves.toMatchObject({ supportedOperations: HOST_CLI_OPERATIONS.slice(1) });
+    await expect(changed.execute({ requestId: "missing", operation: "query", input: { sql: "SELECT 1" } })).rejects.toMatchObject({ code: "CLI_UNSUPPORTED_COMMAND" });
   });
 
   test("rejects a symlinked runtime directory", async () => {

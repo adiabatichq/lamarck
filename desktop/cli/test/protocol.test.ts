@@ -10,13 +10,22 @@ import {
 } from "../src/index";
 
 describe("typed CLI protocol V1", () => {
-  test("negotiates the exact Host and managed operation vectors", () => {
+  test("validates protocol identity and advertised operation names", () => {
     expect(parseCliCapabilities({ protocolVersion: 1, environment: "host", supportedOperations: HOST_CLI_OPERATIONS }, "host").supportedOperations)
       .toEqual(HOST_CLI_OPERATIONS);
     expect(parseCliCapabilities({ protocolVersion: 1, environment: "managed", supportedOperations: MANAGED_CLI_OPERATIONS }, "managed").supportedOperations)
       .toEqual(MANAGED_CLI_OPERATIONS);
     expect(() => parseCliCapabilities({ protocolVersion: 2, environment: "host", supportedOperations: HOST_CLI_OPERATIONS }, "host"))
       .toThrowError(expect.objectContaining({ code: "CLI_HOST_INCOMPATIBLE" }));
+  });
+
+  test("accepts reordered, smaller and newer operation sets, while rejecting malformed capabilities", () => {
+    for (const supportedOperations of [[], ["query"], ["future.command", "query"], [...MANAGED_CLI_OPERATIONS].reverse()]) {
+      expect(parseCliCapabilities({ protocolVersion: 1, environment: "managed", supportedOperations }).supportedOperations).toEqual(supportedOperations);
+    }
+    for (const supportedOperations of [["query", "query"], ["../escape"], [""], [42], ["a".repeat(129)]]) {
+      expect(() => parseCliCapabilities({ protocolVersion: 1, environment: "managed", supportedOperations })).toThrow();
+    }
   });
 
   test("rejects extra routing, identity, producer, and Host-path fields", () => {

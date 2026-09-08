@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { encodeCliFrame } from "@lamarck/cli/transport";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -174,7 +176,7 @@ async function runTwoAppIsolation(): Promise<void> {
           consumedTicket: issueSdkTicket(appB),
         },
         cliChannel: {
-          source: new PassThrough(),
+          source: smokeCliChannel(),
           consumedTicket: issueCliTicket(appA),
         },
       }),
@@ -536,7 +538,7 @@ async function start(
       consumedTicket: consumed,
     },
     cliChannel: {
-      source: new PassThrough(),
+      source: smokeCliChannel(),
       consumedTicket: issueCliTicket(spec),
     },
   });
@@ -838,4 +840,15 @@ function closeServer(server: Server): void {
   } catch {
     // The listener may already be closed after the connected pair was made.
   }
+}
+
+function smokeCliChannel(): PassThrough {
+  const stream = new PassThrough();
+  const bytes = Buffer.from("#!/bin/sh\nexit 0\n");
+  stream.write(encodeCliFrame({ type: "cli.artifact", schemaVersion: 1,
+    digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, bytes: bytes.length }));
+  stream.write(bytes);
+  stream.write(encodeCliFrame({ protocolVersion: 1, environment: "managed", supportedOperations: [] }));
+  stream.write(encodeCliFrame({ type: "app-workspaces.sync", schemaVersion: 1, complete: true, editBases: [] }));
+  return stream;
 }

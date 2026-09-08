@@ -1,10 +1,6 @@
-export const CLI_PROTOCOL_VERSION = 1 as const;
-// A schema change may contain 300 KiB of UTF-8 text. JSON escaping can expand
-// each input byte up to six bytes, so V1 reserves a bounded 2 MiB frame.
-export const CLI_MAX_CONTROL_BYTES = 2 * 1024 * 1024;
-export const CLI_MAX_INLINE_BYTES = 20 * 1024 * 1024;
-export const MANAGED_CLI_SOCKET_PATH = "/run/lamarck/cli.sock" as const;
-export const MANAGED_APP_EDIT_ROOT = "/mnt/lamarck-apps" as const;
+import type { CliHostCapabilities, CliUpload, CliByteStreams, CliErrorValue } from "./transport.js";
+export { CLI_PROTOCOL_VERSION, CLI_MAX_CONTROL_BYTES, CLI_MAX_INLINE_BYTES, MANAGED_CLI_SOCKET_PATH, MANAGED_APP_EDIT_ROOT } from "./transport.js";
+export type { CliEnvironment, CliHostCapabilities, CliUpload, CliByteStreams, CliErrorValue } from "./transport.js";
 
 export const CLI_OPERATIONS = [
   "query",
@@ -35,7 +31,6 @@ export const CLI_OPERATIONS = [
 ] as const;
 
 export type CliOperation = typeof CLI_OPERATIONS[number];
-export type CliEnvironment = "host" | "managed";
 export const HOST_CLI_OPERATIONS: readonly CliOperation[] = Object.freeze(
   CLI_OPERATIONS.filter((operation) => operation !== "app.refresh"),
 );
@@ -250,33 +245,11 @@ export interface CliOperationResultMap {
 export type CliOperationInput<T extends CliOperation> = CliOperationInputMap[T];
 export type CliOperationResult<T extends CliOperation> = CliOperationResultMap[T];
 
-export interface CliHostCapabilities {
-  readonly protocolVersion: 1;
-  readonly environment: CliEnvironment;
-  readonly supportedOperations: readonly CliOperation[];
-}
-
 export interface CliRequest<T extends CliOperation = CliOperation> {
   readonly requestId: string;
   readonly operation: T;
   readonly input: CliOperationInput<T>;
   readonly upload?: CliUpload;
-}
-
-export type CliUpload = {
-  readonly kind: "app-package";
-  readonly archiveDigest: string;
-  readonly archiveBytes: number;
-  readonly baseVersion: string | null;
-  readonly basePackageDigest: string;
-} | {
-  readonly kind: "file-stdin";
-  readonly bytes: number;
-};
-
-export interface CliByteStreams {
-  readonly stdoutBytes: number;
-  readonly stderrBytes: number;
 }
 
 export type CliResponse<T extends CliOperation = CliOperation> =
@@ -289,7 +262,6 @@ export type CliResponse<T extends CliOperation = CliOperation> =
     }
   | { readonly requestId: string; readonly ok: false; readonly error: CliErrorValue };
 
-export interface CliErrorValue { readonly code: string; readonly message: string }
 
 export interface CliTransport {
   hello(): Promise<CliHostCapabilities>;

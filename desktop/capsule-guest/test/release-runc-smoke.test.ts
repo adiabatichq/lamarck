@@ -3,7 +3,7 @@ import { createConnection } from "node:net";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { assertOciSecurityInvariants } from "@lamarck/capsule";
-import { CliStreamReader, MANAGED_CLI_OPERATIONS, parseCliCapabilities, parseCliFrame } from "@lamarck/cli";
+import { CliStreamReader, parseCliCapabilities, parseCliFrame } from "@lamarck/cli";
 import { openWorkloadAppCliBridge } from "../../capsule/src/app-edit/guest-bridge";
 import {
   createReleaseRuncSmokeCliChannel,
@@ -41,7 +41,7 @@ describe("signed Guest release runc smoke", () => {
       client = createConnection(socketPath);
       const reader = new CliStreamReader(client);
       const hello = parseCliCapabilities(parseCliFrame(await reader.readFrame()), "managed");
-      expect(hello.supportedOperations).toEqual(MANAGED_CLI_OPERATIONS);
+      expect(hello.supportedOperations).toEqual([]);
     } finally {
       clearTimeout(timeout);
       client?.destroy();

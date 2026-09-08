@@ -122,6 +122,17 @@ describe("deterministic OCI bundle planning", () => {
       expect.objectContaining<Partial<OciSecurityError>>({ invariant: "mounts" }),
     );
 
+    for (const change of [
+      (mount: { options: string[]; source: string }) => { mount.options = ["bind", "rw", "nosuid", "nodev"]; },
+      (mount: { options: string[]; source: string }) => { mount.source = "/app/forged-cli.mjs"; },
+    ]) {
+      const substitutedCli = copyPlan();
+      change(substitutedCli.config.mounts.find(mount => mount.destination === "/usr/bin/lamarck")!);
+      expect(() => assertOciSecurityInvariants(substitutedCli, expectedIdentity())).toThrowError(
+        expect.objectContaining<Partial<OciSecurityError>>({ invariant: "mounts" }),
+      );
+    }
+
     const writableSdkBridge = copyPlan();
     writableSdkBridge.config.mounts.find(
       (mount) => mount.destination === "/run/lamarck",

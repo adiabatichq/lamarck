@@ -9,7 +9,7 @@ RUN printf '%s\n' \
     && rm -f /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      bash bc bison build-essential ca-certificates cpio file flex git libncurses-dev \
+      bash bc bison build-essential ca-certificates cpio e2fsprogs file flex git libncurses-dev \
       openssl patchelf python3 rsync sed unzip wget xz-utils \
     && rm -rf /var/lib/apt/lists/*
 

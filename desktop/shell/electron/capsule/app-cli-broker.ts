@@ -1,3 +1,5 @@
+import { writeManagedCliArtifact } from "@lamarck/capsule";
+import { parseCliRequestEnvelope } from "@lamarck/cli/transport";
 import { Readable } from "node:stream";
 import type { Duplex } from "node:stream";
 import { watch as watchFileSystem } from "node:fs";
@@ -64,6 +66,7 @@ export class AppCliStreamServer {
 
   constructor(private readonly options: {
     readonly dispatcher: () => CliOperationDispatcher;
+    readonly managedCliArtifact: () => Promise<Parameters<typeof writeManagedCliArtifact>[1]>;
     readonly appsRoot?: string | (() => string);
     readonly watch?: AppWatchFactory;
     readonly watchDebounceMs?: number;
@@ -90,6 +93,8 @@ export class AppCliStreamServer {
     };
     stream.once("close", closeSession);
     const run = async () => {
+      const artifact = await this.options.managedCliArtifact();
+      await this.#write(session, () => writeManagedCliArtifact(stream, artifact));
       const initialBases = await this.options.dispatcher().managedAppEditBases();
       await this.#write(session, () => writeCliBytes(
         stream,
@@ -107,7 +112,16 @@ export class AppCliStreamServer {
       while (!session.closed && !stream.destroyed) {
         let request: CliRequest;
         try {
-          request = parseCliRequest(parseCliFrame(await reader.readFrame()), true);
+          const envelope = parseCliRequestEnvelope(parseCliFrame(await reader.readFrame()), true);
+          if (!this.options.dispatcher().capabilities("managed").supportedOperations.includes(envelope.operation)) {
+            if (envelope.upload) throw new Error("Unsupported CLI operation cannot upload bytes");
+            await this.#write(session, () => writeCliBytes(stream, encodeCliFrame({
+              requestId: envelope.requestId, ok: false,
+              error: { code: "CLI_UNSUPPORTED_COMMAND", message: `${envelope.operation} is not available on this Host.` },
+            })));
+            continue;
+          }
+          request = parseCliRequest(envelope, true);
         } catch (error) {
           if (stream.readableEnded || stream.destroyed) return;
           throw error;

@@ -34,7 +34,7 @@ import {
   publishDirectoryNoReplace,
 } from "./macos-release-publication.mjs";
 import { loadFrozenOsxSign } from "./macos-release-signer.mjs";
-import { runPackagedNodePtySmoke } from "./macos-release-runtime.mjs";
+import { runPackagedNodePtySmoke, validatePackagedManagedCli } from "./macos-release-runtime.mjs";
 import { resolveBuildSystemIdentity } from "./build-system-identity.mjs";
 import {
   requireMarketplaceTrustRoot,
@@ -485,6 +485,8 @@ async function assembleApplication(
     "core.mjs",
     "guard-service.cjs",
     "main.cjs",
+    "lamarck-managed.mjs",
+    "managed-cli.json",
     "marketplace-trust-roots.json",
     "preload.cjs",
     "pty-helper.cjs",
@@ -523,6 +525,8 @@ async function validatePackagedApplication(appPath, releaseConfig) {
     "core.mjs",
     "guard-service.cjs",
     "main.cjs",
+    "lamarck-managed.mjs",
+    "managed-cli.json",
     "marketplace-trust-roots.json",
     "native",
     "preload.cjs",
@@ -533,6 +537,7 @@ async function validatePackagedApplication(appPath, releaseConfig) {
     electronResources,
     join(electronResources, "native"),
   );
+  await validatePackagedManagedCli(electronResources);
   await validateMarketplaceTrustRootResource(
     join(electronResources, "marketplace-trust-roots.json"),
     process.env,

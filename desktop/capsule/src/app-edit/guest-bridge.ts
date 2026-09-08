@@ -4,19 +4,17 @@ import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import {
-  MANAGED_APP_EDIT_ROOT,
   encodeCliFrame,
   parseCliCapabilities,
   parseCliFrame,
-  parseCliRequest,
-  parseCliResponse,
-  type CliHostCapabilities,
-  type CliRequest,
-  type CliResponse,
+  parseCliRequestEnvelope,
+  parseCliWireResponse,
+  type CliWireRequest,
+  type CliWireResponse,
   CliStreamReader,
-  writeCliResponse,
   writeCliBytes,
-} from "@lamarck/cli";
+} from "@lamarck/cli/transport";
+import { MANAGED_CLI_FILENAME, receiveManagedCliArtifact } from "./cli-artifact";
 import { createAppEditSnapshot, hashAppEditPackage } from "./snapshot";
 
 interface AppEditBaseDescriptorV1 {
@@ -43,18 +41,34 @@ class SupersededEditBaseError extends Error {
 
 export interface WorkloadAppCliBridge { close(): Promise<void> }
 
-export async function openWorkloadAppCliBridge(options: {
+interface BridgeOptions {
   readonly socketPath: string;
   readonly upstream: Duplex;
   readonly editRoot: string;
   readonly lowerRoot: string;
   readonly uid: number;
   readonly gid: number;
-}): Promise<WorkloadAppCliBridge> {
+}
+
+type BridgeResponse = CliWireResponse & { readonly bytePayloads?: readonly Buffer[] };
+
+export async function openWorkloadAppCliBridge(options: BridgeOptions): Promise<WorkloadAppCliBridge> {
   if (options.socketPath !== `${dirname(options.socketPath)}/cli.sock`) {
     throw new Error("CLI socket must use its fixed name");
   }
-  const upstreamReader = new CliStreamReader(options.upstream);
+  const reader = new CliStreamReader(options.upstream);
+  let received = false;
+  try {
+    await receiveManagedCliArtifact(reader, dirname(options.socketPath));
+    received = true;
+    return await openBridge(options, reader);
+  } catch (error) {
+    if (received) await rm(`${dirname(options.socketPath)}/${MANAGED_CLI_FILENAME}`, { force: true });
+    throw error;
+  }
+}
+
+async function openBridge(options: BridgeOptions, upstreamReader: CliStreamReader): Promise<WorkloadAppCliBridge> {
   const hello = parseCliCapabilities(parseCliFrame(await upstreamReader.readFrame()), "managed");
   const server = createServer();
   const clients = new Set<Socket>();
@@ -67,8 +81,8 @@ export async function openWorkloadAppCliBridge(options: {
   let upstreamFailure: Error | undefined;
   let pending: {
     readonly requestId: string;
-    readonly operation: CliRequest["operation"];
-    readonly resolve: (response: CliResponse) => void;
+    readonly operation: CliWireRequest["operation"];
+    readonly resolve: (response: BridgeResponse) => void;
     readonly reject: (error: Error) => void;
   } | undefined;
 
@@ -79,12 +93,12 @@ export async function openWorkloadAppCliBridge(options: {
   };
 
   const exchange = async (
-    request: CliRequest,
+    request: CliWireRequest,
     upload?: string | Uint8Array,
-  ): Promise<CliResponse> => {
+  ): Promise<BridgeResponse> => {
     if (pending) throw new Error("Managed CLI attempted concurrent Host exchanges");
     if (upstreamFailure) throw upstreamFailure;
-    return new Promise<CliResponse>((resolveExchange, rejectExchange) => {
+    return new Promise<BridgeResponse>((resolveExchange, rejectExchange) => {
       pending = {
         requestId: request.requestId,
         operation: request.operation,
@@ -180,7 +194,7 @@ export async function openWorkloadAppCliBridge(options: {
     });
   };
 
-  const unwrapResult = async (request: CliRequest, response: CliResponse): Promise<CliResponse> => {
+  const unwrapResult = async (request: CliWireRequest, response: BridgeResponse): Promise<BridgeResponse> => {
     if (!response.ok) return response;
     if (request.operation === "app.list") {
       if (!Array.isArray(response.result)) throw new Error("Host returned invalid App inventory");
@@ -204,7 +218,7 @@ export async function openWorkloadAppCliBridge(options: {
     if (request.operation === "app.refresh") {
       if (!response.result || typeof response.result !== "object") throw new Error("Host omitted the App editing base");
       const wrapped = response.result as { result?: unknown; editBase?: unknown };
-      const appId = requireAppId((request as CliRequest<"app.refresh">).input.appId);
+      const appId = requireAppId(request.input.appId);
       const base = parseBase(wrapped.editBase);
       if (base.appId !== appId) throw new Error("Host returned an editing base for another App");
       await withWorkspace(() => materialize(base));
@@ -213,10 +227,10 @@ export async function openWorkloadAppCliBridge(options: {
     return response;
   };
 
-  const handle = async (request: CliRequest, uploadBytes?: Uint8Array): Promise<CliResponse> => {
+  const handle = async (request: CliWireRequest, uploadBytes?: Uint8Array): Promise<BridgeResponse> => {
     if (request.operation === "app.save") {
       if (request.upload !== undefined) throw new Error("Local App save cannot submit package authority");
-      const saveRequest = request as CliRequest<"app.save">;
+      const saveRequest = request;
       const appId = requireAppId(saveRequest.input.appId);
       try {
         const base = bases.get(appId);
@@ -229,7 +243,7 @@ export async function openWorkloadAppCliBridge(options: {
             join(options.editRoot, appId),
             `${options.editRoot}-transfers`,
           ));
-          const hostRequest: CliRequest<"app.save"> = {
+          const hostRequest: CliWireRequest = {
             ...saveRequest,
             upload: {
               kind: "app-package",
@@ -285,9 +299,9 @@ export async function openWorkloadAppCliBridge(options: {
     const operation = tail.then(async () => {
       await writeCliBytes(client, encodeCliFrame(hello));
       const reader = new CliStreamReader(client);
-      let request: CliRequest;
+      let request: CliWireRequest;
       try {
-        request = parseCliRequest(parseCliFrame(await reader.readFrame()), true);
+        request = parseCliRequestEnvelope(parseCliFrame(await reader.readFrame()));
       } catch (error) {
         if (client.readableEnded || client.destroyed) return;
         throw error;
@@ -299,7 +313,12 @@ export async function openWorkloadAppCliBridge(options: {
       const uploadBytes = request.upload?.kind === "file-stdin"
         ? await reader.readExact(request.upload.bytes)
         : undefined;
-      await writeCliResponse(client, request.operation, await handle(request, uploadBytes));
+      const response = hello.supportedOperations.includes(request.operation)
+        ? await handle(request, uploadBytes)
+        : failure(request, "CLI_UNSUPPORTED_COMMAND", `${request.operation} is not available on this Host.`);
+      const { bytePayloads, ...control } = response;
+      await writeCliBytes(client, encodeCliFrame(control));
+      for (const bytes of bytePayloads ?? []) await writeCliBytes(client, bytes);
       client.end();
     }).catch((error) => {
       if (!client.destroyed) client.destroy(error instanceof Error ? error : new Error(String(error)));
@@ -333,6 +352,8 @@ export async function openWorkloadAppCliBridge(options: {
       await closeServer(server);
       await tail;
       await workspaceTail;
+      await rm(options.socketPath, { force: true });
+      await rm(`${dirname(options.socketPath)}/${MANAGED_CLI_FILENAME}`, { force: true });
     },
   });
 
@@ -345,22 +366,13 @@ export async function openWorkloadAppCliBridge(options: {
       }
       const awaiting = pending;
       if (!awaiting) throw new Error("Host sent an unsolicited CLI response");
-      pending = undefined;
-      let response = parseCliResponse(value, awaiting.requestId);
+      let response: BridgeResponse = parseCliWireResponse(value, awaiting.requestId);
       if (response.ok && response.byteStreams !== undefined) {
-        const result = response.result as Record<string, unknown>;
         const stdout = await upstreamReader.readExact(response.byteStreams.stdoutBytes);
         const stderr = await upstreamReader.readExact(response.byteStreams.stderrBytes);
-        response = {
-          requestId: response.requestId,
-          ok: true,
-          result: {
-            ...result,
-            stdoutBase64: stdout.toString("base64"),
-            stderrBase64: stderr.toString("base64"),
-          },
-        } as CliResponse;
+        response = { ...response, bytePayloads: [stdout, stderr] };
       }
+      pending = undefined;
       awaiting.resolve(response);
     }
   }
@@ -445,12 +457,12 @@ function sameBase(
     && left.lowerPath === right.lowerPath;
 }
 
-function success(request: CliRequest, result: unknown): CliResponse {
-  return { requestId: request.requestId, ok: true, result } as CliResponse;
+function success(request: CliWireRequest, result: unknown): BridgeResponse {
+  return { requestId: request.requestId, ok: true, result } as BridgeResponse;
 }
 
-function failure(request: CliRequest, code: string, message: string): CliResponse {
-  return { requestId: request.requestId, ok: false, error: { code, message } } as CliResponse;
+function failure(request: CliWireRequest, code: string, message: string): BridgeResponse {
+  return { requestId: request.requestId, ok: false, error: { code, message } } as BridgeResponse;
 }
 
 function requireAppId(value: unknown): string {

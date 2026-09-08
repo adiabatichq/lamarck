@@ -121,6 +121,12 @@ mkdir -p \
 	"$artifact_root" \
 	"$runtime_mount" \
 	"$rootfs/bin" \
+	"$rootfs/usr/bin" \
+	"$rootfs/mnt/lamarck-apps" \
+	"$rootfs/mnt/lamarck-apps-lower" \
+	"$rootfs/mnt/lamarck-files" \
+	/mnt/lamarck-apps-lower \
+	/mnt/lamarck-files \
 	"$rootfs/app" \
 	"$rootfs/proc" \
 	"$rootfs/dev/pts" \
@@ -180,6 +186,7 @@ chmod 0755 "$merged" "$runtime_root/home" "$runtime_root/run"
 chmod 0755 "$merged_b" "$runtime_root_b/home" "$runtime_root_b/run"
 
 install -m 0755 /usr/local/libexec/capsule-runtime-probe "$rootfs/bin/capsule-runtime-probe"
+: > "$rootfs/usr/bin/lamarck"
 : > "$rootfs/etc/resolv.conf"
 : > "$rootfs/etc/hosts"
 : > /opt/lamarck/config/empty-resolv.conf

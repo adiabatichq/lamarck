@@ -1,4 +1,5 @@
-import { cp, mkdir, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { cp, mkdir, rm, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
@@ -92,3 +93,11 @@ await buildDeviceIdentityNative({
   bundleDirectory: outDir,
   nativeRoot: resolve(outDir, "native"),
 });
+
+const managedCli = await readFile(resolve(root, "desktop/cli/dist/lamarck-managed.mjs"));
+await writeFile(resolve(outDir, "lamarck-managed.mjs"), managedCli, { mode: 0o555 });
+await writeFile(resolve(outDir, "managed-cli.json"), `${JSON.stringify({
+  type: "cli.artifact", schemaVersion: 1,
+  digest: `sha256:${createHash("sha256").update(managedCli).digest("hex")}`,
+  bytes: managedCli.byteLength,
+})}\n`);
