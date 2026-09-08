@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Duplex, PassThrough, Readable } from "node:stream";
@@ -17,6 +18,7 @@ import {
 } from "../../../capsule/src/protocol/codec";
 import { parseArtifactAdoptionReceipt } from "../../../capsule/src/protocol/validate";
 import type { CapsuleVmHostStream } from "../capsule-vm/launcher";
+import { prepareWorkspaceAppEditBasesMountPath, validateWorkspaceFilesMountPath } from "../workspace-files";
 import type { LoadedCapsuleGuestRelease } from "./guest-release";
 import { HostArtifactStore, type HostArtifact, type HostArtifactActivation } from "./artifact-store";
 import type { CapsulePackageSnapshot } from "./package-snapshot";
@@ -50,6 +52,92 @@ function fakeAppCliStreamServer(): AppCliStreamServer {
 }
 
 describe("MacOsCapsuleBackend orchestration", () => {
+  test.each([false, true])("prepares the editing-base share before startGuest (already exists: %s)", async (alreadyExists) => {
+    const workspace = await realpath(await mkdtemp(join(tmpdir(), "lamarck-first-app-")));
+    const share = join(workspace, ".lamarck", "cache", "app-edit-bases");
+    const harness = createHarness({
+      workspaceFilesPath: () => validateWorkspaceFilesMountPath(workspace),
+      appVersionsPath: () => prepareWorkspaceAppEditBasesMountPath(workspace),
+    });
+    try {
+      await mkdir(join(workspace, "files"));
+      if (alreadyExists) {
+        await mkdir(share, { recursive: true });
+        await writeFile(join(share, "existing-base"), "keep existing content");
+      }
+      const beforeStart = vi.fn(() => {
+        expect(lstatSync(share).isDirectory()).toBe(true);
+        expect(lstatSync(share).isSymbolicLink()).toBe(false);
+        expect(readdirSync(share)).toEqual(alreadyExists ? ["existing-base"] : []);
+        expect(harness.session.operations).toEqual([]);
+      });
+      harness.vm.beforeStart = beforeStart;
+      await harness.backend.startUi(spec("sender-a"));
+      expect(beforeStart).toHaveBeenCalledOnce();
+      expect(harness.vm.startDescriptors[0]).toMatchObject({ appVersionsPath: share });
+      if (alreadyExists) expect(await readFile(join(share, "existing-base"), "utf8")).toBe("keep existing content");
+      expect(existsSync(join(workspace, ".lamarck", "cache", "app-versions"))).toBe(false);
+    } finally {
+      await harness.backend.stopAll();
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("prepares the newly selected Workspace share before restarting the Guest", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "lamarck-switch-workspace-")));
+    let workspace = join(root, "first");
+    const harness = createHarness({
+      workspaceFilesPath: () => validateWorkspaceFilesMountPath(workspace),
+      appVersionsPath: () => prepareWorkspaceAppEditBasesMountPath(workspace),
+    });
+    try {
+      await mkdir(join(workspace, "files"), { recursive: true });
+      await mkdir(join(root, "second", "files"), { recursive: true });
+      const beforeStart = vi.fn(() => {
+        expect(lstatSync(join(workspace, ".lamarck", "cache", "app-edit-bases")).isDirectory()).toBe(true);
+      });
+      harness.vm.beforeStart = beforeStart;
+      await harness.backend.startUi(spec("sender-a"));
+      await harness.backend.stopAll();
+      workspace = join(root, "second");
+      const secondShare = join(workspace, ".lamarck", "cache", "app-edit-bases");
+      expect(existsSync(secondShare)).toBe(false);
+      await harness.backend.startUi(spec("sender-b"));
+      expect(beforeStart).toHaveBeenCalledTimes(2);
+      expect(harness.vm.startDescriptors.map((image) => image.appVersionsPath)).toEqual([
+        join(root, "first", ".lamarck", "cache", "app-edit-bases"), secondShare,
+      ]);
+    } finally {
+      await harness.backend.stopAll();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reports an unwritable editing-base root without calling startGuest", async () => {
+    const workspace = await realpath(await mkdtemp(join(tmpdir(), "lamarck-unwritable-share-")));
+    const cache = join(workspace, ".lamarck", "cache");
+    const share = join(cache, "app-edit-bases");
+    const harness = createHarness({
+      workspaceFilesPath: () => validateWorkspaceFilesMountPath(workspace),
+      appVersionsPath: () => prepareWorkspaceAppEditBasesMountPath(workspace),
+    });
+    try {
+      await mkdir(join(workspace, "files"));
+      await mkdir(cache, { recursive: true });
+      await chmod(cache, 0o500);
+      const error = await rejectionOf(harness.backend.startUi(spec("sender-a")));
+      expect(error.message).toContain(`Could not prepare Workspace App edit-base share at ${share}`);
+      expect(error.message).toMatch(/EACCES|EPERM/);
+      expect(harness.vm.startCalls).toBe(0);
+      expect(harness.session.operations).toEqual([]);
+      expect(existsSync(share)).toBe(false);
+    } finally {
+      await chmod(cache, 0o700);
+      await harness.backend.stopAll();
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   test("initializes shared cache at Desktop startup without booting a VM or requiring a Workspace", async () => {
     const harness = createHarness();
     const initialize = vi.spyOn(harness.store, "initialize");
@@ -1560,7 +1648,11 @@ async function rejectionOf(operation: Promise<unknown>): Promise<Error> {
   throw new Error("Expected operation to reject");
 }
 
-function createHarness(overrides: { opaqueId?: () => string } = {}) {
+function createHarness(overrides: {
+  opaqueId?: () => string;
+  workspaceFilesPath?: () => string;
+  appVersionsPath?: () => string;
+} = {}) {
   const lifecycleEvents: string[] = [];
   const vm = new FakeVm(lifecycleEvents);
   let staleStateResiduePresent = true;
@@ -1608,8 +1700,8 @@ function createHarness(overrides: { opaqueId?: () => string } = {}) {
     stateDirectory: "/private/state/capsule",
     cacheDirectory: "/private/cache/capsule",
     artifactRoot: "/private/artifacts/capsule",
-    workspaceFilesPath: () => "/workspace/files",
-    appVersionsPath: () => "/workspace/.lamarck/cache/app-edit-bases",
+    workspaceFilesPath: overrides.workspaceFilesPath ?? (() => "/workspace/files"),
+    appVersionsPath: overrides.appVersionsPath ?? (() => "/workspace/.lamarck/cache/app-edit-bases"),
     systemStreamServer: system as unknown as SystemStreamServer,
     appCliStreamServer: fakeAppCliStreamServer(),
     dependencies: {

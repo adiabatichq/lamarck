@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -16,6 +17,7 @@ import {
   initializeWorkspaceDirectory,
   inspectWorkspaceForOpen,
   normalizeWorkspacePath,
+  prepareWorkspaceAppEditBasesMountPath,
   validateWorkspaceFilesMountPath,
 } from "./workspace-files";
 import { createWorkspaceVaultVerifier } from "./workspace-vault-crypto";
@@ -228,5 +230,44 @@ describe("Workspace filesystem lifecycle", () => {
     rmSync(files);
     writeFileSync(files, "not a directory");
     expect(() => validateWorkspaceFilesMountPath(workspace)).toThrow("physical directory");
+  });
+
+  test("prepares an empty editing-base root through a canonical Workspace alias", () => {
+    const root = temporaryRoot();
+    const workspace = initializeWorkspaceDirectory(join(root, "workspace"));
+    const alias = join(root, "alias");
+    symlinkSync(workspace, alias);
+
+    const share = prepareWorkspaceAppEditBasesMountPath(alias);
+    expect(share).toBe(join(realpathSync(workspace), ".lamarck", "cache", "app-edit-bases"));
+    expect(readdirSync(share)).toEqual([]);
+    expect(readdirSync(join(workspace, "apps"))).toEqual([]);
+    expect(existsSync(join(workspace, ".lamarck", "cache", "app-versions"))).toBe(false);
+  });
+
+  test.each([".lamarck", ".lamarck/cache", ".lamarck/cache/app-edit-bases"])(
+    "rejects a redirected editing-base share at %s before creating external content",
+    (relativePath) => {
+      const root = temporaryRoot();
+      const workspace = join(root, "workspace");
+      const external = join(root, "external");
+      const target = join(workspace, relativePath);
+      mkdirSync(resolve(target, ".."), { recursive: true });
+      mkdirSync(external);
+      symlinkSync(external, target);
+
+      expect(() => prepareWorkspaceAppEditBasesMountPath(workspace)).toThrow("physical directory");
+      expect(readdirSync(external)).toEqual([]);
+    },
+  );
+
+  test("rejects a regular file in place of the editing-base root without replacing it", () => {
+    const workspace = temporaryRoot();
+    const share = join(workspace, ".lamarck", "cache", "app-edit-bases");
+    mkdirSync(resolve(share, ".."), { recursive: true });
+    writeFileSync(share, "preserve me");
+
+    expect(() => prepareWorkspaceAppEditBasesMountPath(workspace)).toThrow("physical directory");
+    expect(readFileSync(share, "utf8")).toBe("preserve me");
   });
 });

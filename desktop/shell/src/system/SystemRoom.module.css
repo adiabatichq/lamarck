@@ -1037,7 +1037,8 @@
 .fileActions {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, auto)) 1fr repeat(2, minmax(0, auto));
+  grid-template-columns: repeat(2, minmax(0, auto));
+  justify-content: start;
   gap: 6px;
 }
 
@@ -1064,8 +1065,6 @@
   border-color: rgba(79, 227, 193, 0.55);
   color: var(--system-active);
 }
-
-.fileActions .quietAction { color: var(--system-muted); }
 
 .focusHeading {
   display: flex;
@@ -1604,7 +1603,6 @@
   .inventoryHeader, .inventoryRow { grid-template-columns: minmax(200px, 1.3fr) minmax(140px, 1fr) 90px; }
   .inventoryHeader > span:nth-child(3), .inventoryRow > div:nth-child(3) { display: none; }
   .fileActions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .fileActions > span { display: none; }
   .appsManager { grid-template-columns: minmax(290px, 0.72fr) minmax(360px, 1.28fr); }
   .versionList li > button { grid-template-columns: 20px 74px minmax(110px, 1fr); }
   .versionList time { display: none; }

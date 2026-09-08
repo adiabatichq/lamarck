@@ -156,7 +156,7 @@ export interface MacOsCapsuleBackendOptions {
   artifactRoot: string;
   /** The selected Workspace's canonical D1 root. */
   workspaceFilesPath: () => string;
-  /** Core-owned immutable App editing-base cache. */
+  /** Prepare and validate the selected Workspace's Core-owned App editing-base share root. */
   appVersionsPath: () => string;
   /** Host terminator for the workload's ticket-bound System SDK stream. */
   systemStreamServer: SystemStreamServer;
@@ -1043,6 +1043,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     });
 
     try {
+      // Root preparation must precede VM startup; editing-base contents are
+      // synchronized later, after the Guest App CLI stream is attached.
+      const workspaceFilesPath = this.#options.workspaceFilesPath();
+      const appVersionsPath = this.#options.appVersionsPath();
       const probe = await helper.probe();
       if (!probe.virtualizationSupported) {
         throw new Error("Virtualization.framework is unavailable to the signed helper");
@@ -1062,8 +1066,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       guestStartAttempted = true;
       const started = await helper.startGuest({
         ...release.vmImage,
-        workspaceFilesPath: this.#options.workspaceFilesPath(),
-        appVersionsPath: this.#options.appVersionsPath(),
+        workspaceFilesPath,
+        appVersionsPath,
         stateDiskBytes,
         statePreparationId: statePreparation.preparationId,
       });

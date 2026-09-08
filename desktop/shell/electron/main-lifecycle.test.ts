@@ -20,6 +20,10 @@ describe("Shell window lifecycle", () => {
     expect(mainSource).not.toContain('workspaceFilesPath: () => join(workspace, "files")');
   });
 
+  test("prepares the selected Workspace editing-base root at the VM mount boundary", () => {
+    expect(mainSource).toContain("appVersionsPath: () => prepareWorkspaceAppEditBasesMountPath(workspace)");
+  });
+
   test("does not dereference a destroyed BrowserWindow from its closed handler", () => {
     const match = mainSource.match(/win\.on\("closed", \(\) => \{([\s\S]*?)\n  \}\);/);
     if (!match) throw new Error("Shell BrowserWindow closed handler is missing");

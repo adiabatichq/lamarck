@@ -501,24 +501,6 @@ function FilesPanel() {
     }
   }, [path]);
 
-  const transfer = useCallback(async (kind: "import" | "export") => {
-    setError(null);
-    setNotice(null);
-    const chosen = await window.lamarckHost?.chooseVfsTransferPath(kind);
-    if (!chosen?.path) return;
-    const d1Path = window.prompt(
-      kind === "import" ? "D1 destination path" : "D1 source path",
-      path,
-    );
-    if (!d1Path) return;
-    const command = kind === "import"
-      ? `import -- ${quoteVfsWord(chosen.path)} ${quoteVfsWord(d1Path)}`
-      : `export -- ${quoteVfsWord(d1Path)} ${quoteVfsWord(chosen.path)}`;
-    const result = await vfsCommand(command);
-    if (!result.success) throw new Error(decodeBase64Text(result.stderrBase64) || `${kind} failed`);
-    setNotice(kind === "import" ? `Imported to ${d1Path}` : `Exported ${d1Path}`);
-  }, [path]);
-
   const openFiles = useCallback(async (target: "finder" | "obsidian") => {
     setError(null);
     setNotice(null);
@@ -552,9 +534,6 @@ function FilesPanel() {
         <div className={styles.fileActions}>
           <button type="button" onClick={() => void openFiles("finder")}>Open in Finder</button>
           <button type="button" onClick={() => void openFiles("obsidian")}>Open in Obsidian</button>
-          <span />
-          <button type="button" className={styles.quietAction} onClick={() => void transfer("import").catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))}>Import…</button>
-          <button type="button" className={styles.quietAction} onClick={() => void transfer("export").catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))}>Export…</button>
         </div>
       </section>
       <section className={styles.markdownFocus}>

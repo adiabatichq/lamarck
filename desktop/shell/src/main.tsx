@@ -38,7 +38,6 @@ if (import.meta.env.DEV && !window.lamarckHost) {
       workspace: { path, vaultId: "browser" },
     }),
     openWorkspaceFiles: async () => ({ ok: true as const }),
-    chooseVfsTransferPath: async () => ({ path: null }),
     onOpenLauncher: () => () => {},
     openAppViewer: async () => ({
       ok: false as const,

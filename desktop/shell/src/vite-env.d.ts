@@ -71,7 +71,6 @@ interface Window {
     }>;
     openWorkspace(path: string, recoveryCode?: string): Promise<HostWorkspaceOpenResult>;
     openWorkspaceFiles(application: "finder" | "obsidian"): Promise<{ ok: true }>;
-    chooseVfsTransferPath(purpose: "import" | "export"): Promise<{ path: string | null }>;
     onOpenLauncher(callback: () => void): () => void;
     openAppViewer(appId: string): Promise<
       | { ok: true; viewerId: string }

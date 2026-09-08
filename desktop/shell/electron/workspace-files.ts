@@ -88,6 +88,38 @@ export function validateWorkspaceFilesMountPath(selectedWorkspacePath: string): 
   return canonicalFilesPath;
 }
 
+export function prepareWorkspaceAppEditBasesMountPath(selectedWorkspacePath: string): string {
+  let expectedPath = join(resolve(selectedWorkspacePath), ".lamarck", "cache", "app-edit-bases");
+  try {
+    const canonicalWorkspace = realpathSync(resolve(selectedWorkspacePath));
+    expectedPath = join(canonicalWorkspace, ".lamarck", "cache", "app-edit-bases");
+    let directory = canonicalWorkspace;
+    // Validate each parent before creating its child so an existing symlink
+    // cannot redirect cache creation or the VM share outside this Workspace.
+    for (const entry of [".lamarck", "cache", "app-edit-bases"]) {
+      directory = join(directory, entry);
+      try {
+        mkdirSync(directory);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      const info = lstatSync(directory);
+      if (!info.isDirectory() || info.isSymbolicLink()) {
+        throw new Error(`${directory} must be a physical directory`);
+      }
+      if (realpathSync(directory) !== directory) {
+        throw new Error(`${directory} must be the canonical Workspace directory`);
+      }
+    }
+    return expectedPath;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not prepare Workspace App edit-base share at ${expectedPath}: ${reason}`, {
+      cause: error,
+    });
+  }
+}
+
 export function inspectWorkspaceForOpen(input: string): WorkspaceDescriptor {
   const requestedPath = normalizeWorkspacePath(input);
   if (!existsSync(requestedPath)) {

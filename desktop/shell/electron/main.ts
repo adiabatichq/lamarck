@@ -84,6 +84,7 @@ import {
   initializeWorkspaceDirectory,
   inspectWorkspaceForCreate,
   inspectWorkspaceForOpen,
+  prepareWorkspaceAppEditBasesMountPath,
   validateWorkspaceFilesMountPath,
   type WorkspaceDescriptor,
 } from "./workspace-files";
@@ -321,7 +322,7 @@ const capsuleBackend = new MacOsCapsuleBackend({
   cacheDirectory: join(capsuleCacheRoot, "cache"),
   artifactRoot: join(capsuleCacheRoot, "artifacts"),
   workspaceFilesPath: () => validateWorkspaceFilesMountPath(workspace),
-  appVersionsPath: () => join(workspace, ".lamarck", "cache", "app-edit-bases"),
+  appVersionsPath: () => prepareWorkspaceAppEditBasesMountPath(workspace),
   systemStreamServer,
   appCliStreamServer,
 });
@@ -2965,21 +2966,6 @@ app.whenReady().then(async () => {
       await shell.openExternal(`obsidian://open?path=${encodeURIComponent(filesPath)}`);
     }
     return { ok: true as const };
-  });
-  ipcMain.handle("workspace:chooseVfsTransferPath", async (event, purpose: "import" | "export") => {
-    const owner = requireShellIpc(event);
-    if (purpose !== "import" && purpose !== "export") {
-      throw new Error("VFS transfer purpose is invalid");
-    }
-    if (purpose === "import") {
-      const result = await dialog.showOpenDialog(owner, {
-        title: "Choose a file or folder to import",
-        properties: ["openFile", "openDirectory"],
-      });
-      return { path: result.canceled ? null : result.filePaths[0] ?? null };
-    }
-    const result = await dialog.showSaveDialog(owner, { title: "Choose an export destination" });
-    return { path: result.canceled ? null : result.filePath ?? null };
   });
   ipcMain.handle("app-viewer:open", async (event, appId: string) => {
     const owner = requireShellRendererOwner(event);
