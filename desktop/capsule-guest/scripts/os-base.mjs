@@ -3,8 +3,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { copyAndHashSparse, listRegularFiles, sha256File } from "./release-contract.mjs";
 
 export const OS_BASE_MANIFEST = "os-base-manifest.json";
@@ -139,7 +138,7 @@ function safePath(path) { return path.length <= 2048 && !/[\\\x00]/.test(path) &
 function basePath(root, path) { if (!safePath(path)) throw new Error("invalid OS base relative path"); return join(root, path); }
 function hash(bytes) { return `sha256:${createHash("sha256").update(bytes).digest("hex")}`; }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (import.meta.main) {
   const [command, base, pinOrRepository, repositoryOrBuilder, builderOrEpoch, epochOrJobs, jobsOrDestination, destination] = process.argv.slice(2);
   if (command === "create") {
     console.log((await createOsBase(base, pinOrRepository, repositoryOrBuilder, builderOrEpoch, epochOrJobs)).digest);

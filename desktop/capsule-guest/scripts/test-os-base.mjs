@@ -14,6 +14,20 @@ const BUILDER = `sha256:${"a".repeat(64)}`;
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const digest = bytes => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 
+test("the build preflight imports OS base helpers without dispatching the CLI", async t => {
+  const fixture = await createFixture(t);
+  const script = await readFile(new URL("./build-guest-image.sh", import.meta.url), "utf8");
+  const preflight = script.match(/node --input-type=module -e '([\s\S]*?)'/)?.[1];
+  assert(preflight, "the build must validate native inputs before compiling");
+  const modulePath = fileURLToPath(new URL("./os-base.mjs", import.meta.url));
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", preflight,
+    modulePath, fixture.source, BUILDER, "0", "4"], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const direct = spawnSync(process.execPath, [modulePath, "invalid-command"], { encoding: "utf8" });
+  assert.notEqual(direct.status, 0);
+  assert.match(direct.stderr, /usage: os-base\.mjs/);
+});
+
 test("Guest/CLI JS and npm lock changes reuse the base; every OS/native input change invalidates it", async t => {
   const fixture = await createFixture(t);
   const identity = await describeOsBaseInputs(fixture.source, BUILDER);
