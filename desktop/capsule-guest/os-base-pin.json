@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "manifestDigest": "sha256:a89fbf8227a04a1ffbc09464cceef494d4ce8f0d1be901735331c867dc2d775f",
+  "builderImageId": "sha256:3a62d136c5a821cbccbe1461fe5ba3bd44d4cf9a7c03a985de8872631532fd4f",
+  "identityDigest": "sha256:2b42419dbf0ee4b0fa9c27fcd3b8fb37de0b76405438e34645a283e0ecb21963",
+  "archive": {
+    "bytes": 1444034591,
+    "sha256": "sha256:9060acdba4d444fd637522e51b0cf8a5b0b4e9ac3e6332f1b1891b0d81dbf501"
+  }
+}

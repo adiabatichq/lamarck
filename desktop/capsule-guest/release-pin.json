@@ -1,15 +1,15 @@
 {
   "schemaVersion": 1,
-  "imageVersion": "0.1.11",
-  "manifestDigest": "sha256:3755c3a57699ada554c827d52d18b1b479cce006c403213e6ebdee5ef30df9c1",
-  "inventorySha256": "sha256:ad3e7d9b376b35f45cf3c5814dfe278b3692e194bd15fe0535839f3f5fbc0f40",
-  "objectPrefix": "guest/macos/arm64/3755c3a57699ada5",
+  "imageVersion": "0.1.14",
+  "manifestDigest": "sha256:686f486abbd0dd559ef11d1e2e2a4b00c803044d0d5de1ea995581fd24a9ccdd",
+  "inventorySha256": "sha256:19936e571586ec7c6314cf3557b741ce01d7459a8ce0d598e5b8b255bea7814d",
+  "objectPrefix": "guest/macos/arm64/686f486abbd0dd55",
   "correspondingSource": {
-    "imageVersion": "0.1.11",
-    "file": "Lamarck-Capsule-Guest-0.1.11-Open-Source.tar.gz",
-    "url": "https://releases.lamarck.ai/guest/macos/arm64/3755c3a57699ada5/Lamarck-Capsule-Guest-0.1.11-Open-Source.tar.gz",
-    "sha256": "sha256:72ca44a3edd6630bcb2675be6ad323c9d9c37708ab18715a1dfb17afc6a4a8a3",
-    "bytes": 530726810,
+    "imageVersion": "0.1.14",
+    "file": "Lamarck-Capsule-Guest-0.1.14-Open-Source.tar.gz",
+    "url": "https://releases.lamarck.ai/guest/macos/arm64/686f486abbd0dd55/Lamarck-Capsule-Guest-0.1.14-Open-Source.tar.gz",
+    "sha256": "sha256:6042a8e301d74c14549cbedc21f231e45bc63e2902a789db8c14c5aedb6963da",
+    "bytes": 925809779,
     "mediaType": "application/gzip",
     "format": "tar+gzip"
   }
