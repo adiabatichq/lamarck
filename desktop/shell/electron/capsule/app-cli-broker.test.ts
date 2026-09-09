@@ -155,9 +155,9 @@ test("streams a complete App save upload with the bound principal", async () => 
   ]);
 });
 
-test("streams managed file stdin and native output outside control frames", async () => {
-  const stdin = Buffer.alloc(256 * 1024, 0xa5);
-  const stdout = Buffer.from([0, 255, 1, 254]);
+test.each([0, 256 * 1024])("streams %i managed file stdin bytes outside control frames", async (size) => {
+  const stdin = Buffer.alloc(size, 0xa5);
+  const stdout = size === 0 ? Buffer.alloc(0) : Buffer.from([0, 255, 1, 254]);
   let dispatched: CliRequest | undefined;
   const dispatcher = fakeDispatcher(async (request) => {
     dispatched = request;

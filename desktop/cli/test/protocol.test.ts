@@ -58,6 +58,35 @@ describe("typed CLI protocol V1", () => {
     expect(parseCliRequest(request, true)).toEqual(request);
   });
 
+  test.each(["", "Cg=="])("accepts stdin bytes %j only at the trusted inline boundary", (stdinBase64) => {
+    const request = {
+      requestId: "tee-1", operation: "file.command",
+      input: { argv: ["tee", "empty.md"], stdinBase64 },
+    };
+    expect(parseCliRequest(request, { allowInlineFileBytes: true })).toEqual(request);
+    for (const options of [false, true, { allowUpload: true }]) {
+      expect(() => parseCliRequest(request, options)).toThrow("inline file bytes are not allowed");
+    }
+    const withoutStdin = { ...request, input: { argv: request.input.argv } };
+    expect(parseCliRequest(withoutStdin)).toEqual(withoutStdin);
+  });
+
+  test("rejects non-string stdin and still requires non-empty identity and text fields", () => {
+    for (const stdinBase64 of [null, 0, false, {}, []]) {
+      expect(() => parseCliRequest({
+        requestId: "tee-1", operation: "file.command",
+        input: { argv: ["tee", "empty.md"], stdinBase64 },
+      }, { allowInlineFileBytes: true })).toThrow("stdinBase64 is invalid");
+    }
+    for (const [operation, input] of [
+      ["file.command", { argv: ["tee", "empty.md"], author: "", stdinBase64: "" }],
+      ["app.inspect", { appId: "" }],
+      ["query", { sql: "" }],
+    ]) {
+      expect(() => parseCliRequest({ requestId: "invalid", operation, input }, { allowInlineFileBytes: true })).toThrow();
+    }
+  });
+
   test("frames strict JSON and pins response attribution", () => {
     const value = { requestId: "one", ok: true, result: [{ id: 1 }] };
     const frame = encodeCliFrame(value);

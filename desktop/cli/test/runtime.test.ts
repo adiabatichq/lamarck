@@ -36,9 +36,9 @@ describe("CLI rendering and exit behavior", () => {
     expect(output.stderr()).toBe("err");
   });
 
-  test("streams tee stdin as bounded native bytes instead of a control-frame field", async () => {
+  test.each([0, 256 * 1024])("streams %i tee stdin bytes outside the control frame", async (size) => {
     const output = io();
-    const bytes = Buffer.alloc(256 * 1024, 0xa5);
+    const bytes = Buffer.alloc(size, 0xa5);
     (output.value.stdin as unknown as PassThrough).end(bytes);
     let seenRequest: CliRequest | undefined;
     let seenUpload: Buffer | undefined;

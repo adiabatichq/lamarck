@@ -2,7 +2,7 @@ import { access, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises
 import { join } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import { HOST_CLI_OPERATIONS, HostCliTransport, type CliRequest, type CliResponse } from "@lamarck/cli";
-import type { CliOperationDispatcher } from "./cli-dispatcher";
+import { CliOperationDispatcher } from "./cli-dispatcher";
 import { DesktopCliGateway } from "./cli-gateway";
 
 const roots: string[] = [];
@@ -64,24 +64,24 @@ test("turns dispatcher exceptions into stable protocol failures", async () => {
   } finally { await gateway.stop(); }
 });
 
-test("streams Host file bytes outside typed control frames", async () => {
+test.each([0, 256 * 1024])("streams %i Host file bytes through the dispatcher to Core", async (size) => {
   const root = await mkdtemp("/tmp/lamarck-cli-gateway-stream-"); roots.push(root);
-  const stdin = Buffer.alloc(256 * 1024, 0xa5);
-  const stdout = Buffer.from([0, 255, 1, 254]);
+  const stdin = Buffer.alloc(size, 0xa5);
+  const stdout = size === 0 ? Buffer.alloc(0) : Buffer.from([0, 255, 1, 254]);
   let seen: CliRequest | undefined;
-  const dispatcher = {
-    capabilities: () => ({ protocolVersion: 1, environment: "host", supportedOperations: HOST_CLI_OPERATIONS }),
-    dispatch: vi.fn(async (request: CliRequest) => {
+  const dispatcher = new CliOperationDispatcher({
+    coreBaseUrl: "http://core.test", coreToken: "test-token", runtimeStates: () => [],
+    fetch: async (_url, init) => {
+      const { request, principal } = JSON.parse(String(init?.body));
+      expect(principal).toEqual({ kind: "system" });
       seen = request;
-      return {
-        response: {
-          requestId: request.requestId,
-          ok: true,
-          result: { success: true, exitCode: 0, stdoutBase64: stdout.toString("base64"), stderrBase64: "" },
-        } as CliResponse,
-      };
-    }),
-  } as unknown as CliOperationDispatcher;
+      return Response.json({
+        requestId: request.requestId,
+        ok: true,
+        result: { success: true, exitCode: 0, stdoutBase64: stdout.toString("base64"), stderrBase64: "" },
+      });
+    },
+  });
   const gateway = new DesktopCliGateway({ dispatcher, runtimeDirectory: root });
   await gateway.start();
   try {

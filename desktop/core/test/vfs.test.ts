@@ -218,6 +218,33 @@ describe("D1 VFS", () => {
     expect((guard.events[0]!.payload as Record<string, JsonValue>).author).toBe("codex");
   });
 
+  test.each([false, true])("writes empty base64 stdin with tee (existing file: %s)", async (existing) => {
+    const caller = hostCaller(guard);
+    if (existing) {
+      expect((await vfs.command(caller, "tee -- empty.md", {
+        stdin: { encoding: "utf8", data: "previous content\n" },
+      })).success).toBe(true);
+    }
+    const result = await vfs.command(caller, "tee -- empty.md", {
+      stdin: { encoding: "base64", data: "" },
+    });
+    expect(result).toMatchObject({ success: true, exitCode: 0, stdoutBase64: "", stderrBase64: "" });
+    expect(readFileSync(join(filesRoot, "empty.md"))).toEqual(Buffer.alloc(0));
+    expect(guard.events.at(-1)!.payload).toMatchObject({
+      changes: [expect.objectContaining({ kind: existing ? "modified" : "added", path: "empty.md" })],
+    });
+  });
+
+  test.each(["not base64", "YQ", "YR=="])("rejects noncanonical stdin %j without clearing a file", async (data) => {
+    writeFileSync(join(filesRoot, "keep.md"), "keep");
+    const result = await vfs.command(hostCaller(guard), "tee -- keep.md", {
+      stdin: { encoding: "base64", data },
+    });
+    expect(result.success).toBe(false);
+    expect(Buffer.from(result.stderrBase64, "base64").toString()).toContain("canonical base64");
+    expect(readFileSync(join(filesRoot, "keep.md"), "utf8")).toBe("keep");
+  });
+
   test("streams stdin beyond the request limit and records only the consumed VFS effect", async () => {
     const caller = workloadCaller(guard, "channel-large", ["large.bin"]);
     const payload = Buffer.alloc(20 * 1024 * 1024 + 123, 0x5a);

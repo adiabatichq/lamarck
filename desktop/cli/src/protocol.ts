@@ -58,7 +58,12 @@ function validateInput(
       boundedUtf8Text(input.ddl, "ddl", 300 * 1024);
       optionalText(input.author, "author"); optionalText(input.context, "context"); break;
     case "file.command":
-      exactOptionalKeys(input, ["argv"], ["author", "stdinBase64"], `CLI ${operation} input`); argv(input.argv); optionalText(input.author, "author"); optionalText(input.stdinBase64, "stdinBase64"); break;
+      exactOptionalKeys(input, ["argv"], ["author", "stdinBase64"], `CLI ${operation} input`); argv(input.argv); optionalText(input.author, "author");
+      // Empty stdin has a valid empty base64 representation.
+      if (input.stdinBase64 !== undefined && typeof input.stdinBase64 !== "string") {
+        throw new Error("CLI stdinBase64 is invalid");
+      }
+      break;
     case "file.import":
       exactOptionalKeys(input, ["argv"], ["author"], `CLI ${operation} input`); argv(input.argv); optionalText(input.author, "author"); break;
     case "file.export": exactKeys(input, ["argv"], `CLI ${operation} input`); argv(input.argv); break;
