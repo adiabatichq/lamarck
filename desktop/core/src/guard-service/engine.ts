@@ -86,6 +86,7 @@ interface PlannedWrite {
 
 interface QueryPolicy {
   mode: "query";
+  denied?: boolean;
 }
 
 interface D0Policy {
@@ -238,9 +239,13 @@ export class GuardEngine {
           "Guard requires Node.js 24.10.0 or newer (node:sqlite setAuthorizer is unavailable)",
         );
       }
-      this.db.setAuthorizer((action, arg1, arg2, dbName, triggerOrView) =>
-        this.authorize(action, arg1, arg2, dbName, triggerOrView)
-      );
+      this.db.setAuthorizer((action, arg1, arg2, dbName, triggerOrView) => {
+        const decision = this.authorize(action, arg1, arg2, dbName, triggerOrView);
+        if (decision === constants.SQLITE_DENY && this.policy.mode === "query") {
+          this.policy.denied = true;
+        }
+        return decision;
+      });
       this.assertD2PrimaryKeys();
       this.refreshCdcCapture();
     } catch (error) {
@@ -270,20 +275,41 @@ export class GuardEngine {
   ): Array<Record<string, unknown>> {
     this.assertOpen();
     normalizePrincipal(principalInput);
-    const statementSql = this.validateSql(sql, "system.query");
-    const bound = normalizeParams(params);
-
-    return this.withPolicy({ mode: "query" }, () => {
-      const statement = this.db.prepare(statementSql);
-      if (statement.columns().length === 0) {
-        throw new GuardServiceError("GUARD_QUERY_REQUIRED", "Guard: system.query requires a relational result");
-      }
-      return executeRows(statement, bound, {
-        maxRows: this.maxResultRows,
-        maxBytes: this.maxResultBytes,
-        mustComplete: false,
+    const policy: QueryPolicy = { mode: "query" };
+    try {
+      const statementSql = this.validateSql(sql, "system.query");
+      const bound = normalizeParams(params);
+      return this.withPolicy(policy, () => {
+        const statement = this.db.prepare(statementSql);
+        if (statement.columns().length === 0) {
+          throw new GuardServiceError("GUARD_QUERY_REQUIRED", "Guard: system.query requires a relational result");
+        }
+        return executeRows(statement, bound, {
+          maxRows: this.maxResultRows,
+          maxBytes: this.maxResultBytes,
+          mustComplete: false,
+        });
       });
-    });
+    } catch (error) {
+      if (policy.denied || (error instanceof GuardServiceError && error.code === "GUARD_QUERY_REQUIRED")) {
+        throw new GuardServiceError(
+          "GUARD_QUERY_REJECTED",
+          "Query not authorized: only read-only relational queries are allowed; writes, schema changes, and administrative statements are not supported.",
+        );
+      }
+      // Node shares ERR_SQLITE_ERROR across SQL, I/O and corruption failures.
+      // SQLite's numeric SQLITE_ERROR (1) identifies SQL errors; denials above
+      // take precedence because forbidden functions can also report this code.
+      if (error instanceof Error && (
+        ("errcode" in error && error.errcode === 1)
+        || (error instanceof GuardServiceError && [
+          "GUARD_INVALID_SQL", "GUARD_MULTIPLE_STATEMENTS", "GUARD_INVALID_PARAMS", "GUARD_SQL_LIMIT",
+        ].includes(error.code))
+      )) {
+        throw new GuardServiceError("GUARD_QUERY_INVALID", error.message);
+      }
+      throw error;
+    }
   }
 
   mutate(

@@ -77,6 +77,7 @@ import { AppEditMaterializationCoordinator } from "./apps/edit-materialization";
 import { ArchiveHttpError, readAppPackageArchive } from "./apps/package-archive";
 import { AppLifecycleService } from "./apps/lifecycle";
 import { AppLifecycleError } from "./apps/errors";
+import { cliCoded, cliFailure } from "./cli-errors";
 import {
   ProducerDescriptorStore,
   createAppProducerDescriptor,
@@ -90,7 +91,6 @@ import { ConnectorMarketplaceError, MarketplaceService } from "./marketplace/ser
 import {
   MANAGED_APP_EDIT_ROOT,
   parseCliRequest,
-  type CliErrorCode,
   type CliRequest,
   type CliResponse,
   type FileCommandResult,
@@ -1156,38 +1156,11 @@ function quoteCliWord(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-class CoreCliError extends Error {
-  constructor(readonly code: CliErrorCode, message: string) { super(message); }
-}
-
-function cliCoded(code: CliErrorCode, message: string): CoreCliError {
-  return new CoreCliError(code, message);
-}
-
 function requireCliSource(sourceId: string): void {
   const source = connectorSupervisor.getSource(sourceId);
   if (!source || !connectorSupervisor.isRegistered(source.connectorId)) {
     throw cliCoded("SOURCE_NOT_FOUND", `Source ${sourceId} was not found.`);
   }
-}
-
-function cliFailure(requestId: string, error: unknown): CliResponse {
-  if (error instanceof CoreCliError) {
-    return { requestId, ok: false, error: { code: error.code, message: error.message } } as CliResponse;
-  }
-  if (error instanceof AppLifecycleError) {
-    const code = error.code === "APP_PACKAGE_INVALID"
-      ? "APP_INVALID"
-      : error.code === "APP_COMMAND_UNSUPPORTED"
-        ? "CLI_UNSUPPORTED_COMMAND"
-        : error.code;
-    return { requestId, ok: false, error: { code, message: error.message } } as CliResponse;
-  }
-  return {
-    requestId,
-    ok: false,
-    error: { code: "CLI_INTERNAL", message: "Lamarck could not complete the command." },
-  } as CliResponse;
 }
 
 function coreErrorMessage(error: unknown): string {
@@ -1356,7 +1329,11 @@ const server = await serve<{ cwd: string }>({
           const result = await executeCoreCliOperation(request, principal, requestGuardSignal);
           return json({ requestId: request.requestId, ok: true, result } as CliResponse);
         } catch (error) {
-          return json(cliFailure(request.requestId, error));
+          const failure = cliFailure(request.requestId, error);
+          if (!failure.ok && failure.error.code === "CLI_INTERNAL") {
+            console.error(`[lamarck] CLI ${request.operation} (${request.requestId}) failed:`, error);
+          }
+          return json(failure);
         }
       }
 

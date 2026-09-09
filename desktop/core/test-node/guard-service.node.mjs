@@ -493,6 +493,30 @@ describe("Node Guard utility", { concurrency: 1 }, () => {
     }, /exactly one/i);
   });
 
+  test("query failure classifications survive the Guard boundary and reset after denial", async () => {
+    for (const sql of [
+      "DELETE FROM events WHERE 0",
+      "PRAGMA user_version",
+      "CREATE TABLE query_forbidden (id TEXT PRIMARY KEY NOT NULL)",
+      "SELECT load_extension('forbidden')",
+      "SELECT * FROM temp._lamarck_cdc_rows",
+      "REINDEX",
+    ]) {
+      await assert.rejects(() => queryRows(sql), { code: "GUARD_QUERY_REJECTED" }, sql);
+    }
+    for (const [sql, message] of [
+      ["SELEC 1", /syntax error/i],
+      ["SELECT * FROM missing_query_table", /no such table: missing_query_table/i],
+      ["SELECT missing_query_column FROM parents", /no such column: missing_query_column/i],
+      ["SELECT 1; SELECT 2", /exactly one/i],
+      ["-- empty query", /requires SQL/i],
+    ]) {
+      await assert.rejects(() => queryRows(sql), { code: "GUARD_QUERY_INVALID", message }, sql);
+    }
+    assert.deepEqual(await queryRows("WITH value(n) AS (SELECT 42) SELECT n FROM value"), [{ n: 42 }]);
+    assert.deepEqual(await queryRows("SELECT name FROM sqlite_schema WHERE name='query_forbidden'"), []);
+  });
+
   test("mutate enforces direct table grants and denies D0/system writes", async () => {
     await assertRpcRejects("mutate", {
       principal: {

@@ -12,6 +12,14 @@ Core token, gateway token, Workspace selector, or managed socket path.
 
 Use `lamarck --help` for the complete local command surface.
 
+## Query errors
+
+`lamarck query` accepts one read-only relational query. Policy rejections return
+`QUERY_REJECTED`; invalid SQL, including missing tables or columns, returns
+`QUERY_INVALID` with the specific reason. Unexpected failures remain
+`CLI_INTERNAL`. Failed commands exit non-zero and write their message to stderr;
+with `--json`, stderr contains `{ "error": { "code": "...", "message": "..." } }`.
+
 ## Managed Capsule delivery and capabilities
 
 Desktop packages `lamarck-managed.mjs` from the same CLI source and pins its bytes

@@ -233,6 +233,10 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
         await expect(failedRefresh.json()).resolves.toEqual({
           error: `injected manifest ${code}`,
         });
+        await writeFile(manifestFaultControl, code, "utf8"); // Re-arm the one-shot fault for CLI.
+        expect(await runCliFailure("app", "list", "--json")).toEqual({
+          error: { code: "CLI_INTERNAL", message: "Lamarck could not complete the command." },
+        });
 
         // Authoring-state failure cannot rewrite the immutable activation
         // snapshot or revoke its running capability.
@@ -268,6 +272,33 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
       capability: expect.any(String),
       channelId: expect.any(String),
     });
+  });
+
+  test("Host CLI distinguishes query rejections and invalid SQL through Core and Guard", async () => {
+    const rejected = "Query not authorized: only read-only relational queries are allowed; writes, schema changes, and administrative statements are not supported.";
+    for (const sql of [
+      "DELETE FROM events WHERE 0", "PRAGMA user_version",
+      "SELECT load_extension('forbidden')", "BEGIN IMMEDIATE",
+    ]) {
+      expect(await runCliFailure("query", sql, "--json")).toEqual({
+        error: { code: "QUERY_REJECTED", message: rejected },
+      });
+    }
+    for (const [sql, message] of [
+      ["SELEC 1", 'near "SELEC": syntax error'],
+      ["SELECT * FROM missing_query_table", "no such table: missing_query_table"],
+      ["SELECT missing_query_column FROM events", "no such column: missing_query_column"],
+    ]) {
+      expect(await runCliFailure("query", sql, "--json")).toEqual({
+        error: { code: "QUERY_INVALID", message },
+      });
+      await expect(runCli("query", sql)).rejects.toMatchObject({ exitCode: 1, stderr: `${message}\n` });
+    }
+    await expect(runCli("query", "PRAGMA user_version")).rejects.toMatchObject({
+      exitCode: 1, stderr: `${rejected}\n`,
+    });
+    expect(JSON.parse(await runCli("query", "WITH value(n) AS (SELECT 42) SELECT n FROM value", "--json")))
+      .toEqual([{ n: 42 }]);
   });
 
   test("Host CLI lists, saves, pages versions, restores forward, and emits stable JSON errors", async () => {
@@ -661,7 +692,7 @@ async function runCli(...args: string[]): Promise<string> {
     io: { stdin, stdout, stderr } as CliIo,
   });
   const error = Buffer.concat(errors).toString("utf8");
-  if (exitCode !== 0) throw Object.assign(new Error(error), { stderr: error });
+  if (exitCode !== 0) throw Object.assign(new Error(error), { stderr: error, exitCode });
   return Buffer.concat(output).toString("utf8");
 }
 
