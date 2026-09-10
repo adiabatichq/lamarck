@@ -1,5 +1,11 @@
 import { once } from "node:events";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { Duplex } from "node:stream";
+import { build } from "esbuild";
 import { describe, expect, test } from "vitest";
 import {
   LVRM_HEADER_BYTES,
@@ -15,6 +21,23 @@ const RESET = 3;
 const CLOSE = 4;
 
 describe("LVRM Guest Duplex", () => {
+  test.each(["reset-write", "reset-final", "already-destroyed", "destroy-error", "normal", "normal-final", "stalled-reset", "stalled-final"])(
+    "owns socket errors until close in an isolated process: %s",
+    async (mode) => {
+      const directory = await mkdtemp(join(tmpdir(), "lamarck-lvrm-teardown-"));
+      try {
+        const outfile = join(directory, "teardown.mjs");
+        await build({
+          stdin: { contents: teardownProbe, resolveDir: import.meta.dirname, sourcefile: "teardown-probe.ts", loader: "ts" },
+          outfile, bundle: true, platform: "node", target: "node24", format: "esm",
+        });
+        const result = await promisify(execFile)(process.execPath, [outfile, mode], { timeout: 5_000 });
+        expect(result.stderr).toBe("");
+        expect(JSON.parse(result.stdout)).toMatchObject({ mode, rawCloses: 1, relayCloses: 1, protocolSettlements: 1, listeners: 0 });
+      } finally { await rm(directory, { recursive: true, force: true }); }
+    }, 10_000,
+  );
+
   test("decodes fragmented DATA at Host FIN but commits only after dual CLOSE", async () => {
     const raw = new MemoryRawSocket();
     const relay = new LvrmDuplex(raw);
@@ -338,6 +361,86 @@ describe("LVRM Guest Duplex", () => {
     expect(raw.guestWriteEnded).toBe(true);
   });
 });
+
+// Node emits the raw socket error after its write/final/destroy callback. Run
+// outside Vitest so an unowned EPIPE really exits the process; the monitor
+// records uncaught errors without handling or suppressing them.
+const teardownProbe = `
+import assert from "node:assert/strict";
+import { Duplex } from "node:stream";
+import { once } from "node:events";
+import { setImmediate as nextTurn } from "node:timers/promises";
+import { LvrmDuplex } from "../src/lvrm-duplex";
+const mode = process.argv[2];
+process.on("uncaughtExceptionMonitor", error => console.error("UNCAUGHT", error));
+let injectedErrors = 0;
+const epipe = () => { injectedErrors++; return Object.assign(new Error("write EPIPE"), { code: "EPIPE" }); };
+const errorOwners = [];
+class RawSocket extends Duplex {
+  constructor() { super({ allowHalfOpen: true }); }
+  _read() {}
+  _write(bytes, encoding, callback) {
+    if (mode === "stalled-reset") return;
+    queueMicrotask(() => callback(mode === "reset-write" ? epipe() : undefined));
+  }
+  _final(callback) {
+    if (mode === "stalled-final") return;
+    queueMicrotask(() => callback(mode.endsWith("final") ? epipe() : undefined));
+  }
+  _destroy(error, callback) {
+    queueMicrotask(() => callback(mode === "destroy-error" ? epipe() : error));
+  }
+  emit(event, ...args) {
+    if (event === "error") errorOwners.push(this.listenerCount("error"));
+    return super.emit(event, ...args);
+  }
+  setNoDelay() { return this; }
+  setTimeout() { return this; }
+}
+function terminal(kind) {
+  const bytes = Buffer.alloc(12);
+  bytes.write("LVRM"); bytes.writeUInt16BE(2, 4); bytes.writeUInt16BE(kind, 6);
+  return bytes;
+}
+const raw = new RawSocket();
+const relay = new LvrmDuplex(raw);
+const original = new Error("original operation cancelled");
+const errors = [];
+relay.on("error", error => errors.push(error));
+let rawCloses = 0, relayCloses = 0, protocolSettlements = 0;
+const rawClosed = new Promise(resolve => raw.once("close", () => { rawCloses++; resolve(); }));
+const relayClosed = new Promise(resolve => relay.once("close", () => { relayCloses++; resolve(); }));
+const protocol = relay.waitForProtocolClose().then(
+  () => { protocolSettlements++; return undefined; },
+  error => { protocolSettlements++; return error; },
+);
+if (mode.startsWith("normal")) {
+  relay.resume(); raw.push(terminal(2)); relay.end();
+  await once(relay, "finish");
+  await nextTurn(); raw.push(terminal(4));
+} else {
+  if (mode === "already-destroyed") raw.destroy(epipe());
+  relay.destroy(original);
+  relay.destroy(new Error("duplicate destroy must not replace the original"));
+}
+// The production teardown timer is deliberately unref'ed; stand in for the
+// supervisor's event loop while testing an otherwise handle-free fake socket.
+const deadline = setTimeout(() => { throw new Error("teardown exceeded its bound"); }, 3_000);
+await Promise.all([rawClosed, relayClosed]);
+clearTimeout(deadline);
+await nextTurn();
+assert.equal(await protocol, mode.startsWith("normal") ? undefined : original);
+assert.deepEqual(errors, mode.startsWith("normal") ? [] : [original]);
+assert.equal(rawCloses, 1); assert.equal(relayCloses, 1); assert.equal(protocolSettlements, 1);
+if (mode.includes("write") || mode === "reset-final" || mode === "normal-final" || mode === "already-destroyed" || mode === "destroy-error") {
+  assert.ok(injectedErrors > 0);
+  if (mode !== "reset-final") assert.ok(errorOwners.length > 0);
+  assert.ok(errorOwners.every(count => count > 0));
+}
+const listeners = ["readable", "end", "error", "close", "timeout", "finish"].reduce((sum, event) => sum + raw.listenerCount(event), 0);
+assert.equal(listeners, 0);
+console.log(JSON.stringify({ mode, rawCloses, relayCloses, protocolSettlements, listeners }));
+`;
 
 class MemoryRawSocket extends Duplex {
   readonly guestWrites: Buffer[] = [];

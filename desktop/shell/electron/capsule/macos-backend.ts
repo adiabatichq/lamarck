@@ -291,6 +291,11 @@ interface BootBoundary {
   readonly release: LoadedCapsuleGuestRelease;
   stateDiskBytes: number;
   capacity?: VmCapacityCoordinator;
+  readonly blobWaiters: Map<string, (event: GuestEvent) => void>;
+  readonly buildWaiters: Map<string, {
+    expected: BuildDescriptorExpectation;
+    receive(event: GuestEvent): void;
+  }>;
   intentional: boolean;
 }
 
@@ -347,6 +352,7 @@ type PreparedUiOutcome =
 
 interface EventWaiter<T> {
   readonly promise: Promise<T>;
+  resolve(value: T): void;
   armTimeout(timeoutMs: number): void;
   cancel(error?: Error): void;
 }
@@ -1052,6 +1058,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         session,
         release,
         stateDiskBytes,
+        blobWaiters: new Map(),
+        buildWaiters: new Map(),
         get intentional() { return intentional; },
         set intentional(value: boolean) { intentional = value; },
       };
@@ -1080,7 +1088,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         });
         session.on("event", (event) => {
           const boot = provisional();
-          if (boot) this.#observeWorkloadTerminalEvent(boot, event);
+          if (boot) {
+            this.#dispatchOperationEvent(boot, event);
+            this.#observeWorkloadTerminalEvent(boot, event);
+          }
         });
         for (const data of earlyData.splice(0)) session.acceptDataStream(data);
         settleControl(session);
@@ -1524,6 +1535,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       // A successful build.start response means the exact Build output ref
       // exists even if subsequent event correlation or Host CAS work fails.
       completedDescriptor = descriptor;
+      completed.confirm(descriptor);
       const eventDescriptor = await completed.promise;
       if (!deepEqual(descriptor, eventDescriptor)) {
         await this.#loseBoundary(new Error("Guest build response/event descriptors disagree"), boot);
@@ -1684,23 +1696,21 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       releaseImport = await boot.capacity?.reserveImport(blob.bytes);
       throwIfAborted(signal);
       const opened = await boot.session.openDataStream(ticket.ticket, kind);
-      const transfer = startBlobTransfer(opened.stream, blob.bytes, signal);
       try {
-        await writeIterable(
+        await transferBlobImport(
           opened.stream,
           blob.createReadStream(),
-          transfer.signal,
-          transfer.progress,
+          blob.bytes,
+          signal,
+          imported.promise,
+          () => imported.armTimeout(BLOB_EVENT_CONFIRM_TIMEOUT_MS),
         );
-        transfer.complete();
-        imported.armTimeout(BLOB_EVENT_CONFIRM_TIMEOUT_MS);
-        await imported.promise;
-        return blobHandle;
       } catch (error) {
-        transfer.cancel(asError(error));
+        // Also owns failures opening the Host source, before a transfer exists.
         opened.stream.destroy(asError(error));
         throw error;
       }
+      return blobHandle;
     } catch (error) {
       imported.cancel(asError(error));
       boot.session.revokeTicket(ticket.ticket);
@@ -2549,6 +2559,30 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     }).catch((error) => this.#loseBoundaryInBackground(error, boot));
   }
 
+  #dispatchOperationEvent(boot: BootBoundary, event: GuestEvent): void {
+    const body = event.body && typeof event.body === "object" && !Array.isArray(event.body)
+      ? event.body : {};
+    if (event.type === "blob.imported" || event.type === "blob.exported" || event.type === "blob.failed") {
+      // Route first, then let the owner validate the complete Host provenance.
+      // Unclaimed events (including late cancellation events) cannot settle a
+      // different operation. Its own deadline still requires exact confirmation.
+      const receive = typeof body.blobHandle === "string" ? boot.blobWaiters.get(body.blobHandle) : undefined;
+      receive?.(event);
+    } else if (event.type === "build.progress" || event.type === "build.failed") {
+      const waiter = typeof body.buildHandle === "string" ? boot.buildWaiters.get(body.buildHandle) : undefined;
+      waiter?.receive(event);
+    } else if (event.type === "build.completed") {
+      // Protocol v1 identifies completion by immutable source/artifact provenance,
+      // not buildHandle. Snapshot matches before any waiter can remove itself.
+      const waiters = [...boot.buildWaiters.values()];
+      const matches = waiters.filter(({ expected }) => {
+        try { correlateBuildCompletedEvent(event, expected); return true; }
+        catch { return false; }
+      });
+      for (const waiter of matches) waiter.receive(event);
+    }
+  }
+
   #waitForBlobImport(
     boot: BootBoundary,
     blobHandle: string,
@@ -2566,7 +2600,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         throw new GuestOperationError(`Guest blob import failed: ${failed.message}`);
       }
       return undefined;
-    });
+    }, { blobHandle });
   }
 
   #waitForBlobExport(
@@ -2586,7 +2620,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         throw new GuestOperationError(`Guest blob export failed: ${failed.message}`);
       }
       return undefined;
-    });
+    }, { blobHandle });
   }
 
   #waitForBuild(
@@ -2595,22 +2629,40 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     buildHandle: string,
     expected: BuildDescriptorExpectation,
     signal: AbortSignal,
-  ): EventWaiter<BuildDescriptor> {
-    return this.#eventWaiter(boot, BUILD_REQUEST_TIMEOUT_MS, signal, (event) => {
+  ): EventWaiter<BuildDescriptor> & { confirm(descriptor: BuildDescriptor): void } {
+    const observed = new Set<string>();
+    let response: BuildDescriptor | undefined;
+    const waiter = this.#eventWaiter<BuildDescriptor>(boot, BUILD_REQUEST_TIMEOUT_MS, signal, (event) => {
       if (event.type === "build.progress") {
         correlateBuildProgressEvent(event, { appHandle, buildHandle });
         return undefined;
       }
       if (event.type === "build.completed") {
         const descriptor = correlateBuildCompletedEvent(event, expected);
-        return { done: true, value: descriptor };
+        if (response) {
+          if (deepEqual(response, descriptor)) return { done: true, value: descriptor };
+        } else {
+          observed.add(JSON.stringify(descriptor));
+          if (observed.size > 64) throw new Error("Guest exceeded pending Build completion bound");
+        }
+        return undefined;
       }
       if (event.type === "build.failed") {
         const failed = correlateBuildFailedEvent(event, { appHandle, buildHandle });
         throw new GuestOperationError(`Guest build failed: ${failed.message}`);
       }
       return undefined;
-    });
+    }, { buildHandle, expected });
+    return {
+      ...waiter,
+      confirm: (descriptor) => {
+        // Concurrent builds of identical inputs may produce different outputs.
+        // Only this request's authenticated response selects its completion.
+        response = descriptor;
+        if (observed.has(JSON.stringify(descriptor))) waiter.resolve(descriptor);
+        observed.clear();
+      },
+    };
   }
 
   #waitForWorkloadReady(
@@ -2690,6 +2742,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     timeoutMs: number | undefined,
     signal: AbortSignal,
     correlate: (event: GuestEvent) => { done: true; value: T } | undefined,
+    route?: { blobHandle: string } | { buildHandle: string; expected: BuildDescriptorExpectation },
   ): EventWaiter<T> {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2698,7 +2751,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     const cleanup = () => {
       if (timer) clearTimeout(timer);
       signal.removeEventListener("abort", onAbortSignal);
-      boot.session.off("event", onEvent);
+      if (route && "blobHandle" in route) boot.blobWaiters.delete(route.blobHandle);
+      else if (route) boot.buildWaiters.delete(route.buildHandle);
+      else boot.session.off("event", onEvent);
       boot.session.off("fatal", onFatal);
       boot.session.off("close", onClose);
     };
@@ -2708,14 +2763,18 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       cleanup();
       rejectPromise(error);
     };
+    const resolve = (value: T) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolvePromise(value);
+    };
     const onEvent = (event: GuestEvent) => {
       if (settled) return;
       try {
         const result = correlate(event);
         if (!result?.done) return;
-        settled = true;
-        cleanup();
-        resolvePromise(result.value);
+        resolve(result.value);
       } catch (error) {
         const normalized = asError(error);
         reject(normalized);
@@ -2745,7 +2804,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       rejectPromise = rejectValue;
     });
     void promise.catch(() => {});
-    boot.session.on("event", onEvent);
+    if (route && "blobHandle" in route) boot.blobWaiters.set(route.blobHandle, onEvent);
+    else if (route) boot.buildWaiters.set(route.buildHandle, { expected: route.expected, receive: onEvent });
+    else boot.session.on("event", onEvent);
     boot.session.on("fatal", onFatal);
     boot.session.on("close", onClose);
     signal.addEventListener("abort", onAbortSignal, { once: true });
@@ -2753,6 +2814,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     if (timeoutMs !== undefined) armTimeout(timeoutMs);
     return {
       promise,
+      resolve,
       armTimeout,
       cancel: (error = new Error("Guest event waiter cancelled")) => reject(error),
     };
@@ -3200,6 +3262,42 @@ export async function writeIterable(
     await raceAbort(endWritable(destination), signal);
   } catch (error) {
     destination.destroy(asError(error));
+    throw error;
+  }
+}
+
+/** Import success requires both FINs and the authenticated CONTROL event. */
+export async function transferBlobImport(
+  stream: Duplex,
+  source: AsyncIterable<Uint8Array>,
+  expectedBytes: number,
+  signal: AbortSignal,
+  confirmation: Promise<unknown>,
+  onDirectionsComplete: () => void,
+  policy: BlobTransferPolicy = DEFAULT_BLOB_TRANSFER_POLICY,
+): Promise<void> {
+  const transfer = startBlobTransfer(stream, expectedBytes, signal, policy);
+  // Read while writing: an unread Guest FIN keeps the real DATA stream in the
+  // session's active set, even after native I/O has retired the wire stream.
+  const reading = (async () => {
+    for await (const chunk of iterateWithAbort(stream, transfer.signal)) {
+      if (chunk.byteLength !== 0) throw new Error("Guest blob import returned unexpected DATA payload");
+    }
+  })();
+  const writing = writeIterable(stream, source, transfer.signal, transfer.progress).then(() => {
+    transfer.setPhase("guest-fin");
+  });
+  try {
+    await Promise.all([
+      Promise.all([writing, reading]).then(onDirectionsComplete),
+      raceAbort(confirmation, transfer.signal),
+    ]);
+    transfer.complete();
+  } catch (error) {
+    transfer.cancel(asError(error));
+    // Cancellation/deadlines bound both consumers, including a stuck source
+    // iterator. Do not return before the local transfer cleanup has finished.
+    await Promise.allSettled([writing, reading]);
     throw error;
   }
 }

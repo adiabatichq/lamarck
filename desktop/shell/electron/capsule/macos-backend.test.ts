@@ -17,7 +17,7 @@ import {
   MAX_ARTIFACT_ADOPTION_RECEIPT_BYTES,
 } from "../../../capsule/src/protocol/codec";
 import { parseArtifactAdoptionReceipt } from "../../../capsule/src/protocol/validate";
-import type { CapsuleVmHostStream } from "../capsule-vm/launcher";
+import { CapsuleVmHostStream } from "../capsule-vm/launcher";
 import { prepareWorkspaceAppEditBasesMountPath, validateWorkspaceFilesMountPath } from "../workspace-files";
 import type { LoadedCapsuleGuestRelease } from "./guest-release";
 import { HostArtifactStore, type HostArtifact, type HostArtifactActivation } from "./artifact-store";
@@ -52,6 +52,213 @@ function fakeAppCliStreamServer(): AppCliStreamServer {
 }
 
 describe("MacOsCapsuleBackend orchestration", () => {
+  test("retires real import transports after both directions finish", async () => {
+    const harness = createHarness();
+    try {
+      await harness.backend.startUi(spec("sender-a"));
+      expect(harness.session.importStreams.length).toBeGreaterThan(0);
+      await vi.waitFor(() => expect(harness.session.importStreams.every((stream) => stream.destroyed)).toBe(true));
+    } finally {
+      await harness.backend.stopAll();
+    }
+  });
+
+  test("retires an opened import if the Host source cannot be opened", async () => {
+    const h = createHarness();
+    try {
+      const current = await h.backend.startUi(spec("existing"));
+      h.session.guestCache.clear();
+      vi.spyOn(h.store.activation!.artifact, "createReadStream").mockImplementation(() => { throw new Error("source unavailable"); });
+      await expect(h.backend.startUi(spec("failed"))).rejects.toThrow("source unavailable");
+      await vi.waitFor(() => expect(h.session.importStreams.every((stream) => stream.destroyed)).toBe(true));
+      (await h.backend.openUiStream(current.instanceId)).destroy();
+      expect(h.vm.stopCalls).toBe(0);
+    } finally { await h.backend.stopAll(); }
+  });
+
+  test.each([
+    { differentSources: false, responseFirst: false }, { differentSources: true, responseFirst: false },
+    { differentSources: false, responseFirst: true }, { differentSources: true, responseFirst: true },
+  ])("routes overlapping cold launches and exact outputs ($differentSources, response first: $responseFirst)", async ({ differentSources, responseFirst }) => {
+    const harness = createHarness({ snapshotDigest: (path) => differentSources && path.endsWith("notes") ? PACKAGE_B : PACKAGE_A });
+    const boundaryLost = vi.fn();
+    harness.backend.setBoundaryLostHandler(boundaryLost);
+    if (responseFirst) {
+      const emit = harness.session.guestEvent.bind(harness.session);
+      vi.spyOn(harness.session, "guestEvent").mockImplementation((type, body) => {
+        if (type === "build.completed") setImmediate(() => emit(type, body));
+        else emit(type, body);
+      });
+    }
+    const imports = Promise.withResolvers<void>();
+    const builds = Promise.withResolvers<void>();
+    let waitingImports = 0;
+    let waitingBuilds = 0;
+    harness.session.beforeImportEvent = async (kind) => {
+      if (kind !== "package") return;
+      if (++waitingImports === 2) imports.resolve();
+      await imports.promise;
+    };
+    harness.session.beforeBuildComplete = async (_body, descriptor) => {
+      // Same inputs can legitimately produce distinct (e.g. timestamped) EROFS outputs.
+      descriptor.digest = ++waitingBuilds === 1 ? ARTIFACT_A : ARTIFACT_B;
+      if (waitingBuilds === 2) builds.resolve();
+      await builds.promise;
+    };
+    try {
+      const launches = await Promise.all([
+        harness.backend.startUi(spec("sender-a")),
+        harness.backend.startUi({ ...spec("sender-b", differentSources ? PACKAGE_B : PACKAGE_A), appId: "notes", packageDir: "/workspace/apps/notes" }),
+      ]);
+      expect(launches).toHaveLength(2);
+      expect(harness.session.buildStarts).toBe(2);
+      expect(harness.vm.startCalls).toBe(1);
+      expect(harness.store.cas.has(ARTIFACT_A)).toBe(true);
+      expect(harness.store.cas.has(ARTIFACT_B)).toBe(true);
+      expect(boundaryLost).not.toHaveBeenCalled();
+      for (const launch of launches) (await harness.backend.openUiStream(launch.instanceId)).destroy();
+    } finally {
+      imports.resolve();
+      builds.resolve();
+      await harness.backend.stopAll();
+    }
+  });
+
+  test.each(["import", "build"])("isolates one concurrent %s failure and permits a retry", async (stage) => {
+    const harness = createHarness();
+    const boundaryLost = vi.fn();
+    harness.backend.setBoundaryLostHandler(boundaryLost);
+    const gate = Promise.withResolvers<void>();
+    let waiting = 0;
+    const overlap = async () => {
+      const ordinal = ++waiting;
+      if (ordinal === 2) gate.resolve();
+      await gate.promise;
+      if (ordinal === 1) throw new Error("injected concurrent failure");
+    };
+    if (stage === "import") harness.session.beforeImportEvent = async (kind) => {
+      if (kind === "package") await overlap();
+    };
+    else harness.session.beforeBuildComplete = overlap;
+    try {
+      const outcomes = await Promise.allSettled([
+        harness.backend.startUi(spec("sender-a")),
+        harness.backend.startUi({ ...spec("sender-b"), appId: "notes", packageDir: "/workspace/apps/notes" }),
+      ]);
+      expect(outcomes.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+      const live = outcomes.find((result) => result.status === "fulfilled")!;
+      if (live.status !== "fulfilled") throw new Error("missing surviving App");
+      (await harness.backend.openUiStream(live.value.instanceId)).destroy();
+      expect(boundaryLost).not.toHaveBeenCalled();
+      harness.session.beforeImportEvent = undefined;
+      harness.session.beforeBuildComplete = undefined;
+      const failedIndex = outcomes.findIndex((result) => result.status === "rejected");
+      const retry = await harness.backend.startUi({ ...spec("sender-retry"), appId: failedIndex === 0 ? "weather" : "notes" });
+      (await harness.backend.openUiStream(retry.instanceId)).destroy();
+      expect(harness.vm.startCalls).toBe(1);
+    } finally {
+      gate.resolve();
+      await harness.backend.stopAll();
+    }
+  });
+
+  test.each(["blob", "build"])("still rejects altered provenance for a claimed %s operation", async (stage) => {
+    const harness = createHarness();
+    const boundaryLost = vi.fn();
+    harness.backend.setBoundaryLostHandler(boundaryLost);
+    const emit = harness.session.guestEvent.bind(harness.session);
+    vi.spyOn(harness.session, "guestEvent").mockImplementation((type, body) => {
+      if (type === (stage === "blob" ? "blob.imported" : "build.progress")) {
+        body = { ...(body as Record<string, JsonValue>), ...(stage === "blob" ? { digest: PACKAGE_B } : { appHandle: "X".repeat(22) }) };
+      }
+      emit(type, body);
+    });
+    try {
+      await expect(harness.backend.startUi(spec("sender-a"))).rejects.toThrow(/Host-authoritative provenance/);
+      expect(boundaryLost).toHaveBeenCalledOnce();
+      expect(harness.store.activation).toBeUndefined();
+    } finally {
+      await harness.backend.stopAll();
+    }
+  });
+
+  test("requires exact Build completion and runtime provenance before activating an artifact", async () => {
+    vi.useFakeTimers();
+    const harness = createHarness();
+    const boundaryLost = vi.fn();
+    harness.backend.setBoundaryLostHandler(boundaryLost);
+    const completed = Promise.withResolvers<void>();
+    const emit = harness.session.guestEvent.bind(harness.session);
+    vi.spyOn(harness.session, "guestEvent").mockImplementation((type, body) => {
+      if (type === "build.completed") {
+        // One valid descriptor names another output; another names this output
+        // but has invalid runtime provenance. Neither confirms this request.
+        emit(type, { ...(body as Record<string, JsonValue>), digest: ARTIFACT_B });
+        emit(type, { ...(body as Record<string, JsonValue>), nodeVersion: "0.0.0" });
+        completed.resolve();
+      } else emit(type, body);
+    });
+    const launch = rejectionOf(harness.backend.startUi(spec("sender-a")));
+    try {
+      await completed.promise;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.store.activation).toBeUndefined();
+      expect(harness.store.cas.size).toBe(0);
+      expect(boundaryLost).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect((await launch).message).toContain("Timed out waiting for authenticated Guest event");
+      expect(boundaryLost).toHaveBeenCalledOnce();
+      expect(harness.store.activation).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      await harness.backend.stopAll();
+    }
+  });
+
+  test("ignores a cancelled Build's late failure while another Build remains live", async () => {
+    const harness = createHarness();
+    const boundaryLost = vi.fn();
+    harness.backend.setBoundaryLostHandler(boundaryLost);
+    const builds = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
+    const descriptors = new Map<string, JsonValue>();
+    let cancelledBuild: Record<string, any> | undefined;
+    harness.session.beforeBuildComplete = async (body, descriptor) => {
+      const gate = Promise.withResolvers<void>();
+      builds.set(body.buildHandle, gate);
+      descriptors.set(body.buildHandle, descriptor);
+      await gate.promise;
+    };
+    const request = harness.session.request.bind(harness.session);
+    vi.spyOn(harness.session, "request").mockImplementation(async (operation, body) => {
+      if (operation === "build.cancel") {
+        cancelledBuild = harness.session.buildPrepares.find((entry) => entry.buildHandle === body.buildHandle);
+        builds.get(body.buildHandle)?.reject(new Error("build cancelled"));
+      }
+      return request(operation, body);
+    });
+    const cancelled = rejectionOf(harness.backend.startUi(spec("sender-a")));
+    const survivor = harness.backend.startUi({ ...spec("sender-b"), appId: "notes", packageDir: "/workspace/apps/notes" });
+    void survivor.catch(() => {});
+    try {
+      await vi.waitFor(() => expect(builds.size).toBe(2));
+      await harness.backend.stopApp("weather");
+      expect((await cancelled).message).toMatch(/stop requested|cancelled/);
+      const identity = { appHandle: cancelledBuild!.appHandle, buildHandle: cancelledBuild!.buildHandle };
+      harness.session.guestEvent("build.progress", { ...identity, phase: "materializing" });
+      harness.session.guestEvent("build.failed", { ...identity, message: "late cancelled failure" });
+      harness.session.guestEvent("build.completed", { ...(descriptors.get(identity.buildHandle) as Record<string, JsonValue>), digest: ARTIFACT_B });
+      harness.session.guestEvent("blob.failed", { blobHandle: "Z".repeat(22), digest: PACKAGE_B, bytes: 1, message: "late cancelled import" });
+      for (const gate of builds.values()) gate.resolve();
+      const live = await survivor;
+      (await harness.backend.openUiStream(live.instanceId)).destroy();
+      expect(boundaryLost).not.toHaveBeenCalled();
+      expect(harness.vm.startCalls).toBe(1);
+    } finally {
+      for (const gate of builds.values()) gate.resolve();
+      await harness.backend.stopAll();
+    }
+  });
+
   test.each([false, true])("prepares the editing-base share before startGuest (already exists: %s)", async (alreadyExists) => {
     const workspace = await realpath(await mkdtemp(join(tmpdir(), "lamarck-first-app-")));
     const share = join(workspace, ".lamarck", "cache", "app-edit-bases");
@@ -1936,6 +2143,7 @@ function createHarness(overrides: {
   opaqueId?: () => string;
   workspaceFilesPath?: () => string;
   appVersionsPath?: () => string;
+  snapshotDigest?: (path: string) => string;
 } = {}) {
   const lifecycleEvents: string[] = [];
   const vm = new FakeVm(lifecycleEvents);
@@ -1994,7 +2202,10 @@ function createHarness(overrides: {
       loadRelease: async () => release,
       launchVm: () => vm as never,
       createSession: () => session as never,
-      snapshot: async () => snapshot(packageDigest, Buffer.from(`package:${packageDigest}`)),
+      snapshot: async ({ packageDir }) => {
+        const digest = overrides.snapshotDigest?.(packageDir) ?? packageDigest;
+        return snapshot(digest, Buffer.from(`package:${digest}`));
+      },
       manifestDigest: async () => manifestDigest as `sha256:${string}`,
       installInput: async () => ({
         digest: installDigest as `sha256:${string}`,
@@ -2180,6 +2391,8 @@ class FakeSession extends EventEmitter {
     digest: string;
     bytes: number;
   }>();
+  readonly exports = new Map<string, { digest: string; bytes: number }>();
+  readonly importStreams: CapsuleVmHostStream[] = [];
   readonly releasedImports: Array<Record<string, any>> = [];
   readonly outputReleases: Array<Record<string, any>> = [];
   readonly guestCache = new Set<string>();
@@ -2201,6 +2414,8 @@ class FakeSession extends EventEmitter {
   failBeforeOperation: string | undefined;
   failNextDataStreamKind: StreamKind | undefined;
   holdArtifactOutHostFinal = false;
+  beforeImportEvent?: (kind: "package" | "dependency" | "artifact") => Promise<void>;
+  beforeBuildComplete?: (body: Record<string, any>, descriptor: ReturnType<FakeSession["descriptor"]>) => Promise<void>;
   failNextArtifactReceiptWrite = false;
   failImportReleaseForKind: "package" | "dependency" | "artifact" | undefined;
   loseBoundaryOnDataStreamFailure = false;
@@ -2209,10 +2424,6 @@ class FakeSession extends EventEmitter {
   private ticket = 0;
   private eventSeq = 0;
   private heldBuild: { reject(error: Error): void } | undefined;
-  private currentPackageDigest = PACKAGE_A;
-  private currentDependencyDigest = DEPENDENCY;
-  private currentInstallDigest = INSTALL;
-  private currentWarmBuild = false;
   private viewerAttachGate: Promise<void> | undefined;
   private releaseBlockedViewerAttach: (() => void) | undefined;
 
@@ -2317,17 +2528,14 @@ class FakeSession extends EventEmitter {
       }
       case "build.prepare":
         this.buildPrepares.push({ ...body });
-        this.currentPackageDigest = body.packageDigest;
-        this.currentDependencyDigest = body.dependencyDigest ?? body.baseDependencyDigest;
-        this.currentInstallDigest = body.installDigest;
-        this.currentWarmBuild = body.baseArtifactDigest !== undefined;
         this.removeImport(body.packageBlobHandle);
         this.removeImport(body.dependencyBlobHandle);
         this.removeImport(body.baseArtifactBlobHandle);
         return { prepared: true };
       case "build.start": {
         this.buildStarts += 1;
-        if (this.currentWarmBuild && this.failNextWarmBuild) {
+        const prepared = this.buildPrepares.find((entry) => entry.buildHandle === body.buildHandle)!;
+        if (prepared.baseArtifactDigest !== undefined && this.failNextWarmBuild) {
           this.failNextWarmBuild = false;
           throw new CapsuleGuestRequestError(
             "WARM_REBUILD_UNAVAILABLE",
@@ -2337,13 +2545,19 @@ class FakeSession extends EventEmitter {
         if (this.holdBuild) {
           return await new Promise((_resolve, reject) => { this.heldBuild = { reject }; });
         }
-        const descriptor = this.descriptor();
-        this.guestCache.add(`artifact:${descriptor.digest}`);
+        const descriptor = this.descriptor(body.buildHandle);
         this.guestEvent("build.progress", {
           appHandle: body.appHandle,
           buildHandle: body.buildHandle,
           phase: "materializing",
         });
+        try {
+          await this.beforeBuildComplete?.(body, descriptor);
+        } catch (error) {
+          this.guestEvent("build.failed", { ...body, message: String(error) });
+          throw error;
+        }
+        this.guestCache.add(`artifact:${descriptor.digest}`);
         this.guestEvent("build.completed", descriptor);
         return descriptor;
       }
@@ -2355,7 +2569,9 @@ class FakeSession extends EventEmitter {
       case "build.output.release":
         this.outputReleases.push({ ...body });
         return { released: true };
-      case "blob.export.prepare": return { ready: true };
+      case "blob.export.prepare":
+        this.exports.set(body.streamTicket, { digest: body.digest, bytes: body.bytes });
+        return { ready: true };
       case "app.prepare":
         this.removeImport(body.artifactBlobHandle);
         this.appPrepares.push({ appHandle: body.appHandle, mappedHostUid: body.mappedHostUid });
@@ -2424,7 +2640,14 @@ class FakeSession extends EventEmitter {
       if (this.loseBoundaryOnDataStreamFailure) this.emit("fatal", error);
       throw error;
     }
-    const stream = kind === "artifact-out"
+    const isImport = kind === "package-in" || kind === "dependency-in" || kind === "artifact-in";
+    const stream = isImport ? new CapsuleVmHostStream({
+        writeStreamData: (_id: number, _bytes: Buffer, callback: () => void) => callback(),
+        finishStream: (_id: number, callback: () => void) => callback(),
+        destroyStream: (_id: number, _error: unknown, callback: () => void) => callback(),
+        returnReceiveCredit: () => {},
+      } as never, { streamId: this.ticket, channel: "data", sourcePort: 1, destinationPort: 2 } as never, {})
+      : kind === "artifact-out"
       ? new Duplex({
           allowHalfOpen: true,
           autoDestroy: false,
@@ -2432,11 +2655,20 @@ class FakeSession extends EventEmitter {
         })
       : new PassThrough({ allowHalfOpen: true, autoDestroy: false });
     stream.on("error", () => {});
-    if (kind === "package-in" || kind === "dependency-in" || kind === "artifact-in") {
+    if (isImport) {
       const pending = this.imports.get(ticket)!;
-      stream.on("data", () => {});
-      stream.once("finish", () => {
+      this.importStreams.push(stream as CapsuleVmHostStream);
+      stream.once("finish", async () => {
+        try {
+          await this.beforeImportEvent?.(pending.blobKind);
+        } catch (error) {
+          this.guestEvent("blob.failed", {
+            blobHandle: pending.blobHandle, digest: pending.digest, bytes: pending.bytes, message: String(error),
+          });
+          return;
+        }
         this.guestCache.add(`${pending.blobKind}:${pending.digest}`);
+        (stream as CapsuleVmHostStream).acceptFin();
         this.guestEvent("blob.imported", {
           blobHandle: pending.blobHandle,
           digest: pending.digest,
@@ -2444,7 +2676,7 @@ class FakeSession extends EventEmitter {
         });
       });
     } else if (kind === "artifact-out") {
-      const descriptor = this.descriptor();
+      const descriptor = this.exports.get(ticket)!;
       let exportFailed = false;
       let adoptionReceiptReceived = false;
       const decoder = new JsonFrameDecoder(MAX_ARTIFACT_ADOPTION_RECEIPT_BYTES);
@@ -2538,8 +2770,9 @@ class FakeSession extends EventEmitter {
     } as never;
   }
 
-  private descriptor() {
-    const digest = this.currentPackageDigest === PACKAGE_A ? ARTIFACT_A : ARTIFACT_B;
+  private descriptor(buildHandle: string) {
+    const prepared = this.buildPrepares.find((entry) => entry.buildHandle === buildHandle)!;
+    const digest = prepared.packageDigest === PACKAGE_A ? ARTIFACT_A : ARTIFACT_B;
     return {
       format: "erofs-v1" as const,
       digest,
@@ -2550,9 +2783,9 @@ class FakeSession extends EventEmitter {
       libc: "musl",
       nodeVersion: "24.18.0",
       nodeModulesAbi: "137",
-      sourceDigest: this.currentPackageDigest,
-      installDigest: this.currentInstallDigest,
-      dependencyDigest: this.currentDependencyDigest,
+      sourceDigest: prepared.packageDigest,
+      installDigest: prepared.installDigest,
+      dependencyDigest: prepared.dependencyDigest ?? prepared.baseDependencyDigest,
       fileCount: 3,
     };
   }
@@ -2567,7 +2800,7 @@ class FakeSession extends EventEmitter {
     return false;
   }
 
-  private guestEvent(type: GuestEvent["type"], body: JsonValue) {
+  guestEvent(type: GuestEvent["type"], body: JsonValue) {
     this.emit("event", {
       v: CAPSULE_PROTOCOL_VERSION,
       sessionId: SESSION_ID,

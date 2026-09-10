@@ -126,7 +126,7 @@ export class LvrmDuplex extends Duplex {
     raw.pause();
     raw.on("readable", this.onRawReadable);
     raw.once("end", this.onRawEnd);
-    raw.once("error", this.onRawError);
+    raw.on("error", this.onRawError);
     raw.once("close", this.onRawClose);
     raw.on("timeout", this.onRawTimeout);
     this.once("end", this.retireAfterProtocolClose);
@@ -229,6 +229,7 @@ export class LvrmDuplex extends Duplex {
 
   private readonly onRawClose = () => {
     this.rawClosed = true;
+    this.cleanupRawListeners();
     this.drainInput();
     this.verifyPhysicalTermination();
   };
@@ -612,9 +613,14 @@ export class LvrmDuplex extends Duplex {
   private cleanupRawListeners(): void {
     this.raw.off("readable", this.onRawReadable);
     this.raw.off("end", this.onRawEnd);
-    this.raw.off("error", this.onRawError);
-    this.raw.off("close", this.onRawClose);
     this.raw.off("timeout", this.onRawTimeout);
+    // A write callback can finish adapter teardown before Node emits the
+    // corresponding socket error. Keep this socket's error owner through
+    // RESET, end and destroy; fail() preserves the first operation failure.
+    if (this.rawClosed) {
+      this.raw.off("error", this.onRawError);
+      this.raw.off("close", this.onRawClose);
+    }
   }
 }
 
