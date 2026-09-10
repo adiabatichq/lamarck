@@ -10,15 +10,17 @@ export const CAPSULE_STORAGE_PLAN_VERSION = 1 as const;
 /** Every disposable filesystem capacity is rounded to this boundary. */
 export const CAPSULE_STORAGE_ALIGNMENT_BYTES = 64 * MEBIBYTE;
 /** Free space which is never promised to an App, Build, or Guest CAS blob. */
-export const CAPSULE_GUEST_FILESYSTEM_RESERVE_BYTES = 2 * GIBIBYTE;
+export const CAPSULE_GUEST_FILESYSTEM_RESERVE_BYTES = 512 * MEBIBYTE;
 
-export const CAPSULE_BUILD_FIXED_OVERHEAD_BYTES = 512 * MEBIBYTE;
+export const CAPSULE_BUILD_FIXED_OVERHEAD_BYTES = 128 * MEBIBYTE;
 export const CAPSULE_COLD_DEPENDENCY_EXPANSION_FACTOR = 4;
-export const CAPSULE_BUILD_SCRATCH_MIN_BYTES = 1 * GIBIBYTE;
+/** Sealed output is bounded separately from unpacked npm scratch. */
+export const CAPSULE_COLD_ARTIFACT_EXPANSION_FACTOR = 2;
+export const CAPSULE_BUILD_SCRATCH_MIN_BYTES = 512 * MEBIBYTE;
 export const CAPSULE_BUILD_SCRATCH_MAX_BYTES = 8 * GIBIBYTE;
-export const CAPSULE_ARTIFACT_OUTPUT_MIN_BYTES = 256 * MEBIBYTE;
+export const CAPSULE_ARTIFACT_OUTPUT_MIN_BYTES = 128 * MEBIBYTE;
 export const CAPSULE_ARTIFACT_OUTPUT_MAX_BYTES = 4 * GIBIBYTE;
-export const CAPSULE_RUNTIME_SCRATCH_MIN_BYTES = 512 * MEBIBYTE;
+export const CAPSULE_RUNTIME_SCRATCH_MIN_BYTES = 128 * MEBIBYTE;
 export const CAPSULE_RUNTIME_SCRATCH_MAX_BYTES = 2 * GIBIBYTE;
 export const CAPSULE_STORAGE_INPUT_MAX_BYTES = 8 * GIBIBYTE;
 
@@ -105,7 +107,10 @@ export function createCapsuleBuildStoragePlan(
       );
   const artifactOutputBytes = alignStorageBytes(Math.max(
     CAPSULE_ARTIFACT_OUTPUT_MIN_BYTES,
-    Math.min(CAPSULE_ARTIFACT_OUTPUT_MAX_BYTES, inputWorkingBytes),
+    Math.min(CAPSULE_ARTIFACT_OUTPUT_MAX_BYTES, input.mode === "cold"
+      ? safeAdd(packageBytes, safeMultiply(input.dependencyBytes,
+          CAPSULE_COLD_ARTIFACT_EXPANSION_FACTOR, "sealed dependency bytes"), "artifact output")
+      : inputWorkingBytes),
   ));
   const requiredScratchBytes = safeAdd(
     CAPSULE_BUILD_FIXED_OVERHEAD_BYTES,

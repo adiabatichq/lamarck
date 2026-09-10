@@ -179,6 +179,19 @@ public final class CapsuleVmCommandService: @unchecked Sendable {
                     }
                 }
 
+            case "setMemory", "growState", "acknowledgeState":
+                guard let operation = CapsuleVmCapacityOperation(rawValue: request.method),
+                      let params = request.params, Set(params.keys) == ["bytes"],
+                      let bytes = exactUInt64(params["bytes"]) else {
+                    throw CapsuleVmCommandError(code: "invalid_request", message: "Capacity requires an exact byte count")
+                }
+                session.manageCapacity(operation: operation, bytes: bytes) { [weak self] result in
+                    switch result {
+                    case .success(let actual): self?.respondSuccess(streamID: frame.streamID, result: ["bytes": actual])
+                    case .failure(let error): self?.respondFailure(streamID: frame.streamID, error: error)
+                    }
+                }
+
             case "stop":
                 guard request.params == nil else {
                     throw CapsuleVmCommandError(

@@ -295,6 +295,9 @@ function parseDescriptor(source: string): CapsuleGuestReleaseDescriptor {
       "required artifact adoption receipt feature artifact-adoption-receipt-v1 is missing",
     );
   }
+  if (!features.includes("resource-management-v1")) {
+    invalid("$.features", "required resource-management-v1 Guest capability is missing");
+  }
   if (!features.includes("warm-rebuild-v1")) {
     invalid("$.features", "required Host Build feature warm-rebuild-v1 is missing");
   }

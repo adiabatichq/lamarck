@@ -115,7 +115,7 @@ public enum CapsuleVmConfigurationBuilder {
 
         let bootLoader = VZLinuxBootLoader(kernelURL: image.kernelURL)
         bootLoader.initialRamdiskURL = image.initialRamdiskURL
-        bootLoader.commandLine = kernelCommandLine(for: image)
+        bootLoader.commandLine = kernelCommandLine(for: image) + " lamarck.state_bytes=\(stateDiskLease.disk.size)"
         configuration.bootLoader = bootLoader
 
         let rootAttachment = try VZDiskImageStorageDeviceAttachment(
@@ -134,6 +134,7 @@ public enum CapsuleVmConfigurationBuilder {
         stateDevice.blockDeviceIdentifier = stateBlockDeviceIdentifier
         configuration.storageDevices = [rootDevice, stateDevice]
 
+        configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
 

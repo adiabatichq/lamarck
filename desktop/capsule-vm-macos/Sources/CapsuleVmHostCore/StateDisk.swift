@@ -87,15 +87,16 @@ private struct CapsuleVmFileIdentity: Equatable, Sendable {
 }
 
 /// Physical backing policy for the writable Guest disk. Production reserves
-/// every logical byte before VZ can attach the file, so Guest-side quotas can
-/// never grow a sparse image into the Host filesystem's safety reserve.
+/// every filesystem-exposed byte before VZ can attach or grow ext4. The fixed
+/// device ceiling includes an inaccessible tail until Host backing is durable.
 struct CapsuleVmStateDiskAllocationPolicy: Sendable {
     private static let zeroFillChunkBytes = 1_024 * 1_024
 
     static let productionHostReserveBytes: UInt64 = 4 * 1_024 * 1_024 * 1_024
     static let production = CapsuleVmStateDiskAllocationPolicy(
         hostReserveBytes: productionHostReserveBytes,
-        requiresPhysicalAllocation: true
+        requiresPhysicalAllocation: true,
+        onlineGrowth: true
     )
     static let sparseTesting = CapsuleVmStateDiskAllocationPolicy(
         hostReserveBytes: 0,
@@ -104,10 +105,12 @@ struct CapsuleVmStateDiskAllocationPolicy: Sendable {
 
     let hostReserveBytes: UInt64
     let requiresPhysicalAllocation: Bool
+    let onlineGrowth: Bool
 
-    init(hostReserveBytes: UInt64, requiresPhysicalAllocation: Bool) {
+    init(hostReserveBytes: UInt64, requiresPhysicalAllocation: Bool, onlineGrowth: Bool = false) {
         self.hostReserveBytes = hostReserveBytes
         self.requiresPhysicalAllocation = requiresPhysicalAllocation
+        self.onlineGrowth = onlineGrowth
     }
 
     func prepareNewFile(descriptor: Int32, size: UInt64) throws {
@@ -403,7 +406,7 @@ public final class CapsuleVmStateDiskPreparation: @unchecked Sendable {
             }
             try validateStateMetadata(
                 stateMetadata,
-                expectedSize: requirements.stateDiskBytes
+                expectedSize: allocationPolicy.onlineGrowth ? CapsuleVmStateDiskManager.maximumSize : requirements.stateDiskBytes
             )
             let stateIdentity = CapsuleVmFileIdentity(stateMetadata)
             try validatePathEntry(
@@ -545,6 +548,7 @@ public final class CapsuleVmStateDiskPreparation: @unchecked Sendable {
 /// kernel lock lives; its presence is never treated as ownership authority.
 public final class CapsuleVmStateDiskLease: @unchecked Sendable {
     public let disk: CapsuleVmStateDisk
+    public var attachmentBytes: UInt64 { allocationPolicy.onlineGrowth ? CapsuleVmStateDiskManager.maximumSize : disk.size }
 
     private let directoryURL: URL
     private let directoryIdentity: CapsuleVmFileIdentity
@@ -639,8 +643,8 @@ public final class CapsuleVmStateDiskLease: @unchecked Sendable {
               CapsuleVmFileIdentity(stateMetadata) == stateIdentity else {
             throw CapsuleVmStateDiskError.pathChanged
         }
-        try validateStateMetadata(stateMetadata, expectedSize: disk.size)
-        try allocationPolicy.validateFile(descriptor: stateDescriptor, size: disk.size)
+        try validateStateMetadata(stateMetadata, expectedSize: attachmentBytes)
+        try allocationPolicy.validateFile(descriptor: stateDescriptor, size: (try readStateCapacity(directoryDescriptor))?.backedBytes ?? disk.size)
         try validatePathEntry(
             directoryDescriptor: directoryDescriptor,
             name: CapsuleVmStateDiskManager.fileName,
@@ -883,6 +887,8 @@ public enum CapsuleVmStateDiskManager {
         )
 
         try removeRecoverableCreatingFile(directoryDescriptor: directoryDescriptor)
+        let capacity = allocationPolicy.onlineGrowth ? try readStateCapacity(directoryDescriptor) : nil
+        var size = max(size, capacity?.backedBytes ?? 0, capacity?.intentBytes ?? 0)
 
         stateDescriptor = fileName.withCString { name in
             Darwin.openat(directoryDescriptor, name, O_RDWR | O_CLOEXEC | O_NOFOLLOW)
@@ -904,6 +910,9 @@ public enum CapsuleVmStateDiskManager {
             guard isValidSize(validatedSize) else {
                 throw CapsuleVmStateDiskError.fileSizeMismatch
             }
+            if allocationPolicy.onlineGrowth && validatedSize == maximumSize && capacity == nil {
+                throw CapsuleVmStateDiskError.fileSizeMismatch
+            }
             let validatedIdentity = CapsuleVmFileIdentity(stateMetadata)
             try validatePathEntry(
                 directoryDescriptor: directoryDescriptor,
@@ -912,10 +921,15 @@ public enum CapsuleVmStateDiskManager {
             )
             stateIdentity = validatedIdentity
             existingSize = validatedSize
+            // A verified legacy image already exposes its complete size. Reuse
+            // that capacity consistently in admission, the lease and journal.
+            if allocationPolicy.onlineGrowth && capacity == nil {
+                size = max(size, validatedSize)
+            }
             existingPhysicalBytes = try allocationPolicy.physicalBytes(
                 descriptor: stateDescriptor
             )
-            additionalPhysicalBytes = validatedSize == size
+            additionalPhysicalBytes = (validatedSize == size || (allocationPolicy.onlineGrowth && validatedSize == maximumSize))
                 ? try allocationPolicy.additionalAllocationBytes(
                     descriptor: stateDescriptor,
                     size: size
@@ -959,6 +973,19 @@ public enum CapsuleVmStateDiskManager {
         requestedSize: UInt64,
         allocationPolicy: CapsuleVmStateDiskAllocationPolicy
     ) throws -> Int32 {
+        if allocationPolicy.onlineGrowth, existingDescriptor >= 0, let existingSize {
+            guard existingSize <= maximumSize else { throw CapsuleVmStateDiskError.fileSizeMismatch }
+            let capacity = try readStateCapacity(directoryDescriptor)
+            let backing = max(requestedSize, capacity?.backedBytes ?? existingSize)
+            guard backing <= maximumSize else { throw CapsuleVmStateDiskError.invalidSize }
+            // At boot no Guest can write: repair holes without changing bytes.
+            try allocationPolicy.prepareExistingFile(descriptor: existingDescriptor, size: backing)
+            try writeStateCapacity(directoryDescriptor, StateCapacity(backedBytes: backing,
+                exposedBytes: capacity?.exposedBytes ?? min(existingSize, backing), intentBytes: backing))
+            guard Darwin.ftruncate(existingDescriptor, off_t(maximumSize)) == 0,
+                  Darwin.fsync(existingDescriptor) == 0 else { throw CapsuleVmStateDiskError.allocationFailed }
+            return existingDescriptor
+        }
         if existingDescriptor >= 0, let existingSize {
             if existingSize == requestedSize {
                 try allocationPolicy.prepareExistingFile(
@@ -1016,6 +1043,12 @@ public enum CapsuleVmStateDiskManager {
             throw CapsuleVmStateDiskError.allocationFailed
         }
         renamed = true
+        if allocationPolicy.onlineGrowth {
+            try writeStateCapacity(directoryDescriptor, StateCapacity(backedBytes: requestedSize,
+                exposedBytes: requestedSize, intentBytes: requestedSize))
+            guard Darwin.ftruncate(descriptor, off_t(maximumSize)) == 0,
+                  Darwin.fsync(descriptor) == 0 else { throw CapsuleVmStateDiskError.allocationFailed }
+        }
         return descriptor
     }
 
@@ -1232,5 +1265,134 @@ private func validatePathEntry(
           (metadata.st_mode & S_IFMT) == S_IFREG,
           CapsuleVmFileIdentity(metadata) == expected else {
         throw CapsuleVmStateDiskError.pathChanged
+    }
+}
+
+
+private struct StateCapacity: Codable {
+    var schemaVersion: Int = 1
+    let backedBytes: UInt64
+    let exposedBytes: UInt64
+    let intentBytes: UInt64
+}
+private let stateCapacityName = "state.raw.capacity"
+
+private func readStateCapacity(_ directory: Int32) throws -> StateCapacity? {
+    let fd = Darwin.openat(directory, stateCapacityName, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+    if fd < 0 {
+        if errno == ENOENT { return nil }
+        throw CapsuleVmStateDiskError.fileUnavailable
+    }
+    defer { _ = Darwin.close(fd) }
+    var metadata = stat()
+    guard Darwin.fstat(fd, &metadata) == 0 else { throw CapsuleVmStateDiskError.fileUnavailable }
+    try validateCreatingMetadata(metadata)
+    guard metadata.st_size > 0 && metadata.st_size <= 1024 else { throw CapsuleVmStateDiskError.fileSizeMismatch }
+    var data = Data(count: Int(metadata.st_size))
+    let count = data.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
+    guard count == data.count else { throw CapsuleVmStateDiskError.fileUnavailable }
+    let value = try JSONDecoder().decode(StateCapacity.self, from: data)
+    guard value.schemaVersion == 1, value.exposedBytes <= value.backedBytes,
+          value.backedBytes <= value.intentBytes, value.intentBytes <= CapsuleVmStateDiskManager.maximumSize,
+          value.backedBytes >= CapsuleVmStateDiskManager.minimumSize,
+          value.intentBytes.isMultiple(of: CapsuleVmStateDiskManager.sizeAlignment) else {
+        throw CapsuleVmStateDiskError.invalidSize
+    }
+    return value
+}
+
+private func writeStateCapacity(_ directory: Int32, _ value: StateCapacity) throws {
+    let temporary = ".state.raw.capacity.creating"
+    // A prior crash may leave only this uncommitted, fixed-name regular file.
+    let stale = Darwin.openat(directory, temporary, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    if stale >= 0 {
+        defer { _ = Darwin.close(stale) }
+        var metadata = stat()
+        guard Darwin.fstat(stale, &metadata) == 0 else { throw CapsuleVmStateDiskError.fileUnavailable }
+        try validateCreatingMetadata(metadata)
+        guard Darwin.unlinkat(directory, temporary, 0) == 0 else { throw CapsuleVmStateDiskError.fileUnavailable }
+    } else if errno != ENOENT { throw CapsuleVmStateDiskError.fileUnavailable }
+    let fd = Darwin.openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    guard fd >= 0 else { throw CapsuleVmStateDiskError.fileUnavailable }
+    defer { _ = Darwin.close(fd) }
+    let data = try JSONEncoder().encode(value)
+    let count = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+    guard count == data.count, Darwin.fsync(fd) == 0,
+          Darwin.renameat(directory, temporary, directory, stateCapacityName) == 0,
+          Darwin.fsync(directory) == 0 else { throw CapsuleVmStateDiskError.allocationFailed }
+}
+
+extension CapsuleVmStateDiskLease {
+    public func committedCapacity() throws -> UInt64 {
+        mutex.lock(); defer { mutex.unlock() }
+        guard active else { throw CapsuleVmStateDiskError.leaseNotHeld }
+        return try readStateCapacity(directoryDescriptor)?.backedBytes ?? disk.size
+    }
+
+    /// Runs on the background storage queue. No truncation, cache clearing, or
+    /// write below the durable backed high-water is permitted while attached.
+    public func growBacking(to bytes: UInt64) throws -> UInt64 {
+        mutex.lock(); defer { mutex.unlock() }
+        guard active, allocationPolicy.onlineGrowth else { throw CapsuleVmStateDiskError.leaseNotHeld }
+        guard let current = try readStateCapacity(directoryDescriptor), bytes >= CapsuleVmStateDiskManager.minimumSize,
+              bytes <= attachmentBytes, bytes.isMultiple(of: CapsuleVmStateDiskManager.sizeAlignment) else {
+            throw CapsuleVmStateDiskError.invalidSize
+        }
+        if bytes <= current.backedBytes { return current.backedBytes }
+        let target = max(bytes, current.intentBytes)
+        var filesystem = statfs()
+        guard Darwin.fstatfs(stateDescriptor, &filesystem) == 0,
+              UInt64(filesystem.f_bavail) * UInt64(filesystem.f_bsize) >= target - current.backedBytes + allocationPolicy.hostReserveBytes else {
+            throw CapsuleVmStateDiskError.insufficientHostCapacity
+        }
+        try validatePathEntry(directoryDescriptor: directoryDescriptor,
+            name: CapsuleVmStateDiskManager.fileName, expected: stateIdentity)
+        try writeStateCapacity(directoryDescriptor, StateCapacity(backedBytes: current.backedBytes,
+            exposedBytes: current.exposedBytes, intentBytes: target))
+        // APFS F_PREALLOCATE cannot fill an existing sparse range (it allocates
+        // past EOF). Bound writes to unexposed holes, bypass the Host file cache,
+        // and pace 8 MiB batches to avoid monopolizing disk service time.
+        guard Darwin.fcntl(stateDescriptor, F_NOCACHE, 1) == 0 else { throw CapsuleVmStateDiskError.allocationFailed }
+        defer { _ = Darwin.fcntl(stateDescriptor, F_NOCACHE, 0) }
+        let chunk = 1024 * 1024
+        let zeroes = [UInt8](repeating: 0, count: chunk)
+        var cursor = off_t(current.backedBytes)
+        try zeroes.withUnsafeBytes { buffer in
+            while cursor < off_t(target) {
+                let hole = Darwin.lseek(stateDescriptor, cursor, SEEK_HOLE)
+                if hole < 0 { if errno == ENXIO { break }; throw CapsuleVmStateDiskError.allocationFailed }
+                if hole >= off_t(target) { break }
+                let next = Darwin.lseek(stateDescriptor, hole, SEEK_DATA)
+                if next < 0 && errno != ENXIO { throw CapsuleVmStateDiskError.allocationFailed }
+                let end = min(next < 0 ? off_t(target) : next, off_t(target))
+                cursor = hole
+                while cursor < end {
+                    let count = min(chunk, Int(end - cursor))
+                    let written = Darwin.pwrite(stateDescriptor, buffer.baseAddress, count, cursor)
+                    if written < 0 && errno == EINTR { continue }
+                    guard written > 0 else { throw CapsuleVmStateDiskError.allocationFailed }
+                    cursor += off_t(written)
+                    if cursor % (8 * 1024 * 1024) == 0 { usleep(10_000) }
+                }
+            }
+        }
+        guard Darwin.fsync(stateDescriptor) == 0 else { throw CapsuleVmStateDiskError.allocationFailed }
+        // Verify ONLY the new region: the running Guest can legitimately cause
+        // holes below the high-water; those bytes remain committed to the Host.
+        let firstHole = Darwin.lseek(stateDescriptor, off_t(current.backedBytes), SEEK_HOLE)
+        guard firstHole >= off_t(target) || (firstHole < 0 && errno == ENXIO) else {
+            throw CapsuleVmStateDiskError.allocationFailed
+        }
+        try writeStateCapacity(directoryDescriptor, StateCapacity(backedBytes: target,
+            exposedBytes: current.exposedBytes, intentBytes: target))
+        return target
+    }
+
+    public func acknowledgeGrowth(to bytes: UInt64) throws {
+        mutex.lock(); defer { mutex.unlock() }
+        guard active, let current = try readStateCapacity(directoryDescriptor),
+              bytes >= current.exposedBytes, bytes <= current.backedBytes else { throw CapsuleVmStateDiskError.invalidSize }
+        try writeStateCapacity(directoryDescriptor, StateCapacity(backedBytes: current.backedBytes,
+            exposedBytes: bytes, intentBytes: current.intentBytes))
     }
 }

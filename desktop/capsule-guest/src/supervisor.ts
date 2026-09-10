@@ -1,3 +1,5 @@
+import { RuntimeMemoryController, linuxRuntimeMemoryKernel } from "./runtime-memory";
+import { GuestCapacityController } from "./capacity-controller";
 import { createHash } from "node:crypto";
 import type { Readable } from "node:stream";
 import {
@@ -63,6 +65,7 @@ interface SupervisorOptions {
   builds: GuestBuildManager;
   resources: GuestResourceManager;
   admission?: GuestResourceAdmissionLike;
+  capacity?: GuestCapacityController;
   runc?: RuncDriver;
   dataDialer?: GuestDataDialer;
   /** Test seam. Production uses the complete protocol ticket lifetime. */
@@ -119,6 +122,7 @@ interface WorkloadRecord {
   execution?: RuncExecution;
   exit?: Promise<void>;
   readiness?: Promise<void>;
+  memoryController?: RuntimeMemoryController;
   resourceLease?: GuestResourceLease;
   finalized: boolean;
 }
@@ -189,6 +193,7 @@ export class CapsuleGuestSupervisor {
         "artifact-erofs-v1",
         "build-v1",
         "oci-policy-v1",
+        "resource-management-v1",
         "sdk-uds-v1",
         "app-cli-v1",
         "tickets-v1",
@@ -331,6 +336,15 @@ export class CapsuleGuestSupervisor {
 
   private async dispatch(request: HostRequest): Promise<JsonValue> {
     switch (request.op) {
+      case "resources.status":
+      case "resources.memory.prepare":
+      case "resources.memory.commit":
+      case "resources.launch.reserve":
+      case "resources.launch.release":
+      case "resources.disk.grow":
+        if (!this.options.capacity) throw new Error("Guest capacity controller is unavailable");
+        return this.options.capacity.handle(request);
+
       case "ping":
         return { nonce: request.body.nonce };
       case "blob.import.prepare":
@@ -765,7 +779,7 @@ export class CapsuleGuestSupervisor {
       workloadHandle,
     });
     const resources = {
-      memoryBytes: 512 * 1024 * 1024,
+      memoryBytes: (record.body.memoryProfile === "lightweight" ? 256 : 512) * 1024 * 1024,
       pids: 256,
       cpuQuotaMicros: 100_000,
     };
@@ -797,6 +811,8 @@ export class CapsuleGuestSupervisor {
       if (record.resourceLease) throw new Error("workload already owns a resource reservation");
       record.resourceLease = await this.admission.reserve(`workload:${workloadHandle}`, {
         memoryBytes: resources.memoryBytes,
+        kind: "runtime",
+        launchKey: record.body.launchKey,
       });
       const execution = await this.runc.start({
         plan,
@@ -816,9 +832,15 @@ export class CapsuleGuestSupervisor {
       });
       record.execution = execution;
       try {
-        // No await is allowed between retaining the execution handle and the
-        // state transition. If the transition loses a concurrent lifecycle
-        // race, the newly created container is synchronously torn down below.
+        if (!this.options.runc) {
+          record.memoryController = new RuntimeMemoryController(record.resourceLease,
+            linuxRuntimeMemoryKernel(`/sys/fs/cgroup/${plan.config.linux.cgroupsPath}`), undefined,
+            (error) => this.failSession(error));
+          await record.memoryController.start();
+        }
+        // The workload lock serializes start/stop. App-level revocation may
+        // still win during limit readback; a rejected transition tears down
+        // the newly created container before releasing its grant below.
         this.state = transitionSupervisor(this.state, {
           type: "workload.started",
           appHandle,
@@ -826,6 +848,7 @@ export class CapsuleGuestSupervisor {
         });
       } catch (error) {
         const failures: unknown[] = [];
+        await record.memoryController?.stop();
         try {
           await this.runc.stop(execution.containerId, 0);
         } catch (cleanupError) {
@@ -892,6 +915,7 @@ export class CapsuleGuestSupervisor {
     record: WorkloadRecord,
   ): Promise<void> {
     const exit = await record.execution!.wait();
+    await record.memoryController?.stop();
     if (record.finalized) return;
     record.finalized = true;
     try {
@@ -963,6 +987,7 @@ export class CapsuleGuestSupervisor {
 
   private async stopWorkload(appHandle: string, workloadHandle: string, graceMs: number): Promise<void> {
     const record = this.requireWorkload(appHandle, workloadHandle);
+    await record.memoryController?.stop();
     const workload = this.state.apps[appHandle]?.workloads[workloadHandle];
     if (workload && workload.status !== "stopping" && workload.status !== "exited" && workload.status !== "faulted") {
       this.state = transitionSupervisor(this.state, {

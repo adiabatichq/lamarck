@@ -1,3 +1,4 @@
+import { runBuildPhase, type BuildPhaseRequest } from "./build-phase-runner";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import {
@@ -60,7 +61,7 @@ import {
 import type { ArtifactMountLease, ArtifactMountRegistry } from "./resource-manager";
 
 const SYSTEM_PROTOCOL_VERSION = 1;
-export const BUILD_MEMORY_ADMISSION_FLOOR_BYTES = 2 * 1024 * 1024 * 1024;
+export const BUILD_MEMORY_ADMISSION_FLOOR_BYTES = 512 * 1024 * 1024;
 /** Build identities are never recycled inside one verified Guest boot. */
 export const MAX_BUILD_HANDLES_PER_BOOT = 4_096;
 export const MAX_LIVE_BUILDS = 64;
@@ -99,6 +100,8 @@ interface BuildRecord {
   body: BuildPrepareBody;
   state: "prepared" | "running";
   controller?: AbortController;
+  resourceLease?: GuestResourceLease;
+  executionStarted?: boolean;
   /** Settles only after all runc/cgroup/netns/volume cleanup is authoritative. */
   lifecycle?: Promise<SealedArtifactDescriptor>;
 }
@@ -128,6 +131,8 @@ export interface BuildManagerOptions {
   artifactMountRegistry?: ArtifactMountRegistry;
   warmMounts?: WarmNodeModulesMountOperations;
   volumeOperations?: BuildVolumeOperations;
+  /** Explicit seam for tests which do not run in a Linux Guest. */
+  isolatedPhases?: boolean;
   /** Deterministic test clock. */
   now?: () => number;
 }
@@ -172,6 +177,8 @@ export class GuestBuildManager {
   private readonly seenBuildHandles = new Map<string, string>();
   private readonly terminalBuilds = new Map<string, TerminalBuildRecord>();
   private readonly now: () => number;
+  private readonly isolatedPhases: boolean;
+  private readonly activeExecutions = new Set<Promise<SealedArtifactDescriptor>>();
   private draining = false;
   private drainPromise: Promise<void> | undefined;
   private fatalContainment: BuildContainmentError | undefined;
@@ -190,6 +197,7 @@ export class GuestBuildManager {
       destroy: destroyBoundedVolume,
     };
     this.now = options.now ?? Date.now;
+    this.isolatedPhases = options.isolatedPhases ?? (!options.runner && !options.sealer && !options.volumeOperations);
   }
 
   prepare(body: BuildPrepareBody): Promise<void> {
@@ -236,12 +244,16 @@ export class GuestBuildManager {
     }
 
     let tracked!: Promise<void>;
-    const operation = this.prepareBuild(cloned).then(() => {
+    const operation = this.prepareBuild(cloned).then(async () => {
       // CAS verification yields. The drain fence must win before publishing a
       // live/seen authority record.
-      this.assertAcceptingBuilds();
-      this.seenBuildHandles.set(buildHandle, appHandle);
-      this.builds.set(buildHandle, { body: cloned, state: "prepared" });
+      const resourceLease = await this.admission.reserve(`build:${buildHandle}`,
+        { ...buildAdmissionRequest(cloned), kind: "build", launchKey: cloned.launchKey });
+      try {
+        this.assertAcceptingBuilds();
+        this.seenBuildHandles.set(buildHandle, appHandle);
+        this.builds.set(buildHandle, { body: cloned, state: "prepared", resourceLease });
+      } catch (error) { resourceLease.release(); throw error; }
     });
     tracked = operation.finally(() => {
       if (this.preparingBuilds.get(buildHandle)?.promise === tracked) {
@@ -283,7 +295,7 @@ export class GuestBuildManager {
     record.state = "running";
     const controller = new AbortController();
     record.controller = controller;
-    const lifecycle = this.executeBuild(record, controller).then(
+    const lifecycle = this.scheduleBuild(record, controller).then(
       (descriptor) => {
         try {
           throwIfAborted(controller.signal);
@@ -305,6 +317,7 @@ export class GuestBuildManager {
         return descriptor;
       },
       (error: unknown) => {
+        if (!record.executionStarted) record.resourceLease?.release();
         if (error instanceof BuildContainmentError) this.fatalContainment ??= error;
         this.retireBuild(buildHandle, record, {
           appHandle,
@@ -320,6 +333,23 @@ export class GuestBuildManager {
     record.lifecycle = lifecycle;
     void lifecycle.catch(() => undefined);
     return lifecycle;
+  }
+
+  private async scheduleBuild(record: BuildRecord, controller: AbortController): Promise<SealedArtifactDescriptor> {
+    while (this.activeExecutions.size >= 2) {
+      throwIfAborted(controller.signal);
+      await new Promise<void>((resolve, reject) => {
+        const cancelled = () => { cleanup(); reject(controller.signal.reason); };
+        const cleanup = () => controller.signal.removeEventListener("abort", cancelled);
+        controller.signal.addEventListener("abort", cancelled, { once: true });
+        void Promise.race(this.activeExecutions).catch(() => {}).then(() => { cleanup(); resolve(); });
+      });
+    }
+    throwIfAborted(controller.signal);
+    record.executionStarted = true;
+    const execution = this.executeBuild(record, controller);
+    this.activeExecutions.add(execution);
+    try { return await execution; } finally { this.activeExecutions.delete(execution); }
   }
 
   private async executeBuild(
@@ -338,20 +368,22 @@ export class GuestBuildManager {
     const cgroupPath = `${this.paths.cgroupRoot}/builds/${buildKey}`;
     const warmRequested = record.body.baseArtifactDigest !== undefined;
     const warmNodeModules = `${workspace}/node_modules`;
-    let resourceLease: GuestResourceLease | undefined;
+    const resourceLease = record.resourceLease;
     let warmArtifactLease: ArtifactMountLease | undefined;
     let warmNodeModulesAttached = false;
     let volumeAttempted = false;
     let networkAttempted = false;
     let containmentFailed = false;
     let primaryError: unknown;
+    const phase = <T>(request: BuildPhaseRequest, inline: () => Promise<T>): Promise<T> =>
+      this.isolatedPhases ? runBuildPhase<T>(cgroupPath, request, controller.signal) : inline();
     try {
       throwIfAborted(controller.signal);
-      resourceLease = await this.admission.reserve(
-        `build:${buildHandle}`,
-        buildAdmissionRequest(record.body),
-      );
+      if (!resourceLease) throw new Error("Prepared Build lost its resource reservation");
       throwIfAborted(controller.signal);
+      if (this.isolatedPhases) {
+        await prepareBuildCgroup(this.paths.cgroupRoot, cgroupPath, record.body.resources);
+      }
       volumeAttempted = true;
       await this.volumeOperations.create({
         imagePath: volumeImage,
@@ -361,28 +393,13 @@ export class GuestBuildManager {
         signal: controller.signal,
       });
       throwIfAborted(controller.signal);
-      await materializeCapsuleTree(
-        await this.blobs.open("package", record.body.packageDigest),
-        workspace,
-        controller.signal,
-      );
+      await phase({ op: "materialize", source: this.isolatedPhases ? this.blobs.path("package", record.body.packageDigest) : "", destination: workspace },
+        async () => materializeCapsuleTree(await this.blobs.open("package", record.body.packageDigest), workspace, controller.signal));
       throwIfAborted(controller.signal);
-      const packageMetadata = await validatePackageMetadata(workspace, controller.signal);
-      const hasPackageLock = await regularFileExists(`${workspace}/package-lock.json`);
-      if (!hasPackageLock) {
-        throw new Error("Build Capsule requires package-lock.json lockfileVersion 2 or 3");
-      }
-      const packageLock = await readBoundedJsonFile(
-        `${workspace}/package-lock.json`,
-        MAX_PACKAGE_LOCK_BYTES,
-        "package-lock.json",
-        controller.signal,
+      const { packageMetadata, currentInstallInput, registryPackages } = await phase(
+        { op: "validate-input", workspace, installDigest: record.body.installDigest },
+        () => validateBuildInput(workspace, record.body.installDigest, controller.signal),
       );
-      validatePackageLockValue(packageLock);
-      const currentInstallInput = await evaluateInstallInputAt(workspace, controller.signal);
-      if (currentInstallInput.digest !== record.body.installDigest) {
-        throw installInputMismatch("candidate package");
-      }
       throwIfAborted(controller.signal);
 
       if (warmRequested) {
@@ -410,10 +427,8 @@ export class GuestBuildManager {
           });
         }
         try {
-          const baseInstallInput = await evaluateInstallInputAt(
-            warmArtifactLease.mountRoot,
-            controller.signal,
-          );
+          const baseInstallInput = await phase({ op: "install-input", workspace: warmArtifactLease.mountRoot },
+            () => evaluateInstallInputAt(warmArtifactLease!.mountRoot, controller.signal));
           if (
             baseInstallInput.digest !== record.body.installDigest
             || !baseInstallInput.warmEligible
@@ -429,7 +444,7 @@ export class GuestBuildManager {
             "sealed warm base node_modules",
           );
           if (packageMetadata.requiresSystemSdk) {
-            await validateInstalledSystemSdk(baseNodeModules, controller.signal);
+            await phase({ op: "validate-sdk", nodeModules: baseNodeModules }, () => validateInstalledSystemSdk(baseNodeModules, controller.signal));
           }
         } catch (error) {
           throwIfAborted(controller.signal);
@@ -448,11 +463,8 @@ export class GuestBuildManager {
       } else {
         await mkdir(dependencies, { recursive: true, mode: 0o700 });
         if (record.body.dependencyDigest) {
-          await materializeCapsuleTree(
-            await this.blobs.open("dependency", record.body.dependencyDigest),
-            dependencies,
-            controller.signal,
-          );
+          await phase({ op: "materialize", source: this.isolatedPhases ? this.blobs.path("dependency", record.body.dependencyDigest) : "", destination: dependencies },
+            async () => materializeCapsuleTree(await this.blobs.open("dependency", record.body.dependencyDigest!), dependencies, controller.signal));
         } else {
           await mkdir(`${dependencies}/tarballs`, { recursive: true, mode: 0o755 });
           await writeFile(
@@ -464,8 +476,8 @@ export class GuestBuildManager {
         throwIfAborted(controller.signal);
         await mkdir(home, { recursive: true, mode: 0o700 });
         if (record.body.dependencyDigest) {
-          await validateDependencyBundle(dependencies, controller.signal);
-        } else if (packageLockHasRegistryPackages(packageLock)) {
+          await phase({ op: "validate-dependencies", directory: dependencies }, () => validateDependencyBundle(dependencies, controller.signal));
+        } else if (registryPackages) {
           throw new Error("package-lock requires an imported npm dependency bundle");
         }
       }
@@ -473,7 +485,7 @@ export class GuestBuildManager {
       const appUid = record.body.mappedHostUid + 1_000;
       const appGid = record.body.mappedHostGid + 1_000;
       if (this.manageOwnership) {
-        await chownTree(root, appUid, appGid, controller.signal);
+        await phase({ op: "chown", root, uid: appUid, gid: appGid }, () => chownTree(root, appUid, appGid, controller.signal));
       }
       throwIfAborted(controller.signal);
       if (warmRequested) {
@@ -518,18 +530,15 @@ export class GuestBuildManager {
           throw new Error(`offline npm materialization failed (${run.exitCode}): ${tail(run.logs)}`);
         }
         if (packageMetadata.requiresSystemSdk) {
-          await validateInstalledSystemSdk(`${workspace}/node_modules`, controller.signal);
+          await phase({ op: "validate-sdk", nodeModules: `${workspace}/node_modules` }, () => validateInstalledSystemSdk(`${workspace}/node_modules`, controller.signal));
         }
       }
       throwIfAborted(controller.signal);
-      await validateSealableTree(workspace, controller.signal);
-      throwIfAborted(controller.signal);
-      const sealed = await this.sealer.seal(
-        workspace,
-        output,
-        controller.signal,
-        warmRequested ? { readonlyNodeModules: true } : undefined,
-      );
+      const sealed = await phase({ op: "seal", workspace, output, mkfsPath: this.paths.mkfsErofsPath, warm: warmRequested }, async () => {
+        await validateSealableTree(workspace, controller.signal);
+        return this.sealer.seal(workspace, output, controller.signal,
+          warmRequested ? { readonlyNodeModules: true } : undefined);
+      });
       throwIfAborted(controller.signal);
       const sealedDetails = await lstat(output);
       if (
@@ -548,6 +557,7 @@ export class GuestBuildManager {
         ownerKey: record.body.ownerKey,
         referenceId: `build:${buildHandle}:output`,
         maximumBytes: record.body.artifactOutputBytes,
+        diskSource: resourceLease,
         signal: controller.signal,
       });
       throwIfAborted(controller.signal);
@@ -646,6 +656,7 @@ export class GuestBuildManager {
     }
     if (record.body.appHandle !== appHandle) throw new Error("Unknown Build handle");
     if (record.state === "prepared") {
+      record.resourceLease?.release();
       this.retireBuild(buildHandle, record, {
         appHandle,
         state: "cancelled",
@@ -691,6 +702,7 @@ export class GuestBuildManager {
     const lifecycleBarriers: Promise<SealedArtifactDescriptor>[] = [];
     for (const [buildHandle, record] of [...this.builds]) {
       if (record.state === "prepared") {
+        record.resourceLease?.release();
         this.retireBuild(buildHandle, record, {
           appHandle: record.body.appHandle,
           state: "cancelled",
@@ -826,10 +838,11 @@ export function buildAdmissionRequest(body: BuildPrepareBody): {
 } {
   const storage = requireBuildStoragePlan(body);
   return {
-    diskBytes: storage.scratchBytes,
-    // Metadata validation and sealing execute in the trusted supervisor,
-    // outside the Build cgroup. Charge the production 2 GiB floor even if a
-    // malformed Host request asks for a smaller container limit.
+    // Scratch contains the sealer output while CAS publication copies it. Hold
+    // both until the output's exact bytes transfer to its durable CAS lease.
+    diskBytes: storage.scratchBytes + storage.artifactOutputBytes,
+    // All input-sized work and descendants share one enforced parent grant.
+    // Broker streaming buffers remain bounded inside the management reserve.
     memoryBytes: Math.max(
       body.resources.memoryBytes,
       BUILD_MEMORY_ADMISSION_FLOOR_BYTES,
@@ -880,11 +893,25 @@ async function removeBuildCgroupTree(path: string): Promise<void> {
   }
 }
 
-async function prepareBuildCgroup(root: string): Promise<void> {
+async function prepareBuildCgroup(root: string, path?: string, resources?: BuildPrepareBody["resources"]): Promise<void> {
   const builds = `${root}/builds`;
   await mkdir(builds, { recursive: true, mode: 0o755 });
   await enableCgroupControllers(root, ["cpu", "memory", "pids"]);
   await enableCgroupControllers(builds, ["cpu", "memory", "pids"]);
+  await writeFile(`${builds}/cpu.max`, "200000 100000");
+  if (path && resources) {
+    await mkdir(path, { recursive: true, mode: 0o755 });
+    await writeFile(`${path}/memory.max`, String(Math.max(resources.memoryBytes, BUILD_MEMORY_ADMISSION_FLOOR_BYTES)));
+    await writeFile(`${path}/memory.swap.max`, "0");
+    await writeFile(`${path}/memory.oom.group`, "1");
+    if (Number((await readFile(`${path}/memory.max`, "utf8")).trim()) !== Math.max(resources.memoryBytes, BUILD_MEMORY_ADMISSION_FLOOR_BYTES)
+      || (await readFile(`${path}/memory.swap.max`, "utf8")).trim() !== "0") {
+      throw new BuildContainmentError("Build kernel memory grant was not acknowledged");
+    }
+    await writeFile(`${path}/pids.max`, String(resources.pids + 32));
+    await enableCgroupControllers(path, ["cpu", "memory", "pids"]);
+    await mkdir(`${path}/worker`, { mode: 0o755 });
+  }
 }
 
 async function enableCgroupControllers(path: string, controllers: readonly string[]): Promise<void> {
@@ -964,7 +991,7 @@ async function validatePackageMetadata(
   return { requiresSystemSdk };
 }
 
-async function validateSealableTree(root: string, signal?: AbortSignal): Promise<void> {
+export async function validateSealableTree(root: string, signal?: AbortSignal): Promise<void> {
   const rootPath = resolve(root);
   const pending = [rootPath];
   while (pending.length > 0) {
@@ -1037,7 +1064,7 @@ async function normalizeSealableTree(
   return count;
 }
 
-async function chownTree(root: string, uid: number, gid: number, signal?: AbortSignal): Promise<void> {
+export async function chownTree(root: string, uid: number, gid: number, signal?: AbortSignal): Promise<void> {
   const pending = [root];
   while (pending.length > 0) {
     throwIfAborted(signal);
@@ -1066,7 +1093,7 @@ async function regularFileExists(path: string): Promise<boolean> {
   }
 }
 
-async function evaluateInstallInputAt(root: string, signal?: AbortSignal) {
+export async function evaluateInstallInputAt(root: string, signal?: AbortSignal) {
   const packageJson = await readBoundedRegularBytes(
     `${root}/package.json`,
     MAX_INSTALL_PACKAGE_JSON_BYTES,
@@ -1159,7 +1186,7 @@ async function requireRealDirectoryInside(path: string, root: string, label: str
   }
 }
 
-async function validateInstalledSystemSdk(nodeModules: string, signal?: AbortSignal): Promise<void> {
+export async function validateInstalledSystemSdk(nodeModules: string, signal?: AbortSignal): Promise<void> {
   throwIfAborted(signal);
   const root = `${nodeModules}/@lamarck/system`;
   await requireRealDirectoryInside(root, nodeModules, "installed System SDK");
@@ -1340,4 +1367,14 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
+}
+
+/** Runs only in the per-Build worker in production; never parses App-sized JSON in the supervisor. */
+export async function validateBuildInput(workspace: string, installDigest: string, signal?: AbortSignal) {
+  const packageMetadata = await validatePackageMetadata(workspace, signal);
+  const packageLock = await readBoundedJsonFile(`${workspace}/package-lock.json`, MAX_PACKAGE_LOCK_BYTES, "package-lock.json", signal);
+  validatePackageLockValue(packageLock);
+  const currentInstallInput = await evaluateInstallInputAt(workspace, signal);
+  if (currentInstallInput.digest !== installDigest) throw installInputMismatch("candidate package");
+  return { packageMetadata, currentInstallInput, registryPackages: packageLockHasRegistryPackages(packageLock) };
 }

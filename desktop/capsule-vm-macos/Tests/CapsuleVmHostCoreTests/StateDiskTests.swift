@@ -727,3 +727,116 @@ private func temporaryStateDirectory() throws -> URL {
     }
     return url
 }
+
+@Test func onlineGrowthKeepsOneInodeAndNeverRewritesAnExposedTail() throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let initial = CapsuleVmStateDiskManager.minimumSize
+    let step = CapsuleVmStateDiskManager.sizeAlignment
+    let policy = CapsuleVmStateDiskAllocationPolicy(hostReserveBytes: 0, requiresPhysicalAllocation: false, onlineGrowth: true)
+    let lease = try CapsuleVmHostCore.CapsuleVmStateDiskManager.acquireForTesting(in: directory, size: initial, allocationPolicy: policy)
+    #expect(lease.attachmentBytes == CapsuleVmStateDiskManager.maximumSize)
+    #expect(try lease.growBacking(to: initial + step) == initial + step)
+    try lease.acknowledgeGrowth(to: initial + step)
+    let file = try FileHandle(forUpdating: lease.disk.url)
+    defer { try? file.close() }
+    try file.seek(toOffset: initial + 4096)
+    let marker = Data("Guest data after a lost acknowledgement".utf8)
+    try file.write(contentsOf: marker)
+    try file.synchronize()
+    let identity = try FileManager.default.attributesOfItem(atPath: lease.disk.url.path)[.systemFileNumber] as? NSNumber
+    #expect(try lease.growBacking(to: initial) == initial + step)
+    #expect(try lease.growBacking(to: initial + 2 * step) == initial + 2 * step)
+    try file.seek(toOffset: initial + 4096)
+    #expect(try file.read(upToCount: marker.count) == marker)
+    #expect(try FileManager.default.attributesOfItem(atPath: lease.disk.url.path)[.systemFileNumber] as? NSNumber == identity)
+    try lease.release()
+    // Backed high-water is retained even when a caller asks for the old size.
+    let recovered = try CapsuleVmHostCore.CapsuleVmStateDiskManager.acquireForTesting(in: directory, size: initial, allocationPolicy: policy)
+    #expect(recovered.disk.size == initial + 2 * step)
+    #expect(try recovered.committedCapacity() == initial + 2 * step)
+    try recovered.release()
+}
+
+@Test func onlineGrowthReusesVerifiedLegacyCapacityWhenRequestIsSmaller() throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let requested = CapsuleVmStateDiskManager.minimumSize
+    let existing = 2 * requested
+    let legacy = try CapsuleVmStateDiskManager.acquire(in: directory, size: existing)
+    let url = legacy.disk.url
+    let identity = try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber
+    let file = try FileHandle(forUpdating: url)
+    defer { try? file.close() }
+    let marker = Data("preserve legacy Guest data".utf8)
+    for offset in [UInt64(4096), existing - 4096] {
+        try file.seek(toOffset: offset)
+        try file.write(contentsOf: marker)
+    }
+    try file.synchronize()
+    try legacy.release()
+
+    let policy = CapsuleVmStateDiskAllocationPolicy(hostReserveBytes: 0, requiresPhysicalAllocation: false, onlineGrowth: true)
+    let preparation = try CapsuleVmHostCore.CapsuleVmStateDiskManager.prepareForTesting(in: directory, size: requested, allocationPolicy: policy)
+    #expect(preparation.requirements.stateDiskBytes == existing)
+    let lease = try preparation.consume()
+    #expect(lease.disk.size == existing)
+    #expect(try lease.committedCapacity() == existing)
+    try lease.acknowledgeGrowth(to: lease.disk.size)
+    let journal = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("state.raw.capacity"))) as? [String: UInt64])
+    #expect(journal["schemaVersion"] == 1)
+    for key in ["backedBytes", "exposedBytes", "intentBytes"] { #expect(journal[key] == existing) }
+    #expect(lease.attachmentBytes == CapsuleVmStateDiskManager.maximumSize)
+    #expect(try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber == identity)
+    for offset in [UInt64(4096), existing - 4096] {
+        try file.seek(toOffset: offset)
+        #expect(try file.read(upToCount: marker.count) == marker)
+    }
+    try lease.release()
+    let recovered = try CapsuleVmHostCore.CapsuleVmStateDiskManager.acquireForTesting(in: directory, size: requested, allocationPolicy: policy)
+    #expect(recovered.disk.size == existing)
+    #expect(try recovered.committedCapacity() == existing)
+    try recovered.release()
+}
+
+@Test(arguments: [false, true]) func onlineGrowthPreservesCurrentDiskWithMissingOrCorruptJournal(corrupt: Bool) throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let policy = CapsuleVmStateDiskAllocationPolicy(hostReserveBytes: 0, requiresPhysicalAllocation: false, onlineGrowth: true)
+    let lease = try CapsuleVmHostCore.CapsuleVmStateDiskManager.acquireForTesting(in: directory, size: CapsuleVmStateDiskManager.minimumSize, allocationPolicy: policy)
+    let url = lease.disk.url
+    let file = try FileHandle(forUpdating: url)
+    defer { try? file.close() }
+    let marker = Data("current Guest data".utf8)
+    try file.seek(toOffset: 4096)
+    try file.write(contentsOf: marker)
+    try file.synchronize()
+    try lease.release()
+    let journal = directory.appendingPathComponent("state.raw.capacity")
+    if corrupt { try Data("invalid journal".utf8).write(to: journal) }
+    else { try FileManager.default.removeItem(at: journal) }
+    let before = try FileManager.default.attributesOfItem(atPath: url.path)
+    #expect(throws: (any Error).self) {
+        try CapsuleVmHostCore.CapsuleVmStateDiskManager.prepareForTesting(in: directory, size: CapsuleVmStateDiskManager.minimumSize, allocationPolicy: policy)
+    }
+    let after = try FileManager.default.attributesOfItem(atPath: url.path)
+    #expect(before[.systemFileNumber] as? NSNumber == after[.systemFileNumber] as? NSNumber)
+    #expect(before[.size] as? NSNumber == after[.size] as? NSNumber)
+    try file.seek(toOffset: 4096)
+    #expect(try file.read(upToCount: marker.count) == marker)
+    if corrupt { #expect(try Data(contentsOf: journal) == Data("invalid journal".utf8)) }
+    else { #expect(!FileManager.default.fileExists(atPath: journal.path)) }
+}
+
+@Test func onlineGrowthRejectsInvalidCapacityWithoutChangingDataOrCommitment() throws {
+    let directory = try temporaryStateDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let initial = CapsuleVmStateDiskManager.minimumSize
+    let policy = CapsuleVmStateDiskAllocationPolicy(hostReserveBytes: 0, requiresPhysicalAllocation: false, onlineGrowth: true)
+    let lease = try CapsuleVmHostCore.CapsuleVmStateDiskManager.acquireForTesting(in: directory, size: initial, allocationPolicy: policy)
+    #expect(throws: CapsuleVmStateDiskError.invalidSize) { try lease.growBacking(to: initial + 1) }
+    #expect(throws: CapsuleVmStateDiskError.invalidSize) { try lease.growBacking(to: CapsuleVmStateDiskManager.maximumSize + 1) }
+    #expect(try lease.committedCapacity() == initial)
+    try lease.release()
+    #expect(throws: CapsuleVmStateDiskError.leaseNotHeld) { try lease.growBacking(to: initial) }
+}

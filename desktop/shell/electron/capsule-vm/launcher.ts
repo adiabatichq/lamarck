@@ -351,7 +351,7 @@ export class CapsuleVmHostClient extends EventEmitter {
       );
     }
     const value = await this.request("prepareState", options);
-    if (!isStatePreparationResult(value) || value.stateDiskBytes !== options.stateDiskBytes) {
+    if (!isStatePreparationResult(value) || value.stateDiskBytes < options.stateDiskBytes) {
       throw new CapsuleVmProtocolError(
         "invalid_state_preparation_response",
         "Helper returned invalid state-disk admission requirements",
@@ -400,6 +400,19 @@ export class CapsuleVmHostClient extends EventEmitter {
         "Helper returned an invalid state-preparation cancellation result",
       );
     }
+  }
+
+  async setMemory(bytes: number): Promise<number> { return this.capacityCommand("setMemory", bytes); }
+  async growState(bytes: number): Promise<number> { return this.capacityCommand("growState", bytes); }
+  async acknowledgeState(bytes: number): Promise<number> { return this.capacityCommand("acknowledgeState", bytes); }
+  private async capacityCommand(method: string, bytes: number): Promise<number> {
+    if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > 64 * 1024 ** 3) throw new Error("Invalid capacity request");
+    const value = await this.request(method, { bytes }, 10 * 60_000);
+    if (!isPlainObject(value) || !hasExactKeys(value, ["bytes"]) || typeof value.bytes !== "number" || !Number.isSafeInteger(value.bytes)
+      || (method === "growState" ? value.bytes < bytes || value.bytes > CAPSULE_STATE_CAPACITY_MAX_BYTES : value.bytes !== bytes)) {
+      throw new CapsuleVmProtocolError("invalid_capacity_response", "Helper did not acknowledge the requested capacity");
+    }
+    return value.bytes as number;
   }
 
   async stopGuest(): Promise<void> {

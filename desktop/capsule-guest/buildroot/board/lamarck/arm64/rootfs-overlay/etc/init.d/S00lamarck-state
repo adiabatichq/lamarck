@@ -25,7 +25,11 @@ start() {
 		# attachment. Never issue whole-device discard while formatting.
 		# VZ may still translate filesystem zero ranges into APFS holes; the
 		# Host materializes those zero-valued ranges before the next attachment.
-		mkfs.ext4 -F -m 0 -E nodiscard -L LAMARCK_STATE "$device"
+		state_bytes="$(tr ' ' '\n' </proc/cmdline | sed -n 's/^lamarck.state_bytes=//p')"
+		case "$state_bytes" in ''|*[!0-9]*) echo "Missing Host-backed state capacity" >&2; return 1 ;; esac
+		[ "$state_bytes" -ge 4294967296 ] && [ "$state_bytes" -le 68719476736 ] && \
+			[ "$((state_bytes % 67108864))" -eq 0 ] || return 1
+		mkfs.ext4 -F -m 0 -b 4096 -E nodiscard -L LAMARCK_STATE "$device" "$((state_bytes / 4096))"
 		type=ext4
 	fi
 	[ "$type" = ext4 ] || {

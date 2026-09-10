@@ -89,6 +89,9 @@ export interface AppStopBody {
 }
 
 export interface WorkloadPrepareBody {
+  launchKey?: string;
+  /** Host-selected validated profile; absent means the conservative 512 MiB grant. */
+  memoryProfile?: "lightweight" | "standard";
   appHandle: string;
   workloadHandle: string;
   workloadKind: WorkloadKind;
@@ -131,6 +134,7 @@ export interface BlobExportPrepareBody {
 }
 
 export interface BuildPrepareBody {
+  launchKey?: string;
   /** Stable owner shared with the imported package/dependency references. */
   ownerKey: string;
   appHandle: string;
@@ -204,6 +208,12 @@ export interface WorkloadStopBody {
 }
 
 export type HostOperation =
+  | "resources.status"
+  | "resources.memory.prepare"
+  | "resources.memory.commit"
+  | "resources.launch.reserve"
+  | "resources.launch.release"
+  | "resources.disk.grow"
   | "ping"
   | "blob.import.prepare"
   | "blob.import.release"
@@ -231,6 +241,12 @@ export type RequestFor<TOperation extends HostOperation, TBody> = {
 };
 
 export type HostRequest =
+  | RequestFor<"resources.status", Record<string, never>>
+  | RequestFor<"resources.memory.prepare", { memoryBytes: number }>
+  | RequestFor<"resources.memory.commit", { memoryBytes: number }>
+  | RequestFor<"resources.launch.reserve", { launchKey: string; runtimeMemoryBytes: number; buildMemoryBytes: number }>
+  | RequestFor<"resources.launch.release", { launchKey: string }>
+  | RequestFor<"resources.disk.grow", { bytes: number }>
   | RequestFor<"ping", PingBody>
   | RequestFor<"blob.import.prepare", BlobImportPrepareBody>
   | RequestFor<"blob.import.release", BlobImportReleaseBody>

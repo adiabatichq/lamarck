@@ -8,6 +8,7 @@ import { validateArtifactDigest } from "@lamarck/capsule";
 import {
   UNBOUNDED_GUEST_RESOURCE_ADMISSION,
   type GuestResourceAdmissionLike,
+  type GuestResourceLease,
 } from "./resource-admission";
 
 const READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW;
@@ -135,6 +136,7 @@ export class GuestBlobStore {
     expectedBytes: number,
     source: AsyncIterable<Uint8Array>,
     referenceOptions: BlobReferenceOptions,
+    diskSource?: GuestResourceLease,
   ): Promise<{ digest: string; bytes: number; path: string; reused: boolean }> {
     const digest = validateArtifactDigest(digestValue, "digest");
     assertBlobBytes(expectedBytes);
@@ -149,9 +151,10 @@ export class GuestBlobStore {
     const importNonce = randomBytes(16).toString("hex");
     await this.reserveOwnerPending(ownerKey, expectedBytes);
     let ownerPending = true;
-    const resourceLease = await this.admission.reserve(
-      `blob:${kind}:${digest}:${importNonce}`,
-      { diskBytes: expectedBytes },
+    const reservationKey = `blob:${kind}:${digest}:${importNonce}`;
+    const resourceLease = await Promise.resolve().then(() => diskSource?.transferDisk
+      ? diskSource.transferDisk(reservationKey, expectedBytes)
+      : this.admission.reserve(reservationKey, { diskBytes: expectedBytes })
     ).catch(async (error) => {
       await this.releaseOwnerPending(ownerKey, expectedBytes);
       ownerPending = false;
@@ -295,7 +298,7 @@ export class GuestBlobStore {
   async importLocalFile(
     kind: ImportedBlobKind,
     path: string,
-    options: BlobReferenceOptions & { signal?: AbortSignal; maximumBytes?: number },
+    options: BlobReferenceOptions & { signal?: AbortSignal; maximumBytes?: number; diskSource?: GuestResourceLease },
   ): Promise<{ digest: string; bytes: number; path: string; reused: boolean }> {
     const signal = options.signal;
     throwIfAborted(signal);
@@ -321,7 +324,7 @@ export class GuestBlobStore {
       assertStableIdentity(before, afterHash, "local artifact changed while hashing");
       throwIfAborted(signal);
       const source = readOpenFile(handle, bytes, signal);
-      const imported = await this.receive(kind, `sha256:${digest}`, bytes, source, options);
+      const imported = await this.receive(kind, `sha256:${digest}`, bytes, source, options, options.diskSource);
       throwIfAborted(signal);
       const afterImport = await handle.stat({ bigint: true });
       assertStableIdentity(before, afterImport, "local artifact changed while importing");

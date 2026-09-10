@@ -26,8 +26,8 @@ describe("Capsule storage plan", () => {
       dependencyBytes: 128 * MIB,
     })).toEqual({
       version: CAPSULE_STORAGE_PLAN_VERSION,
-      scratchBytes: 1_664 * MIB,
-      artifactOutputBytes: 576 * MIB,
+      scratchBytes: 1_024 * MIB,
+      artifactOutputBytes: 320 * MIB,
     });
   });
 
@@ -38,7 +38,7 @@ describe("Capsule storage plan", () => {
       baseArtifactBytes: 256 * MIB,
     })).toEqual({
       version: 1,
-      scratchBytes: 1_152 * MIB,
+      scratchBytes: 768 * MIB,
       artifactOutputBytes: 320 * MIB,
     });
     expect(createCapsuleRuntimeStoragePlan(1)).toEqual({
@@ -55,7 +55,7 @@ describe("Capsule storage plan", () => {
     expect(() => createCapsuleBuildStoragePlan({
       mode: "cold",
       packageBytes: GIB,
-      dependencyBytes: 896 * MIB,
+      dependencyBytes: 1_024 * MIB,
     })).toThrowError(expect.objectContaining<Partial<CapsuleStoragePlanError>>({
       code: "CAPSULE_STORAGE_PLAN_INVALID",
     }));
@@ -96,8 +96,8 @@ describe("Capsule storage plan", () => {
         { key: "dependency:b", bytes: 128 * MIB },
       ],
       liveRuntimeLeases: [
-        { artifact, scratchBytes: 512 * MIB },
-        { artifact, scratchBytes: 512 * MIB },
+        { artifact, scratchBytes: 256 * MIB },
+        { artifact, scratchBytes: 256 * MIB },
       ],
     });
     expect(planned.peakBytes).toBe(
@@ -105,11 +105,11 @@ describe("Capsule storage plan", () => {
       + 64 * MIB
       + 128 * MIB
       + 256 * MIB
-      + 2 * 512 * MIB
-      + 1_664 * MIB
-      + 576 * MIB,
+      + 2 * 256 * MIB
+      + 1_024 * MIB
+      + 320 * MIB,
     );
-    expect(planned.stateDiskBytes).toBe(planned.peakBytes);
+    expect(planned.stateDiskBytes).toBe(CAPSULE_STATE_CAPACITY_MIN_BYTES);
     expect(planned.buildPlan.artifactOutputBytes).toBeLessThanOrEqual(
       CAPSULE_ARTIFACT_OUTPUT_MAX_BYTES,
     );
@@ -125,10 +125,10 @@ describe("Capsule storage plan", () => {
       liveRuntimeLeases: [],
     });
     expect(planned.peakBytes).toBe(
-      CAPSULE_GUEST_FILESYSTEM_RESERVE_BYTES + 256 * MIB + 512 * MIB,
+      CAPSULE_GUEST_FILESYSTEM_RESERVE_BYTES + 256 * MIB + 256 * MIB,
     );
     expect(planned.stateDiskBytes).toBe(CAPSULE_STATE_CAPACITY_MIN_BYTES);
-    expect(planned.runtimePlan.scratchBytes).toBe(512 * MIB);
+    expect(planned.runtimePlan.scratchBytes).toBe(256 * MIB);
   });
 
   test("rejects inconsistent retained CAS identities and noncanonical live leases", () => {

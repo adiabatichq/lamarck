@@ -30,7 +30,7 @@ try {
   try {
     // Match CapsuleVmStateDiskManager.defaultSize. This remains a sparse Host
     // file but gives the supervisor the same admission headroom as a VZ boot.
-    await stateHandle.truncate(8 * 1024 * 1024 * 1024);
+    await stateHandle.truncate(4 * 1024 * 1024 * 1024);
   } finally {
     await stateHandle.close();
   }
@@ -43,6 +43,7 @@ try {
     `lamarck.image_digest=${release.descriptor.manifestDigest}`,
     "lamarck.state_device=/dev/vdb",
     "lamarck.state_label=LAMARCK_STATE",
+    "lamarck.state_bytes=4294967296",
     "lamarck.boot_smoke=1",
   ].join(" ");
   const qemuArgs = (imagePath, rootfsPath, statePath) => [
@@ -64,6 +65,7 @@ try {
     "-drive", `if=none,id=state,format=raw,file=${statePath}`,
     "-device", "virtio-blk-device,drive=state,bus=virtio-mmio-bus.1",
     "-device", "virtio-rng-device",
+    "-device", "virtio-balloon-device",
   ];
 
   let executable = process.env.LAMARCK_QEMU_AARCH64;

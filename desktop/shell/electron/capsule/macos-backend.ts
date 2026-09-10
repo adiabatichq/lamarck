@@ -1,3 +1,4 @@
+import { BuildProgressQueue, VmCapacityCoordinator } from "./capacity-coordinator";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
@@ -167,6 +168,9 @@ export interface MacOsCapsuleBackendOptions {
 }
 
 interface VmHostLike {
+  setMemory?(bytes: number): Promise<number>;
+  growState?(bytes: number): Promise<number>;
+  acknowledgeState?(bytes: number): Promise<number>;
   probe(): Promise<{ virtualizationSupported: boolean }>;
   prepareState(options: {
     stateDirectory: string;
@@ -271,12 +275,22 @@ export interface MacOsCapsuleBackendDependencies {
   nonce(): number;
 }
 
+interface LaunchCapacity {
+  key: string;
+  memoryProfile: "lightweight" | "standard";
+  runtimeBytes: number;
+  buildBytes: number;
+  boot?: BootBoundary;
+  releaseBuild?: () => void;
+}
+
 interface BootBoundary {
   readonly generation: number;
   readonly helper: VmHostLike;
   readonly session: GuestSessionLike;
   readonly release: LoadedCapsuleGuestRelease;
-  readonly stateDiskBytes: number;
+  stateDiskBytes: number;
+  capacity?: VmCapacityCoordinator;
   intentional: boolean;
 }
 
@@ -317,6 +331,8 @@ interface ActivationCheckpoint {
 }
 
 interface PreparedUiRecord {
+  releaseBuild?: () => void;
+  expires?: ReturnType<typeof setTimeout>;
   readonly preparationId: string;
   readonly candidate: Candidate;
   readonly packageDigest: `sha256:${string}`;
@@ -373,6 +389,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   readonly #artifacts: ArtifactStoreLike;
   readonly #storageBudget: CapsuleStorageBudgetLike;
   readonly #serial = new BoundedSerialQueue(MAX_SERIAL_OPERATIONS);
+  readonly #appLaunchQueues = new Map<string, BoundedSerialQueue>();
+  readonly #buildQueue = new BuildProgressQueue();
+  #stateReconcilePromise?: Promise<void>;
   readonly #instances = new Map<string, UiRecord>();
   readonly #preparedUi = new Map<string, PreparedUiRecord>();
   readonly #preparedInstances = new Map<string, PreparedUiRecord>();
@@ -380,7 +399,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   readonly #workloads = new Map<string, UiRecord>();
   readonly #latestActivationSequenceByApp = new Map<string, number>();
   readonly #namespaceBases = new Set<number>();
-  readonly #launchControllers = new Map<string, Set<AbortController>>();
+  readonly #launches = new Map<string, Map<AbortController, Promise<readonly unknown[]>>>();
+  readonly #launchCleanupFailures = new WeakMap<AbortSignal, unknown[]>();
+  readonly #appStops = new Map<string, Promise<void>>();
+  readonly #uiStops = new Map<string, Promise<void>>();
   readonly #shuttingDownBoots = new Map<BootBoundary, number>();
 
   #boundaryLostHandler: ((error: unknown) => void) | undefined;
@@ -486,14 +508,16 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     previousInstanceId?: string,
   ): Promise<CapsuleUiPreparation> {
     try {
-      this.#assertAcceptingWork();
+      this.#assertAcceptingWork(spec.appId);
     } catch (error) {
       return Promise.reject(error);
     }
-    return this.#withLaunch(spec.appId, (signal) => this.#serial.run(async () => {
-      this.#assertAcceptingWork();
+    return this.#withLaunch(spec.appId, (signal) => this.#appLaunchQueue(spec.appId).run(async () => {
+      throwIfAborted(signal);
+      this.#assertAcceptingWork(spec.appId);
       const ownerKey = hashAppId(spec.appId);
       let launchedCandidate: Candidate | undefined;
+      const launch: LaunchCapacity = { key: this.#dependencies.opaqueId(), memoryProfile: "standard", runtimeBytes: 512 * 1024 ** 2, buildBytes: 0 };
       try {
         return await this.#withTransientStorage(ownerKey, async () => {
           let previous: UiRecord | undefined;
@@ -512,6 +536,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           }
 
           const release = await this.#loadRelease();
+          throwIfAborted(signal);
           const snapshot = await this.#dependencies.snapshot({
             packageDir: spec.packageDir,
             cacheDir: join(this.#options.cacheDirectory, "packages", ownerKey),
@@ -520,12 +545,17 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           });
           await this.#assertSnapshotManifestAuthority(snapshot, spec);
           throwIfAborted(signal);
-          const resolved = await this.#resolveArtifact(release, spec, snapshot, signal);
+          launch.memoryProfile = await selectRuntimeMemoryProfile(snapshot, spec.command);
+          throwIfAborted(signal);
+          launch.runtimeBytes = (launch.memoryProfile === "lightweight" ? 256 : 512) * 1024 ** 2;
+          const resolved = await this.#resolveArtifact(release, spec, snapshot, signal, launch);
+          throwIfAborted(signal);
           const runtimeCapacity = createCapsuleRuntimeStateCapacityPlan({
             artifact: retainedArtifact(resolved.artifact),
             liveRuntimeLeases: this.#liveRuntimeStorageLeases(),
           });
-          const boot = await this.#ensureBoot(runtimeCapacity.stateDiskBytes, release);
+          const boot = await this.#ensureBoot(runtimeCapacity.stateDiskBytes, release, signal);
+          throwIfAborted(signal);
           if (previous && previous.bootGeneration !== boot.generation) {
             throw new Error("Previous UI belongs to a lost Guest boundary");
           }
@@ -535,6 +565,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
             resolved,
             runtimeCapacity.runtimePlan,
             signal,
+            launch,
           );
           launchedCandidate = candidate;
           candidate.lifecycle = "prepared";
@@ -547,6 +578,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
             retention: this.#artifacts.retain(candidate.artifact),
             state: "prepared",
           };
+          prepared.releaseBuild = launch.releaseBuild;
+          launch.releaseBuild = undefined;
+          prepared.expires = setTimeout(() => {
+            if (prepared.state === "prepared") void this.abortPreparedUi(preparationId).catch(() => {});
+          }, 120_000);
+          prepared.expires.unref();
           this.#preparedUi.set(preparationId, prepared);
           this.#preparedInstances.set(candidate.instanceId, prepared);
           return Object.freeze({
@@ -562,6 +599,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           const boot = await this.#requireCurrentBoot(candidate.bootGeneration);
           await this.#discardCandidate(candidate, boot);
         } catch (cleanupError) {
+          this.#recordLaunchCleanupFailure(signal, cleanupError);
           failures.push(cleanupError);
           await this.#loseBoundary(cleanupError);
         }
@@ -572,18 +610,26 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           );
         }
         throw error;
+      } finally {
+        try {
+          await this.#withLaunchCleanup(signal, async () => {
+            if (launch.boot?.capacity && !launch.boot.intentional) await launch.boot.capacity.releaseLaunch(launch.key);
+          });
+        } finally { launch.releaseBuild?.(); }
       }
     }));
   }
 
   commitPreparedUi(preparationId: string): Promise<CapsuleUiInstance> {
+    const pending = this.#preparedUi.get(preparationId);
     try {
-      this.#assertAcceptingWork();
+      this.#assertAcceptingWork(pending?.candidate.appId);
     } catch (error) {
       return Promise.reject(error);
     }
-    return this.#serial.runCritical(async () => {
-      this.#assertAcceptingWork();
+    const commit = (signal?: AbortSignal) => this.#serial.runCritical(async () => {
+      throwIfAborted(signal);
+      this.#assertAcceptingWork(pending?.candidate.appId);
       const outcome = this.#preparedOutcomes.get(preparationId);
       if (outcome?.decision === "committed") return { instanceId: outcome.instanceId };
       if (outcome?.decision === "aborted") {
@@ -596,8 +642,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         throw new Error("App Capsule UI preparation is already committing");
       }
       prepared.state = "committing";
-      return await this.#commitPreparation(prepared);
+      return await this.#commitPreparation(prepared, signal);
     });
+    return pending ? this.#withLaunch(pending.candidate.appId, commit) : commit();
   }
 
   abortPreparedUi(preparationId: string): Promise<void> {
@@ -669,10 +716,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   stopUi(instanceId: string): Promise<void> {
+    const pending = this.#uiStops.get(instanceId);
+    if (pending) return pending;
     const known = this.#instances.get(instanceId)
       ?? this.#preparedInstances.get(instanceId)?.candidate;
-    if (known) this.#abortLaunches(known.appId, "UI stop requested");
-    return this.#serial.runCritical(async () => {
+    if (!known) return this.#serial.runCritical(async () => {});
+    const stopping = this.#stopAppWork(known.appId, "UI stop requested", async () => {
       const prepared = this.#preparedInstances.get(instanceId);
       if (prepared) {
         await this.#abortPreparation(prepared);
@@ -688,12 +737,13 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         await this.#loseBoundary(error, boot);
         throw error;
       }
-    });
+    }).finally(() => { this.#uiStops.delete(instanceId); });
+    this.#uiStops.set(instanceId, stopping);
+    return stopping;
   }
 
   stopApp(appId: string): Promise<void> {
-    this.#abortLaunches(appId, "App stop requested");
-    return this.#serial.runCritical(async () => {
+    return this.#stopAppWork(appId, "App stop requested", async () => {
       const preparations = [...this.#preparedUi.values()]
         .filter((prepared) => prepared.candidate.appId === appId);
       for (const prepared of preparations) await this.#abortPreparation(prepared);
@@ -714,8 +764,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   retireApp(appId: string): Promise<void> {
-    this.#abortLaunches(appId, "App retirement requested");
-    return this.#serial.runCritical(async () => {
+    return this.#stopAppWork(appId, "App retirement requested", async () => {
       // A boundary-loss path clears the in-memory instance registry before it
       // knows whether VZ actually stopped. Wait for an in-progress cleanup,
       // then refuse Host cache retirement if that stop remained ambiguous.
@@ -778,15 +827,17 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     // shutdown and must join the same physical teardown.
     this.#stopAllPromise = shared;
     this.#stoppingAll = true;
+    const preparations = [...this.#launches.values()].flatMap((launches) => [...launches.values()]);
     this.#abortAllLaunches("Capsule backend is stopping");
     let operation: Promise<void>;
     try {
-      operation = this.#serial.runCritical(async () => {
+      // Preparations and commits can need the lifecycle queue to finish. Join
+      // their cleanup before entering it, while admission remains fenced.
+      operation = this.#waitForLaunches(preparations).then((failures) => this.#serial.runCritical(async () => {
         if (this.#fatalCleanup) await this.#fatalCleanup;
         if (this.#terminalFailure) throw this.#terminalFailure;
         const boot = this.#boot;
         if (boot) {
-          const failures: unknown[] = [];
           for (const prepared of [...this.#preparedUi.values()]) {
             try {
               await this.#discardCandidate(prepared.candidate, boot);
@@ -818,9 +869,6 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           } catch (error) {
             failures.push(error);
           }
-          if (failures.length > 0) {
-            throw new AggregateError(failures, "Capsule Guest shutdown was incomplete");
-          }
         } else if (this.#bootPromise) {
           const pending = await this.#bootPromise.catch(() => undefined);
           if (pending) await this.#shutdownBoot(pending);
@@ -828,7 +876,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         this.#instances.clear();
         this.#abandonAllPreparations();
         this.#workloads.clear();
-      });
+        if (failures.length > 0) {
+          throw new AggregateError(failures, "Capsule preparation cleanup or Guest shutdown was incomplete");
+        }
+      }));
     } catch (error) {
       operation = Promise.reject(error);
     }
@@ -906,8 +957,11 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   async #ensureBoot(
     requiredStateDiskBytes: number,
     release: LoadedCapsuleGuestRelease,
+    signal: AbortSignal,
   ): Promise<BootBoundary> {
+    throwIfAborted(signal);
     const current = this.#boot;
+    if (current?.capacity) current.stateDiskBytes = current.capacity.stateDiskBytes;
     if (
       current
       && current.stateDiskBytes >= requiredStateDiskBytes
@@ -915,9 +969,13 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     ) {
       return current;
     }
+    if (current && sameGuestRelease(current.release, release) && current.capacity) {
+      current.stateDiskBytes = await current.capacity.growState(requiredStateDiskBytes);
+      return current;
+    }
     if (this.#bootPromise) {
       await this.#bootPromise;
-      return await this.#ensureBoot(requiredStateDiskBytes, release);
+      return await this.#ensureBoot(requiredStateDiskBytes, release, signal);
     }
     if (current) {
       if (this.#instances.size > 0 || this.#workloads.size > 0) {
@@ -930,12 +988,14 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         this.#parseGuestResult(current, parseVmDrainResult, drained);
         await this.#shutdownBoot(current);
       } catch (error) {
+        this.#recordLaunchCleanupFailure(signal, error);
         await this.#loseBoundary(error, current);
         throw error;
       }
     }
 
-    const promise = this.#createBoot(requiredStateDiskBytes, release);
+    throwIfAborted(signal);
+    const promise = this.#createBoot(CAPSULE_STATE_CAPACITY_MIN_BYTES, release, signal);
     this.#bootPromise = promise;
     try {
       const boot = await promise;
@@ -947,10 +1007,14 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         || this.#stoppingAll
         || this.#terminalFailure
       ) {
-        await this.#shutdownBoot(boot);
+        await this.#withLaunchCleanup(signal, () => this.#shutdownBoot(boot));
+        if (this.#stoppingAll) throwIfAborted(signal);
         throw new Error("Capsule Guest boundary failed during authenticated boot");
       }
       this.#boot = boot;
+      if (boot.capacity && requiredStateDiskBytes > boot.stateDiskBytes) {
+        boot.stateDiskBytes = await boot.capacity.growState(requiredStateDiskBytes);
+      }
       return boot;
     } finally {
       if (this.#bootPromise === promise) this.#bootPromise = undefined;
@@ -960,6 +1024,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   async #createBoot(
     stateDiskBytes: number,
     release: LoadedCapsuleGuestRelease,
+    signal: AbortSignal,
   ): Promise<BootBoundary> {
     const helper = this.#dependencies.launchVm({ executablePath: this.#options.helperPath });
     const generation = ++this.#bootGeneration;
@@ -1063,6 +1128,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         additionalPhysicalBytes: statePreparation.additionalPhysicalBytes,
         peakPhysicalBytes: statePreparation.peakPhysicalBytes,
       });
+      stateDiskBytes = statePreparation.stateDiskBytes;
+      if (boundary) boundary.stateDiskBytes = stateDiskBytes;
       guestStartAttempted = true;
       const started = await helper.startGuest({
         ...release.vmImage,
@@ -1084,7 +1151,23 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       const nonce = this.#dependencies.nonce();
       const ping = await session.request("ping", { nonce });
       parsePingResult(ping, nonce);
-      return provisional()!;
+      const ready = provisional()!;
+      if (helper.setMemory && helper.growState && helper.acknowledgeState) {
+        ready.capacity = new VmCapacityCoordinator(session, {
+          setMemory: (bytes) => helper.setMemory!(bytes),
+          growState: (bytes) => helper.growState!(bytes),
+          acknowledgeState: (bytes) => helper.acknowledgeState!(bytes),
+        }, this.#storageBudget, join(this.#options.stateDirectory, "state.raw"), stateDiskBytes);
+        await ready.capacity.status();
+        // Recover a backed-but-not-exposed growth after an interrupted prior boot.
+        const growth = await session.request("resources.disk.grow", { bytes: stateDiskBytes });
+        if (!growth || typeof growth !== "object" || Array.isArray(growth) || growth.stateCapacityBytes !== stateDiskBytes) {
+          throw new Error("Guest did not recover the committed state filesystem capacity");
+        }
+        await helper.acknowledgeState(stateDiskBytes);
+        ready.capacity.start();
+      }
+      return ready;
     } catch (error) {
       const bootFailure = asError(error);
       intentional = true;
@@ -1124,6 +1207,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       if (stopError !== undefined || storageError !== undefined) {
         const cleanupFailures = [stopError, storageError]
           .filter((failure): failure is NonNullable<typeof failure> => failure !== undefined);
+        for (const failure of cleanupFailures) this.#recordLaunchCleanupFailure(signal, failure);
         const quarantineReason = stopError !== undefined && storageError !== undefined
           ? "VZ stop was not confirmed and state-disk usage could not be reconciled"
           : stopError !== undefined
@@ -1150,9 +1234,11 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     spec: CapsuleUiSpec,
     snapshot: CapsuleTreeSnapshot,
     signal: AbortSignal,
+    launch: LaunchCapacity,
   ): Promise<ResolvedArtifact> {
     const appKey = hashAppId(spec.appId);
     const active = await this.#artifacts.active(appKey);
+    throwIfAborted(signal);
     if (
       active
       && active.appVersion === spec.version
@@ -1180,7 +1266,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           retainedImportBlobs: buildRetainedBlobs(snapshot, input),
           liveRuntimeLeases: this.#liveRuntimeStorageLeases(),
         });
-        const boot = await this.#ensureBoot(capacity.stateDiskBytes, release);
+        const boot = await this.#ensureBoot(CAPSULE_STATE_CAPACITY_MIN_BYTES, release, signal);
         return await this.#buildArtifact(
           boot,
           spec,
@@ -1189,9 +1275,18 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           input,
           capacity.buildPlan,
           signal,
+          launch,
         );
       } catch (error) {
         if (!isWarmRebuildUnavailable(error)) throw error;
+        // The warm attempt has authoritatively drained. Its cold fallback can
+        // need a larger profile; reacquire the complete handoff reservation.
+        await this.#withLaunchCleanup(signal, async () => {
+          if (launch.boot?.capacity) await launch.boot.capacity.releaseLaunch(launch.key);
+        });
+        launch.boot = undefined;
+        launch.releaseBuild?.();
+        launch.releaseBuild = undefined;
         throwIfAborted(signal);
       }
     }
@@ -1210,7 +1305,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       retainedImportBlobs: buildRetainedBlobs(snapshot, input),
       liveRuntimeLeases: this.#liveRuntimeStorageLeases(),
     });
-    const boot = await this.#ensureBoot(capacity.stateDiskBytes, release);
+    const boot = await this.#ensureBoot(CAPSULE_STATE_CAPACITY_MIN_BYTES, release, signal);
     return await this.#buildArtifact(
       boot,
       spec,
@@ -1219,6 +1314,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       input,
       capacity.buildPlan,
       signal,
+      launch,
     );
   }
 
@@ -1255,7 +1351,24 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     input: ArtifactBuildInput,
     storagePlan: CapsuleBuildStoragePlan,
     signal: AbortSignal,
+    launch: LaunchCapacity,
   ): Promise<ResolvedArtifact> {
+    throwIfAborted(signal);
+    const inputBytes = input.mode === "cold" ? input.dependencies.snapshot.bytes : input.base.artifact.bytes;
+    // React/Vite's 131 MiB broker bundle is validated at 512 MiB. The measured
+    // 191 MiB TensorFlow/Three bundle uses the conservative 1 GiB profile.
+    launch.buildBytes = inputBytes <= 160 * 1024 ** 2 && snapshot.bytes <= 1024 ** 2
+      ? 512 * 1024 ** 2 : 1024 * 1024 ** 2;
+    if (!launch.releaseBuild) {
+      launch.releaseBuild = await this.#buildQueue.acquire(async () => {
+        throwIfAborted(signal);
+        if (boot.capacity) {
+          await boot.capacity.reserveLaunch(launch.key, launch.runtimeBytes, launch.buildBytes);
+          launch.boot = boot;
+        }
+      }, signal);
+    }
+    throwIfAborted(signal);
     const appKey = hashAppId(spec.appId);
     const appHandle = this.#dependencies.opaqueId();
     const buildHandle = this.#dependencies.opaqueId();
@@ -1309,6 +1422,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         );
         if (!released) throw new Error("Guest package import reference disappeared before Build prepare");
       } catch (cleanupError) {
+        this.#recordLaunchCleanupFailure(signal, cleanupError);
         await this.#loseBoundary(cleanupError, boot);
         throw cleanupAggregateError("Partial Build import cleanup failed", error, cleanupError);
       }
@@ -1331,7 +1445,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       return cancelBuild;
     };
     try {
-      const prepared = await boot.session.request("build.prepare", {
+      const reserveBuild = () => boot.session.request("build.prepare", {
+        ...(boot.capacity ? { launchKey: launch.key } : {}),
         ownerKey: appKey,
         appHandle,
         buildHandle,
@@ -1358,11 +1473,14 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         artifactOutputBytes: storagePlan.artifactOutputBytes,
         timeoutMs: BUILD_TIMEOUT_MS,
         resources: {
-          memoryBytes: 2 * 1024 * 1024 * 1024,
+          memoryBytes: launch.buildBytes,
           pids: 512,
-          cpuQuotaMicros: 200_000,
+          cpuQuotaMicros: 100_000,
         },
       });
+      const prepared = boot.capacity
+        ? await boot.capacity.withDiskAdmission(storagePlan.scratchBytes + storagePlan.artifactOutputBytes, reserveBuild)
+        : await reserveBuild();
       this.#parseGuestResult(boot, parseBuildPrepareResult, prepared);
       buildPrepared = true;
       throwIfAborted(signal);
@@ -1506,6 +1624,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           cleanupFailures,
           "Unsuccessful Build cleanup was not authoritative",
         );
+        this.#recordLaunchCleanupFailure(signal, cleanupError);
         await this.#loseBoundary(cleanupError, boot);
         throw new AggregateError([error, cleanupError], "Build cleanup did not retire exact Guest resources");
       }
@@ -1541,6 +1660,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       blob.bytes,
       signal,
     );
+    let releaseImport: (() => void) | undefined;
     try {
       const rawResult = await boot.session.request("blob.import.prepare", {
         ownerKey,
@@ -1561,6 +1681,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         }
         return blobHandle;
       }
+      releaseImport = await boot.capacity?.reserveImport(blob.bytes);
+      throwIfAborted(signal);
       const opened = await boot.session.openDataStream(ticket.ticket, kind);
       const transfer = startBlobTransfer(opened.stream, blob.bytes, signal);
       try {
@@ -1589,11 +1711,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       try {
         await this.#releaseImportedBlob(boot, ownerKey, blobHandle, blobKind, blob);
       } catch (cleanupError) {
+        this.#recordLaunchCleanupFailure(signal, cleanupError);
         await this.#loseBoundary(cleanupError, boot);
         throw cleanupAggregateError("Guest blob import cleanup failed", error, cleanupError);
       }
       throw error;
-    }
+    } finally { releaseImport?.(); }
   }
 
   async #releaseImportedBlob(
@@ -1719,7 +1842,13 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     resolved: ResolvedArtifact,
     storagePlan: CapsuleRuntimeStoragePlan,
     signal: AbortSignal,
+    launch: LaunchCapacity,
   ): Promise<Candidate> {
+    throwIfAborted(signal);
+    if (boot.capacity && !launch.boot) {
+      await boot.capacity.reserveLaunch(launch.key, launch.runtimeBytes, 0);
+      launch.boot = boot;
+    }
     const { artifact } = resolved;
     throwIfAborted(signal);
     const ownerKey = hashAppId(spec.appId);
@@ -1767,7 +1896,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     this.#workloads.set(workloadHandle, candidate);
     let appPrepared = false;
     try {
-      const appResult = await boot.session.request("app.prepare", {
+      const reserveApp = () => boot.session.request("app.prepare", {
         ownerKey,
         appHandle,
         artifactDigest: artifact.digest,
@@ -1778,6 +1907,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         storagePlanVersion: storagePlan.version,
         scratchBytes: storagePlan.scratchBytes,
       });
+      const appResult = boot.capacity
+        ? await boot.capacity.withDiskAdmission(storagePlan.scratchBytes, reserveApp)
+        : await reserveApp();
       this.#parseGuestResult(boot, parseAppPrepareResult, appResult);
       appPrepared = true;
 
@@ -1794,6 +1926,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         ttlMs: TICKET_TTL_MS,
       });
       const workloadPrepareBody: RequestBodyFor<"workload.prepare"> = {
+        memoryProfile: launch.memoryProfile,
+        ...(boot.capacity ? { launchKey: launch.key } : {}),
         appHandle,
         workloadHandle,
         workloadKind: "ui",
@@ -1887,6 +2021,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
             artifact,
           );
         } catch (cleanupError) {
+          this.#recordLaunchCleanupFailure(signal, cleanupError);
           await this.#loseBoundary(cleanupError, boot);
           throw new AggregateError(
             [error, cleanupError],
@@ -1907,6 +2042,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         this.#releaseNamespace(namespaceBase);
         this.#workloads.delete(workloadHandle);
       } catch (cleanupError) {
+        this.#recordLaunchCleanupFailure(signal, cleanupError);
         await this.#loseBoundary(cleanupError, boot);
         throw new AggregateError(
           [error, cleanupError],
@@ -1917,7 +2053,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     }
   }
 
-  async #commitPreparation(prepared: PreparedUiRecord): Promise<CapsuleUiInstance> {
+  async #commitPreparation(prepared: PreparedUiRecord, signal?: AbortSignal): Promise<CapsuleUiInstance> {
     const candidate = prepared.candidate;
     let boot: BootBoundary;
     try {
@@ -1928,7 +2064,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     }
     if (candidate.terminalError) {
       const error = candidate.terminalError;
-      await this.#abortPreparation(prepared, error);
+      await this.#abortPreparation(prepared, error, signal);
       throw error;
     }
 
@@ -1936,22 +2072,23 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       ? undefined
       : this.#instances.get(prepared.previousInstanceId);
     if (prepared.previousInstanceId !== undefined && !previous) {
-      await this.#abortPreparation(prepared);
+      await this.#abortPreparation(prepared, undefined, signal);
       throw new Error("Prepared replacement no longer owns its previous UI generation");
     }
     if (previous && (
       previous.appId !== candidate.appId
       || previous.bootGeneration !== candidate.bootGeneration
     )) {
-      await this.#abortPreparation(prepared);
+      await this.#abortPreparation(prepared, undefined, signal);
       throw new Error("Prepared replacement previous UI authority changed");
     }
 
     let activation: ActivationCheckpoint | undefined;
     try {
-      activation = await this.#activateCandidate(candidate, prepared.packageDigest, boot);
+      activation = await this.#activateCandidate(candidate, prepared.packageDigest, boot, signal);
+      throwIfAborted(signal);
     } catch (error) {
-      return await this.#failPreparedCommit(prepared, boot, error);
+      return await this.#failPreparedCommit(prepared, boot, error, activation, signal);
     }
 
     if (!previous) {
@@ -1967,7 +2104,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         });
         return { instanceId: candidate.instanceId };
       } catch (error) {
-        return await this.#failPreparedCommit(prepared, boot, error, activation);
+        return await this.#failPreparedCommit(prepared, boot, error, activation, signal);
       }
     }
 
@@ -1982,6 +2119,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         previous.terminalError
           ?? new Error("Prepared replacement lost its previous UI generation during commit"),
         activation,
+        signal,
       );
     }
 
@@ -1989,9 +2127,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     try {
       await this.#stopRecord(previous, boot);
     } catch (error) {
+      this.#recordLaunchCleanupFailure(signal, error);
       let rollbackError: unknown;
       try {
-        await this.#rollbackCandidateActivation(candidate, activation);
+        await this.#rollbackCandidateActivation(candidate, activation, signal);
       } catch (failure) {
         rollbackError = failure;
       }
@@ -2009,9 +2148,14 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       throw error;
     }
 
+    this.#instances.delete(previous.instanceId);
+    // A stop during the confirmed previous-UI teardown only discards this
+    // candidate; it does not invalidate the shared VM or unrelated Apps.
+    if (signal?.aborted) {
+      return await this.#failPreparedCommit(prepared, boot, abortError(signal), activation, signal);
+    }
     try {
       if (candidate.terminalError) throw candidate.terminalError;
-      this.#instances.delete(previous.instanceId);
       this.#publishCandidate(candidate);
       this.#latestActivationSequenceByApp.set(
         candidate.appId,
@@ -2025,7 +2169,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     } catch (error) {
       let rollbackError: unknown;
       try {
-        await this.#rollbackCandidateActivation(candidate, activation);
+        await this.#rollbackCandidateActivation(candidate, activation, signal);
       } catch (failure) {
         rollbackError = failure;
       }
@@ -2067,11 +2211,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     boot: BootBoundary,
     cause: unknown,
     activation?: ActivationCheckpoint,
+    signal?: AbortSignal,
   ): Promise<never> {
     const failures: unknown[] = [cause];
     if (activation) {
       try {
-        await this.#rollbackCandidateActivation(prepared.candidate, activation);
+        await this.#rollbackCandidateActivation(prepared.candidate, activation, signal);
       } catch (error) {
         failures.push(error);
       }
@@ -2079,6 +2224,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     try {
       await this.#discardCandidate(prepared.candidate, boot);
     } catch (error) {
+      this.#recordLaunchCleanupFailure(signal, error);
       failures.push(error);
       try {
         await this.#loseBoundary(error, boot);
@@ -2094,7 +2240,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     throw cause;
   }
 
-  async #abortPreparation(prepared: PreparedUiRecord, outcomeError?: Error): Promise<void> {
+  async #abortPreparation(prepared: PreparedUiRecord, outcomeError?: Error, signal?: AbortSignal): Promise<void> {
     let boot: BootBoundary;
     try {
       boot = await this.#requireCurrentBoot(prepared.candidate.bootGeneration);
@@ -2108,6 +2254,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     try {
       await this.#discardCandidate(prepared.candidate, boot);
     } catch (error) {
+      this.#recordLaunchCleanupFailure(signal, error);
       try {
         await this.#loseBoundary(error, boot);
       } finally {
@@ -2125,6 +2272,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   #completePreparation(prepared: PreparedUiRecord, outcome: PreparedUiOutcome): void {
+    if (prepared.expires) clearTimeout(prepared.expires);
+    prepared.releaseBuild?.();
+    prepared.releaseBuild = undefined;
     if (this.#preparedUi.get(prepared.preparationId) === prepared) {
       this.#preparedUi.delete(prepared.preparationId);
     }
@@ -2165,6 +2315,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     candidate: Candidate,
     packageDigest: `sha256:${string}`,
     boot: BootBoundary,
+    signal?: AbortSignal,
   ): Promise<ActivationCheckpoint> {
     if (candidate.terminalError) throw candidate.terminalError;
     const latestSequence = this.#latestActivationSequenceByApp.get(candidate.appId) ?? 0;
@@ -2176,6 +2327,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       appKey: hashAppId(candidate.appId),
       previous: await this.#artifacts.active(hashAppId(candidate.appId)),
     };
+    throwIfAborted(signal);
     try {
       await this.#artifacts.activate(checkpoint.appKey, candidate.artifact, {
         appVersion: candidate.spec.version,
@@ -2185,6 +2337,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         dependencyDigest: candidate.dependencyDigest,
       });
       candidate.activated = true;
+      throwIfAborted(signal);
       if (candidate.terminalError) throw candidate.terminalError;
       await this.#assertBoot(boot);
       return checkpoint;
@@ -2193,6 +2346,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         await this.#restoreActivation(checkpoint);
         candidate.activated = false;
       } catch (rollbackError) {
+        this.#recordLaunchCleanupFailure(signal, rollbackError);
         this.#terminalFailure ??= new CapsuleRestartRequiredError(
           "Host artifact activation could not be rolled back; runtime is quarantined",
           { cause: rollbackError },
@@ -2209,12 +2363,14 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   async #rollbackCandidateActivation(
     candidate: Candidate,
     checkpoint: ActivationCheckpoint,
+    signal?: AbortSignal,
   ): Promise<void> {
     if (!candidate.activated) return;
     try {
       await this.#restoreActivation(checkpoint);
       candidate.activated = false;
     } catch (error) {
+      this.#recordLaunchCleanupFailure(signal, error);
       this.#terminalFailure ??= new CapsuleRestartRequiredError(
         "Host artifact activation rollback failed; runtime is quarantined",
         { cause: error },
@@ -2634,6 +2790,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     boot.intentional = true;
     if (this.#boot === boot) this.#boot = undefined;
     try {
+      await boot.capacity?.close();
       await boot.helper.stopGuest();
       // Only the helper's confirmed VZ stop response authorizes reuse of
       // quarantined userns ranges. A failed stop keeps them reserved even if a
@@ -2764,13 +2921,18 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   async #withTransientStorage<T>(ownerKey: string, operation: () => Promise<T>): Promise<T> {
     if (!this.#boot && !this.#bootPromise) {
-      await this.#reconcileStateDiskResidueBeforeStorageAdmission();
+      this.#stateReconcilePromise ??= this.#reconcileStateDiskResidueBeforeStorageAdmission().catch((error) => {
+        this.#stateReconcilePromise = undefined;
+        throw error;
+      });
+      await this.#stateReconcilePromise;
     }
     const packageCache = join(this.#options.cacheDirectory, "packages", ownerKey);
-    const dependencyCache = join(this.#options.cacheDirectory, "dependencies", ownerKey);
+    // Source snapshots are transient. Verified dependency tarballs/trees stay
+    // in the bounded Host cache across launches and are removed on retirement.
+    // Clearing them here turns every cold fallback into downloads and rewrites.
     const reclaim = async () => {
       await this.#storageBudget.remove(packageCache, { recursive: true });
-      await this.#storageBudget.remove(dependencyCache, { recursive: true });
     };
     await reclaim();
     try {
@@ -2811,34 +2973,89 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     }
   }
 
+  #appLaunchQueue(appId: string): BoundedSerialQueue {
+    let queue = this.#appLaunchQueues.get(appId);
+    if (!queue) { queue = new BoundedSerialQueue(MAX_SERIAL_OPERATIONS); this.#appLaunchQueues.set(appId, queue); }
+    return queue;
+  }
+
   #withLaunch<T>(appId: string, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const controller = new AbortController();
-    let controllers = this.#launchControllers.get(appId);
-    if (!controllers) {
-      controllers = new Set();
-      this.#launchControllers.set(appId, controllers);
+    const cleanupFailures: unknown[] = [];
+    this.#launchCleanupFailures.set(controller.signal, cleanupFailures);
+    let launches = this.#launches.get(appId);
+    if (!launches) {
+      launches = new Map();
+      this.#launches.set(appId, launches);
     }
-    controllers.add(controller);
-    return operation(controller.signal).finally(() => {
-      controllers!.delete(controller);
-      if (controllers!.size === 0) this.#launchControllers.delete(appId);
+    // Publish completion before invoking work, including queued operations.
+    // The barrier includes all asynchronous finally/cleanup paths.
+    const result = Promise.resolve().then(() => operation(controller.signal)).finally(() => {
+      launches.delete(controller);
+      if (launches.size === 0) { this.#launches.delete(appId); this.#appLaunchQueues.delete(appId); }
     });
+    // The launch caller receives its original result. Stop barriers wait for
+    // the same work to finish, but inspect only explicitly recorded cleanup
+    // failures, never the launch error's identity, type or cancellation state.
+    const completion = result.then(() => cleanupFailures, () => cleanupFailures);
+    launches.set(controller, completion);
+    return result;
+  }
+
+  #recordLaunchCleanupFailure(signal: AbortSignal | undefined, error: unknown): void {
+    if (signal) this.#launchCleanupFailures.get(signal)?.push(error);
+  }
+
+  async #withLaunchCleanup<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      this.#recordLaunchCleanupFailure(signal, error);
+      throw error;
+    }
+  }
+
+  async #waitForLaunches(preparations: Promise<readonly unknown[]>[]): Promise<unknown[]> {
+    return (await Promise.all(preparations)).flat();
+  }
+
+  #stopAppWork(appId: string, reason: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this.#appStops.get(appId);
+    const preparations = [...this.#launches.get(appId)?.values() ?? []];
+    const stopping = Promise.resolve().then(async () => {
+      const failures = await this.#waitForLaunches(preparations);
+      if (previous) await previous;
+      if (failures.length > 0) throw new AggregateError(failures, "App preparation cleanup failed");
+      await this.#serial.runCritical(async () => {
+        if (this.#fatalCleanup) await this.#fatalCleanup;
+        if (this.#terminalFailure) throw this.#terminalFailure;
+        await operation();
+      });
+    }).finally(() => {
+      if (this.#appStops.get(appId) === stopping) this.#appStops.delete(appId);
+    });
+    // Fence synchronously, before cancellation callbacks or another stop can
+    // reenter. Repeated stops keep that fence through the last teardown.
+    this.#appStops.set(appId, stopping);
+    this.#abortLaunches(appId, reason);
+    return stopping;
   }
 
   #abortLaunches(appId: string, reason: string): void {
-    for (const controller of this.#launchControllers.get(appId) ?? []) {
+    for (const controller of this.#launches.get(appId)?.keys() ?? []) {
       controller.abort(new Error(reason));
     }
   }
 
   #abortAllLaunches(reason: string): void {
-    for (const appId of this.#launchControllers.keys()) this.#abortLaunches(appId, reason);
+    for (const appId of this.#launches.keys()) this.#abortLaunches(appId, reason);
   }
 
-  #assertAcceptingWork(): void {
+  #assertAcceptingWork(appId?: string): void {
     if (this.#terminalFailure) throw this.#terminalFailure;
     if (this.#stoppingAll) throw new Error("Capsule backend is stopping");
     if (this.#fatalCleanup) throw new Error("Capsule boundary recovery is still in progress");
+    if (appId !== undefined && this.#appStops.has(appId)) throw new Error("App is stopping");
   }
 }
 
@@ -3094,8 +3311,8 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
   });
 }
 
-function throwIfAborted(signal: AbortSignal): void {
-  if (signal.aborted) throw abortError(signal);
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortError(signal);
 }
 
 async function readSnapshotManifestDigest(
@@ -3247,4 +3464,28 @@ function cleanupAggregateError(
 
 function deepEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+
+/** Candidate profile calibrated against React 19 / Vite 6 fixtures. Unknown
+ * commands, native install hooks, and larger packages retain the 512 MiB grant. */
+async function selectRuntimeMemoryProfile(snapshot: CapsuleTreeSnapshot, command: readonly string[]): Promise<"lightweight" | "standard"> {
+  if (snapshot.bytes > 1024 ** 2 || command[0] !== "npm" || command[1] !== "run" || !["start", "dev"].includes(command[2] ?? "") || command.length !== 3) return "standard";
+  try {
+    const selected = await readCapsuleTreeSelection(snapshot, [
+      { path: "package.json", maxBytes: MAX_INSTALL_PACKAGE_JSON_BYTES },
+      { path: "package-lock.json", maxBytes: MAX_INSTALL_PACKAGE_LOCK_BYTES },
+      { path: "binding.gyp" },
+    ]);
+    if (selected.present.has("binding.gyp")) return "standard";
+    const pkg = JSON.parse(selected.contents.get("package.json")!.toString());
+    const lock = JSON.parse(selected.contents.get("package-lock.json")!.toString());
+    const packages = lock.packages;
+    if (!packages || Object.keys(packages).length > 180
+      || !/^6\./.test(packages["node_modules/vite"]?.version ?? "")
+      || !/^19\./.test(packages["node_modules/react"]?.version ?? "")
+      || !/^vite(?: --host(?: (?:0\.0\.0\.0|127\.0\.0\.1))?)?(?: --port [0-9]+)?(?: --strictPort)?$/.test(pkg.scripts?.[command[2]!] ?? "")
+      || ["preinstall", "install", "postinstall", "prepare", "predev", "postdev", "prestart", "poststart"].some((key) => pkg.scripts?.[key])) return "standard";
+    return "lightweight";
+  } catch { return "standard"; }
 }

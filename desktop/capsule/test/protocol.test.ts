@@ -285,8 +285,8 @@ describe("Capsule protocol validation", () => {
       mappedHostUid: 131_072,
       mappedHostGid: 196_608,
       storagePlanVersion: 1,
-      scratchBytes: 1024 * 1024 * 1024,
-      artifactOutputBytes: 256 * 1024 * 1024,
+      scratchBytes: 512 * 1024 * 1024,
+      artifactOutputBytes: 128 * 1024 * 1024,
       timeoutMs: 60_000,
       resources: {
         memoryBytes: 512 * 1024 * 1024,
@@ -383,12 +383,12 @@ describe("Capsule protocol validation", () => {
         mappedHostUid: 131_072,
         mappedHostGid: 196_608,
         storagePlanVersion: 1,
-        scratchBytes: 512 * 1024 * 1024,
+        scratchBytes: 128 * 1024 * 1024,
       },
     };
     expect(parseHostRequest(base)).toMatchObject({
       op: "app.prepare",
-      body: { storagePlanVersion: 1, scratchBytes: 512 * 1024 * 1024 },
+      body: { storagePlanVersion: 1, scratchBytes: 128 * 1024 * 1024 },
     });
     expect(() => parseHostRequest({
       ...base,

@@ -194,7 +194,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
   test.each([false, true])("post-build cache cleanup preserves the operation result (build fails: %s)", async (buildFails) => {
     const harness = createHarness();
     if (buildFails) harness.manifestDigest = CHANGED_MANIFEST_AUTHORITY;
-    harness.removeStorage.mockResolvedValueOnce(0).mockResolvedValueOnce(0)
+    harness.removeStorage.mockResolvedValueOnce(0)
       .mockRejectedValueOnce(new Error("temporary cache is unwritable"));
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -206,6 +206,17 @@ describe("MacOsCapsuleBackend orchestration", () => {
       warning.mockRestore();
       await harness.backend.stopAll();
     }
+  });
+
+  test("retains verified dependency caches across open/close and clears them on retirement", async () => {
+    const harness = createHarness();
+    const first = await harness.backend.startUi(spec("sender-a"));
+    await harness.backend.stopUi(first.instanceId);
+    await harness.backend.startUi(spec("sender-b"));
+    expect(harness.removeStorage.mock.calls.some(([path]) => String(path).includes("/dependencies/"))).toBe(false);
+    await harness.backend.retireApp("weather");
+    expect(harness.removeStorage.mock.calls.some(([path]) => String(path).includes("/dependencies/"))).toBe(true);
+    await harness.backend.stopAll();
   });
 
   test("rejects a package snapshot whose manifest changed after Core issued authority", async () => {
@@ -254,48 +265,30 @@ describe("MacOsCapsuleBackend orchestration", () => {
     ]);
   });
 
-  test("drains and reboots an idle Guest before growing its exact state capacity", async () => {
+  test("reuses the 4 GiB Guest for calibrated dependency builds and keeps the old UI usable until commit", async () => {
     const harness = createHarness();
     const first = await harness.backend.startUi(spec("sender-a"));
-    await harness.backend.stopUi(first.instanceId);
-
     harness.packageDigest = PACKAGE_B;
     harness.installWarmEligible = false;
     harness.dependencyDigest = LARGE_DEPENDENCY;
     harness.dependencyBytes = 128 * 1024 * 1024;
     harness.session.cacheBlob("dependency", LARGE_DEPENDENCY);
-
-    await harness.backend.startUi(spec("sender-b", PACKAGE_B));
-    expect(harness.vm.startCalls).toBe(2);
-    expect(harness.vm.stopCalls).toBe(1);
-    expect(harness.session.operations.filter((operation) => operation === "vm.drain"))
-      .toHaveLength(1);
-    const capacities = harness.vm.startDescriptors.map((value) => value.stateDiskBytes as number);
-    expect(capacities[0]).toBe(4 * 1024 * 1024 * 1024);
-    expect(capacities[1]).toBeGreaterThan(capacities[0]!);
-    expect(harness.storageEvents).toContain(
-      `reserve:${capacities[1]}:/private/state/capsule/state.raw`,
-    );
+    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), first.instanceId);
+    const oldViewer = await harness.backend.openUiStream(first.instanceId);
+    oldViewer.destroy();
+    await harness.backend.commitPreparedUi(prepared.preparationId);
+    expect(harness.vm.startCalls).toBe(1);
+    expect(harness.vm.stopCalls).toBe(0);
+    expect(harness.session.operations.filter((operation) => operation === "vm.drain")).toHaveLength(0);
+    expect(harness.session.buildStarts).toBe(2);
     await harness.backend.stopAll();
   });
 
-  test("rejects Guest capacity growth without disturbing a live last-known-good App", async () => {
-    const harness = createHarness();
-    const first = await harness.backend.startUi(spec("sender-a"));
-
-    harness.packageDigest = PACKAGE_B;
-    harness.installWarmEligible = false;
-    harness.dependencyDigest = LARGE_DEPENDENCY;
-    harness.dependencyBytes = 128 * 1024 * 1024;
-    harness.session.cacheBlob("dependency", LARGE_DEPENDENCY);
-
-    await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B)))
-      .rejects.toThrow("last-known-good runtime remains active");
-    expect(harness.vm.startCalls).toBe(1);
-    expect(harness.vm.stopCalls).toBe(0);
-    expect(harness.session.buildStarts).toBe(1);
-    const viewer = await harness.backend.openUiStream(first.instanceId);
-    viewer.destroy();
+  test("a heavier authenticated dependency bundle receives the larger Build profile", async () => {
+    const harness = createHarness(); harness.dependencyBytes = 191 * 1024 ** 2;
+    harness.session.cacheBlob("dependency", DEPENDENCY);
+    await harness.backend.startUi(spec("sender-heavy"));
+    expect(harness.session.buildPrepares[0]?.resources.memoryBytes).toBe(1024 ** 3);
     await harness.backend.stopAll();
   });
 
@@ -697,7 +690,9 @@ describe("MacOsCapsuleBackend orchestration", () => {
       harness.session.holdArtifactOutHostFinal = true;
 
       const opening = rejectionOf(harness.backend.startUi(spec("sender-a")));
-      await vi.advanceTimersByTimeAsync(0);
+      // Reach the held FIN before advancing its deadline. Launch preparation
+      // now crosses independent queues and may need another event-loop turn.
+      await vi.waitFor(() => expect(harness.session.artifactOutHostReceipts).toBe(1));
       await vi.advanceTimersByTimeAsync(30_001);
 
       await expect(opening).resolves.toMatchObject({
@@ -917,6 +912,278 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await harness.backend.stopAll();
   });
 
+  test("global shutdown awaits a delayed cached lookup and cannot restart the VM afterwards", async () => {
+    const h = createHarness();
+    await h.backend.startUi(spec("existing"));
+    const lookup = Promise.withResolvers<void>();
+    const active = h.store.active.bind(h.store);
+    let entered = false;
+    h.store.active = async () => {
+      const result = await active();
+      entered = true;
+      await lookup.promise;
+      return result;
+    };
+    const opening = rejectionOf(h.backend.startUi(spec("cached")));
+    await vi.waitFor(() => expect(entered).toBe(true));
+    // Include work still waiting in the same-App preparation queue.
+    const queued = rejectionOf(h.backend.startUi(spec("queued")));
+    let returned = false;
+    const stop = h.backend.stopAll();
+    expect(h.backend.stopAll()).toBe(stop);
+    const stopping = stop.then(() => { returned = true; });
+    const late = await rejectionOf(h.backend.startUi(spec("late")));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const returnedBeforeLookup = returned;
+    lookup.resolve();
+    const [error, queuedError] = await Promise.all([opening, queued, stopping]);
+    expect(late.message).toContain("backend is stopping");
+    expect(error.message).toContain("backend is stopping");
+    expect(queuedError.message).toContain("backend is stopping");
+    expect(returnedBeforeLookup).toBe(false);
+    expect(h.vm.startCalls).toBe(1);
+    expect(h.vm.stopCalls).toBe(1);
+  });
+
+  test.each([false, true])("shutdown joins an unfinished shared boot (global: %s)", async (global) => {
+    const h = createHarness();
+    const boot = Promise.withResolvers<void>();
+    const start = h.vm.startGuest.bind(h.vm);
+    h.vm.startGuest = async (descriptor) => { const result = await start(descriptor); await boot.promise; return result; };
+    const opening = rejectionOf(h.backend.startUi(spec("first")));
+    await vi.waitFor(() => expect(h.vm.startCalls).toBe(1));
+    const other = global ? undefined : h.backend.startUi({ ...spec("other"), appId: "notes" });
+    const stopping = global ? h.backend.stopAll() : h.backend.stopApp("weather");
+    boot.resolve();
+    await Promise.all([opening, stopping]);
+    if (other) {
+      const stream = await h.backend.openUiStream((await other).instanceId);
+      stream.destroy();
+      expect(h.vm.stopCalls).toBe(0);
+      await h.backend.stopAll();
+    }
+    expect(h.vm.startCalls).toBe(1);
+    expect(h.vm.stopCalls).toBe(1);
+  });
+
+  test("shutdown deadline also bounds pending lookup cleanup and retains its fence", async () => {
+    vi.useFakeTimers();
+    const h = createHarness();
+    const lookup = Promise.withResolvers<void>();
+    try {
+      await h.backend.startUi(spec("existing"));
+      const active = h.store.active.bind(h.store);
+      const entered = Promise.withResolvers<void>();
+      h.store.active = async () => { const result = await active(); entered.resolve(); await lookup.promise; return result; };
+      const opening = rejectionOf(h.backend.startUi(spec("pending")));
+      await entered.promise;
+      const stopping = h.backend.stopAll();
+      const failure = rejectionOf(stopping);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(await failure).toMatchObject({ restartRequired: true });
+      expect(h.backend.stopAll()).toBe(stopping);
+      lookup.resolve();
+      await opening;
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(h.backend.prepareUi(spec("late"))).rejects.toMatchObject({ restartRequired: true });
+      expect(h.vm.startCalls).toBe(1);
+    } finally {
+      lookup.resolve();
+      vi.useRealTimers();
+    }
+  });
+
+  test.each(["stopApp", "retireApp", "stopUi"] as const)(
+    "%s fences the App and awaits Build cancellation while another App stays responsive",
+    async (method) => {
+      const h = createHarness();
+      const current = await h.backend.startUi(spec("current"));
+      const other = await h.backend.startUi({ ...spec("other"), appId: "notes" });
+      const prepared = await h.backend.prepareUi(spec("prepared"));
+      h.packageDigest = PACKAGE_B;
+      h.session.holdBuild = true;
+      const cancel = Promise.withResolvers<void>();
+      const request = h.session.request.bind(h.session);
+      let entered = false;
+      h.session.request = async (op, body) => {
+        if (op === "build.cancel") { entered = true; await cancel.promise; }
+        return await request(op, body);
+      };
+      const opening = rejectionOf(h.backend.startUi(spec("building", PACKAGE_B)));
+      await vi.waitFor(() => expect(h.session.buildStarts).toBe(2));
+      const removalsBefore = h.storageRemovals.length;
+      let completed = 0;
+      const stop = () => method === "stopUi"
+        ? h.backend.stopUi(current.instanceId) : h.backend[method]("weather");
+      const stopping = stop().then(() => { completed += 1; });
+      const repeated = stop().then(() => { completed += 1; });
+      await vi.waitFor(() => expect(entered).toBe(true));
+      const late = rejectionOf(h.backend.prepareUi(spec("late", PACKAGE_B)));
+      const commit = rejectionOf(h.backend.commitPreparedUi(prepared.preparationId));
+      const stream = await h.backend.openUiStream(other.instanceId);
+      stream.destroy();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const beforeAcknowledgement = {
+        completed, deactivated: h.store.deactivatedKeys.length,
+        removedDependencies: h.storageRemovals.slice(removalsBefore)
+          .some((entry) => entry.path.includes("/dependencies/")),
+      };
+      cancel.resolve();
+      const [error, commitError, lateError] = await Promise.all([opening, commit, late, stopping, repeated]);
+      const vmStopsBeforeGlobalStop = h.vm.stopCalls;
+      // stopUi targets one instance; explicitly discard the other prepared UI.
+      await h.backend.abortPreparedUi(prepared.preparationId).catch(() => {});
+      await h.backend.stopAll();
+      expect(beforeAcknowledgement).toEqual({ completed: 0, deactivated: 0, removedDependencies: false });
+      expect(lateError.message).toContain("App is stopping");
+      expect(commitError.message).toContain("App is stopping");
+      expect(error.message).toMatch(/stop requested|retirement requested/);
+      expect(vmStopsBeforeGlobalStop).toBe(0);
+      expect(completed).toBe(2);
+    },
+  );
+
+  test.each(["stopApp", "retireApp", "stopUi", "stopAll"] as const)(
+    "%s continues teardown after an ordinary launch or commit failure with successful cleanup",
+    async (method) => {
+      for (const phase of ["preparation", "commit"] as const) {
+        const h = createHarness();
+        const current = await h.backend.startUi(spec("existing"));
+        const prepared = phase === "commit" ? await h.backend.prepareUi(spec("candidate")) : undefined;
+        const lookup = Promise.withResolvers<void>();
+        const entered = Promise.withResolvers<void>();
+        const active = h.store.active.bind(h.store);
+        // AggregateError is also a valid primary failure; its shape must not
+        // be used to infer whether Guest cleanup succeeded.
+        const lookupError = new AggregateError([new Error("cache unavailable")], "ordinary artifact lookup failure");
+        h.store.active = async () => { entered.resolve(); await lookup.promise; throw lookupError; };
+        const opening = rejectionOf(prepared
+          ? h.backend.commitPreparedUi(prepared.preparationId)
+          : h.backend.startUi(spec("pending")));
+        await entered.promise;
+        const stopping = method === "stopAll" ? h.backend.stopAll()
+          : h.backend[method](method === "stopUi" ? current.instanceId : "weather");
+        const stopResult = stopping.then(() => undefined, (error: unknown) => error);
+        lookup.resolve();
+        const [launchError, stopError] = await Promise.all([opening, stopResult]);
+        h.store.active = active;
+        try {
+          expect(launchError).toBe(lookupError);
+          expect(stopError).toBeUndefined();
+          await expect(h.backend.openUiStream(current.instanceId)).rejects.toThrow("no longer active");
+          expect(h.vm.stopCalls).toBe(method === "stopAll" ? 1 : 0);
+          // A successful stop must admit subsequent work without Host restart.
+          const next = await h.backend.startUi(spec("next"));
+          const stream = await h.backend.openUiStream(next.instanceId);
+          stream.destroy();
+          expect(h.vm.startCalls).toBe(method === "stopAll" ? 2 : 1);
+        } finally {
+          await h.backend.stopAll().catch(() => {});
+        }
+      }
+    },
+  );
+
+  test.each(["stopApp", "stopAll"] as const)(
+    "%s still fails when an ordinary commit failure is followed by failed candidate cleanup",
+    async (method) => {
+      const h = createHarness();
+      await h.backend.startUi(spec("existing"));
+      const prepared = await h.backend.prepareUi(spec("candidate"));
+      const lookup = Promise.withResolvers<void>();
+      const entered = Promise.withResolvers<void>();
+      h.store.active = async () => { entered.resolve(); await lookup.promise; throw new Error("lookup failed"); };
+      const committing = rejectionOf(h.backend.commitPreparedUi(prepared.preparationId));
+      await entered.promise;
+      const stopping = method === "stopAll" ? h.backend.stopAll() : h.backend.stopApp("weather");
+      const stopFailure = rejectionOf(stopping);
+      h.session.failAppStop = true;
+      lookup.resolve();
+      const [commitError, stopError] = await Promise.all([committing, stopFailure]);
+      expect(commitError.message).toContain("cleanup failed");
+      expect(stopError.message).toContain("preparation cleanup");
+      const cleanupError = method === "stopAll" ? stopError.cause : stopError;
+      expect(cleanupError).toBeInstanceOf(AggregateError);
+      expect((cleanupError as AggregateError).errors).toEqual([
+        expect.objectContaining({ message: "teardown failed" }),
+      ]);
+      expect(h.vm.stopCalls).toBe(1);
+      if (method === "stopAll") expect(h.backend.stopAll()).toBe(stopping);
+      else await h.backend.stopAll();
+    },
+  );
+
+  test.each(["stopApp", "retireApp", "stopUi", "stopAll"] as const)(
+    "%s reports preparation cleanup failure instead of treating settlement as success",
+    async (method) => {
+      const h = createHarness();
+      const current = await h.backend.startUi(spec("existing"));
+      h.packageDigest = PACKAGE_B;
+      h.session.holdBuild = true;
+      const request = h.session.request.bind(h.session);
+      h.session.request = async (op, body) => {
+        const result = await request(op, body);
+        if (op === "build.cancel") throw new Error("cancel acknowledgement lost");
+        return result;
+      };
+      const opening = rejectionOf(h.backend.startUi(spec("building", PACKAGE_B)));
+      await vi.waitFor(() => expect(h.session.buildStarts).toBe(2));
+      const stopping = method === "stopAll" ? h.backend.stopAll()
+        : h.backend[method](method === "stopUi" ? current.instanceId : "weather");
+      const [launchError, stopError] = await Promise.all([opening, rejectionOf(stopping)]);
+      expect(launchError.message).toContain("Build cleanup");
+      expect(stopError.message).toContain("preparation cleanup");
+      expect(h.store.deactivatedKeys).toEqual([]);
+      expect(h.storageRemovals.some((entry) => entry.path.includes("/dependencies/"))).toBe(false);
+      expect(h.vm.stopCalls).toBe(1);
+      if (method === "stopAll") expect(h.backend.stopAll()).toBe(stopping);
+      else await h.backend.stopAll();
+    },
+  );
+
+  test.each(["lookup", "activation", "previous stop"] as const)(
+    "App stop fences an in-flight replacement commit during %s without losing another App",
+    async (phase) => {
+      const h = createHarness();
+      const current = await h.backend.startUi(spec("current"));
+      const other = await h.backend.startUi({ ...spec("other"), appId: "notes" });
+      h.packageDigest = PACKAGE_B;
+      const prepared = await h.backend.prepareUi(spec("replacement", PACKAGE_B), current.instanceId);
+      const barrier = Promise.withResolvers<void>();
+      let entered = false;
+      const pause = async () => { if (!entered) { entered = true; await barrier.promise; } };
+      if (phase === "lookup") {
+        const active = h.store.active.bind(h.store);
+        h.store.active = async () => { const result = await active(); await pause(); return result; };
+      } else if (phase === "activation") {
+        const activate = h.store.activate.bind(h.store);
+        h.store.activate = async (...args) => { await activate(...args); await pause(); };
+      } else {
+        const request = h.session.request.bind(h.session);
+        h.session.request = async (op, body) => {
+          const result = await request(op, body);
+          if (op === "app.stop") await pause();
+          return result;
+        };
+      }
+      const committing = rejectionOf(h.backend.commitPreparedUi(prepared.preparationId));
+      await vi.waitFor(() => expect(entered).toBe(true));
+      let returned = false;
+      const stopping = h.backend.stopApp("weather").then(() => { returned = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const returnedBeforeCommit = returned;
+      barrier.resolve();
+      const [error] = await Promise.all([committing, stopping]);
+      const stream = await h.backend.openUiStream(other.instanceId);
+      stream.destroy();
+      expect(returnedBeforeCommit).toBe(false);
+      expect(error.message).toContain("stop requested");
+      expect(h.store.activation?.packageDigest).toBe(PACKAGE_A);
+      expect(h.vm.stopCalls).toBe(0);
+      await h.backend.stopAll();
+    },
+  );
+
   test("cancels an in-flight build before a queued App stop", async () => {
     const harness = createHarness();
     harness.session.holdBuild = true;
@@ -928,6 +1195,23 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await stop;
     expect(harness.session.operations).toContain("build.cancel");
     expect(harness.store.activation).toBeUndefined();
+    await harness.backend.stopAll();
+  });
+
+  test("a different App's long Build leaves existing viewer traffic and cancellation responsive", async () => {
+    const harness = createHarness();
+    const existing = await harness.backend.startUi(spec("sender-existing"));
+    harness.packageDigest = PACKAGE_B;
+    harness.session.holdBuild = true;
+    const other = harness.backend.startUi({ ...spec("sender-other", PACKAGE_B), appId: "notes", packageDir: "/workspace/apps/notes" });
+    const rejected = expect(other).rejects.toThrow(/stop requested|cancelled/);
+    await vi.waitFor(() => expect(harness.session.buildStarts).toBe(2));
+    const viewer = await harness.backend.openUiStream(existing.instanceId);
+    expect(viewer.destroyed).toBe(false); viewer.destroy();
+    await harness.backend.stopApp("notes"); await rejected;
+    const retained = await harness.backend.openUiStream(existing.instanceId);
+    retained.destroy();
+    expect(harness.vm.startCalls).toBe(1);
     await harness.backend.stopAll();
   });
 
@@ -2479,6 +2763,7 @@ function guestRelease(): LoadedCapsuleGuestRelease {
         "artifact-erofs-v1",
         "build-v1",
         "oci-policy-v1",
+        "resource-management-v1",
         "sdk-uds-v1",
         "tickets-v1",
         "vsock-record-v2",

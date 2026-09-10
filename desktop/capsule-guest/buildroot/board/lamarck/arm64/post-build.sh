@@ -19,6 +19,12 @@ compiler="$(find "$HOST_DIR/bin" -maxdepth 1 \( -type f -o -type l \) -name 'aar
 "$compiler" -O2 -pipe -std=c11 -Wall -Wextra -Werror \
 	-o "$target/usr/libexec/lamarck-net-helper" "$guest/native/net-helper.c"
 
+"$compiler" -O2 -pipe -std=c11 -Wall -Wextra -Werror \
+	-o "$target/usr/libexec/lamarck-build-worker" "$guest/native/build-worker.c"
+
+"$compiler" -O2 -pipe -std=c11 -Wall -Wextra -Werror \
+	-o "$target/usr/libexec/lamarck-grow-state" "$guest/native/grow-state.c"
+
 make_oci_root() {
 	root="$1"
 	rm -rf "$root"

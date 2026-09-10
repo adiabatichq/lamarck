@@ -43,7 +43,7 @@ import Virtualization
     let bootLoader = try #require(configuration.bootLoader as? VZLinuxBootLoader)
     #expect(bootLoader.kernelURL == image.kernelURL)
     #expect(bootLoader.initialRamdiskURL == image.initialRamdiskURL)
-    #expect(bootLoader.commandLine == CapsuleVmConfigurationBuilder.kernelCommandLine(for: image))
+    #expect(bootLoader.commandLine == CapsuleVmConfigurationBuilder.kernelCommandLine(for: image) + " lamarck.state_bytes=4294967296")
     #expect(bootLoader.commandLine.contains("lamarck.image_digest=\(image.imageDigest)"))
     #expect(bootLoader.commandLine.contains("lamarck.state_device=/dev/vdb"))
     #expect(bootLoader.commandLine.contains("lamarck.state_label=LAMARCK_STATE"))

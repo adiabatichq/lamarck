@@ -268,7 +268,7 @@ describe("artifact mount ownership", () => {
         mappedHostUid: 100_000,
         mappedHostGid: 200_000,
         storagePlanVersion: 1,
-        scratchBytes: 512 * 1024 * 1024,
+        scratchBytes: 128 * 1024 * 1024,
       })).rejects.toThrow(/injected Runtime volume creation failure/);
       expect(runtimePresentAtRelease).toBe(false);
       expect(registry.snapshot()).toEqual({ mounts: 0, references: 0 });

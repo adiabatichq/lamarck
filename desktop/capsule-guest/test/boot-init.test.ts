@@ -19,7 +19,7 @@ describe("read-only Guest boot contract", () => {
     expect(init.indexOf("[ -d /var/lib/lamarck ]")).toBeLessThan(
       init.indexOf("mount -t ext4"),
     );
-    expect(init).toContain("mkfs.ext4 -F -m 0 -E nodiscard");
+    expect(init).toContain("mkfs.ext4 -F -m 0 -b 4096 -E nodiscard");
     expect(init).toContain("rw,nodev,nosuid,noatime,nodiscard");
     expect(init).not.toMatch(/\bfstrim\b/);
   });

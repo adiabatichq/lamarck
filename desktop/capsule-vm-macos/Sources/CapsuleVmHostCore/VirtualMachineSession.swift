@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @preconcurrency import Virtualization
 
@@ -152,7 +153,13 @@ private struct CapsuleVmPendingStatePreparation: @unchecked Sendable {
     let preparation: CapsuleVmStateDiskPreparation
 }
 
+public enum CapsuleVmCapacityOperation: String, Sendable {
+    case setMemory, growState, acknowledgeState
+}
+public typealias CapsuleVmCapacityCompletion = @Sendable (Result<UInt64, Error>) -> Void
+
 public protocol CapsuleVmSessionControlling: AnyObject, Sendable {
+    func manageCapacity(operation: CapsuleVmCapacityOperation, bytes: UInt64, completion: @escaping CapsuleVmCapacityCompletion)
     func currentState() -> CapsuleVmLifecycleState
     func prepareState(
         descriptor: CapsuleVmStatePreparationDescriptor,
@@ -170,6 +177,12 @@ public protocol CapsuleVmSessionControlling: AnyObject, Sendable {
     func acceptHostStreamFrame(_ frame: CapsuleVmFrame) throws
 }
 
+public extension CapsuleVmSessionControlling {
+    func manageCapacity(operation: CapsuleVmCapacityOperation, bytes: UInt64, completion: @escaping CapsuleVmCapacityCompletion) {
+        completion(.failure(CapsuleVmLifecycleError.sessionUnavailable))
+    }
+}
+
 public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionControlling,
     VZVirtualMachineDelegate, @unchecked Sendable {
 
@@ -182,6 +195,8 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
 
     private var lifecycle = CapsuleVmLifecycle()
     private var bootGeneration: UInt64 = 0
+    private let capacityQueue = DispatchQueue(label: "app.lamarck.capsule-vm.capacity", qos: .utility)
+    private var bootMemoryCeiling: UInt64 = 0
     private var virtualMachine: VZVirtualMachine?
     private var multiplexer: CapsuleVmVsockMultiplexer?
     private var consoleRelay: CapsuleVmConsoleRelay?
@@ -217,6 +232,42 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
 
     public func currentState() -> CapsuleVmLifecycleState {
         vmQueue.sync { lifecycle.state }
+    }
+
+    public func manageCapacity(operation: CapsuleVmCapacityOperation, bytes: UInt64, completion: @escaping CapsuleVmCapacityCompletion) {
+        vmQueue.async { [self] in
+            guard lifecycle.state == .running, let vm = virtualMachine else {
+                completion(.failure(CapsuleVmLifecycleError.sessionUnavailable)); return
+            }
+            if operation == .setMemory {
+                guard bytes >= 512 * 1024 * 1024, bytes <= bootMemoryCeiling,
+                      bytes.isMultiple(of: 1024 * 1024),
+                      let balloon = vm.memoryBalloonDevices.first as? VZVirtioTraditionalMemoryBalloonDevice else {
+                    completion(.failure(CapsuleVmLifecycleError.sessionUnavailable)); return
+                }
+                // A pressure warning denies new supply; existing Apps retain G.
+                var pressure: Int32 = 0
+                var size = MemoryLayout<Int32>.size
+                if bytes > balloon.targetVirtualMachineMemorySize,
+                   sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &size, nil, 0) == 0,
+                   pressure > 1 {
+                    completion(.failure(CapsuleVmCommandError(code: "host_memory_pressure", message: "Host memory is under pressure"))); return
+                }
+                balloon.targetVirtualMachineMemorySize = bytes
+                // This acknowledges the command only. The Host must separately
+                // verify Guest usable capacity before committing admission.
+                completion(.success(bytes)); return
+            }
+            guard let lease = stateDiskLeaseHolder.currentLease() else {
+                completion(.failure(CapsuleVmLifecycleError.sessionUnavailable)); return
+            }
+            capacityQueue.async {
+                do {
+                    if operation == .growState { completion(.success(try lease.growBacking(to: bytes))) }
+                    else { try lease.acknowledgeGrowth(to: bytes); completion(.success(bytes)) }
+                } catch { completion(.failure(error)) }
+            }
+        }
     }
 
     public func prepareState(
@@ -614,6 +665,7 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
                 }
                 return
             }
+            bootMemoryCeiling = configuration.memorySize
             let machine = VZVirtualMachine(configuration: configuration, queue: vmQueue)
             machine.delegate = self
             guard let socketDevice = machine.socketDevices.first as? VZVirtioSocketDevice,

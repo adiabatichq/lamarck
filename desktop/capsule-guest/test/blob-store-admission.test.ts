@@ -14,6 +14,22 @@ afterEach(async () => {
 });
 
 describe("CAS disk admission", () => {
+  test("transfers prepared output capacity into CAS without double admission or an unreserved gap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lamarck-cas-transfer-")); roots.push(root);
+    const admission = new GuestResourceAdmission({ diskBudgetBytes: 100, memoryBudgetBytes: 1 });
+    const build = await admission.reserve("build", { diskBytes: 100 });
+    const blobs = new GuestBlobStore(join(root, "cas"), { admission });
+    const source = join(root, "artifact.erofs"); await writeFile(source, "abc", { mode: 0o400 });
+    await blobs.importLocalFile("artifact", source, { ownerKey: OWNER_A, referenceId: "build:output", diskSource: build });
+    expect(build.diskBytes).toBe(97);
+    expect(admission.snapshot().reservedDiskBytes).toBe(100);
+    await expect(admission.reserve("racer", { diskBytes: 1 })).rejects.toThrow(/disk admission denied/);
+    build.release();
+    expect(admission.snapshot()).toMatchObject({ reservedDiskBytes: 3, reservations: 1 });
+    expect(() => build.transferDisk!("retired", 1)).toThrow(/closing/);
+    await blobs.release("build:output");
+    expect(admission.snapshot()).toMatchObject({ reservedDiskBytes: 0, reservations: 0 });
+  });
   test("rejects a local sealed output above its plan ceiling before CAS admission", async () => {
     const root = await mkdtemp(join(tmpdir(), "lamarck-cas-local-ceiling-"));
     roots.push(root);

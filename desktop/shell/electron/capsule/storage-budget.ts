@@ -75,6 +75,7 @@ export interface CapsuleStorageBudgetLike {
     path: string;
     bytes: number;
   }): Promise<CapsuleStorageFileReservation>;
+  reserveStateGrowth?(path: string, targetBytes: number): Promise<{ settle(): Promise<void> }>;
   reserveStateDisk(options: {
     owner: "host";
     path: string;
@@ -372,7 +373,7 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
       }
       this.#replaceFileChargeLocked(
         path,
-        actual ? { bytes: existingPhysicalBytes, owners: new Set([owner]) } : undefined,
+        actual ? { bytes: Math.max(existingPhysicalBytes, await stateCommitment(path)), owners: new Set([owner]) } : undefined,
       );
       if (additionalPhysicalBytes > 0) {
         reservationId = await this.#admitReservationLocked(
@@ -397,12 +398,12 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
         if (settled) return;
         await requireNoCreatingResidue();
         const actual = await safeRegularFileUsage(path);
-        if (!actual || actual.logicalBytes !== stateDiskBytes) {
+        if (!actual || actual.logicalBytes !== stateDiskBytes && actual.logicalBytes !== 64 * GIBIBYTE) {
           throw new CapsuleStorageAdmissionError(
             "VM helper did not publish the admitted state disk",
           );
         }
-        if (actual.physicalBytes < stateDiskBytes
+        if ((actual.logicalBytes !== 64 * GIBIBYTE && actual.physicalBytes < stateDiskBytes)
           || actual.physicalBytes > peakPhysicalBytes) {
           throw new CapsuleStorageAdmissionError(
             "VM helper state disk is not fully allocated within its admitted physical peak",
@@ -411,7 +412,7 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
         await this.#settleStateDiskReservation(
           reservationId,
           path,
-          { bytes: actual.physicalBytes, owners: new Set([owner]) },
+          { bytes: Math.max(actual.physicalBytes, await stateCommitment(path)), owners: new Set([owner]) },
         );
         settled = true;
       },
@@ -419,7 +420,7 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
         if (settled) return;
         await requireNoCreatingResidue();
         const actual = await safeRegularFileUsage(path);
-        if (actual && actual.logicalBytes !== stateDiskBytes
+        if (actual && actual.logicalBytes !== stateDiskBytes && actual.logicalBytes !== 64 * GIBIBYTE
           && actual.physicalBytes !== existingPhysicalBytes) {
           throw new CapsuleStorageAdmissionError(
             "Failed VM start left an unexpected state disk",
@@ -434,7 +435,7 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
           reservationId,
           path,
           actual
-            ? { bytes: actual.physicalBytes, owners: new Set([owner]) }
+            ? { bytes: Math.max(actual.physicalBytes, await stateCommitment(path)), owners: new Set([owner]) }
             : undefined,
         );
         settled = true;
@@ -451,11 +452,33 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
         await this.#settleStateDiskReservation(
           reservationId,
           path,
-          actual ? { bytes: existingPhysicalBytes, owners: new Set([owner]) } : undefined,
+          actual ? { bytes: Math.max(existingPhysicalBytes, await stateCommitment(path)), owners: new Set([owner]) } : undefined,
         );
         settled = true;
       },
     });
+  }
+
+  async reserveStateGrowth(pathValue: string, targetBytes: number): Promise<{ settle(): Promise<void> }> {
+    const path = await this.#canonicalManagedFilePath(pathValue);
+    positiveBytes(targetBytes, "state growth");
+    let reservationId: number | undefined;
+    await this.#locked(async () => {
+      const roots = await this.#prepare();
+      const prior = Math.max(this.#files.get(path)?.bytes ?? 0, await stateCommitment(path));
+      this.#replaceFileChargeLocked(path, { bytes: prior, owners: new Set(["host"]) });
+      if (targetBytes > prior) reservationId = await this.#admitReservationLocked("host", "vm-state", targetBytes - prior, roots[0]!);
+    });
+    let settled = false;
+    return { settle: async () => {
+      if (settled) return;
+      const actual = await safeRegularFileUsage(path);
+      if (!actual) throw new CapsuleStorageAdmissionError("Active state disk disappeared");
+      await this.#settleStateDiskReservation(reservationId, path, {
+        bytes: Math.max(actual.physicalBytes, await stateCommitment(path)), owners: new Set(["host"]),
+      });
+      settled = true;
+    } };
   }
 
   async reconcileStateDisk(options: {
@@ -489,7 +512,7 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
       }
       this.#replaceFileChargeLocked(
         path,
-        actual ? { bytes: existingPhysicalBytes, owners: new Set([owner]) } : undefined,
+        actual ? { bytes: Math.max(existingPhysicalBytes, await stateCommitment(path)), owners: new Set([owner]) } : undefined,
       );
     });
   }
@@ -676,7 +699,9 @@ export class CapsuleStorageBudget implements CapsuleStorageBudgetLike {
           `Capsule managed storage contains an unsupported entry: ${path}`,
         );
       }
-      const bytes = Number(details.size);
+      const bytes = entry.name === "state.raw"
+        ? Math.max(Number(details.blocks) * 512, await stateCommitment(path))
+        : Number(details.size);
       nonnegativeBytes(bytes, "managed file bytes");
       if (this.#usedBytes + bytes > Number.MAX_SAFE_INTEGER) {
         throw new CapsuleStorageAdmissionError("Capsule managed storage usage is too large");
@@ -836,4 +861,22 @@ function isSameOrDescendant(root: string, candidate: string): boolean {
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error && error.code === code;
+}
+
+
+/** The helper's durable high-water survives sparse holes and Host restarts. */
+async function stateCommitment(path: string): Promise<number> {
+  let file;
+  try { file = await open(`${path}.capacity`, constants.O_RDONLY | constants.O_NOFOLLOW); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0; throw error; }
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || stat.nlink !== 1 || stat.size < 1 || stat.size > 1024) throw new CapsuleStorageAdmissionError("Invalid state capacity record");
+    const value = JSON.parse(await file.readFile("utf8"));
+    if (value.schemaVersion !== 1 || !Number.isSafeInteger(value.backedBytes) || !Number.isSafeInteger(value.intentBytes)
+      || value.backedBytes < 4 * GIBIBYTE || value.intentBytes < value.backedBytes || value.intentBytes > 64 * GIBIBYTE) {
+      throw new CapsuleStorageAdmissionError("Invalid state high-water commitment");
+    }
+    return value.intentBytes;
+  } finally { await file.close(); }
 }

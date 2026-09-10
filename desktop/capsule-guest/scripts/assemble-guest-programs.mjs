@@ -10,6 +10,7 @@ import { validateJavaScriptBuilderOutput } from "./js-builder-inventory.mjs";
 import { copyTreeNoLinks, sha256File } from "./release-contract.mjs";
 
 export const GUEST_PROGRAM_FILES = Object.freeze([
+  ["build-phase-worker.js", "/usr/libexec/lamarck-build-phase-worker.js"],
   ["supervisor.js", "/usr/libexec/lamarck-supervisor.js"],
   ["offline-npm.js", "/usr/libexec/lamarck-offline-npm"],
   ["offline-npm.js", "/opt/lamarck/rootfs/build-node24/usr/libexec/lamarck-offline-npm"],

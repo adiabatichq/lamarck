@@ -1,235 +1,245 @@
 import { readFile, statfs } from "node:fs/promises";
 import { CAPSULE_GUEST_FILESYSTEM_RESERVE_BYTES } from "@lamarck/capsule";
 
-const MEBIBYTE = 1024 * 1024;
-const MINIMUM_MEMORY_RESERVE_BYTES = 256 * MEBIBYTE;
+const MiB = 1024 * 1024;
+export const GUEST_MANAGEMENT_MEMORY_BYTES = 384 * MiB;
+export const SHARED_BUILD_MEMORY_BYTES = 512 * MiB;
 
 export interface GuestResourceRequest {
   readonly diskBytes?: number;
   readonly memoryBytes?: number;
+  readonly kind?: "build" | "runtime";
+  /** A Host-owned reservation for the complete Build -> Runtime transition. */
+  readonly launchKey?: string;
 }
-
 export interface GuestResourceLease {
   readonly key: string;
   readonly diskBytes: number;
   readonly memoryBytes: number;
+  /** Move held disk capacity to a durable output without releasing it first. */
+  transferDisk?(key: string, bytes: number): GuestResourceLease;
+  /** Reserve before writing memory.max; apply must READ BACK the effective limit. */
+  growMemory?(bytes: number, apply: () => Promise<number>): Promise<void>;
   release(): void;
 }
-
 export interface GuestResourceAdmissionLike {
   reserve(key: string, request: GuestResourceRequest): Promise<GuestResourceLease>;
 }
-
 export interface GuestResourceAdmissionSnapshot {
   readonly diskBudgetBytes: number;
   readonly memoryBudgetBytes: number;
+  readonly memoryCeilingBytes: number;
+  readonly sharedBuildMemoryBytes: number;
   readonly reservedDiskBytes: number;
   readonly reservedMemoryBytes: number;
+  readonly runtimeMemoryBytes: number;
   readonly reservations: number;
 }
-
 export class GuestResourceAdmissionError extends Error {
   readonly code = "CAPSULE_RESOURCE_EXHAUSTED";
-
-  constructor(message: string) {
-    super(message);
-    this.name = "GuestResourceAdmissionError";
-  }
+  constructor(message: string) { super(message); this.name = "GuestResourceAdmissionError"; }
 }
-
+export class GuestMemoryContainmentError extends Error {
+  readonly fatalGuest = true;
+}
 interface Reservation {
-  readonly diskBytes: number;
-  readonly memoryBytes: number;
+  diskBytes: number;
+  memoryBytes: number;
+  kind?: "build" | "runtime";
+  launchKey?: string;
+  futureRuntime: number;
+  busy: boolean;
+  releaseRequested: boolean;
 }
 
-/**
- * One Guest-wide reservation ledger for every bounded App, Build, workload,
- * and newly persisted CAS object. The budgets are derived once after stale
- * scratch recovery, so sparse volumes cannot collectively promise more than
- * the shared VM can actually supply.
+/** One ledger of kernel grants, future handoffs, and bounded disk commitments.
+ * Every mutation before an await is a short transaction on the Guest event loop.
+ * Sequential phases borrow the same launch grant; existing Runtimes stay separate.
  */
 export class GuestResourceAdmission implements GuestResourceAdmissionLike {
-  readonly #diskBudgetBytes: number;
-  readonly #memoryBudgetBytes: number;
+  #diskBudgetBytes: number;
+  #memoryBudgetBytes: number;
+  readonly #memoryCeilingBytes: number;
+  readonly #sharedBuildMemoryBytes: number;
   readonly #reservations = new Map<string, Reservation>();
-  #reservedDiskBytes = 0;
-  #reservedMemoryBytes = 0;
-  #tail: Promise<void> = Promise.resolve();
 
-  constructor(options: {
-    diskBudgetBytes: number;
-    memoryBudgetBytes: number;
-  }) {
-    this.#diskBudgetBytes = boundedCapacity(options.diskBudgetBytes, "diskBudgetBytes");
-    this.#memoryBudgetBytes = boundedCapacity(options.memoryBudgetBytes, "memoryBudgetBytes");
+  constructor(options: { diskBudgetBytes: number; memoryBudgetBytes: number; sharedBuildMemoryBytes?: number }) {
+    this.#diskBudgetBytes = positive(options.diskBudgetBytes, "diskBudgetBytes");
+    this.#memoryBudgetBytes = positive(options.memoryBudgetBytes, "memoryBudgetBytes");
+    this.#memoryCeilingBytes = this.#memoryBudgetBytes;
+    this.#sharedBuildMemoryBytes = nonnegative(options.sharedBuildMemoryBytes ?? 0, "sharedBuildMemoryBytes");
   }
 
   static async fromSystem(options: {
-    stateRoot: string;
-    meminfoPath?: string;
-    diskReserveBytes?: number;
-    memoryReserveBytes?: number;
+    stateRoot: string; meminfoPath?: string; diskReserveBytes?: number; memoryReserveBytes?: number;
   }): Promise<GuestResourceAdmission> {
     const filesystem = await statfs(options.stateRoot, { bigint: true });
-    const availableDiskBytes = safeBigIntBytes(
-      filesystem.bavail * filesystem.bsize,
-      "available Guest state disk",
-    );
-    const totalMemoryBytes = parseMemTotalBytes(
-      await readFile(options.meminfoPath ?? "/proc/meminfo", "utf8"),
-    );
-    const diskReserveBytes = boundedReserve(
-      options.diskReserveBytes ?? CAPSULE_GUEST_FILESYSTEM_RESERVE_BYTES,
-      "diskReserveBytes",
-    );
-    const memoryReserveBytes = boundedReserve(
-      options.memoryReserveBytes
-        ?? Math.max(MINIMUM_MEMORY_RESERVE_BYTES, Math.floor(totalMemoryBytes / 4)),
-      "memoryReserveBytes",
-    );
-    if (availableDiskBytes <= diskReserveBytes) {
-      throw new GuestResourceAdmissionError(
-        "Guest state disk does not have enough free space to preserve its safety reserve",
-      );
-    }
-    if (totalMemoryBytes <= memoryReserveBytes) {
-      throw new GuestResourceAdmissionError(
-        "Guest memory does not have enough capacity to preserve its supervisor reserve",
-      );
-    }
+    const disk = Number(filesystem.bavail * filesystem.bsize);
+    const total = parseGuestMemory(await readFile(options.meminfoPath ?? "/proc/meminfo", "utf8")).totalBytes;
     return new GuestResourceAdmission({
-      diskBudgetBytes: availableDiskBytes - diskReserveBytes,
-      memoryBudgetBytes: totalMemoryBytes - memoryReserveBytes,
+      diskBudgetBytes: positive(disk - (options.diskReserveBytes ?? CAPSULE_GUEST_FILESYSTEM_RESERVE_BYTES), "Guest disk after safety reserve"),
+      memoryBudgetBytes: positive(total - (options.memoryReserveBytes ?? GUEST_MANAGEMENT_MEMORY_BYTES), "Guest memory after management reserve"),
+      sharedBuildMemoryBytes: SHARED_BUILD_MEMORY_BYTES,
     });
   }
 
-  async reserve(keyValue: string, request: GuestResourceRequest): Promise<GuestResourceLease> {
-    const key = validateReservationKey(keyValue);
-    const diskBytes = boundedRequest(request.diskBytes ?? 0, "diskBytes");
-    const memoryBytes = boundedRequest(request.memoryBytes ?? 0, "memoryBytes");
-    if (diskBytes === 0 && memoryBytes === 0) {
-      throw new Error("Guest resource reservation must request disk or memory");
-    }
+  reserveLaunch(key: string, runtimeBytes: number, buildBytes: number): GuestResourceLease {
+    positive(runtimeBytes, "Runtime grant"); nonnegative(buildBytes, "Build grant");
+    return this.#reserve(key, { memoryBytes: Math.max(runtimeBytes, buildBytes) }, runtimeBytes);
+  }
 
-    let releaseGate!: () => void;
-    const prior = this.#tail;
-    this.#tail = new Promise<void>((resolve) => {
-      releaseGate = resolve;
-    });
-    await prior;
-    try {
-      if (this.#reservations.has(key)) {
-        throw new Error(`Guest resource reservation already exists: ${key}`);
-      }
-      if (this.#reservedDiskBytes + diskBytes > this.#diskBudgetBytes) {
-        throw new GuestResourceAdmissionError(
-          `Guest state disk admission denied ${key}: ${diskBytes} bytes exceed the remaining shared budget`,
-        );
-      }
-      if (this.#reservedMemoryBytes + memoryBytes > this.#memoryBudgetBytes) {
-        throw new GuestResourceAdmissionError(
-          `Guest memory admission denied ${key}: ${memoryBytes} bytes exceed the remaining shared budget`,
-        );
-      }
-      this.#reservations.set(key, { diskBytes, memoryBytes });
-      this.#reservedDiskBytes += diskBytes;
-      this.#reservedMemoryBytes += memoryBytes;
-    } finally {
-      releaseGate();
-    }
+  releaseLaunch(key: string): void {
+    const record = this.#reservations.get(key);
+    if (!record) return; // Lost acknowledgement is safe to retry.
+    if (record.kind || record.launchKey) throw new Error("Not a launch reservation");
+    this.#release(key, record);
+  }
 
-    let released = false;
+  async reserve(key: string, request: GuestResourceRequest): Promise<GuestResourceLease> {
+    return this.#reserve(key, request, 0);
+  }
+
+  #reserve(key: string, request: GuestResourceRequest, futureRuntime: number): GuestResourceLease {
+    validateKey(key);
+    if (this.#reservations.has(key)) throw new Error(`Guest resource reservation already exists: ${key}`);
+    const memoryBytes = nonnegative(request.memoryBytes ?? 0, "memoryBytes");
+    const diskBytes = nonnegative(request.diskBytes ?? 0, "diskBytes");
+    if (!memoryBytes && !diskBytes) throw new Error("Guest resource reservation must request disk or memory");
+    const parent = request.launchKey ? this.#reservations.get(request.launchKey) : undefined;
+    if (request.launchKey && (!parent || parent.releaseRequested || parent.kind || parent.memoryBytes < memoryBytes)) {
+      throw new GuestResourceAdmissionError("Launch grant is missing or insufficient for its next phase");
+    }
+    const runtime = request.kind === "runtime" ? memoryBytes : futureRuntime;
+    const transferredFuture = parent && request.kind === "runtime" ? Math.min(parent.futureRuntime, memoryBytes) : 0;
+    this.#check(diskBytes, parent ? 0 : memoryBytes, runtime - transferredFuture);
+    if (parent) { parent.memoryBytes -= memoryBytes; parent.futureRuntime -= transferredFuture; }
+    const record: Reservation = { diskBytes, memoryBytes, kind: request.kind, launchKey: request.launchKey,
+      futureRuntime, busy: false, releaseRequested: false };
+    this.#reservations.set(key, record);
+    return this.#lease(key, record);
+  }
+
+  #lease(key: string, record: Reservation): GuestResourceLease {
     return Object.freeze({
-      key,
-      diskBytes,
-      memoryBytes,
-      release: () => {
-        if (released) return;
-        const reservation = this.#reservations.get(key);
-        if (!reservation) {
-          throw new Error(`Guest resource reservation disappeared: ${key}`);
-        }
-        released = true;
-        this.#reservations.delete(key);
-        this.#reservedDiskBytes -= reservation.diskBytes;
-        this.#reservedMemoryBytes -= reservation.memoryBytes;
+      key, get diskBytes() { return record.diskBytes; }, get memoryBytes() { return record.memoryBytes; },
+      transferDisk: (targetKey: string, bytes: number) => {
+        validateKey(targetKey); positive(bytes, "disk transfer");
+        if (record.releaseRequested || this.#reservations.get(key) !== record || record.busy) throw new Error("Reservation is closing or changing");
+        if (this.#reservations.has(targetKey) || bytes > record.diskBytes) throw new Error("Invalid disk reservation transfer");
+        const target: Reservation = { diskBytes: bytes, memoryBytes: 0, futureRuntime: 0, busy: false, releaseRequested: false };
+        record.diskBytes -= bytes;
+        this.#reservations.set(targetKey, target);
+        return this.#lease(targetKey, target);
       },
+      growMemory: async (bytes: number, apply: () => Promise<number>) => {
+        positive(bytes, "memory grant");
+        if (record.releaseRequested || !this.#reservations.has(key) || record.busy) throw new Error("Grant is closing or already changing");
+        if (bytes < record.memoryBytes) throw new Error("Live memory grants cannot shrink");
+        if (bytes === record.memoryBytes) return;
+        const previous = record.memoryBytes;
+        const delta = bytes - previous;
+        this.#check(0, delta, record.kind === "runtime" ? delta : 0);
+        record.memoryBytes = bytes; // Capacity is held BEFORE the kernel can observe a larger hard limit.
+        record.busy = true;
+        try {
+          const effective = await apply();
+          if (effective !== previous && effective !== bytes) throw new GuestMemoryContainmentError("Unexpected effective memory limit");
+          record.memoryBytes = effective;
+          if (effective !== bytes) throw new Error("Kernel did not accept the requested memory grant");
+        } finally {
+          // If apply/readback fails ambiguously, keep the larger commitment.
+          record.busy = false;
+          if (record.releaseRequested) this.#release(key, record);
+        }
+      },
+      release: () => this.#release(key, record),
     });
+  }
+
+  #release(key: string, record: Reservation): void {
+    record.releaseRequested = true;
+    if (record.busy || this.#reservations.get(key) !== record) return;
+    const parent = record.launchKey ? this.#reservations.get(record.launchKey) : undefined;
+    if (parent) {
+      parent.memoryBytes += record.memoryBytes;
+      if (record.kind === "runtime") parent.futureRuntime += record.memoryBytes;
+    }
+    this.#reservations.delete(key);
+  }
+
+  #check(disk: number, memory: number, runtime: number): void {
+    const state = this.snapshot();
+    if (state.reservedDiskBytes + disk > this.#diskBudgetBytes) throw new GuestResourceAdmissionError("Guest state disk admission denied: bounded commitments exceed available capacity");
+    if (state.reservedMemoryBytes + memory > this.#memoryBudgetBytes) throw new GuestResourceAdmissionError("Guest memory admission denied: capacity has not been supplied");
+    if (state.runtimeMemoryBytes + runtime > this.#memoryCeilingBytes - this.#sharedBuildMemoryBytes) {
+      throw new GuestResourceAdmissionError("Runtime capacity exhausted: the shared Build reserve must remain available");
+    }
+  }
+
+  /** Fence admissions BEFORE asking the Host to reclaim any pages. */
+  prepareMemoryCapacity(bytes: number): void {
+    positive(bytes, "memory capacity");
+    if (bytes > this.#memoryBudgetBytes || bytes < this.snapshot().reservedMemoryBytes) {
+      throw new GuestResourceAdmissionError("Memory reclamation would cross an active commitment");
+    }
+    this.#memoryBudgetBytes = bytes;
+  }
+
+  /** Only call with capacity actually read from the Guest kernel after supply. */
+  acknowledgeMemoryCapacity(usableBytes: number): void {
+    const bytes = Math.min(positive(usableBytes, "acknowledged capacity"), this.#memoryCeilingBytes);
+    if (bytes < this.snapshot().reservedMemoryBytes) throw new GuestResourceAdmissionError("Guest usable memory fell below its active commitments");
+    this.#memoryBudgetBytes = bytes;
+  }
+
+  /** ext4 growth is irreversible; increment by the VERIFIED filesystem delta. */
+  acknowledgeDiskGrowth(additionalBytes: number): void {
+    this.#diskBudgetBytes = positive(this.#diskBudgetBytes + nonnegative(additionalBytes, "disk growth"), "disk budget");
   }
 
   snapshot(): GuestResourceAdmissionSnapshot {
-    return Object.freeze({
-      diskBudgetBytes: this.#diskBudgetBytes,
-      memoryBudgetBytes: this.#memoryBudgetBytes,
-      reservedDiskBytes: this.#reservedDiskBytes,
-      reservedMemoryBytes: this.#reservedMemoryBytes,
-      reservations: this.#reservations.size,
-    });
+    let disk = 0, memory = 0, runtime = 0;
+    for (const item of this.#reservations.values()) {
+      disk += item.diskBytes; memory += item.memoryBytes;
+      runtime += item.kind === "runtime" ? item.memoryBytes : item.futureRuntime;
+    }
+    return Object.freeze({ diskBudgetBytes: this.#diskBudgetBytes, memoryBudgetBytes: this.#memoryBudgetBytes,
+      memoryCeilingBytes: this.#memoryCeilingBytes, sharedBuildMemoryBytes: this.#sharedBuildMemoryBytes,
+      reservedDiskBytes: disk, reservedMemoryBytes: memory, runtimeMemoryBytes: runtime, reservations: this.#reservations.size });
   }
 }
 
-const NOOP_LEASE: GuestResourceLease = Object.freeze({
-  key: "noop",
-  diskBytes: 0,
-  memoryBytes: 0,
-  release() {},
-});
+const NOOP_LEASE: GuestResourceLease = Object.freeze({ key: "noop", diskBytes: 0, memoryBytes: 0, release() {} });
+/** Unit-test seam; main.ts always supplies a real ledger. */
+export const UNBOUNDED_GUEST_RESOURCE_ADMISSION: GuestResourceAdmissionLike = Object.freeze({ async reserve() { return NOOP_LEASE; } });
 
-/** Test/backward-compatible seam. Production always installs the bounded ledger. */
-export const UNBOUNDED_GUEST_RESOURCE_ADMISSION: GuestResourceAdmissionLike = Object.freeze({
-  async reserve() {
-    return NOOP_LEASE;
-  },
-});
-
-function parseMemTotalBytes(source: string): number {
-  const matches = [...source.matchAll(/^MemTotal:\s+(\d+)\s+kB\s*$/gm)];
-  if (matches.length !== 1) {
-    throw new GuestResourceAdmissionError("/proc/meminfo must contain exactly one MemTotal value");
-  }
-  const kibibytes = Number(matches[0]![1]);
-  if (!Number.isSafeInteger(kibibytes) || kibibytes < 1) {
-    throw new GuestResourceAdmissionError("/proc/meminfo contains an invalid MemTotal value");
-  }
-  return boundedCapacity(kibibytes * 1024, "MemTotal");
+export function parseGuestMemory(source: string): { totalBytes: number; availableBytes: number; balloonBytes: number } {
+  const field = (name: string, required = false) => {
+    const matches = [...source.matchAll(new RegExp(`^${name}:\\s+(\\d+)\\s+kB\\s*$`, "gm"))];
+    if (matches.length !== 1) {
+      if (!required && matches.length === 0) return 0;
+      throw new GuestResourceAdmissionError(`/proc/meminfo must contain exactly one ${name} value`);
+    }
+    return nonnegative(Number(matches[0]![1]) * 1024, name);
+  };
+  return { totalBytes: positive(field("MemTotal", true), "MemTotal"), availableBytes: field("MemAvailable"), balloonBytes: field("Balloon") };
 }
-
-function safeBigIntBytes(value: bigint, label: string): number {
-  if (value < 1n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw new GuestResourceAdmissionError(`${label} is outside the supported range`);
-  }
-  return Number(value);
+/** MemTotal may include balloon pages when DEFLATE_ON_OOM is negotiated.
+ * Linux 6.18.39 exposes the current NR_BALLOON_PAGES as Balloon in meminfo.
+ * Compare against the immutable boot total to avoid subtracting twice on
+ * devices that already reduce MemTotal. Leave room for per-CPU stat drift. */
+export function usableGuestMemory(memory: ReturnType<typeof parseGuestMemory>, bootTotal: number): number {
+  return Math.max(0, Math.min(memory.totalBytes,
+    bootTotal - memory.balloonBytes - (memory.balloonBytes > 0 ? 8 * MiB : 0)));
 }
-
-function boundedCapacity(value: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new GuestResourceAdmissionError(`${label} must be a positive safe integer`);
-  }
+function positive(value: number, label: string): number {
+  if (value <= 0) throw new GuestResourceAdmissionError(`${label} must be positive`);
+  return nonnegative(value, label);
+}
+function nonnegative(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new GuestResourceAdmissionError(`${label} must be a nonnegative safe integer`);
   return value;
 }
-
-function boundedReserve(value: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new GuestResourceAdmissionError(`${label} must be a nonnegative safe integer`);
-  }
-  return value;
-}
-
-function boundedRequest(value: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`Guest resource ${label} must be a nonnegative safe integer`);
-  }
-  return value;
-}
-
-function validateReservationKey(value: string): string {
-  if (
-    typeof value !== "string"
-    || value.length < 1
-    || value.length > 512
-    || value.includes("\0")
-  ) {
-    throw new Error("Guest resource reservation key is invalid");
-  }
-  return value;
+function validateKey(value: string): void {
+  if (typeof value !== "string" || !value.length || value.length > 512 || value.includes("\0")) throw new Error("Guest resource reservation key is invalid");
 }

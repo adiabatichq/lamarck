@@ -9,6 +9,7 @@ const outputDirectory = resolve(root, "dist");
 await mkdir(outputDirectory, { recursive: true });
 await build({
   entryPoints: {
+    "build-phase-worker": resolve(root, "src", "build-phase-worker.ts"),
     supervisor: resolve(root, "src", "main.ts"),
     "offline-npm": resolve(root, "src", "offline-npm.ts"),
     "release-runc-smoke": resolve(root, "src", "release-runc-smoke.ts"),

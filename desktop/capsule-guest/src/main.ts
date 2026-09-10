@@ -1,5 +1,6 @@
+import { GuestCapacityController } from "./capacity-controller";
 import { randomBytes } from "node:crypto";
-import { lstat, mkdir, readFile, rm, chmod } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rm, chmod } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { validateArtifactDigest } from "@lamarck/capsule";
 import { GuestBlobStore } from "./blob-store";
@@ -29,6 +30,19 @@ export function parseTrustedImageDigestFromCmdline(cmdline: string): string {
 
 export async function startGuestSupervisor(): Promise<void> {
   const imageDigest = parseTrustedImageDigestFromCmdline(await readFile("/proc/cmdline", "utf8"));
+  // Do not advertise resource-management-v1 on an image whose kernel cannot
+  // reclaim RAM or report pressure, even if its program overlay is current.
+  if (!(await readdir("/sys/bus/virtio/drivers/virtio_balloon")).some((name) => /^virtio[0-9]+$/.test(name))) {
+    throw new Error("Guest memory balloon driver is not bound to the Host device");
+  }
+  if (!/^Balloon:\s+\d+\s+kB\s*$/m.test(await readFile("/proc/meminfo", "utf8"))) {
+    throw new Error("Guest kernel cannot acknowledge current balloon capacity");
+  }
+  for (const resource of ["cpu", "io", "memory"]) {
+    if (!/^some avg10=[0-9.]+ /m.test(await readFile(`/proc/pressure/${resource}`, "utf8"))) {
+      throw new Error(`Guest ${resource} pressure accounting is unavailable`);
+    }
+  }
   const architecture = process.arch === "arm64"
     ? "arm64"
     : process.arch === "x64"
@@ -55,6 +69,7 @@ export async function startGuestSupervisor(): Promise<void> {
     imageDigest,
     architecture,
     supervisorVersion: SUPERVISOR_VERSION,
+    capacity: new GuestCapacityController(admission, GUEST_ROOT),
     blobs,
     builds,
     resources,

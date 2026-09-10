@@ -220,7 +220,7 @@ export class LinuxBuildCapsuleRunner implements BuildCapsuleRunner {
 
   private cgroupPath(plan: BuildOciBundlePlan): string {
     const relative = plan.config.linux.cgroupsPath;
-    if (!/^lamarck\/builds\/b-[a-f0-9]{32}$/.test(relative)) {
+    if (!/^lamarck\/builds\/b-[a-f0-9]{32}\/npm$/.test(relative)) {
       throw new Error("Build plan contains an invalid cgroup path");
     }
     return `${this.cgroupMount}/${relative}`;

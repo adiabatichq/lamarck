@@ -13,6 +13,31 @@ const APP_A = "a".repeat(64);
 const APP_B = "b".repeat(64);
 
 describe("Host-wide Capsule storage admission", () => {
+  test("retains durable growth intent across a lost acknowledgement, sparse blocks, and restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "capsule-budget-highwater-"));
+    const state = join(root, "state.raw"), GiB = 1024 ** 3;
+    await writeFile(state, ""); await truncate(state, 64 * GiB);
+    const journal = (backedBytes: number, intentBytes: number) => JSON.stringify({ schemaVersion: 1, backedBytes, exposedBytes: 4 * GiB, intentBytes });
+    await writeFile(`${state}.capacity`, journal(4 * GiB, 4 * GiB));
+    const options = { roots: [root], aggregateBytes: 16 * GiB, perAppBytes: 8 * GiB, filesystemReserveBytes: 0,
+      dependencies: { availableBytes: async () => 20 * GiB } };
+    const budget = new CapsuleStorageBudget(options);
+    expect((await budget.snapshot()).usedBytes).toBeGreaterThanOrEqual(4 * GiB);
+    expect((await budget.snapshot()).usedBytes).toBeLessThan(4 * GiB + 1024);
+    const growth = await budget.reserveStateGrowth(state, 5 * GiB);
+    expect((await budget.snapshot()).reservedBytes).toBe(GiB);
+    // The native writer persisted intent, then lost the command reply before
+    // confirming backing/Guest growth. Failure still owns the full high-water.
+    await writeFile(`${state}.capacity`, journal(4 * GiB, 5 * GiB));
+    await growth.settle(); await growth.settle();
+    expect((await budget.snapshot()).reservedBytes).toBe(0);
+    const restarted = new CapsuleStorageBudget(options);
+    expect((await restarted.snapshot()).usedBytes).toBeGreaterThanOrEqual(5 * GiB);
+    expect((await restarted.snapshot()).usedBytes).toBeLessThan(5 * GiB + 1024);
+    const retry = await restarted.reserveStateGrowth(state, 5 * GiB);
+    expect((await restarted.snapshot()).reservedBytes).toBe(0);
+    await retry.settle();
+  });
   test("shares one aggregate quota while preserving per-App attribution", async () => {
     const root = await mkdtemp(join(tmpdir(), "capsule-budget-"));
     const budget = new CapsuleStorageBudget({

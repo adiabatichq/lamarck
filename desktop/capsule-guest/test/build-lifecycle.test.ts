@@ -19,6 +19,7 @@ import {
   type SealedArtifactDescriptor,
 } from "../src/build-manager";
 import { BuildContainmentError } from "../src/build-runner";
+import { GuestResourceAdmission } from "../src/resource-admission";
 import {
   MAX_DEPENDENCY_MANIFEST_BYTES,
   validateDependencyBundle,
@@ -36,6 +37,21 @@ afterEach(async () => {
 });
 
 describe("Guest Build lifecycle authority", () => {
+  test("prepare holds scratch and output before acknowledgement; cancellation releases both", async () => {
+    const body = buildBody(buildHandle(50_000));
+    const admission = new GuestResourceAdmission({ diskBudgetBytes: body.scratchBytes + body.artifactOutputBytes,
+      memoryBudgetBytes: 2 * body.resources.memoryBytes });
+    const blobs = { has: vi.fn(async () => true) } as unknown as GuestBlobStore;
+    const manager = new GuestBuildManager(blobs, { imageDigest: IMAGE, admission });
+    await manager.prepare(body);
+    expect(admission.snapshot().reservedDiskBytes).toBe(body.scratchBytes + body.artifactOutputBytes);
+    await expect(manager.prepare(buildBody(buildHandle(50_001)))).rejects.toThrow(/disk admission denied/);
+    await manager.cancel(APP, body.buildHandle, 0);
+    expect(admission.snapshot()).toMatchObject({ reservedDiskBytes: 0, reservedMemoryBytes: 0, reservations: 0 });
+    await manager.prepare(buildBody(buildHandle(50_001)));
+    await manager.drain();
+    expect(admission.snapshot().reservations).toBe(0);
+  });
   test("shares one lifecycle and publishes completion only after its finalizer settles", async () => {
     const manager = createManager();
     const body = buildBody(buildHandle(1));
@@ -212,10 +228,10 @@ describe("Guest Build parser and iterator bounds", () => {
     expect(has).not.toHaveBeenCalled();
   });
 
-  test("charges the fixed supervisor-memory floor even for a small cgroup request", () => {
+  test("holds output publication space and the enforced whole-Build memory floor", () => {
     const body = buildBody(buildHandle(30_000));
     body.resources.memoryBytes = 64 * 1024 * 1024;
-    expect(buildAdmissionRequest(body).diskBytes).toBe(body.scratchBytes);
+    expect(buildAdmissionRequest(body).diskBytes).toBe(body.scratchBytes + body.artifactOutputBytes);
     expect(buildAdmissionRequest(body).memoryBytes).toBe(BUILD_MEMORY_ADMISSION_FLOOR_BYTES);
     body.resources.memoryBytes = BUILD_MEMORY_ADMISSION_FLOOR_BYTES * 2;
     expect(buildAdmissionRequest(body).memoryBytes).toBe(BUILD_MEMORY_ADMISSION_FLOOR_BYTES * 2);

@@ -199,7 +199,7 @@ function compileBuildOciBundlePlan(raw: BuildOciPlanInput): BuildOciBundlePlan {
       },
       mounts: fixedBuildMounts(buildRoot),
       linux: {
-        cgroupsPath: `lamarck/builds/${buildKey}`,
+        cgroupsPath: `lamarck/builds/${buildKey}/npm`,
         rootfsPropagation: "private",
         namespaces: [
           ...["user", "mount", "pid", "ipc", "uts", "cgroup"].map((type) => ({ type })),

@@ -188,6 +188,30 @@ export function parseHostRequest(value: unknown): HostRequest {
   };
 
   switch (object.op) {
+    case "resources.status":
+      exactObject(object.body, "$.body", []);
+      return { ...base, op: object.op, body: {} };
+    case "resources.memory.prepare":
+    case "resources.memory.commit": {
+      const body = exactObject(object.body, "$.body", ["memoryBytes"]);
+      return { ...base, op: object.op, body: { memoryBytes: boundedInteger(body.memoryBytes, "$.body.memoryBytes", 1, 4 * 1024 ** 3) } };
+    }
+    case "resources.disk.grow": {
+      const body = exactObject(object.body, "$.body", ["bytes"]);
+      return { ...base, op: object.op, body: { bytes: boundedInteger(body.bytes, "$.body.bytes", 4 * 1024 ** 3, 64 * 1024 ** 3) } };
+    }
+    case "resources.launch.reserve": {
+      const body = exactObject(object.body, "$.body", ["launchKey", "runtimeMemoryBytes", "buildMemoryBytes"]);
+      return { ...base, op: object.op, body: {
+        launchKey: opaqueId(body.launchKey, "$.body.launchKey"),
+        runtimeMemoryBytes: boundedInteger(body.runtimeMemoryBytes, "$.body.runtimeMemoryBytes", 256 * 1024 ** 2, 512 * 1024 ** 2),
+        buildMemoryBytes: boundedInteger(body.buildMemoryBytes, "$.body.buildMemoryBytes", 0, 2 * 1024 ** 3),
+      } };
+    }
+    case "resources.launch.release": {
+      const body = exactObject(object.body, "$.body", ["launchKey"]);
+      return { ...base, op: object.op, body: { launchKey: opaqueId(body.launchKey, "$.body.launchKey") } };
+    }
     case "ping":
       return { ...base, op: "ping", body: parsePingBody(object.body) };
     case "blob.import.prepare":
@@ -487,6 +511,7 @@ function parseBuildPrepareBody(value: unknown): BuildPrepareBody {
     "baseArtifactBytes",
     "baseArtifactBlobHandle",
     "baseDependencyDigest",
+    "launchKey",
   ]);
   const resources = exactObject(object.resources, "$.body.resources", [
     "memoryBytes",
@@ -580,6 +605,7 @@ function parseBuildPrepareBody(value: unknown): BuildPrepareBody {
       : { dependencyBytes: dependency.dependencyBytes }),
   }, scratchBytes, artifactOutputBytes);
   return {
+    ...(object.launchKey === undefined ? {} : { launchKey: opaqueId(object.launchKey, "$.body.launchKey") }),
     ownerKey: appOwnerKey(object.ownerKey, "$.body.ownerKey"),
     appHandle: opaqueId(object.appHandle, "$.body.appHandle"),
     buildHandle: opaqueId(object.buildHandle, "$.body.buildHandle"),
@@ -689,7 +715,7 @@ function parseWorkloadPrepareBody(value: unknown): WorkloadPrepareBody {
     value,
     "$.body",
     ["appHandle", "workloadHandle", "workloadKind", "argv", "cwd", "environment", "sdkTicket", "cliTicket"],
-    ["logsTicket", "uiPort"],
+    ["logsTicket", "uiPort", "launchKey", "memoryProfile"],
   );
   const workloadKind = stringEnum(
     object.workloadKind,
@@ -706,6 +732,8 @@ function parseWorkloadPrepareBody(value: unknown): WorkloadPrepareBody {
     invalid("$.body.uiPort", "only UI workloads may declare a port");
   }
   return {
+    ...(object.launchKey === undefined ? {} : { launchKey: opaqueId(object.launchKey, "$.body.launchKey") }),
+    ...(object.memoryProfile === undefined ? {} : { memoryProfile: stringEnum(object.memoryProfile, ["lightweight", "standard"] as const, "$.body.memoryProfile") }),
     appHandle: opaqueId(object.appHandle, "$.body.appHandle"),
     workloadHandle: opaqueId(object.workloadHandle, "$.body.workloadHandle"),
     workloadKind,
