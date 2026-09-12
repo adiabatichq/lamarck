@@ -22,7 +22,7 @@ export class GuestCapacityController {
       filesystemBytes: Number(fs.blocks * fs.bsize), freeDiskBytes: Number(fs.bavail * fs.bsize) };
   }
 
-  async handle(request: HostRequest): Promise<JsonValue> {
+  async handle(request: HostRequest, replacement?: { workloadKey: string; ownerKey: string }): Promise<JsonValue> {
     switch (request.op) {
       case "resources.status": return this.status();
       case "resources.memory.prepare":
@@ -35,7 +35,8 @@ export class GuestCapacityController {
         return this.status();
       }
       case "resources.launch.reserve":
-        this.admission.reserveLaunch(request.body.launchKey, request.body.runtimeMemoryBytes, request.body.buildMemoryBytes);
+        if (request.body.replacement && !replacement) throw new Error("Replacement requires authoritative workload validation");
+        this.admission.reserveLaunch(request.body.launchKey, request.body.runtimeMemoryBytes, request.body.buildMemoryBytes, replacement);
         return this.status();
       case "resources.launch.release":
         this.admission.releaseLaunch(request.body.launchKey);

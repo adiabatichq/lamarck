@@ -244,7 +244,9 @@ export type HostRequest =
   | RequestFor<"resources.status", Record<string, never>>
   | RequestFor<"resources.memory.prepare", { memoryBytes: number }>
   | RequestFor<"resources.memory.commit", { memoryBytes: number }>
-  | RequestFor<"resources.launch.reserve", { launchKey: string; runtimeMemoryBytes: number; buildMemoryBytes: number }>
+  | RequestFor<"resources.launch.reserve", { launchKey: string; runtimeMemoryBytes: number; buildMemoryBytes: number;
+      /** Exact prior workload in this authenticated, boot-bound session. */
+      replacement?: { appHandle: string; workloadHandle: string; ownerKey: string } }>
   | RequestFor<"resources.launch.release", { launchKey: string }>
   | RequestFor<"resources.disk.grow", { bytes: number }>
   | RequestFor<"ping", PingBody>

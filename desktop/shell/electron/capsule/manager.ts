@@ -4,6 +4,7 @@ import type {
   CapsuleBackend,
   CapsuleBackendStatus,
   CapsuleUiLostEvent,
+  CapsuleUiSpec,
 } from "./backend";
 import { CapsuleRestartRequiredError } from "./backend";
 import {
@@ -371,23 +372,9 @@ export class CapsuleManager {
     }, opening.abortController);
     try {
       this.#assertPendingUiCurrent(pending, "launch");
-      const prepared = await this.#backend.prepareUi({
-        appId,
-        activationId: activation.activationId,
-        activationSequence: activation.activationSequence,
-        version: activation.version,
-        manifestDigest: activation.manifestDigest,
-        packageDigest: activation.packageDigest,
-        packageDir: activation.immutablePackagePath,
-        command: [...ui.command],
-        port: ui.port,
-        writeTables: [...activation.manifest.permissions.writes.tables],
-        fileGrants: [
-          `apps/${appId}/`,
-          ...activation.manifest.permissions.writes.files,
-        ],
-        sdkSenderId: runtimeSenderId,
-      });
+      const prepared = await this.#backend.prepareUi(
+        createUiSpec(appId, activation, ui, runtimeSenderId),
+      );
       pending.preparationId = prepared.preparationId;
       pending.instanceId = prepared.instanceId;
       this.#assertPendingUiCurrent(pending, "launch");
@@ -641,23 +628,9 @@ export class CapsuleManager {
     });
     try {
       this.#assertPendingUiCurrent(pending, "reload");
-      const prepared = await this.#backend.prepareUi({
-        appId: viewer.appId,
-        activationId: activation.activationId,
-        activationSequence: activation.activationSequence,
-        version: activation.version,
-        manifestDigest: activation.manifestDigest,
-        packageDigest: activation.packageDigest,
-        packageDir: activation.immutablePackagePath,
-        command: [...ui.command],
-        port: ui.port,
-        writeTables: [...activation.manifest.permissions.writes.tables],
-        fileGrants: [
-          `apps/${viewer.appId}/`,
-          ...activation.manifest.permissions.writes.files,
-        ],
-        sdkSenderId: runtimeSenderId,
-      }, viewer.instanceId);
+      const prepared = await this.#backend.prepareUi(
+        createUiSpec(viewer.appId, activation, ui, runtimeSenderId), viewer.instanceId,
+      );
       pending.preparationId = prepared.preparationId;
       pending.instanceId = prepared.instanceId;
       this.#assertPendingUiCurrent(pending, "reload");
@@ -1537,6 +1510,31 @@ class ControlPlaneLostError extends Error {
     super("Core control plane is unavailable");
     this.name = "ControlPlaneLostError";
   }
+}
+
+function createUiSpec(
+  appId: string,
+  activation: PreparedActivation,
+  ui: NonNullable<PreparedActivation["manifest"]["runtime"]["ui"]>,
+  runtimeSenderId: string,
+): CapsuleUiSpec {
+  return {
+    appId,
+    activationId: activation.activationId,
+    activationSequence: activation.activationSequence,
+    version: activation.version,
+    manifestDigest: activation.manifestDigest,
+    packageDigest: activation.packageDigest,
+    packageDir: activation.immutablePackagePath,
+    command: [...ui.command],
+    port: ui.port,
+    writeTables: [...activation.manifest.permissions.writes.tables],
+    fileGrants: [
+      `apps/${appId}/`,
+      ...activation.manifest.permissions.writes.files,
+    ],
+    sdkSenderId: runtimeSenderId,
+  };
 }
 
 function validatedViewerOwner(owner: AppViewerOwner): AppViewerOwner {

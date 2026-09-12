@@ -9,6 +9,7 @@ export interface GuestCapacity {
   memoryBudgetBytes: number; memoryCeilingBytes: number; reservedMemoryBytes: number;
   diskBudgetBytes: number;
   runtimeMemoryBytes: number; sharedBuildMemoryBytes: number; reservedDiskBytes: number;
+  projectedRuntimeMemoryBytes?: number;
   cpuPressureAvg10?: number | null; ioPressureAvg10?: number | null; memoryPressureAvg10?: number | null;
   totalBytes: number; usableMemoryBytes: number; availableBytes: number; filesystemBytes: number; freeDiskBytes: number;
 }
@@ -36,6 +37,8 @@ export function parseGuestCapacity(value: unknown): GuestCapacity {
     if (pressure !== undefined && pressure !== null && (typeof pressure !== "number" || !Number.isFinite(pressure) || pressure < 0 || pressure > 100)) throw new Error("Invalid Guest pressure acknowledgement");
   }
   const state = value as GuestCapacity;
+  if (state.projectedRuntimeMemoryBytes !== undefined && (!Number.isSafeInteger(state.projectedRuntimeMemoryBytes)
+    || state.projectedRuntimeMemoryBytes < 0 || state.projectedRuntimeMemoryBytes > state.runtimeMemoryBytes)) throw new Error("Invalid projected Runtime commitments");
   if (state.memoryBudgetBytes > state.memoryCeilingBytes || state.memoryCeilingBytes > 4 * GiB
     || state.reservedMemoryBytes > state.memoryBudgetBytes || state.runtimeMemoryBytes > state.reservedMemoryBytes) throw new Error("Inconsistent Guest memory commitments");
   return state;
@@ -94,11 +97,13 @@ export class VmCapacityCoordinator {
     return () => { if (!released) { released = true; this.#pendingImportDisk -= bytes; } };
   }
 
-  async reserveLaunch(key: string, runtimeBytes: number, buildBytes: number): Promise<void> {
+  async reserveLaunch(key: string, runtimeBytes: number, buildBytes: number,
+    replacement?: RequestBodyFor<"resources.launch.reserve">["replacement"]): Promise<void> {
     return this.#memoryTransaction(async () => {
       this.#lastActivity = this.now();
       const state = await this.status();
-      if (state.runtimeMemoryBytes + runtimeBytes > state.memoryCeilingBytes - state.sharedBuildMemoryBytes) {
+      // Replacement credit is calculated only by the Guest from its live lease.
+      if (!replacement && (state.projectedRuntimeMemoryBytes ?? state.runtimeMemoryBytes) + runtimeBytes > state.memoryCeilingBytes - state.sharedBuildMemoryBytes) {
         throw new CapacityExhaustedError("This App exceeds available Runtime capacity; existing Apps remain active");
       }
       if (buildBytes > 0 && this.#building.size > 0 && ((state.cpuPressureAvg10 ?? 0) > 50
@@ -109,7 +114,8 @@ export class VmCapacityCoordinator {
       if (required > state.memoryCeilingBytes) throw new CapacityExhaustedError("Transient Build capacity is currently occupied");
       await this.#supply(required, state);
       try {
-        await this.session.request("resources.launch.reserve", { launchKey: key, runtimeMemoryBytes: runtimeBytes, buildMemoryBytes: buildBytes });
+        await this.session.request("resources.launch.reserve", { launchKey: key, runtimeMemoryBytes: runtimeBytes, buildMemoryBytes: buildBytes,
+          ...(replacement ? { replacement } : {}) });
         if (buildBytes > 0) this.#building.add(key);
       } catch (error) {
         // The reserve may have reached the Guest even if its reply was lost.
@@ -207,33 +213,44 @@ function align(value: number, unit: number): number { return Math.ceil(value / u
 
 interface QueuedLaunch {
   admit(): Promise<void>; signal: AbortSignal; resolve(release: () => void): void; reject(error: unknown): void;
+  build: boolean;
   cancel(): void;
 }
-/** Only waits for finite in-flight Builds, never for a long-lived App to close. */
+/** Only waits for finite Builds/preparations, never for a long-lived App to close. */
 export class BuildProgressQueue {
   #active = 0;
+  #activeBuilds = 0;
   #queue: QueuedLaunch[] = [];
   #pumping = false;
-  acquire(admit: () => Promise<void>, signal: AbortSignal): Promise<() => void> {
+  #pumpAgain = false;
+  acquire(admit: () => Promise<void>, signal: AbortSignal, build = true): Promise<() => void> {
     if (signal.aborted) return Promise.reject(signal.reason);
     if (this.#queue.length >= 64) return Promise.reject(new Error("Build queue is full"));
     return new Promise((resolve, reject) => {
-      const item: QueuedLaunch = { admit, signal, resolve, reject, cancel: () => {
-        const index = this.#queue.indexOf(item);
-        if (index >= 0) this.#queue.splice(index, 1);
+      const item: QueuedLaunch = { admit, signal, build, resolve, reject, cancel: () => {
+        this.#remove(item);
         reject(signal.reason ?? new Error("Build cancelled"));
+        void this.#pump();
       } };
       signal.addEventListener("abort", item.cancel, { once: true });
       this.#queue.push(item);
       void this.#pump();
     });
   }
+  #remove(item: QueuedLaunch): void {
+    const index = this.#queue.indexOf(item);
+    if (index >= 0) this.#queue.splice(index, 1);
+    item.signal.removeEventListener("abort", item.cancel);
+  }
   async #pump(): Promise<void> {
-    if (this.#pumping) return;
+    if (this.#pumping) { this.#pumpAgain = true; return; }
     this.#pumping = true;
     try {
-      while (this.#active < 2 && this.#queue.length) {
-        const item = this.#queue[0]!;
+      while (this.#queue.length) {
+        // Keep FIFO when a Build slot is free; otherwise let the oldest
+        // cached launch attempt normal resource admission past waiting Builds.
+        const item = this.#queue.find(candidate => !candidate.build || this.#activeBuilds < 2);
+        if (!item) return;
         if (item.signal.aborted) { item.cancel(); continue; }
         item.signal.removeEventListener("abort", item.cancel);
         try { await item.admit(); }
@@ -242,17 +259,25 @@ export class BuildProgressQueue {
             item.signal.addEventListener("abort", item.cancel, { once: true });
             return;
           }
-          this.#queue.shift(); item.signal.removeEventListener("abort", item.cancel); item.reject(error); continue;
+          this.#remove(item); item.reject(error); continue;
         }
         // Cancellation during admission cannot drop a successfully held grant:
         // the caller gets the release handle and owns authoritative cleanup.
-        const index = this.#queue.indexOf(item);
-        if (index >= 0) this.#queue.splice(index, 1);
-        item.signal.removeEventListener("abort", item.cancel);
+        this.#remove(item);
         this.#active += 1;
+        if (item.build) this.#activeBuilds += 1;
         let released = false;
-        item.resolve(() => { if (released) return; released = true; this.#active -= 1; void this.#pump(); });
+        item.resolve(() => {
+          if (released) return;
+          released = true; this.#active -= 1;
+          if (item.build) this.#activeBuilds -= 1;
+          void this.#pump();
+        });
       }
-    } finally { this.#pumping = false; }
+    } finally {
+      this.#pumping = false;
+      // A release/cancellation while admit() awaited must not lose its wakeup.
+      if (this.#pumpAgain) { this.#pumpAgain = false; void this.#pump(); }
+    }
   }
 }

@@ -20,6 +20,7 @@ export const EXPECTED_FEATURES = Object.freeze([
   "artifact-erofs-v1",
   "build-v1",
   "oci-policy-v1",
+  "replacement-admission-v1",
   "resource-management-v1",
   "sdk-uds-v1",
   "tickets-v1",

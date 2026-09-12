@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Duplex, PassThrough } from "node:stream";
@@ -9,7 +9,7 @@ import { describe, expect, test, vi } from "vitest";
 import type { GuestBlobStore } from "../src/blob-store";
 import type { GuestFilesystemPaths } from "../src/config";
 import { GuestContainmentError } from "../src/containment-error";
-import { GuestResourceAdmissionError } from "../src/resource-admission";
+import { GuestResourceAdmission, GuestResourceAdmissionError } from "../src/resource-admission";
 import {
   AppViewerProxyRegistry,
   ArtifactMountRegistry,
@@ -137,6 +137,88 @@ describe("App viewer proxy ownership", () => {
 });
 
 describe("artifact mount ownership", () => {
+  test.each(["none", "scratch", "mount", "admission"])("publishes only complete Apps and retains ownership across %s teardown failure", async failure => {
+    const root = await mkdtemp(join(tmpdir(), "capsule-app-ownership-")), paths = fixturePaths(root);
+    const appKey = `a-${opaqueAppKey(APP)}`, cgroup = `${paths.cgroupRoot}/apps/${appKey}`;
+    const scratchBytes = 128 * 1024 ** 2;
+    const admission = new GuestResourceAdmission({ diskBudgetBytes: scratchBytes, memoryBudgetBytes: 1 });
+    const preparing = deferred(), allowPrepare = deferred(), stopping = deferred(), allowStop = deferred();
+    const failureCause = new Error(`injected ${failure} failure`);
+    const failOnce = (phase: string) => { if (failure === phase) { failure = "none"; throw failureCause; } };
+    const events: string[] = [];
+    const registry = new ArtifactMountRegistry({
+      mount: async () => `${paths.artifactMountRoot}/lower`,
+      unmount: async () => {
+        expect(await exists(`${paths.runtimeRoot}/${appKey}`)).toBe(false);
+        events.push("mount.release"); failOnce("mount");
+      },
+    });
+    const manager = new GuestResourceManager({ has: async () => true } as unknown as GuestBlobStore, {
+      paths, manageOwnership: false, mountBinary: "/usr/bin/true", umountBinary: "/usr/bin/true", artifactMountRegistry: registry,
+      admission: { reserve: async (key, request) => {
+        const lease = await admission.reserve(key, request);
+        return { ...lease, release: () => { events.push("capacity.release"); failOnce("admission"); lease.release(); } };
+      } },
+      operations: {
+        isMountPoint: async () => false,
+        createVolume: async () => {
+          preparing.resolve(); await allowPrepare.promise;
+          for (const path of [paths.cgroupRoot, `${paths.cgroupRoot}/apps`, cgroup, `${cgroup}/workloads`]) {
+            await mkdir(path, { recursive: true });
+            await writeFile(`${path}/cgroup.controllers`, "cpu memory pids");
+          }
+        },
+        destroyVolume: async ({ mountPath }) => {
+          stopping.resolve(); await allowStop.promise;
+          // Ordinary fixture files emulate virtual cgroup controls; remove
+          // those files so production's directory retirement can run.
+          for (const path of [cgroup, `${cgroup}/workloads`]) {
+            for (const entry of await readdir(path, { withFileTypes: true }).catch(() => [])) {
+              if (entry.isFile()) await rm(join(path, entry.name));
+            }
+          }
+          events.push("scratch.remove"); failOnce("scratch");
+          await rm(mountPath, { recursive: true, force: true });
+        },
+      },
+    });
+    const body = { ownerKey: "a".repeat(64), appHandle: APP, artifactDigest: DIGEST_A, artifactBytes: 1,
+      artifactBlobHandle: "L".repeat(22), mappedHostUid: 100_000, mappedHostGid: 200_000, storagePlanVersion: 1 as const, scratchBytes };
+    try {
+      const prepared = manager.prepareApp(body);
+      await preparing.promise;
+      expect(() => manager.getApp(APP)).toThrow(`App ${APP} is not prepared`);
+      expect(admission.snapshot().reservedDiskBytes).toBe(scratchBytes);
+      allowPrepare.resolve(); const app = await prepared;
+      expect(manager.getApp(APP)).toBe(app);
+      expect(Object.keys(app).sort()).toEqual(["appHandle", "appKey", "artifactDigest", "cgroupPath", "mappedHostGid", "mappedHostUid", "netnsPath", "runtimeRoot", "scratchBytes", "scratchImage"]);
+      expect(await manager.prepareApp(body)).toBe(app);
+      await expect(manager.prepareApp({ ...body, mappedHostUid: 300_000 })).rejects.toThrow(/cannot be rebound/);
+      const stopped = manager.stopApp(APP).then(() => undefined, error => error);
+      await stopping.promise;
+      expect(manager.getApp(APP)).toBe(app);
+      expect(admission.snapshot().reservedDiskBytes).toBe(scratchBytes);
+      expect(registry.snapshot()).toEqual({ mounts: 1, references: 1 });
+      const expectedFailure = failure;
+      allowStop.resolve(); const error = await stopped;
+      if (expectedFailure !== "none") {
+        expect(error).toBeInstanceOf(GuestContainmentError);
+        const cause = expectedFailure === "admission" ? error.cause : error.cause.errors[0];
+        // ArtifactMountRegistry adds its own containment error around unmount failures.
+        expect(expectedFailure === "mount" ? cause.cause : cause).toBe(failureCause);
+        expect(manager.getApp(APP)).toBe(app);
+        expect(admission.snapshot().reservedDiskBytes).toBe(scratchBytes);
+        expect(registry.snapshot().references).toBe(expectedFailure === "admission" ? 0 : 1);
+        await manager.stopApp(APP);
+      } else expect(error).toBeUndefined();
+      expect(events.indexOf("scratch.remove")).toBeLessThan(events.indexOf("mount.release"));
+      expect(events.indexOf("mount.release")).toBeLessThan(events.indexOf("capacity.release"));
+      expect(() => manager.getApp(APP)).toThrow(`App ${APP} is not prepared`);
+      expect(admission.snapshot().reservations).toBe(0);
+      await manager.drain();
+    } finally { allowPrepare.resolve(); allowStop.resolve(); await rm(root, { recursive: true, force: true }); }
+  });
+
   test("recomputes Runtime scratch before observing the imported artifact", async () => {
     const has = vi.fn(async () => true);
     const manager = new GuestResourceManager({ has } as unknown as GuestBlobStore, {
@@ -320,6 +402,12 @@ function fixturePaths(root: string): GuestFilesystemPaths {
     netHelperPath: "/usr/bin/true",
     mkfsErofsPath: "/usr/bin/true",
   };
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
 }
 
 async function exists(path: string): Promise<boolean> {

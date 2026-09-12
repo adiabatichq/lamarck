@@ -11,6 +11,7 @@ export interface GuestResourceRequest {
   readonly kind?: "build" | "runtime";
   /** A Host-owned reservation for the complete Build -> Runtime transition. */
   readonly launchKey?: string;
+  readonly ownerKey?: string;
 }
 export interface GuestResourceLease {
   readonly key: string;
@@ -33,6 +34,7 @@ export interface GuestResourceAdmissionSnapshot {
   readonly reservedDiskBytes: number;
   readonly reservedMemoryBytes: number;
   readonly runtimeMemoryBytes: number;
+  readonly projectedRuntimeMemoryBytes: number;
   readonly reservations: number;
 }
 export class GuestResourceAdmissionError extends Error {
@@ -50,6 +52,7 @@ interface Reservation {
   futureRuntime: number;
   busy: boolean;
   releaseRequested: boolean;
+  replacement?: { old: Reservation; ownerKey: string };
 }
 
 /** One ledger of kernel grants, future handoffs, and bounded disk commitments.
@@ -83,9 +86,17 @@ export class GuestResourceAdmission implements GuestResourceAdmissionLike {
     });
   }
 
-  reserveLaunch(key: string, runtimeBytes: number, buildBytes: number): GuestResourceLease {
+  reserveLaunch(key: string, runtimeBytes: number, buildBytes: number,
+    replacement?: { workloadKey: string; ownerKey: string }): GuestResourceLease {
     positive(runtimeBytes, "Runtime grant"); nonnegative(buildBytes, "Build grant");
-    return this.#reserve(key, { memoryBytes: Math.max(runtimeBytes, buildBytes) }, runtimeBytes);
+    let binding: Reservation["replacement"];
+    if (replacement) {
+      const old = this.#reservations.get(replacement.workloadKey);
+      if (!old || old.kind !== "runtime" || old.releaseRequested || old.launchKey) throw new Error("Replacement workload is not an active Runtime");
+      if ([...this.#reservations.values()].some(item => item.replacement?.old === old)) throw new Error("Replacement workload is already claimed");
+      binding = { old, ownerKey: replacement.ownerKey };
+    }
+    return this.#reserve(key, { memoryBytes: Math.max(runtimeBytes, buildBytes) }, runtimeBytes, binding);
   }
 
   releaseLaunch(key: string): void {
@@ -99,7 +110,7 @@ export class GuestResourceAdmission implements GuestResourceAdmissionLike {
     return this.#reserve(key, request, 0);
   }
 
-  #reserve(key: string, request: GuestResourceRequest, futureRuntime: number): GuestResourceLease {
+  #reserve(key: string, request: GuestResourceRequest, futureRuntime: number, replacement?: Reservation["replacement"]): GuestResourceLease {
     validateKey(key);
     if (this.#reservations.has(key)) throw new Error(`Guest resource reservation already exists: ${key}`);
     const memoryBytes = nonnegative(request.memoryBytes ?? 0, "memoryBytes");
@@ -109,13 +120,21 @@ export class GuestResourceAdmission implements GuestResourceAdmissionLike {
     if (request.launchKey && (!parent || parent.releaseRequested || parent.kind || parent.memoryBytes < memoryBytes)) {
       throw new GuestResourceAdmissionError("Launch grant is missing or insufficient for its next phase");
     }
-    const runtime = request.kind === "runtime" ? memoryBytes : futureRuntime;
+    if (parent?.replacement && request.ownerKey !== parent.replacement.ownerKey) throw new Error("Replacement phase App identity mismatch");
+    if (parent && [...this.#reservations.values()].some(item => item.launchKey === request.launchKey && item.memoryBytes > 0)) {
+      throw new GuestResourceAdmissionError("Previous launch phase has not authoritatively released its grant");
+    }
     const transferredFuture = parent && request.kind === "runtime" ? Math.min(parent.futureRuntime, memoryBytes) : 0;
-    this.#check(diskBytes, parent ? 0 : memoryBytes, runtime - transferredFuture);
     if (parent) { parent.memoryBytes -= memoryBytes; parent.futureRuntime -= transferredFuture; }
     const record: Reservation = { diskBytes, memoryBytes, kind: request.kind, launchKey: request.launchKey,
-      futureRuntime, busy: false, releaseRequested: false };
+      futureRuntime, busy: false, releaseRequested: false, replacement };
     this.#reservations.set(key, record);
+    try { this.#check(); }
+    catch (error) {
+      this.#reservations.delete(key);
+      if (parent) { parent.memoryBytes += memoryBytes; parent.futureRuntime += transferredFuture; }
+      throw error;
+    }
     return this.#lease(key, record);
   }
 
@@ -138,13 +157,22 @@ export class GuestResourceAdmission implements GuestResourceAdmissionLike {
         if (bytes === record.memoryBytes) return;
         const previous = record.memoryBytes;
         const delta = bytes - previous;
-        this.#check(0, delta, record.kind === "runtime" ? delta : 0);
+        const parent = record.launchKey ? this.#reservations.get(record.launchKey) : undefined;
+        const borrowed = Math.min(parent?.memoryBytes ?? 0, delta);
+        if (parent) parent.memoryBytes -= borrowed;
         record.memoryBytes = bytes; // Capacity is held BEFORE the kernel can observe a larger hard limit.
+        try { this.#check(); }
+        catch (error) {
+          record.memoryBytes = previous;
+          if (parent) parent.memoryBytes += borrowed;
+          throw error;
+        }
         record.busy = true;
         try {
           const effective = await apply();
           if (effective !== previous && effective !== bytes) throw new GuestMemoryContainmentError("Unexpected effective memory limit");
           record.memoryBytes = effective;
+          if (effective === previous && parent) parent.memoryBytes += borrowed;
           if (effective !== bytes) throw new Error("Kernel did not accept the requested memory grant");
         } finally {
           // If apply/readback fails ambiguously, keep the larger commitment.
@@ -157,6 +185,13 @@ export class GuestResourceAdmission implements GuestResourceAdmissionLike {
   }
 
   #release(key: string, record: Reservation): void {
+    if (this.#reservations.get(key) !== record) return;
+    const reservations = [...this.#reservations.values()];
+    const children = reservations.filter(item => item.launchKey === key);
+    if (children.some(item => item.kind === "build" || (record.replacement
+      && reservations.includes(record.replacement.old)))) {
+      throw new Error("Launch cannot retire before authoritative phase or old Runtime cleanup");
+    }
     record.releaseRequested = true;
     if (record.busy || this.#reservations.get(key) !== record) return;
     const parent = record.launchKey ? this.#reservations.get(record.launchKey) : undefined;
@@ -164,14 +199,15 @@ export class GuestResourceAdmission implements GuestResourceAdmissionLike {
       parent.memoryBytes += record.memoryBytes;
       if (record.kind === "runtime") parent.futureRuntime += record.memoryBytes;
     }
+    for (const child of children) child.launchKey = undefined;
     this.#reservations.delete(key);
   }
 
-  #check(disk: number, memory: number, runtime: number): void {
+  #check(): void {
     const state = this.snapshot();
-    if (state.reservedDiskBytes + disk > this.#diskBudgetBytes) throw new GuestResourceAdmissionError("Guest state disk admission denied: bounded commitments exceed available capacity");
-    if (state.reservedMemoryBytes + memory > this.#memoryBudgetBytes) throw new GuestResourceAdmissionError("Guest memory admission denied: capacity has not been supplied");
-    if (state.runtimeMemoryBytes + runtime > this.#memoryCeilingBytes - this.#sharedBuildMemoryBytes) {
+    if (state.reservedDiskBytes > this.#diskBudgetBytes) throw new GuestResourceAdmissionError("Guest state disk admission denied: bounded commitments exceed available capacity");
+    if (state.reservedMemoryBytes > this.#memoryBudgetBytes) throw new GuestResourceAdmissionError("Guest memory admission denied: capacity has not been supplied");
+    if (state.projectedRuntimeMemoryBytes > this.#memoryCeilingBytes - this.#sharedBuildMemoryBytes) {
       throw new GuestResourceAdmissionError("Runtime capacity exhausted: the shared Build reserve must remain available");
     }
   }
@@ -198,14 +234,24 @@ export class GuestResourceAdmission implements GuestResourceAdmissionLike {
   }
 
   snapshot(): GuestResourceAdmissionSnapshot {
+    const reservations = [...this.#reservations.values()];
     let disk = 0, memory = 0, runtime = 0;
-    for (const item of this.#reservations.values()) {
+    for (const item of reservations) {
       disk += item.diskBytes; memory += item.memoryBytes;
       runtime += item.kind === "runtime" ? item.memoryBytes : item.futureRuntime;
     }
+    let projected = runtime;
+    for (const [key, item] of this.#reservations) {
+      if (!item.replacement || !reservations.includes(item.replacement.old)) continue;
+      const candidate = reservations.find(child => child.launchKey === key && child.kind === "runtime");
+      // Reserve the larger of commit and abort outcomes. The old grant stays
+      // fully charged in actual memory, including during ambiguous growth.
+      projected -= Math.min(item.replacement.old.memoryBytes, item.futureRuntime + (candidate?.memoryBytes ?? 0));
+    }
     return Object.freeze({ diskBudgetBytes: this.#diskBudgetBytes, memoryBudgetBytes: this.#memoryBudgetBytes,
       memoryCeilingBytes: this.#memoryCeilingBytes, sharedBuildMemoryBytes: this.#sharedBuildMemoryBytes,
-      reservedDiskBytes: disk, reservedMemoryBytes: memory, runtimeMemoryBytes: runtime, reservations: this.#reservations.size });
+      reservedDiskBytes: disk, reservedMemoryBytes: memory, runtimeMemoryBytes: runtime,
+      projectedRuntimeMemoryBytes: projected, reservations: this.#reservations.size });
   }
 }
 

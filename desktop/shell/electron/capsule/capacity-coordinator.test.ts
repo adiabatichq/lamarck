@@ -5,6 +5,81 @@ const MiB = 1024 ** 2, GiB = 1024 ** 3;
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe("Build progress scheduling", () => {
+  test("cached D bypasses queued Build C while A/B retain both slots; Builds then resume FIFO", async () => {
+    const queue = new BuildProgressQueue(), signal = new AbortController().signal;
+    const a = await queue.acquire(async () => {}, signal), b = await queue.acquire(async () => {}, signal);
+    const order: string[] = [];
+    const c = queue.acquire(async () => { order.push("C"); }, signal);
+    const d = queue.acquire(async () => { order.push("D"); }, signal, false);
+    const e = queue.acquire(async () => { order.push("E"); }, signal);
+    await tick(); expect(order).toEqual(["D"]);
+    (await d)(); await tick(); expect(order).toEqual(["D"]);
+    a(); const releaseC = await c; expect(order).toEqual(["D", "C"]);
+    b(); const releaseE = await e; expect(order).toEqual(["D", "C", "E"]);
+    releaseC(); releaseC(); releaseE();
+  });
+
+  test.each([false, true])("cached bypass still waits for capacity and has a finite outcome (capacity returns: %s)", async available => {
+    const queue = new BuildProgressQueue(), signal = new AbortController().signal;
+    const a = await queue.acquire(async () => {}, signal), b = await queue.acquire(async () => {}, signal);
+    const c = queue.acquire(async () => {}, signal);
+    let capacity = false;
+    const admit = vi.fn(async () => { if (!capacity) throw new CapacityExhaustedError("RAM occupied"); });
+    const d = queue.acquire(admit, signal, false);
+    const outcome = d.then(release => release, error => error);
+    await tick(); await tick(); expect(admit).toHaveBeenCalledTimes(1);
+    capacity = available; a(); const releaseC = await c;
+    await tick(); b(); releaseC();
+    const result = await outcome;
+    if (available) result(); else expect(result).toBeInstanceOf(CapacityExhaustedError);
+    const attempts = admit.mock.calls.length;
+    await tick(); expect(admit).toHaveBeenCalledTimes(attempts);
+  });
+
+  test.each(["failure", "cancel", "cancel-during-admission"])("non-head %s preserves C and wakes the next cached launch", async mode => {
+    const queue = new BuildProgressQueue(), signal = new AbortController().signal, abort = new AbortController();
+    const a = await queue.acquire(async () => {}, signal), b = await queue.acquire(async () => {}, signal);
+    const admitC = vi.fn(async () => {}), c = queue.acquire(admitC, signal);
+    let rejectAdmission!: (error: Error) => void;
+    const admitD = vi.fn(async () => {
+      if (mode === "failure") throw new Error("admission failed");
+      if (mode === "cancel") throw new CapacityExhaustedError("RAM occupied");
+      await new Promise<void>((_resolve, reject) => { rejectAdmission = reject; });
+    });
+    const d = queue.acquire(admitD, abort.signal, false).catch(error => error);
+    await tick();
+    const admitE = vi.fn(async () => {}), e = queue.acquire(admitE, signal, false);
+    await tick();
+    if (mode !== "failure") abort.abort(new Error("cancelled"));
+    if (mode === "cancel-during-admission") rejectAdmission(abort.signal.reason);
+    expect(await d).toBeInstanceOf(Error);
+    await tick(); expect(admitE).toHaveBeenCalledTimes(1); expect(admitC).not.toHaveBeenCalled();
+    const attempts = admitD.mock.calls.length;
+    (await e)(); await tick(); expect(admitD).toHaveBeenCalledTimes(attempts);
+    a(); (await c)(); b(); expect(admitC).toHaveBeenCalledTimes(1);
+  });
+
+  test("a release during pending non-head admission wakes its capacity retry without spinning", async () => {
+    const queue = new BuildProgressQueue(), signal = new AbortController().signal;
+    const a = await queue.acquire(async () => {}, signal), b = await queue.acquire(async () => {}, signal);
+    const c = queue.acquire(async () => {}, signal);
+    let rejectAdmission!: (error: Error) => void;
+    const admit = vi.fn().mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectAdmission = reject; }))
+      .mockResolvedValue(undefined);
+    const d = queue.acquire(admit, signal, false);
+    await tick(); expect(admit).toHaveBeenCalledTimes(1);
+    a(); rejectAdmission(new CapacityExhaustedError("stale capacity observation"));
+    const releaseC = await c;
+    await tick(); expect(admit).toHaveBeenCalledTimes(2);
+    (await d)(); releaseC(); b();
+  });
+
+  test("cached candidates can prepare concurrently without consuming Build execution slots", async () => {
+    const queue = new BuildProgressQueue();
+    const releases = await Promise.all(Array.from({ length: 10 }, () => queue.acquire(async () => {}, new AbortController().signal, false)));
+    const build = await queue.acquire(async () => {}, new AbortController().signal);
+    releases.forEach(release => release()); build();
+  });
   test("ten simultaneous requests complete with at most two active Builds", async () => {
     const queue = new BuildProgressQueue();
     let active = 0, peak = 0;
@@ -45,13 +120,20 @@ describe("Build progress scheduling", () => {
     first(); second(); await tick(); expect(admit).not.toHaveBeenCalled();
   });
 
-  test("cancellation during admission returns ownership so the caller can release the grant", async () => {
+  test("non-head cancellation during admission returns ownership so the caller can release the grant", async () => {
     const queue = new BuildProgressQueue();
     const signal = new AbortController();
+    const a = await queue.acquire(async () => {}, new AbortController().signal);
+    const b = await queue.acquire(async () => {}, new AbortController().signal);
+    const admitC = vi.fn(async () => {}), c = queue.acquire(admitC, new AbortController().signal);
     let done!: () => void;
-    const request = queue.acquire(() => new Promise<void>((resolve) => { done = resolve; }), signal.signal);
-    signal.abort(new Error("cancelled")); done(); const release = await request; release();
-    const next = await queue.acquire(async () => {}, new AbortController().signal); next();
+    const request = queue.acquire(() => new Promise<void>((resolve) => { done = resolve; }), signal.signal, false);
+    signal.abort(new Error("cancelled")); done(); const release = await request; release(); release();
+    expect(admitC).not.toHaveBeenCalled();
+    a(); (await c)(); b();
+    // No phantom finite owner may leave an exhausted request waiting forever.
+    await expect(queue.acquire(async () => { throw new CapacityExhaustedError("full"); }, new AbortController().signal))
+      .rejects.toThrow("full");
   });
 });
 

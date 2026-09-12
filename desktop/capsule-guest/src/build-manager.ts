@@ -248,7 +248,7 @@ export class GuestBuildManager {
       // CAS verification yields. The drain fence must win before publishing a
       // live/seen authority record.
       const resourceLease = await this.admission.reserve(`build:${buildHandle}`,
-        { ...buildAdmissionRequest(cloned), kind: "build", launchKey: cloned.launchKey });
+        { ...buildAdmissionRequest(cloned), kind: "build", launchKey: cloned.launchKey, ownerKey: cloned.ownerKey });
       try {
         this.assertAcceptingBuilds();
         this.seenBuildHandles.set(buildHandle, appHandle);

@@ -19,6 +19,7 @@ import {
 } from "@lamarck/capsule";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { GuestBlobStore } from "../src/blob-store";
+import { GuestCapacityController } from "../src/capacity-controller";
 import type { GuestBuildManager } from "../src/build-manager";
 import { BuildContainmentError } from "../src/build-runner";
 import type { GuestDataDialer } from "../src/data-dialer";
@@ -49,6 +50,27 @@ afterEach(async () => {
 });
 
 describe("Capsule Guest supervisor data routing", () => {
+  test("replacement authority resolves the live App workload in this session, never a Host credit", async () => {
+    const MiB = 1024 ** 2;
+    const admission = new GuestResourceAdmission({ diskBudgetBytes: 1, memoryBudgetBytes: 3556 * MiB, sharedBuildMemoryBytes: 512 * MiB });
+    const h = await createHarness({ blobPresent: true, admission });
+    await prepareAndStartWorkload(h, { workloadKind: "service" });
+    const replacement = { appHandle: APP, workloadHandle: WORKLOAD, ownerKey: OWNER };
+    const request = { launchKey: "U".repeat(22), runtimeMemoryBytes: 512 * MiB, buildMemoryBytes: 512 * MiB, replacement };
+    for (const invalid of [
+      { ...replacement, ownerKey: "b".repeat(64) },
+      { ...replacement, appHandle: "X".repeat(22) },
+      { ...replacement, workloadHandle: "Y".repeat(22) },
+    ]) expect(await h.request("resources.launch.reserve", { ...request, replacement: invalid })).toMatchObject({ ok: false });
+    expect(admission.snapshot().reservations).toBe(1);
+    expect(await h.request("resources.launch.reserve", request)).toMatchObject({ ok: true });
+    expect(admission.snapshot()).toMatchObject({ reservedMemoryBytes: 1024 * MiB, projectedRuntimeMemoryBytes: 512 * MiB });
+    expect(await h.request("resources.launch.reserve", { ...request, launchKey: "V".repeat(22) })).toMatchObject({ ok: false });
+    expect(await h.request("resources.launch.release", { launchKey: request.launchKey })).toMatchObject({ ok: true });
+    expect(await h.request("workload.stop", { appHandle: APP, workloadHandle: WORKLOAD, graceMs: 0 })).toMatchObject({ ok: true });
+    expect(await h.request("resources.launch.reserve", request)).toMatchObject({ ok: false });
+    expect(admission.snapshot().reservations).toBe(0);
+  });
   test("returns a cache hit without opening a DATA transport", async () => {
     const harness = await createHarness({ blobPresent: true });
     const response = await harness.request("blob.import.prepare", {
@@ -1467,6 +1489,11 @@ async function createHarness(options: {
     builds: builds as unknown as GuestBuildManager,
     resources: resources as unknown as GuestResourceManager,
     ...(options.admission === undefined ? {} : { admission: options.admission }),
+    ...(options.admission instanceof GuestResourceAdmission ? { capacity: (() => {
+      const capacity = new GuestCapacityController(options.admission, "/unused");
+      vi.spyOn(capacity, "status").mockImplementation(async () => (options.admission as GuestResourceAdmission).snapshot() as never);
+      return capacity;
+    })() } : {}),
     ...(options.ticketTtlMs === undefined ? {} : { ticketTtlMs: options.ticketTtlMs }),
     ...(options.blobTransferPolicy === undefined
       ? {}

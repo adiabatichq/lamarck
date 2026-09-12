@@ -184,6 +184,12 @@ interface PreparedApp {
   scratchImage: string;
 }
 
+interface AppResourceRecord {
+  readonly app: PreparedApp;
+  readonly resourceLease: GuestResourceLease;
+  readonly artifactLease: ArtifactMountLease;
+}
+
 export interface ResourceManagerOptions {
   paths?: GuestFilesystemPaths;
   manageOwnership?: boolean;
@@ -411,9 +417,7 @@ export class GuestResourceManager {
   private readonly isMountPoint: ResourceManagerOperations["isMountPoint"];
   private readonly createVolume: ResourceManagerOperations["createVolume"];
   private readonly destroyVolume: ResourceManagerOperations["destroyVolume"];
-  private readonly apps = new Map<string, PreparedApp>();
-  private readonly appLeases = new Map<string, GuestResourceLease>();
-  private readonly artifactLeases = new Map<string, ArtifactMountLease>();
+  private readonly apps = new Map<string, AppResourceRecord>();
   /** Shared with Build so one digest has one Guest-wide loop mount ledger. */
   readonly artifactMountRegistry: ArtifactMountRegistry;
   private readonly viewerProxies = new AppViewerProxyRegistry();
@@ -439,7 +443,7 @@ export class GuestResourceManager {
 
   getApp(appHandleValue: string): Readonly<PreparedApp> {
     const appHandle = validateOpaqueId(appHandleValue, "appHandle");
-    const app = this.apps.get(appHandle);
+    const app = this.apps.get(appHandle)?.app;
     if (!app) throw new Error(`App ${appHandle} is not prepared`);
     return app;
   }
@@ -451,7 +455,7 @@ export class GuestResourceManager {
       version: body.storagePlanVersion,
       scratchBytes: body.scratchBytes,
     });
-    const existing = this.apps.get(appHandle);
+    const existing = this.apps.get(appHandle)?.app;
     if (existing) {
       if (
         existing.artifactDigest === artifactDigest
@@ -523,9 +527,7 @@ export class GuestResourceManager {
       await mkdir(this.paths.netnsRoot, { recursive: true, mode: 0o700 });
       await runFixedCommand(this.paths.netHelperPath, ["create", netnsPath]);
       await this.prepareAppCgroup(cgroupPath, app.scratchBytes);
-      this.artifactLeases.set(appHandle, artifactLease);
-      this.appLeases.set(appHandle, resourceLease);
-      this.apps.set(appHandle, app);
+      this.apps.set(appHandle, { app, resourceLease, artifactLease });
       return app;
     } catch (error) {
       try {
@@ -544,8 +546,9 @@ export class GuestResourceManager {
 
   async stopApp(appHandle: string): Promise<void> {
     const app = this.getApp(appHandle);
-    const artifactLease = this.artifactLeases.get(appHandle);
-    const resourceLease = this.appLeases.get(appHandle);
+    const record = this.apps.get(appHandle);
+    const artifactLease = record?.artifactLease;
+    const resourceLease = record?.resourceLease;
     const failures: unknown[] = [];
     if (!artifactLease) failures.push(new Error(`App ${appHandle} has no artifact mount lease`));
     if (!resourceLease) failures.push(new Error(`App ${appHandle} has no resource admission lease`));
@@ -617,8 +620,6 @@ export class GuestResourceManager {
         { cause },
       );
     }
-    this.appLeases.delete(appHandle);
-    this.artifactLeases.delete(appHandle);
     this.apps.delete(appHandle);
   }
 

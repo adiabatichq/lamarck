@@ -236,6 +236,37 @@ const verifyPreparedViewer = async (binding: {
 const publishReloadedViewer = (): void => {};
 
 describe("CapsuleManager", () => {
+  test("open and reload each copy the activation's command and grant arrays", async () => {
+    const backend = new FakeBackend(), base = createFetch();
+    const sources: Array<{ command: string[]; tables: string[]; files: string[] }> = [];
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const response = await base.fetch(input, init);
+      if (String(input).endsWith("/activation/prepare")) {
+        const payload = await response.json();
+        const { runtime, permissions } = payload.activation.manifest;
+        sources.push({ command: runtime.ui.command, tables: permissions.writes.tables, files: permissions.writes.files });
+        response.json = async () => payload;
+      }
+      return response;
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100", coreToken: "host-token", fetch, ...systemBindings() });
+    await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
+    await manager.reloadApp("app-a", verifyPreparedViewer, publishReloadedViewer);
+    expect(backend.preparations).toHaveLength(2);
+    for (const [index, { spec }] of backend.preparations.entries()) {
+      const source = sources[index]!;
+      expect(spec.command).not.toBe(source.command);
+      expect(spec.writeTables).not.toBe(source.tables);
+      expect(spec.fileGrants).not.toBe(source.files);
+      source.command.push("changed"); source.tables.push("changed"); source.files.push("changed/");
+      expect(spec.command).toEqual(["npm", "run", "start"]);
+      expect(spec.writeTables).toEqual(["app_a_records"]);
+      expect(spec.fileGrants).toEqual(["apps/app-a/", "shared/app-a/"]);
+    }
+    await manager.stopAll();
+  });
+
   test("aggregates running workloads and the latest activation failure", async () => {
     const backend = new FakeBackend();
     const { fetch } = createFetch();

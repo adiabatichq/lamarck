@@ -1,3 +1,4 @@
+import { GuestResourceAdmission, type GuestResourceLease } from "../../../capsule-guest/src/resource-admission";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync } from "node:fs";
@@ -2139,6 +2140,165 @@ async function rejectionOf(operation: Promise<unknown>): Promise<Error> {
   throw new Error("Expected operation to reject");
 }
 
+// Real Guest ledger under the Host backend; transport/runc remain test doubles.
+function enableCapacity(h: ReturnType<typeof createHarness>) {
+  const MiB = 1024 ** 2;
+  const admission = new GuestResourceAdmission({ diskBudgetBytes: 50 * 1024 ** 3, memoryBudgetBytes: Math.floor(3555.9 * MiB), sharedBuildMemoryBytes: 512 * MiB });
+  const leases = new Map<string, GuestResourceLease>();
+  const bodies = new Map<string, Record<string, any>>();
+  const launches: Record<string, any>[] = [];
+  const released: string[] = [];
+  Object.assign(h.vm, { setMemory: async (bytes: number) => bytes, growState: async (bytes: number) => bytes, acknowledgeState: async (bytes: number) => bytes });
+  const status = () => ({ ...admission.snapshot(), totalBytes: 3940 * MiB, usableMemoryBytes: 3940 * MiB, availableBytes: 1000 * MiB, filesystemBytes: 4 * 1024 ** 3, freeDiskBytes: 3 * 1024 ** 3 });
+  const request = h.session.request.bind(h.session);
+  h.session.request = async (op, body) => {
+    if (op.startsWith("resources.")) {
+      h.session.operations.push(op);
+      if (op === "resources.launch.reserve") {
+        admission.reserveLaunch(body.launchKey, body.runtimeMemoryBytes, body.buildMemoryBytes,
+          body.replacement ? { workloadKey: body.replacement.workloadHandle, ownerKey: body.replacement.ownerKey } : undefined);
+        launches.push(body);
+      }
+      if (op === "resources.launch.release") { admission.releaseLaunch(body.launchKey); released.push(body.launchKey); }
+      return { ...status(), ...(op === "resources.disk.grow" ? { stateCapacityBytes: body.bytes } : {}) };
+    }
+    if (op === "workload.prepare") bodies.set(body.workloadHandle, body);
+    if (op === "build.prepare") leases.set(body.buildHandle, await admission.reserve(body.buildHandle,
+      { kind: "build", memoryBytes: body.resources.memoryBytes, launchKey: body.launchKey, ownerKey: body.ownerKey }));
+    if (op === "workload.start") {
+      const prepared = bodies.get(body.workloadHandle)!;
+      leases.set(body.workloadHandle, await admission.reserve(body.workloadHandle,
+        { kind: "runtime", memoryBytes: (prepared.memoryProfile === "lightweight" ? 256 : 512) * MiB, launchKey: prepared.launchKey,
+          ownerKey: launches.find(launch => launch.launchKey === prepared.launchKey)?.replacement?.ownerKey }));
+    }
+    try {
+      const result = await request(op, body);
+      if (op === "app.stop") for (const [key, prepared] of bodies) if (prepared.appHandle === body.appHandle) { leases.get(key)?.release(); leases.delete(key); }
+      if (op === "build.cancel") { leases.get(body.buildHandle)?.release(); leases.delete(body.buildHandle); }
+      return result;
+    } finally {
+      if (op === "build.start") { leases.get(body.buildHandle)?.release(); leases.delete(body.buildHandle); }
+    }
+  };
+  return { admission, launches, released };
+}
+
+describe("replacement reservation ownership through Host preparation", () => {
+  test.each(["cached", "warm", "cold", "warm-fallback"])("%s replacement retains its real grant until commit", async mode => {
+    const h = createHarness(), c = enableCapacity(h);
+    const first = await h.backend.startUi(spec("old"));
+    await c.admission.reserve("unrelated", { kind: "runtime", memoryBytes: 2304 * 1024 ** 2 });
+    if (mode !== "cached") h.packageDigest = PACKAGE_B;
+    if (mode === "cold") h.installWarmEligible = false;
+    if (mode === "warm-fallback") h.session.failNextWarmBuild = true;
+    const old = await h.backend.openUiStream(first.instanceId);
+    const prepared = await h.backend.prepareUi(spec("candidate", h.packageDigest), first.instanceId);
+    const launch = c.launches.at(-1)!;
+    expect(launch.replacement).toMatchObject({ appHandle: h.session.appPrepares[0]!.appHandle, ownerKey: appKey("weather") });
+    const earlierReleases = mode === "warm-fallback" ? 1 : 0;
+    expect(c.released.filter(key => key === launch.launchKey)).toHaveLength(earlierReleases);
+    expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 3328 * 1024 ** 2, projectedRuntimeMemoryBytes: 2816 * 1024 ** 2 });
+    expect(old.destroyed).toBe(false);
+    await h.backend.commitPreparedUi(prepared.preparationId);
+    expect(c.released.filter(key => key === launch.launchKey)).toHaveLength(earlierReleases + 1);
+    expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 2816 * 1024 ** 2, reservations: 2 });
+    expect(old.destroyed).toBe(true);
+    await h.backend.stopAll();
+  });
+
+  test.each(["abort", "expiry", "exit"])("%s releases the reservation after discarding only the candidate", async mode => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const h = createHarness(), c = enableCapacity(h);
+    try {
+      const first = await h.backend.startUi(spec("old"));
+      const old = await h.backend.openUiStream(first.instanceId);
+      const prepared = await h.backend.prepareUi(spec("candidate"), first.instanceId);
+      expect(c.admission.snapshot().reservations).toBe(3);
+      if (mode === "expiry") await vi.advanceTimersByTimeAsync(120_001);
+      else {
+        if (mode === "exit") h.session.guestEvent("workload.exited", {
+          appHandle: h.session.appPrepares.at(-1)!.appHandle,
+          workloadHandle: [...h.session.workloadApps.keys()].at(-1)!, exitCode: 1, signal: null,
+        });
+        await h.backend.abortPreparedUi(prepared.preparationId);
+      }
+      expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 512 * 1024 ** 2, reservations: 1 });
+      expect(old.destroyed).toBe(false);
+    } finally { await h.backend.stopAll(); vi.useRealTimers(); }
+  });
+
+  test("competing updates retry after finite replacement retirement and preserve unrelated viewers", async () => {
+    const h = createHarness(), c = enableCapacity(h);
+    const first = await h.backend.startUi(spec("old"));
+    const otherSpec = { ...spec("other"), appId: "other", packageDir: "/workspace/apps/other" };
+    const other = await h.backend.startUi(otherSpec);
+    await c.admission.reserve("background", { kind: "runtime", memoryBytes: 1792 * 1024 ** 2 });
+    const viewer = await h.backend.openUiStream(other.instanceId);
+    const prepared = await h.backend.prepareUi(spec("candidate"), first.instanceId);
+    let ready = false;
+    const waiting = h.backend.prepareUi({ ...otherSpec, sdkSenderId: "other-candidate" }, other.instanceId).then(value => { ready = true; return value; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(ready).toBe(false);
+    expect(c.admission.snapshot().reservedMemoryBytes).toBe(3328 * 1024 ** 2);
+    await h.backend.commitPreparedUi(prepared.preparationId);
+    const next = await waiting;
+    expect(viewer.destroyed).toBe(false);
+    await h.backend.abortPreparedUi(next.preparationId);
+    expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 2816 * 1024 ** 2, reservations: 3 });
+    await h.backend.stopAll();
+  });
+
+  test.each(["queued", "building"])("cancelling a %s replacement releases its launch without disturbing another App", async phase => {
+    const h = createHarness(), c = enableCapacity(h);
+    const first = await h.backend.startUi(spec("old"));
+    const otherSpec = { ...spec("other"), appId: "other", packageDir: "/workspace/apps/other" };
+    const other = await h.backend.startUi(otherSpec);
+    const viewer = await h.backend.openUiStream(other.instanceId);
+    let blocker: CapsuleUiPreparation | undefined;
+    if (phase === "queued") {
+      await c.admission.reserve("background", { kind: "runtime", memoryBytes: 1792 * 1024 ** 2 });
+      blocker = await h.backend.prepareUi(otherSpec, other.instanceId);
+    } else {
+      h.packageDigest = PACKAGE_B;
+      h.session.holdBuild = true;
+    }
+    const update = rejectionOf(h.backend.prepareUi(spec("candidate", h.packageDigest), first.instanceId));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    await h.backend.stopUi(first.instanceId);
+    expect(await update).toBeInstanceOf(Error);
+    expect(viewer.destroyed).toBe(false);
+    if (blocker) await h.backend.abortPreparedUi(blocker.preparationId);
+    expect(c.admission.snapshot().reservations).toBe(phase === "queued" ? 2 : 1);
+    await h.backend.stopAll();
+  });
+
+  test("a missing retirement acknowledgement contains the VM instead of dropping ownership", async () => {
+    const h = createHarness(), c = enableCapacity(h);
+    const first = await h.backend.startUi(spec("old"));
+    const prepared = await h.backend.prepareUi(spec("candidate"), first.instanceId);
+    const request = h.session.request.bind(h.session);
+    h.session.request = async (op, body) => {
+      if (op === "resources.launch.release") throw new Error("retirement acknowledgement lost");
+      return request(op, body);
+    };
+    await expect(h.backend.abortPreparedUi(prepared.preparationId)).rejects.toThrow(/acknowledgement lost/);
+    expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 1024 * 1024 ** 2, reservations: 2 });
+    expect(h.vm.stopCalls).toBe(1);
+  });
+
+  test("failed candidate cleanup retains commitments until VM containment", async () => {
+    const h = createHarness(), c = enableCapacity(h);
+    const first = await h.backend.startUi(spec("old"));
+    const prepared = await h.backend.prepareUi(spec("candidate"), first.instanceId);
+    const held = c.admission.snapshot();
+    h.session.failAppStop = true;
+    await expect(h.backend.abortPreparedUi(prepared.preparationId)).rejects.toThrow(/teardown/);
+    expect(c.admission.snapshot()).toEqual(held);
+    expect(c.released).not.toContain(c.launches.at(-1)!.launchKey);
+    expect(h.vm.stopCalls).toBe(1);
+  });
+});
+
 function createHarness(overrides: {
   opaqueId?: () => string;
   workspaceFilesPath?: () => string;
@@ -2996,6 +3156,7 @@ function guestRelease(): LoadedCapsuleGuestRelease {
         "artifact-erofs-v1",
         "build-v1",
         "oci-policy-v1",
+        "replacement-admission-v1",
         "resource-management-v1",
         "sdk-uds-v1",
         "tickets-v1",

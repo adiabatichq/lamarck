@@ -276,6 +276,7 @@ export interface MacOsCapsuleBackendDependencies {
 }
 
 interface LaunchCapacity {
+  previous?: UiRecord;
   key: string;
   memoryProfile: "lightweight" | "standard";
   runtimeBytes: number;
@@ -336,7 +337,7 @@ interface ActivationCheckpoint {
 }
 
 interface PreparedUiRecord {
-  releaseBuild?: () => void;
+  readonly launch: LaunchCapacity;
   expires?: ReturnType<typeof setTimeout>;
   readonly preparationId: string;
   readonly candidate: Candidate;
@@ -523,6 +524,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       this.#assertAcceptingWork(spec.appId);
       const ownerKey = hashAppId(spec.appId);
       let launchedCandidate: Candidate | undefined;
+      let retainedLaunch = false;
       const launch: LaunchCapacity = { key: this.#dependencies.opaqueId(), memoryProfile: "standard", runtimeBytes: 512 * 1024 ** 2, buildBytes: 0 };
       try {
         return await this.#withTransientStorage(ownerKey, async () => {
@@ -541,7 +543,11 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
             throw new Error("Capsule backend reached its live UI isolation limit");
           }
 
+          launch.previous = previous;
           const release = await this.#loadRelease();
+          if (previous && !release.handshake.expectedFeatures.includes("replacement-admission-v1")) {
+            throw new Error("App updates require a Guest rebuild with replacement-admission-v1");
+          }
           throwIfAborted(signal);
           const snapshot = await this.#dependencies.snapshot({
             packageDir: spec.packageDir,
@@ -579,19 +585,19 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           const prepared: PreparedUiRecord = {
             preparationId,
             candidate,
+            launch,
             packageDigest: snapshot.packageDigest,
             ...(previousInstanceId === undefined ? {} : { previousInstanceId }),
             retention: this.#artifacts.retain(candidate.artifact),
             state: "prepared",
           };
-          prepared.releaseBuild = launch.releaseBuild;
-          launch.releaseBuild = undefined;
           prepared.expires = setTimeout(() => {
             if (prepared.state === "prepared") void this.abortPreparedUi(preparationId).catch(() => {});
           }, 120_000);
           prepared.expires.unref();
           this.#preparedUi.set(preparationId, prepared);
           this.#preparedInstances.set(candidate.instanceId, prepared);
+          retainedLaunch = true;
           return Object.freeze({
             preparationId,
             instanceId: candidate.instanceId,
@@ -617,11 +623,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         }
         throw error;
       } finally {
-        try {
-          await this.#withLaunchCleanup(signal, async () => {
-            if (launch.boot?.capacity && !launch.boot.intentional) await launch.boot.capacity.releaseLaunch(launch.key);
-          });
-        } finally { launch.releaseBuild?.(); }
+        if (!retainedLaunch) await this.#releaseLaunchCapacity(launch, signal);
       }
     }));
   }
@@ -1374,8 +1376,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       launch.releaseBuild = await this.#buildQueue.acquire(async () => {
         throwIfAborted(signal);
         if (boot.capacity) {
-          await boot.capacity.reserveLaunch(launch.key, launch.runtimeBytes, launch.buildBytes);
+          const replacement = this.#replacementBinding(launch, boot);
           launch.boot = boot;
+          await boot.capacity.reserveLaunch(launch.key, launch.runtimeBytes, launch.buildBytes, replacement);
         }
       }, signal);
     }
@@ -1856,8 +1859,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   ): Promise<Candidate> {
     throwIfAborted(signal);
     if (boot.capacity && !launch.boot) {
-      await boot.capacity.reserveLaunch(launch.key, launch.runtimeBytes, 0);
-      launch.boot = boot;
+      launch.releaseBuild = await this.#buildQueue.acquire(async () => {
+        throwIfAborted(signal);
+        const replacement = this.#replacementBinding(launch, boot);
+        launch.boot = boot;
+        await boot.capacity!.reserveLaunch(launch.key, launch.runtimeBytes, 0, replacement);
+      }, signal, false);
     }
     const { artifact } = resolved;
     throwIfAborted(signal);
@@ -2069,7 +2076,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     try {
       boot = await this.#requireCurrentBoot(candidate.bootGeneration);
     } catch (error) {
-      this.#completePreparation(prepared, { decision: "aborted" });
+      await this.#finishPreparation(prepared, { decision: "aborted" });
       throw error;
     }
     if (candidate.terminalError) {
@@ -2108,7 +2115,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           candidate.appId,
           candidate.spec.activationSequence,
         );
-        this.#completePreparation(prepared, {
+        await this.#finishPreparation(prepared, {
           decision: "committed",
           instanceId: candidate.instanceId,
         });
@@ -2147,7 +2154,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       try {
         await this.#loseBoundary(error, boot);
       } finally {
-        this.#completePreparation(prepared, { decision: "aborted" });
+        await this.#finishPreparation(prepared, { decision: "aborted" });
       }
       if (rollbackError !== undefined) {
         throw new AggregateError(
@@ -2171,7 +2178,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         candidate.appId,
         candidate.spec.activationSequence,
       );
-      this.#completePreparation(prepared, {
+      await this.#finishPreparation(prepared, {
         decision: "committed",
         instanceId: candidate.instanceId,
       });
@@ -2186,7 +2193,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       try {
         await this.#loseBoundary(error, boot);
       } finally {
-        this.#completePreparation(prepared, { decision: "aborted" });
+        await this.#finishPreparation(prepared, { decision: "aborted" });
       }
       if (rollbackError !== undefined) {
         throw new AggregateError(
@@ -2242,7 +2249,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         if (boundaryError !== error) failures.push(boundaryError);
       }
     } finally {
-      this.#completePreparation(prepared, { decision: "aborted" });
+      await this.#finishPreparation(prepared, { decision: "aborted" });
     }
     if (failures.length > 1) {
       throw new AggregateError(failures, "Candidate activation rollback or cleanup failed");
@@ -2255,7 +2262,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     try {
       boot = await this.#requireCurrentBoot(prepared.candidate.bootGeneration);
     } catch (error) {
-      this.#completePreparation(prepared, {
+      await this.#finishPreparation(prepared, {
         decision: "aborted",
         ...(outcomeError === undefined ? {} : { error: outcomeError }),
       });
@@ -2268,23 +2275,51 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       try {
         await this.#loseBoundary(error, boot);
       } finally {
-        this.#completePreparation(prepared, {
+        await this.#finishPreparation(prepared, {
           decision: "aborted",
           ...(outcomeError === undefined ? {} : { error: outcomeError }),
         });
       }
       throw error;
     }
-    this.#completePreparation(prepared, {
+    await this.#finishPreparation(prepared, {
       decision: "aborted",
       ...(outcomeError === undefined ? {} : { error: outcomeError }),
     });
   }
 
+  #replacementBinding(launch: LaunchCapacity, boot: BootBoundary): RequestBodyFor<"resources.launch.reserve">["replacement"] {
+    const previous = launch.previous;
+    if (!previous) return undefined;
+    if (this.#boot !== boot || previous.bootGeneration !== boot.generation
+      || this.#instances.get(previous.instanceId) !== previous || previous.lifecycle !== "active" || previous.terminalError) {
+      throw new Error("Replacement lost its previous UI generation before admission");
+    }
+    return { appHandle: previous.appHandle, workloadHandle: previous.workloadHandle, ownerKey: hashAppId(previous.appId) };
+  }
+
+  async #releaseLaunchCapacity(launch: LaunchCapacity, signal?: AbortSignal): Promise<void> {
+    try {
+      if (launch.boot?.capacity && !launch.boot.intentional) await launch.boot.capacity.releaseLaunch(launch.key);
+    } catch (error) {
+      this.#recordLaunchCleanupFailure(signal, error);
+      await this.#loseBoundary(error, launch.boot);
+      throw error;
+    } finally {
+      launch.releaseBuild?.();
+      launch.releaseBuild = undefined;
+    }
+  }
+
+  async #finishPreparation(prepared: PreparedUiRecord, outcome: PreparedUiOutcome): Promise<void> {
+    await this.#releaseLaunchCapacity(prepared.launch);
+    this.#completePreparation(prepared, outcome);
+  }
+
   #completePreparation(prepared: PreparedUiRecord, outcome: PreparedUiOutcome): void {
     if (prepared.expires) clearTimeout(prepared.expires);
-    prepared.releaseBuild?.();
-    prepared.releaseBuild = undefined;
+    prepared.launch.releaseBuild?.();
+    prepared.launch.releaseBuild = undefined;
     if (this.#preparedUi.get(prepared.preparationId) === prepared) {
       this.#preparedUi.delete(prepared.preparationId);
     }

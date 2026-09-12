@@ -193,6 +193,7 @@ export class CapsuleGuestSupervisor {
         "artifact-erofs-v1",
         "build-v1",
         "oci-policy-v1",
+        "replacement-admission-v1",
         "resource-management-v1",
         "sdk-uds-v1",
         "app-cli-v1",
@@ -339,11 +340,27 @@ export class CapsuleGuestSupervisor {
       case "resources.status":
       case "resources.memory.prepare":
       case "resources.memory.commit":
-      case "resources.launch.reserve":
       case "resources.launch.release":
       case "resources.disk.grow":
         if (!this.options.capacity) throw new Error("Guest capacity controller is unavailable");
         return this.options.capacity.handle(request);
+
+      case "resources.launch.reserve": {
+        if (!this.options.capacity) throw new Error("Guest capacity controller is unavailable");
+        const previous = request.body.replacement;
+        if (!previous) return this.options.capacity.handle(request);
+        // CONTROL is bound to this boot/session. Handles alone never grant
+        // credit: resolve the live lease and immutable App owner in the Guest.
+        const record = this.requireWorkload(previous.appHandle, previous.workloadHandle);
+        const app = this.state.apps[previous.appHandle];
+        const status = app?.workloads[previous.workloadHandle]?.status;
+        if (app?.status !== "ready" || !["running", "ready"].includes(status ?? "")
+          || record.finalized || !record.execution || !record.resourceLease
+          || this.appBlobReferences.get(previous.appHandle)?.ownerKey !== previous.ownerKey) {
+          throw new Error("Replacement does not name an active workload of this App");
+        }
+        return this.options.capacity.handle(request, { workloadKey: record.resourceLease.key, ownerKey: previous.ownerKey });
+      }
 
       case "ping":
         return { nonce: request.body.nonce };
@@ -813,6 +830,7 @@ export class CapsuleGuestSupervisor {
         memoryBytes: resources.memoryBytes,
         kind: "runtime",
         launchKey: record.body.launchKey,
+        ownerKey: this.appBlobReferences.get(appHandle)?.ownerKey,
       });
       const execution = await this.runc.start({
         plan,

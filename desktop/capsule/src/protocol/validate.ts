@@ -201,11 +201,18 @@ export function parseHostRequest(value: unknown): HostRequest {
       return { ...base, op: object.op, body: { bytes: boundedInteger(body.bytes, "$.body.bytes", 4 * 1024 ** 3, 64 * 1024 ** 3) } };
     }
     case "resources.launch.reserve": {
-      const body = exactObject(object.body, "$.body", ["launchKey", "runtimeMemoryBytes", "buildMemoryBytes"]);
+      const body = exactObject(object.body, "$.body", ["launchKey", "runtimeMemoryBytes", "buildMemoryBytes"], ["replacement"]);
+      const replacement = body.replacement === undefined ? undefined
+        : exactObject(body.replacement, "$.body.replacement", ["appHandle", "workloadHandle", "ownerKey"]);
       return { ...base, op: object.op, body: {
         launchKey: opaqueId(body.launchKey, "$.body.launchKey"),
         runtimeMemoryBytes: boundedInteger(body.runtimeMemoryBytes, "$.body.runtimeMemoryBytes", 256 * 1024 ** 2, 512 * 1024 ** 2),
         buildMemoryBytes: boundedInteger(body.buildMemoryBytes, "$.body.buildMemoryBytes", 0, 2 * 1024 ** 3),
+        ...(replacement === undefined ? {} : { replacement: {
+          appHandle: opaqueId(replacement.appHandle, "$.body.replacement.appHandle"),
+          workloadHandle: opaqueId(replacement.workloadHandle, "$.body.replacement.workloadHandle"),
+          ownerKey: appOwnerKey(replacement.ownerKey, "$.body.replacement.ownerKey"),
+        } }),
       } };
     }
     case "resources.launch.release": {

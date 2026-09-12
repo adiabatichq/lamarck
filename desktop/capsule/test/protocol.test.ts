@@ -32,6 +32,19 @@ const BLOB_HANDLE = "L".repeat(22);
 const BUILD_HANDLE = "D".repeat(22);
 
 describe("Capsule protocol validation", () => {
+  test("replacement metadata is exact and bound to the current authenticated session", () => {
+    const request = { v: CAPSULE_PROTOCOL_VERSION, sessionId: SESSION_ID, requestId: REQUEST_ID, kind: "request", op: "resources.launch.reserve",
+      body: { launchKey: BUILD_HANDLE, runtimeMemoryBytes: 256 * 1024 ** 2, buildMemoryBytes: 512 * 1024 ** 2,
+        replacement: { appHandle: APP_HANDLE, workloadHandle: WORKLOAD_HANDLE, ownerKey: OWNER_KEY } } };
+    expect(parseHostRequestForSession(request, SESSION_ID)).toEqual(request);
+    expect(() => parseHostRequestForSession(request, OTHER_SESSION_ID)).toThrow();
+    for (const replacement of [
+      { ...request.body.replacement, memoryCreditBytes: 512 * 1024 ** 2 },
+      { ...request.body.replacement, ownerKey: "forged" },
+      { ...request.body.replacement, workloadHandle: "" },
+      { appHandle: APP_HANDLE, ownerKey: OWNER_KEY },
+    ]) expect(() => parseHostRequest({ ...request, body: { ...request.body, replacement } })).toThrow();
+  });
   test("bounds active blob transfers by progress and advertised size", () => {
     expect(blobTransferAbsoluteDeadlineMs(8 * 1024 * 1024)).toBe(68_000);
     expect(normalizeBlobTransferPolicy({ idleTimeoutMs: 5 })).toEqual({
