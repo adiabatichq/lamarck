@@ -137,6 +137,8 @@ export class VmCapacityCoordinator {
     // Boot kernel overhead is not grantable memory and cannot be ballooned in.
     const overhead = this.bootMemoryBytes - state.memoryCeilingBytes;
     const target = Math.min(this.bootMemoryBytes, align(required + overhead + CACHE_HEADROOM, 64 * MiB));
+    // Preserve typed helper pressure errors: reject this request instead of
+    // making the Build queue wait and block launches that need no new supply.
     await this.helper.setMemory(target);
     const expectedUsable = target - (this.bootMemoryBytes - state.memoryCeilingBytes - MANAGEMENT);
     const deadline = Date.now() + 5_000;

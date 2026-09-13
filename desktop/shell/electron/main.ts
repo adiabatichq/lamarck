@@ -43,6 +43,8 @@ import {
   type ReloadedBrowserBinding,
 } from "./capsule/manager";
 import { MacOsCapsuleBackend } from "./capsule/macos-backend";
+import { CapacityExhaustedError } from "./capsule/capacity-coordinator";
+import { CapsuleVmHostError } from "./capsule-vm/launcher";
 import { isCapsuleRestartRequiredError } from "./capsule/backend";
 import { SystemBroker } from "./capsule/system-broker";
 import { SystemStreamServer } from "./capsule/system-stream";
@@ -2981,7 +2983,10 @@ app.whenReady().then(async () => {
             ? "CAPSULE_RESTART_REQUIRED"
             : error instanceof AppViewerBusyError
               ? "APP_VIEWER_BUSY"
-              : "APP_VIEWER_OPEN_FAILED",
+              : error instanceof CapacityExhaustedError
+                  || (error instanceof CapsuleVmHostError && error.code === "host_memory_pressure")
+                ? "CAPSULE_RESOURCE_EXHAUSTED"
+                : "APP_VIEWER_OPEN_FAILED",
           message: errorMessage(error),
           restartRequired: isCapsuleRestartRequiredError(error),
         },

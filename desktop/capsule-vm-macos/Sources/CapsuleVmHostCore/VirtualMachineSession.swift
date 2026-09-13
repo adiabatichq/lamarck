@@ -2,6 +2,15 @@ import Darwin
 import Foundation
 @preconcurrency import Virtualization
 
+// kern.memorystatus_vm_pressure_level returns NOTE_MEMORYSTATUS_PRESSURE_*
+// (XNU's sysctl_memorystatus_vm_pressure_level converts the internal VM enum).
+// These are notification values from bsd/sys/event.h, not kVMPressure* levels.
+private enum HostMemoryPressure: UInt32 {
+    case normal = 0x01
+    case warning = 0x02
+    case critical = 0x04
+}
+
 public enum CapsuleVmLifecycleState: String, Equatable, Sendable {
     case idle
     case starting
@@ -245,13 +254,27 @@ public final class CapsuleVmVirtualMachineSession: NSObject, CapsuleVmSessionCon
                       let balloon = vm.memoryBalloonDevices.first as? VZVirtioTraditionalMemoryBalloonDevice else {
                     completion(.failure(CapsuleVmLifecycleError.sessionUnavailable)); return
                 }
-                // A pressure warning denies new supply; existing Apps retain G.
-                var pressure: Int32 = 0
-                var size = MemoryLayout<Int32>.size
+                var pressure: UInt32 = 0
+                var size = MemoryLayout<UInt32>.size
                 if bytes > balloon.targetVirtualMachineMemorySize,
                    sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &size, nil, 0) == 0,
-                   pressure > 1 {
-                    completion(.failure(CapsuleVmCommandError(code: "host_memory_pressure", message: "Host memory is under pressure"))); return
+                   size == MemoryLayout<UInt32>.size {
+                    switch HostMemoryPressure(rawValue: pressure) {
+                    case .normal, .warning:
+                        // Restore reclaimed supply on demand, including under warning.
+                        break
+                    case .critical:
+                        // Reject only this supply request; a later Retry reads pressure again.
+                        completion(.failure(CapsuleVmCommandError(
+                            code: "host_memory_pressure",
+                            message: "Host memory is temporarily unavailable under critical pressure; retry when memory is available"
+                        )))
+                        return
+                    case nil:
+                        // An unavailable/unknown pressure reading is not a capacity grant.
+                        // As with sysctl failure, the Guest must still confirm real supply.
+                        break
+                    }
                 }
                 balloon.targetVirtualMachineMemorySize = bytes
                 // This acknowledges the command only. The Host must separately

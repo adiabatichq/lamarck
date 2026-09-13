@@ -80,6 +80,7 @@ interface Window {
             code:
               | "CAPSULE_RESTART_REQUIRED"
               | "APP_VIEWER_BUSY"
+              | "CAPSULE_RESOURCE_EXHAUSTED"
               | "APP_VIEWER_OPEN_FAILED";
             message: string;
             restartRequired: boolean;
