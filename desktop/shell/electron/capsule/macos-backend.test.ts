@@ -9,6 +9,7 @@ import { Duplex, PassThrough, Readable } from "node:stream";
 import { describe, expect, test, vi } from "vitest";
 import {
   CAPSULE_PROTOCOL_VERSION,
+  RUNTIME_STARTUP_TIMEOUT_MS,
   type GuestEvent,
   type JsonValue,
   type StreamKind,
@@ -2214,7 +2215,11 @@ describe("replacement reservation ownership through Host preparation", () => {
       const old = await h.backend.openUiStream(first.instanceId);
       const prepared = await h.backend.prepareUi(spec("candidate"), first.instanceId);
       expect(c.admission.snapshot().reservations).toBe(3);
-      if (mode === "expiry") await vi.advanceTimersByTimeAsync(120_001);
+      if (mode === "expiry") {
+        await vi.advanceTimersByTimeAsync(120_001);
+        expect(c.admission.snapshot().reservations).toBe(3);
+        await vi.advanceTimersByTimeAsync(RUNTIME_STARTUP_TIMEOUT_MS - 120_001 + 1);
+      }
       else {
         if (mode === "exit") h.session.guestEvent("workload.exited", {
           appHandle: h.session.appPrepares.at(-1)!.appHandle,

@@ -262,10 +262,11 @@ describe("single VM capacity acknowledgement", () => {
     expect(f.operations.slice(-2)).toEqual(["resources.launch.reserve", "resources.launch.release"]);
   });
 
-  test("measured pressure admits one Build and rejects another until that Build retires", async () => {
+  test("sustained pressure admits one Build and rejects another until that Build retires", async () => {
     const f = fixture();
     Object.assign(f.state, { ioPressureAvg10: 20 });
     await f.coordinator.reserveLaunch("first", 256 * MiB, 512 * MiB);
+    f.time(1_000);
     await expect(f.coordinator.reserveLaunch("second", 256 * MiB, 512 * MiB)).rejects.toThrow(/one concurrent Build/);
     await f.coordinator.releaseLaunch("first");
     await f.coordinator.reserveLaunch("second", 256 * MiB, 512 * MiB);

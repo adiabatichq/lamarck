@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import { describe, expect, test, vi } from "vitest";
 import { GuestResourceAdmission, usableGuestMemory } from "../src/resource-admission";
 import { RuntimeMemoryController } from "../src/runtime-memory";
@@ -64,17 +65,35 @@ describe("enforced Runtime grants and complete launch reservations", () => {
   test("controller confirms kernel limits, preserves clean caches, and grows in 64 MiB increments", async () => {
     const admission = capacity();
     const grant = await admission.reserve("runtime", { kind: "runtime", memoryBytes: 256 * MiB });
-    let actual = 256 * MiB, working = 160 * MiB;
-    const kernel = { workingBytes: async () => working, readLimit: async () => actual,
+    let now = 0, actual = 256 * MiB, working = 160 * MiB;
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    const kernel = { workingBytes: async () => working,
+      measure: async () => ({ usageBytes: Math.max(220 * MiB, working), anonBytes: working,
+        kernelBytes: 0, pressureTotalUs: 0, highEvents: 0, maxEvents: 0 }), readLimit: async () => actual,
       writeLimit: vi.fn(async (bytes: number) => { expect(grant.memoryBytes).toBe(bytes); actual = bytes; }), writeHigh: vi.fn(async () => {}) };
     const controller = new RuntimeMemoryController(grant, kernel);
-    await controller.start(); await controller.poll();
-    expect(kernel.writeLimit).not.toHaveBeenCalled();
-    working = 220 * MiB; await controller.poll();
-    expect(actual).toBe(320 * MiB);
-    working = 600 * MiB; await controller.poll(); await controller.poll(); await controller.poll(); await controller.poll();
-    expect(actual).toBe(512 * MiB);
-    await controller.stop(); grant.release();
+    const sample = async () => { now += 250; await controller.poll(); };
+    try {
+      await controller.start(); await sample(); await sample();
+      expect(kernel.writeLimit).not.toHaveBeenCalled();
+      working = 220 * MiB; await sample();
+      expect(actual).toBe(256 * MiB);
+      await sample();
+      expect(actual).toBe(320 * MiB);
+      for (let target = 384 * MiB; target <= 1024 * MiB; target += 64 * MiB) {
+        working = actual; await sample();
+        expect(actual).toBe(target - 64 * MiB);
+        await sample();
+        expect(actual).toBe(target);
+      }
+      working = actual; await sample(); await sample();
+      expect(actual).toBe(1024 * MiB);
+      expect(kernel.writeLimit).toHaveBeenCalledTimes(12);
+    } finally {
+      await controller.stop(); grant.release(); clock.mockRestore(); vi.useRealTimers();
+    }
+    expect(admission.snapshot().reservedMemoryBytes).toBe(0);
   });
 
   test("cancellation while sampling never raises a stopped workload limit", async () => {

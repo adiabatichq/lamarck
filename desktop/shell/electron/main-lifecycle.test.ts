@@ -82,7 +82,7 @@ describe("App viewer IPC contract", () => {
     expect(handler).toContain('"APP_VIEWER_BUSY"');
     expect(handler).toContain("const owner = requireShellRendererOwner(event)");
     expect(handler).toContain("await awaitShellRendererRetirement(event.sender, owner)");
-    expect(handler).toContain("openAppViewer(event.sender, owner, appId)");
+    expect(handler).toContain("openAppViewer(event.sender, owner, appId, opening.controller.signal)");
   });
 
   test("rechecks the renderer owner before publishing a prepared viewer", () => {
@@ -529,7 +529,8 @@ describe("Shell Host configuration", () => {
     expect(loader).toContain("viewerSession.webRequest.onCompleted");
     expect(loader).toContain("mainResponse");
     expect(loader).toContain("contents.stop()");
-    expect(loader).toContain("8_000");
+    expect(loader).toContain("timeoutMs = RUNTIME_STARTUP_TIMEOUT_MS");
+    expect(loader).toContain("}, timeoutMs)");
     expect(loader).not.toContain("setImmediate");
   });
 
