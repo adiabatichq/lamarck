@@ -1,4 +1,5 @@
-const DEFAULT_TIMEOUT_MS = 8_000;
+import { RUNTIME_STARTUP_TIMEOUT_MS } from "@lamarck/capsule";
+const DEFAULT_TIMEOUT_MS = RUNTIME_STARTUP_TIMEOUT_MS;
 const DEFAULT_RETRY_DELAY_MS = 100;
 const MAX_RETRY_DELAY_MS = 500;
 const TRANSIENT_STATUS_CODES = new Set([502, 503, 504]);
@@ -14,6 +15,7 @@ interface ViewerReadinessResponse {
 export interface ViewerReadinessOptions {
   request(signal: AbortSignal): Promise<ViewerReadinessResponse>;
   assertCurrent?(): void;
+  signal?: AbortSignal;
   timeoutMs?: number;
   retryDelayMs?: number;
   now?: () => number;
@@ -44,6 +46,7 @@ export async function waitForViewerHttpReady(
   let lastResult = "no response";
 
   while (true) {
+    options.signal?.throwIfAborted();
     options.assertCurrent?.();
     const remainingBeforeRequest = timeoutMs - (now() - startedAt);
     if (remainingBeforeRequest <= 0) {
@@ -51,8 +54,11 @@ export async function waitForViewerHttpReady(
     }
 
     const controller = new AbortController();
+    let abortAttempt: (() => void) | undefined;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     const attemptDeadline = new Promise<never>((_resolve, reject) => {
+      abortAttempt = () => { controller.abort(options.signal?.reason); reject(options.signal?.reason); };
+      options.signal?.addEventListener("abort", abortAttempt, { once: true });
       deadlineTimer = setTimeout(() => {
         controller.abort();
         reject(new ViewerReadinessDeadlineError());
@@ -66,7 +72,12 @@ export async function waitForViewerHttpReady(
       ]);
       const result = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
       lastResult = result;
-      if (response.body) {
+      const unrecoverable = (response.status < 200 || response.status > 299) && !TRANSIENT_STATUS_CODES.has(response.status);
+      if (unrecoverable) {
+        // Report the status immediately; body cleanup must not delay rejection.
+        void response.body?.cancel().catch(() => {});
+        controller.abort();
+      } else if (response.body) {
         // Keep the same absolute attempt deadline through response cleanup.
         // A fetch that returns headers but never releases its body must not
         // leave the Shell's "Preparing" state hanging forever.
@@ -82,8 +93,10 @@ export async function waitForViewerHttpReady(
       lastResult = error instanceof Error ? error.message : String(error);
     } finally {
       if (deadlineTimer) clearTimeout(deadlineTimer);
+      if (abortAttempt) options.signal?.removeEventListener("abort", abortAttempt);
     }
 
+    options.signal?.throwIfAborted();
     options.assertCurrent?.();
     if (response) {
       const result = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;

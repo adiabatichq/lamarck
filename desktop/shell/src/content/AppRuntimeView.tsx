@@ -22,6 +22,7 @@ export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRu
 
   useEffect(() => {
     let cancelled = false;
+    let openingId: string | null = null;
     let openedViewerId: string | null = null;
     let retryTimer: number | null = null;
     let animationFrame = 0;
@@ -29,7 +30,7 @@ export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRu
     setError(null);
     setTakingLong(false);
 
-    const longTimer = window.setTimeout(() => setTakingLong(true), 1_200);
+    const longTimer = window.setTimeout(() => setTakingLong(true), 60_000);
 
     async function open(attempt = 1): Promise<void> {
       const retry = (failure: ViewerOpenFailure): boolean => {
@@ -40,7 +41,8 @@ export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRu
       };
 
       try {
-        const result = await window.lamarckHost?.openAppViewer(appId);
+        openingId = crypto.randomUUID();
+        const result = await window.lamarckHost?.openAppViewer(appId, openingId);
         if (!result) throw new Error("App Capsule Host is unavailable");
         if (!result.ok) {
           if (cancelled) return;
@@ -73,6 +75,7 @@ export function AppRuntimeView({ appId, appName = appId, hidden = false }: AppRu
 
     return () => {
       cancelled = true;
+      if (openingId) window.lamarckHost?.cancelAppOpening(openingId);
       window.clearTimeout(longTimer);
       window.cancelAnimationFrame(animationFrame);
       if (retryTimer !== null) window.clearTimeout(retryTimer);

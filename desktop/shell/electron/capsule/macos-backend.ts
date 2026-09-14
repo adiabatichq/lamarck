@@ -1,4 +1,6 @@
-import { BuildProgressQueue, VmCapacityCoordinator } from "./capacity-coordinator";
+import { performance } from "node:perf_hooks";
+import { RUNTIME_STARTUP_TIMEOUT_MS } from "@lamarck/capsule";
+import { BuildProgressQueue, VmCapacityCoordinator, CapacityExhaustedError } from "./capacity-coordinator";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
@@ -132,7 +134,6 @@ const USER_NAMESPACE_RANGE = 65_536;
 const FIRST_USER_NAMESPACE_BASE = 131_072;
 const LAST_USER_NAMESPACE_BASE = 2_147_418_112;
 const TICKET_TTL_MS = 60_000;
-const UI_READY_TIMEOUT_MS = 45_000;
 const WORKLOAD_STREAM_ATTACH_TIMEOUT_MS = 10_000;
 const BLOB_EVENT_CONFIRM_TIMEOUT_MS = 10_000;
 const BUILD_TIMEOUT_MS = 120_000;
@@ -301,6 +302,7 @@ interface BootBoundary {
 }
 
 interface UiRecord {
+  startupDeadlineMs?: number;
   readonly instanceId: string;
   readonly appId: string;
   readonly appHandle: string;
@@ -592,8 +594,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
             state: "prepared",
           };
           prepared.expires = setTimeout(() => {
-            if (prepared.state === "prepared") void this.abortPreparedUi(preparationId).catch(() => {});
-          }, 120_000);
+            if (prepared.state === "prepared") this.#failWorkload(boot, candidate,
+              new GuestOperationError("Runtime startup budget exhausted"));
+          }, Math.max(1, candidate.startupDeadlineMs! - performance.now()));
           prepared.expires.unref();
           this.#preparedUi.set(preparationId, prepared);
           this.#preparedInstances.set(candidate.instanceId, prepared);
@@ -601,6 +604,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           return Object.freeze({
             preparationId,
             instanceId: candidate.instanceId,
+            startupDeadlineMs: candidate.startupDeadlineMs,
           });
         });
       } catch (error) {
@@ -1171,6 +1175,28 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           growState: (bytes) => helper.growState!(bytes),
           acknowledgeState: (bytes) => helper.acknowledgeState!(bytes),
         }, this.#storageBudget, join(this.#options.stateDirectory, "state.raw"), stateDiskBytes);
+        ready.capacity.onAvailable = () => this.#buildQueue.wake();
+        ready.capacity.onFailure = (error) => {
+          if (this.#boot === ready && !ready.intentional) this.#loseBoundaryInBackground(error, ready);
+        };
+        ready.capacity.onObserved = (state) => {
+          if (this.#boot !== ready || ready.intentional) return;
+          for (const sample of state.workloads ?? []) {
+            const candidate = this.#workloads.get(sample.workloadHandle);
+            if (!candidate || candidate.bootGeneration !== ready.generation || candidate.appHandle !== sample.appHandle) continue;
+            if (!["launching", "prepared"].includes(candidate.lifecycle) || candidate.terminalError
+              || sample.sampleAgeMs === null || sample.sampleAgeMs > 2_000
+              || sample.error?.code !== "CAPSULE_RESOURCE_EXHAUSTED") continue;
+            // Recoverable supply/release waits use the original startup deadline,
+            // even when an individual supply attempt fails.
+            if (sample.growthWait !== "exhausted") continue;
+            const error = new CapacityExhaustedError(`${sample.error.message}; Runtime capacity unavailable. Retry after capacity is available.`);
+            // Reject only an unpublished candidate. Existing Apps retain their
+            // limits and are never evicted by a resource-policy decision.
+            if (candidate.lifecycle === "launching") this.#abortLaunches(candidate.appId, error);
+            this.#failWorkload(ready, candidate, error);
+          }
+        };
         await ready.capacity.status();
         // Recover a backed-but-not-exposed growth after an interrupted prior boot.
         const growth = await session.request("resources.disk.grow", { bytes: stateDiskBytes });
@@ -2005,15 +2031,18 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         signal,
       );
 
+      candidate.startupDeadlineMs = performance.now() + RUNTIME_STARTUP_TIMEOUT_MS;
       const ready = this.#waitForWorkloadReady(
         boot,
         appHandle,
         workloadHandle,
         spec.port,
         signal,
+        Math.max(1, Math.floor(candidate.startupDeadlineMs - performance.now())),
       );
       try {
-        const started = await boot.session.request("workload.start", { appHandle, workloadHandle });
+        const started = await boot.session.request("workload.start", { appHandle, workloadHandle,
+          startupTimeoutMs: Math.max(1, Math.floor(candidate.startupDeadlineMs - performance.now())) });
         this.#parseGuestResult(boot, parseWorkloadStartResult, started);
         await Promise.race([ready.promise, sdkClosure]);
       } catch (error) {
@@ -2078,6 +2107,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     } catch (error) {
       await this.#finishPreparation(prepared, { decision: "aborted" });
       throw error;
+    }
+    if (candidate.startupDeadlineMs !== undefined && performance.now() >= candidate.startupDeadlineMs) {
+      candidate.terminalError ??= new GuestOperationError("Runtime startup budget exhausted");
     }
     if (candidate.terminalError) {
       const error = candidate.terminalError;
@@ -2171,8 +2203,19 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     if (signal?.aborted) {
       return await this.#failPreparedCommit(prepared, boot, abortError(signal), activation, signal);
     }
+    if (candidate.terminalError) {
+      // The prior Runtime is already gone. Reuse the existing loss notification
+      // so Manager/Main retire its browser authority instead of retaining a
+      // viewer for a dead generation when this candidate is discarded.
+      try {
+        this.#uiLostHandler?.({ instanceId: previous.instanceId, appId: previous.appId, error: candidate.terminalError });
+      } catch (error) {
+        await this.#loseBoundary(error, boot);
+        throw error;
+      }
+      return await this.#failPreparedCommit(prepared, boot, candidate.terminalError, activation, signal);
+    }
     try {
-      if (candidate.terminalError) throw candidate.terminalError;
       this.#publishCandidate(candidate);
       this.#latestActivationSequenceByApp.set(
         candidate.appId,
@@ -2516,6 +2559,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       return;
     }
 
+    this.#failWorkload(boot, record, terminalError);
+  }
+
+  #failWorkload(boot: BootBoundary, record: UiRecord, terminalError: Error): void {
     if (record.bootGeneration !== boot.generation) {
       this.#loseBoundaryInBackground(new Error("Guest terminal event crossed VM generations"), boot);
       return;
@@ -2555,10 +2602,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       }).catch((error) => this.#loseBoundaryInBackground(error, boot));
       return;
     }
-    if (record.lifecycle === "replacement") {
-      this.#loseBoundaryInBackground(terminalError, boot);
-      return;
-    }
+    // Commit already owns the previous-UI retirement. Its next authority check
+    // observes terminalError and discards this candidate after verified cleanup.
+    if (record.lifecycle === "replacement") return;
 
     record.lifecycle = "lost";
     this.#instances.delete(record.instanceId);
@@ -2706,9 +2752,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     workloadHandle: string,
     port: number,
     signal: AbortSignal,
+    timeoutMs: number,
   ): EventWaiter<void> {
     let started = false;
-    return this.#eventWaiter(boot, UI_READY_TIMEOUT_MS, signal, (event) => {
+    return this.#eventWaiter(boot, timeoutMs, signal, (event) => {
       if (event.type === "workload.started") {
         const actual = claimedWorkloadIdentity(event);
         if (actual && !sameWorkload(actual, { appHandle, workloadHandle })) {
@@ -2751,7 +2798,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         throw new GuestOperationError("Guest UI workload exited before viewer readiness");
       }
       return undefined;
-    });
+    }, undefined, new GuestOperationError("Runtime startup budget exhausted"));
   }
 
   async #waitForWorkloadStreamsAttached(
@@ -2778,6 +2825,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     signal: AbortSignal,
     correlate: (event: GuestEvent) => { done: true; value: T } | undefined,
     route?: { blobHandle: string } | { buildHandle: string; expected: BuildDescriptorExpectation },
+    timeoutError?: GuestOperationError,
   ): EventWaiter<T> {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2829,9 +2877,11 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
-        const error = new Error("Timed out waiting for authenticated Guest event");
+        const error = timeoutError ?? new Error("Timed out waiting for authenticated Guest event");
         reject(error);
-        this.#loseBoundaryInBackground(error, boot);
+        // Runtime startup expiry is cleaned up by the candidate's owner.
+        // Protocol deadlines still require VM teardown.
+        if (!(error instanceof GuestOperationError)) this.#loseBoundaryInBackground(error, boot);
       }, durationMs);
     };
     const promise = new Promise<T>((resolve, rejectValue) => {
@@ -3138,9 +3188,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     return stopping;
   }
 
-  #abortLaunches(appId: string, reason: string): void {
+  #abortLaunches(appId: string, reason: string | Error): void {
     for (const controller of this.#launches.get(appId)?.keys() ?? []) {
-      controller.abort(new Error(reason));
+      controller.abort(typeof reason === "string" ? new Error(reason) : reason);
     }
   }
 

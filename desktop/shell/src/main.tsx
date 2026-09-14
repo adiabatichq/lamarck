@@ -39,6 +39,7 @@ if (import.meta.env.DEV && !window.lamarckHost) {
     }),
     openWorkspaceFiles: async () => ({ ok: true as const }),
     onOpenLauncher: () => () => {},
+    cancelAppOpening: () => {},
     openAppViewer: async () => ({
       ok: false as const,
       error: {

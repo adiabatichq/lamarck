@@ -1,10 +1,11 @@
 import { readFile, statfs } from "node:fs/promises";
-import type { HostRequest, JsonValue } from "@lamarck/capsule";
+import type { HostRequest, JsonValue, RuntimeMemoryStatus } from "@lamarck/capsule";
 import { GuestResourceAdmission, GUEST_MANAGEMENT_MEMORY_BYTES, parseGuestMemory, usableGuestMemory } from "./resource-admission";
 import { runFixedCommand } from "./fixed-command";
 
 export class GuestCapacityController {
   #diskTail: Promise<unknown> = Promise.resolve();
+  runtimeMemoryStatuses: () => RuntimeMemoryStatus[] = () => [];
   constructor(readonly admission: GuestResourceAdmission, readonly stateRoot: string) {}
 
   async status() {
@@ -16,9 +17,14 @@ export class GuestCapacityController {
         return Number(/^some avg10=([0-9.]+)/m.exec(text)?.[1] ?? 0);
       } catch { return null; }
     };
+    const [cpuPressureAvg10, ioPressureAvg10, memoryPressureAvg10] = await Promise.all([
+      pressure("cpu"), pressure("io"), pressure("memory"),
+    ]);
+    // Capture ledger and workload observations together after the asynchronous reads.
     return { ...this.admission.snapshot(), ...memory,
+      workloads: this.runtimeMemoryStatuses().slice(0, 32),
       usableMemoryBytes: usableGuestMemory(memory, this.admission.snapshot().memoryCeilingBytes + GUEST_MANAGEMENT_MEMORY_BYTES),
-      cpuPressureAvg10: await pressure("cpu"), ioPressureAvg10: await pressure("io"), memoryPressureAvg10: await pressure("memory"),
+      cpuPressureAvg10, ioPressureAvg10, memoryPressureAvg10,
       filesystemBytes: Number(fs.blocks * fs.bsize), freeDiskBytes: Number(fs.bavail * fs.bsize) };
   }
 

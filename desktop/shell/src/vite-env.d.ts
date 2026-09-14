@@ -72,7 +72,8 @@ interface Window {
     openWorkspace(path: string, recoveryCode?: string): Promise<HostWorkspaceOpenResult>;
     openWorkspaceFiles(application: "finder" | "obsidian"): Promise<{ ok: true }>;
     onOpenLauncher(callback: () => void): () => void;
-    openAppViewer(appId: string): Promise<
+    cancelAppOpening(openingId: string): void;
+    openAppViewer(appId: string, openingId: string): Promise<
       | { ok: true; viewerId: string }
       | {
           ok: false;

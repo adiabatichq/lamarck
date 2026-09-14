@@ -1,11 +1,13 @@
-import type { RequestBodyFor } from "./guest-session";
-import type { HostOperation, JsonValue } from "@lamarck/capsule";
+import { CapsuleVmHostError } from "../capsule-vm/launcher";
+import { CapsuleGuestRequestError, type RequestBodyFor } from "./guest-session";
+import type { HostOperation, JsonValue, RuntimeMemoryStatus } from "@lamarck/capsule";
 import type { CapsuleStorageBudgetLike } from "./storage-budget";
 
 const MiB = 1024 ** 2, GiB = 1024 ** 3;
 const MANAGEMENT = 384 * MiB;
 const CACHE_HEADROOM = 256 * MiB;
 export interface GuestCapacity {
+  workloads?: RuntimeMemoryStatus[];
   memoryBudgetBytes: number; memoryCeilingBytes: number; reservedMemoryBytes: number;
   diskBudgetBytes: number;
   runtimeMemoryBytes: number; sharedBuildMemoryBytes: number; reservedDiskBytes: number;
@@ -25,6 +27,12 @@ export class CapacityExhaustedError extends Error {
   readonly code = "CAPSULE_RESOURCE_EXHAUSTED";
 }
 
+function resourceUnavailable(error: unknown): boolean {
+  return error instanceof CapacityExhaustedError
+    || (error instanceof CapsuleGuestRequestError && error.code === "CAPSULE_RESOURCE_EXHAUSTED")
+    || (error instanceof CapsuleVmHostError && error.code === "host_memory_pressure");
+}
+
 export function parseGuestCapacity(value: unknown): GuestCapacity {
   if (!value || typeof value !== "object") throw new Error("Missing Guest capacity acknowledgement");
   const fields = ["diskBudgetBytes", "memoryBudgetBytes", "memoryCeilingBytes", "reservedMemoryBytes", "runtimeMemoryBytes", "sharedBuildMemoryBytes", "reservedDiskBytes", "totalBytes", "usableMemoryBytes", "availableBytes", "filesystemBytes", "freeDiskBytes"] as const;
@@ -36,12 +44,43 @@ export function parseGuestCapacity(value: unknown): GuestCapacity {
     const pressure = (value as Record<string, unknown>)[key];
     if (pressure !== undefined && pressure !== null && (typeof pressure !== "number" || !Number.isFinite(pressure) || pressure < 0 || pressure > 100)) throw new Error("Invalid Guest pressure acknowledgement");
   }
+  const workloads = (value as GuestCapacity).workloads;
+  if (workloads !== undefined) {
+    if (!Array.isArray(workloads) || workloads.length > 32) throw new Error("Invalid Guest workload observations");
+    const identities = new Set<string>();
+    for (const workload of workloads) {
+      if (!workload || typeof workload !== "object"
+        || ![workload.appHandle, workload.workloadHandle].every(id => typeof id === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(id))
+        || !["none", "supply", "release", "exhausted"].includes(workload.growthWait)) throw new Error("Invalid Guest workload identity");
+      for (const field of ["sampleAgeMs", "requestedGrowthBytes", "waitingMs"] as const) {
+        const number = workload[field];
+        if (number === null && field === "sampleAgeMs") continue;
+        if (typeof number !== "number" || !Number.isFinite(number) || number < 0 || number > Number.MAX_SAFE_INTEGER) throw new Error("Invalid Guest workload measurement");
+      }
+      if (identities.has(workload.workloadHandle)) throw new Error("Duplicate Guest workload observation");
+      identities.add(workload.workloadHandle);
+      if (workload.requestedGrowthBytes > GiB
+        || (workload.error !== null && (typeof workload.error?.code !== "string" || workload.error.code.length > 64
+          || typeof workload.error.message !== "string" || workload.error.message.length > 256))) throw new Error("Invalid Guest workload diagnostic");
+    }
+  }
   const state = value as GuestCapacity;
   if (state.projectedRuntimeMemoryBytes !== undefined && (!Number.isSafeInteger(state.projectedRuntimeMemoryBytes)
     || state.projectedRuntimeMemoryBytes < 0 || state.projectedRuntimeMemoryBytes > state.runtimeMemoryBytes)) throw new Error("Invalid projected Runtime commitments");
   if (state.memoryBudgetBytes > state.memoryCeilingBytes || state.memoryCeilingBytes > 4 * GiB
     || state.reservedMemoryBytes > state.memoryBudgetBytes || state.runtimeMemoryBytes > state.reservedMemoryBytes) throw new Error("Inconsistent Guest memory commitments");
   return state;
+}
+
+interface BuildPressureState { deferred: boolean; high: number; low: number; observedAt: number }
+/** Hysteresis is independent of execution and shared by admission/observation. */
+export function buildPressureDecision(state: GuestCapacity, previous: BuildPressureState, now: number): BuildPressureState {
+  if (now - previous.observedAt < 1_000) return previous;
+  const high = (state.cpuPressureAvg10 ?? 0) > 50 || (state.ioPressureAvg10 ?? 0) > 10 || (state.memoryPressureAvg10 ?? 0) > 1;
+  const low = state.cpuPressureAvg10 != null && state.ioPressureAvg10 != null && state.memoryPressureAvg10 != null
+    && state.cpuPressureAvg10 < 30 && state.ioPressureAvg10 < 5 && state.memoryPressureAvg10 < 0.5;
+  const samples = { high: high ? previous.high + 1 : 0, low: low ? previous.low + 1 : 0 };
+  return { ...samples, deferred: samples.high >= 2 ? true : samples.low >= 2 ? false : previous.deferred, observedAt: now };
 }
 
 /** Private coordination of the one VM. Guest capacity, boot ceiling and Host
@@ -54,6 +93,12 @@ export class VmCapacityCoordinator {
   #lastActivity: number;
   #lastReclaim = 0;
   #closed = false;
+  #observing = false;
+  #previousReserved?: number;
+  #pressure: BuildPressureState = { deferred: false, high: 0, low: 0, observedAt: -Infinity };
+  onAvailable: () => void = () => {};
+  onObserved: (state: GuestCapacity) => void = () => {};
+  onFailure: (error: unknown) => void = () => {};
   readonly #building = new Set<string>();
   #timer?: ReturnType<typeof setInterval>;
   constructor(readonly session: Session, readonly helper: Helper,
@@ -62,7 +107,15 @@ export class VmCapacityCoordinator {
     readonly now = Date.now) { this.#lastActivity = now(); }
 
   start(): void {
-    this.#timer = setInterval(() => { void this.observeIdle().catch(() => {}); }, 5_000);
+    this.#timer = setInterval(() => {
+      if (this.#observing) return;
+      this.#observing = true;
+      void this.observeIdle().catch(error => {
+        // A Runtime can grow between observation and the reclaim fence. That
+        // ordinary admission conflict must not become a VM containment failure.
+        if (!resourceUnavailable(error)) this.onFailure(error);
+      }).finally(() => { this.#observing = false; });
+    }, 1_000);
     this.#timer.unref();
   }
   async close(): Promise<void> {
@@ -106,8 +159,8 @@ export class VmCapacityCoordinator {
       if (!replacement && (state.projectedRuntimeMemoryBytes ?? state.runtimeMemoryBytes) + runtimeBytes > state.memoryCeilingBytes - state.sharedBuildMemoryBytes) {
         throw new CapacityExhaustedError("This App exceeds available Runtime capacity; existing Apps remain active");
       }
-      if (buildBytes > 0 && this.#building.size > 0 && ((state.cpuPressureAvg10 ?? 0) > 50
-        || (state.ioPressureAvg10 ?? 0) > 10 || (state.memoryPressureAvg10 ?? 0) > 1)) {
+      this.#observePressure(state);
+      if (buildBytes > 0 && this.#building.size > 0 && this.#pressure.deferred) {
         throw new CapacityExhaustedError("Guest pressure permits only one concurrent Build");
       }
       const required = state.reservedMemoryBytes + Math.max(runtimeBytes, buildBytes);
@@ -130,6 +183,7 @@ export class VmCapacityCoordinator {
     this.#lastActivity = this.now();
     await this.session.request("resources.launch.release", { launchKey: key });
     this.#building.delete(key);
+    this.onAvailable();
   }
 
   async #supply(required: number, state: GuestCapacity): Promise<void> {
@@ -149,7 +203,7 @@ export class VmCapacityCoordinator {
       if (measured.usableMemoryBytes <= expectedUsable + 16 * MiB
         && measured.usableMemoryBytes - MANAGEMENT >= required) {
         const ack = parseGuestCapacity(await this.session.request("resources.memory.commit", { memoryBytes: Math.min(state.memoryCeilingBytes, target - overhead) }));
-        if (ack.memoryBudgetBytes >= required) return;
+        if (ack.memoryBudgetBytes >= required) { this.onAvailable(); return; }
       }
       if (Date.now() >= deadline) break;
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -161,9 +215,20 @@ export class VmCapacityCoordinator {
     return this.#memoryTransaction(async () => {
       if (this.#closed) return;
       const state = await this.status();
+      this.#observePressure(state);
+      if (this.#previousReserved !== undefined && state.reservedMemoryBytes < this.#previousReserved) this.onAvailable();
+      this.#previousReserved = state.reservedMemoryBytes;
+      this.onObserved(state);
+      const pendingGrowth = Math.max(0, ...(state.workloads ?? []).filter(workload => workload.sampleAgeMs !== null
+        && workload.sampleAgeMs < 2_000 && workload.growthWait === "supply").map(workload => workload.requestedGrowthBytes));
       // Keep growth headroom supplied even when the balloon was previously idle.
-      if (state.reservedMemoryBytes > state.memoryBudgetBytes - 128 * MiB && state.memoryBudgetBytes < state.memoryCeilingBytes) {
-        await this.#supply(Math.min(state.memoryCeilingBytes, state.reservedMemoryBytes + CACHE_HEADROOM), state);
+      if ((pendingGrowth > 0 || state.reservedMemoryBytes > state.memoryBudgetBytes - 128 * MiB) && state.memoryBudgetBytes < state.memoryCeilingBytes) {
+        try {
+          await this.#supply(Math.min(state.memoryCeilingBytes, state.reservedMemoryBytes + Math.max(pendingGrowth, CACHE_HEADROOM)), state);
+        } catch (error) {
+          if (!resourceUnavailable(error)) throw error;
+          this.onObserved(await this.status());
+        }
         this.#lastActivity = this.now();
         return;
       }
@@ -178,6 +243,13 @@ export class VmCapacityCoordinator {
       // is delayed. A later supply commits only observed Guest capacity.
       this.#lastReclaim = this.now();
     });
+  }
+
+  #observePressure(state: GuestCapacity): void {
+    const next = buildPressureDecision(state, this.#pressure, this.now());
+    const recovered = this.#pressure.deferred && !next.deferred;
+    this.#pressure = next;
+    if (recovered) this.onAvailable();
   }
 
   async growState(required: number): Promise<number> {
@@ -244,22 +316,26 @@ export class BuildProgressQueue {
     if (index >= 0) this.#queue.splice(index, 1);
     item.signal.removeEventListener("abort", item.cancel);
   }
+  wake(): void { void this.#pump(); }
+
   async #pump(): Promise<void> {
     if (this.#pumping) { this.#pumpAgain = true; return; }
     this.#pumping = true;
+    const attempted = new Set<QueuedLaunch>();
     try {
       while (this.#queue.length) {
         // Keep FIFO when a Build slot is free; otherwise let the oldest
         // cached launch attempt normal resource admission past waiting Builds.
-        const item = this.#queue.find(candidate => !candidate.build || this.#activeBuilds < 2);
+        const item = this.#queue.find(candidate => !attempted.has(candidate) && (!candidate.build || this.#activeBuilds < 2));
         if (!item) return;
         if (item.signal.aborted) { item.cancel(); continue; }
         item.signal.removeEventListener("abort", item.cancel);
+        attempted.add(item);
         try { await item.admit(); }
         catch (error) {
           if (error instanceof CapacityExhaustedError && this.#active > 0 && !item.signal.aborted) {
             item.signal.addEventListener("abort", item.cancel, { once: true });
-            return;
+            continue;
           }
           this.#remove(item); item.reject(error); continue;
         }

@@ -21,6 +21,7 @@ export interface GuestResourceLease {
   transferDisk?(key: string, bytes: number): GuestResourceLease;
   /** Reserve before writing memory.max; apply must READ BACK the effective limit. */
   growMemory?(bytes: number, apply: () => Promise<number>): Promise<void>;
+  growthWaitReason?(bytes: number): "supply" | "release" | "exhausted";
   release(): void;
 }
 export interface GuestResourceAdmissionLike {
@@ -149,6 +150,19 @@ export class GuestResourceAdmission implements GuestResourceAdmissionLike {
         record.diskBytes -= bytes;
         this.#reservations.set(targetKey, target);
         return this.#lease(targetKey, target);
+      },
+      growthWaitReason: (bytes: number) => {
+        const state = this.snapshot();
+        const parent = record.launchKey ? this.#reservations.get(record.launchKey) : undefined;
+        const extra = Math.max(0, bytes - record.memoryBytes - (parent?.memoryBytes ?? 0));
+        // Supply can restore ballooned capacity, but cannot enlarge the VM or
+        // spend the protected Build reserve. Otherwise only finite phases help.
+        if (state.memoryBudgetBytes < state.memoryCeilingBytes
+          && state.reservedMemoryBytes + extra <= state.memoryCeilingBytes
+          && state.projectedRuntimeMemoryBytes + extra <= state.memoryCeilingBytes - state.sharedBuildMemoryBytes) return "supply";
+        if ([...this.#reservations.values()].some(item => item !== parent
+          && (item.kind === "build" || item.futureRuntime > 0))) return "release";
+        return "exhausted";
       },
       growMemory: async (bytes: number, apply: () => Promise<number>) => {
         positive(bytes, "memory grant");

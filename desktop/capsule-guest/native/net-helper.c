@@ -371,7 +371,7 @@ static int probe_namespace(const char *path, const char *port_value, const char 
   int port = parse_port(port_value);
   char *end = NULL;
   long timeout = strtol(timeout_value, &end, 10);
-  if (port < 0 || !end || *end || timeout < 100 || timeout > 60000 || enter_namespace(path) != 0) return 1;
+  if (port < 0 || !end || *end || timeout < 100 || timeout > 180000 || enter_namespace(path) != 0) return 1;
   signal(SIGPIPE, SIG_IGN);
   struct timespec deadline;
   if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) return 1;

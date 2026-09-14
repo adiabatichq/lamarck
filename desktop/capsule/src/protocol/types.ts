@@ -196,7 +196,11 @@ export interface ViewerDetachBody {
   workloadHandle: string;
 }
 
+export const RUNTIME_STARTUP_TIMEOUT_MS = 180_000;
+
 export interface WorkloadStartBody {
+  /** Remaining duration; Host and Guest monotonic clocks are independent. */
+  startupTimeoutMs?: number;
   appHandle: string;
   workloadHandle: string;
 }
@@ -314,3 +318,14 @@ export type ControlResponse =
     ok: false;
     error: { code: string; message: string };
   };
+
+/** Private Guest-to-Host memory demand. Ages use only the Guest clock. */
+export type RuntimeMemoryStatus = {
+  appHandle: string;
+  workloadHandle: string;
+  sampleAgeMs: number | null;
+  requestedGrowthBytes: number;
+  growthWait: "none" | "supply" | "release" | "exhausted";
+  waitingMs: number;
+  error: { code: string; message: string } | null;
+};

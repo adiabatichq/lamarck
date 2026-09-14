@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+import { RUNTIME_STARTUP_TIMEOUT_MS } from "@lamarck/capsule";
 import { RuntimeMemoryController, linuxRuntimeMemoryKernel } from "./runtime-memory";
 import { GuestCapacityController } from "./capacity-controller";
 import { createHash } from "node:crypto";
@@ -122,6 +124,7 @@ interface WorkloadRecord {
   execution?: RuncExecution;
   exit?: Promise<void>;
   readiness?: Promise<void>;
+  readinessAbort?: AbortController;
   memoryController?: RuntimeMemoryController;
   resourceLease?: GuestResourceLease;
   finalized: boolean;
@@ -208,6 +211,10 @@ export class CapsuleGuestSupervisor {
     this.runc = options.runc ?? new LinuxRuncDriver();
     this.dataDialer = options.dataDialer ?? new VsockDataDialer();
     this.admission = options.admission ?? UNBOUNDED_GUEST_RESOURCE_ADMISSION;
+    if (options.capacity) options.capacity.runtimeMemoryStatuses = () => [...this.workloads.entries()]
+      .filter(([, record]) => !record.finalized && record.memoryController)
+      .slice(0, 32).map(([workloadHandle, record]) => ({ appHandle: record.body.appHandle,
+        workloadHandle, ...record.memoryController!.memoryStatus() }));
     this.ticketTtlMs = boundedPositiveInteger(options.ticketTtlMs, TICKET_TTL_MS, TICKET_TTL_MS);
     this.blobTransferPolicy = normalizeBlobTransferPolicy(options.blobTransferPolicy);
   }
@@ -615,7 +622,7 @@ export class CapsuleGuestSupervisor {
         ));
       case "workload.start":
         await this.withWorkloadLock(request.body.workloadHandle, async () => (
-          await this.startWorkload(request.body.appHandle, request.body.workloadHandle, request.sessionId)
+          await this.startWorkload(request.body.appHandle, request.body.workloadHandle, request.sessionId, request.body.startupTimeoutMs)
         ));
         return { started: true };
       case "workload.stop":
@@ -781,7 +788,8 @@ export class CapsuleGuestSupervisor {
     return { awaitingStreams: true };
   }
 
-  private async startWorkload(appHandle: string, workloadHandle: string, sessionId: string): Promise<void> {
+  private async startWorkload(appHandle: string, workloadHandle: string, sessionId: string, startupTimeoutMs = RUNTIME_STARTUP_TIMEOUT_MS): Promise<void> {
+    const deadline = performance.now() + startupTimeoutMs;
     const record = this.requireWorkload(appHandle, workloadHandle);
     if (!record.sdk || record.sdk.socket.destroyed) throw new Error("authenticated SDK stream has not attached");
     if (!record.cli || record.cli.socket.destroyed) throw new Error("authenticated App CLI stream has not attached");
@@ -795,6 +803,7 @@ export class CapsuleGuestSupervisor {
       appHandle,
       workloadHandle,
     });
+    record.readinessAbort = new AbortController();
     const resources = {
       memoryBytes: (record.body.memoryProfile === "lightweight" ? 256 : 512) * 1024 * 1024,
       pids: 256,
@@ -903,6 +912,7 @@ export class CapsuleGuestSupervisor {
           workloadHandle,
           record.body.uiPort,
           record,
+          deadline,
         );
         void record.readiness.catch((error) => this.failSession(
           asContainmentError(
@@ -933,6 +943,7 @@ export class CapsuleGuestSupervisor {
     record: WorkloadRecord,
   ): Promise<void> {
     const exit = await record.execution!.wait();
+    record.readinessAbort?.abort();
     await record.memoryController?.stop();
     if (record.finalized) return;
     record.finalized = true;
@@ -969,10 +980,13 @@ export class CapsuleGuestSupervisor {
     workloadHandle: string,
     port: number,
     record: WorkloadRecord,
+    deadline: number,
   ): Promise<void> {
     try {
-      await this.options.resources.waitForViewerReady(appHandle, port, 30_000);
-      if (record.finalized) return;
+      const remaining = Math.floor(deadline - performance.now());
+      if (remaining < 100) throw new Error("Runtime startup budget exhausted");
+      await this.options.resources.waitForViewerReady(appHandle, port, remaining, record.readinessAbort?.signal);
+      if (record.finalized || record.readinessAbort?.signal.aborted) return;
       this.state = transitionSupervisor(this.state, {
         type: "workload.ready",
         appHandle,
@@ -980,7 +994,7 @@ export class CapsuleGuestSupervisor {
       });
       this.emit("workload.ready", { appHandle, workloadHandle, port });
     } catch (error) {
-      if (record.finalized) return;
+      if (record.finalized || record.readinessAbort?.signal.aborted) return;
       this.state = transitionSupervisor(this.state, {
         type: "workload.faulted",
         appHandle,
@@ -1005,6 +1019,8 @@ export class CapsuleGuestSupervisor {
 
   private async stopWorkload(appHandle: string, workloadHandle: string, graceMs: number): Promise<void> {
     const record = this.requireWorkload(appHandle, workloadHandle);
+    record.readinessAbort?.abort();
+    await record.readiness;
     await record.memoryController?.stop();
     const workload = this.state.apps[appHandle]?.workloads[workloadHandle];
     if (workload && workload.status !== "stopping" && workload.status !== "exited" && workload.status !== "faulted") {

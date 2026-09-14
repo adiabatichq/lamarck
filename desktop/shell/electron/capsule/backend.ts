@@ -30,6 +30,7 @@ export interface CapsuleUiInstance {
  * last-known-good activation or retired a prior UI generation.
  */
 export interface CapsuleUiPreparation extends CapsuleUiInstance {
+  readonly startupDeadlineMs?: number;
   preparationId: string;
 }
 

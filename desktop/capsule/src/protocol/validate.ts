@@ -774,8 +774,10 @@ function parseViewerDetachBody(value: unknown): ViewerDetachBody {
 }
 
 function parseWorkloadStartBody(value: unknown): WorkloadStartBody {
-  const object = exactObject(value, "$.body", ["appHandle", "workloadHandle"]);
+  const object = exactObject(value, "$.body", ["appHandle", "workloadHandle"], ["startupTimeoutMs"]);
   return {
+    ...(object.startupTimeoutMs === undefined ? {} : { startupTimeoutMs:
+      boundedInteger(object.startupTimeoutMs, "$.body.startupTimeoutMs", 1, 180_000) }),
     appHandle: opaqueId(object.appHandle, "$.body.appHandle"),
     workloadHandle: opaqueId(object.workloadHandle, "$.body.workloadHandle"),
   };

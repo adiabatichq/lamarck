@@ -623,10 +623,10 @@ export class GuestResourceManager {
     this.apps.delete(appHandle);
   }
 
-  async waitForViewerReady(appHandle: string, port: number, timeoutMs: number): Promise<void> {
+  async waitForViewerReady(appHandle: string, port: number, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     const app = this.getApp(appHandle);
     if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error("invalid viewer port");
-    if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60_000) {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 180_000) {
       throw new Error("invalid viewer readiness timeout");
     }
     await runFixedCommand(this.paths.netHelperPath, [
@@ -634,7 +634,7 @@ export class GuestResourceManager {
       app.netnsPath,
       String(port),
       String(timeoutMs),
-    ], { timeoutMs: timeoutMs + 1_000 });
+    ], { timeoutMs: timeoutMs + 1_000, signal });
   }
 
   async proxyViewer(appHandle: string, port: number, stream: Duplex): Promise<ChildProcess> {

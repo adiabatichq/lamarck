@@ -85,6 +85,7 @@ export interface ReloadedBrowserBinding {
  * the backend's atomic commit both succeed.
  */
 export interface PreparedViewerBinding {
+  readonly startupDeadlineMs?: number;
   readonly viewerId: string;
   readonly appId: string;
   readonly instanceId: string;
@@ -150,6 +151,7 @@ interface PendingUiOperation {
   viewerId: string;
   generation: number;
   preparationId?: string;
+  startupDeadlineMs?: number;
   instanceId?: string;
   committedInstanceId?: string;
   committedViewer?: StoredViewer;
@@ -267,7 +269,9 @@ export class CapsuleManager {
     appId: string,
     ownerValue: AppViewerOwner,
     verifyPreparedViewer: VerifyPreparedViewer,
+    signal?: AbortSignal,
   ): Promise<OpenedAppViewer> {
+    signal?.throwIfAborted();
     if (this.#terminalFailure) throw this.#terminalFailure;
     if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
     const owner = validatedViewerOwner(ownerValue);
@@ -300,6 +304,9 @@ export class CapsuleManager {
     // Register ownership before invoking backend or Core code. Lifecycle
     // replacement can therefore cancel even a synchronously reentrant launch.
     this.#openingOperations.set(appId, tracked);
+    const cancel = () => { void this.#cancelOpeningOperation(tracked,
+      new Error("App opening was cancelled")).catch(() => {}); };
+    signal?.addEventListener("abort", cancel, { once: true });
     void this.#openViewer(
       appId,
       opening,
@@ -314,10 +321,15 @@ export class CapsuleManager {
       if (!isExpectedCancellation(error)) this.#recordFailure(appId, error);
       throw error;
     } finally {
-      if (this.#openingOperations.get(appId) === tracked) {
-        this.#openingOperations.delete(appId);
+      // Keep the App fenced through final capability revocation, including a
+      // cancellation racing with the successful commit.
+      signal?.removeEventListener("abort", cancel);
+      try { await tracked.cancellation; } finally {
+        if (this.#openingOperations.get(appId) === tracked) {
+          this.#openingOperations.delete(appId);
+        }
+        this.#openingApps.delete(appId);
       }
-      this.#openingApps.delete(appId);
     }
   }
 
@@ -376,6 +388,7 @@ export class CapsuleManager {
         createUiSpec(appId, activation, ui, runtimeSenderId),
       );
       pending.preparationId = prepared.preparationId;
+      pending.startupDeadlineMs = prepared.startupDeadlineMs;
       pending.instanceId = prepared.instanceId;
       this.#assertPendingUiCurrent(pending, "launch");
 
@@ -632,6 +645,7 @@ export class CapsuleManager {
         createUiSpec(viewer.appId, activation, ui, runtimeSenderId), viewer.instanceId,
       );
       pending.preparationId = prepared.preparationId;
+      pending.startupDeadlineMs = prepared.startupDeadlineMs;
       pending.instanceId = prepared.instanceId;
       this.#assertPendingUiCurrent(pending, "reload");
 
@@ -1204,6 +1218,7 @@ export class CapsuleManager {
     };
     return Object.freeze({
       viewerId: pending.viewerId,
+      startupDeadlineMs: pending.startupDeadlineMs,
       appId: pending.appId,
       instanceId,
       channelId: browserIssued.channelId,

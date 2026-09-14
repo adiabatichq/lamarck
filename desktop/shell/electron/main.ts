@@ -1,3 +1,4 @@
+import { RUNTIME_STARTUP_TIMEOUT_MS } from "@lamarck/capsule";
 import { loadManagedCliArtifact } from "./capsule/managed-cli-artifact";
 // Electron main process
 // - Launches the isolated Node Guard utility before the Node Core
@@ -272,6 +273,10 @@ interface AppViewerSessionState {
 }
 
 const appViewers = new Map<string, AppViewerRecord>();
+// Renderer operation handles only; Manager/backend own cancellation and cleanup.
+const appOpenings = new Map<string, {
+  owner: AppViewerOwner; controller: AbortController; viewerId?: string;
+}>();
 // Includes hidden first-launch renderers during the narrow interval after
 // their browser authority is bound but before they can enter appViewers.
 const preparedAppViewerSenderIds = new Set<number>();
@@ -1776,7 +1781,9 @@ async function loadAppViewerDocument(
     statusCode: number;
     statusLine: string;
   }) => void,
+  timeoutMs = RUNTIME_STARTUP_TIMEOUT_MS,
 ): Promise<() => void> {
+  authoritySignal?.throwIfAborted();
   const contents = view.webContents;
   const viewerSession = contents.session;
   const expectedOrigin = new URL(viewerUrl).origin;
@@ -1812,8 +1819,8 @@ async function loadAppViewerDocument(
   const deadline = new Promise<never>((_resolve, reject) => {
     deadlineTimer = setTimeout(() => {
       if (!contents.isDestroyed()) contents.stop();
-      reject(new Error("App viewer document did not finish within 8000ms"));
-    }, 8_000);
+      reject(new Error("App viewer document exhausted the Runtime startup budget"));
+    }, timeoutMs);
   });
   let abortListener: (() => void) | undefined;
   const cancelled = new Promise<never>((_resolve, reject) => {
@@ -1835,7 +1842,12 @@ async function loadAppViewerDocument(
     await Promise.race([
       Promise.all([
         contents.loadURL(viewerUrl),
-        mainResponse,
+        mainResponse.then((response) => {
+          if (response.statusCode < 200 || response.statusCode > 299) {
+            throw new Error(`App viewer document failed: ${response.statusLine}`);
+          }
+          return response;
+        }),
       ]).then(([, response]) => {
         finalMainResponse = response;
       }),
@@ -1880,6 +1892,13 @@ async function prepareAppViewerSurface(
   options: PrepareAppViewerSurfaceOptions,
 ): Promise<PreparedAppViewerSurface> {
   const { appId, binding, shellContents } = options;
+  const deadline = binding.startupDeadlineMs ?? performance.now() + RUNTIME_STARTUP_TIMEOUT_MS;
+  const remaining = () => {
+    binding.signal.throwIfAborted();
+    const duration = deadline - performance.now();
+    if (duration <= 0) throw new Error("Runtime startup budget exhausted");
+    return duration;
+  };
   const protocolPartition = appPartition(appId, binding.channelId);
   let gateway: ViewerGatewayBinding | null = null;
   let view: WebContentsView | null = null;
@@ -2044,6 +2063,8 @@ async function prepareAppViewerSurface(
     binding.assertCurrent();
     options.assertHostCurrent();
     await waitForViewerHttpReady({
+      timeoutMs: remaining(),
+      signal: binding.signal,
       request: (signal) => viewerSession!.fetch(gateway!.viewerUrl, {
         cache: "no-store",
         redirect: "manual",
@@ -2078,7 +2099,9 @@ async function prepareAppViewerSurface(
           ),
         );
       },
+      remaining(),
     );
+    remaining();
     assertHealthy();
     binding.assertCurrent();
     options.assertHostCurrent();
@@ -2142,6 +2165,7 @@ async function openAppViewer(
   sender: WebContents,
   ownerLease: AppViewerOwner,
   appId: string,
+  signal: AbortSignal,
 ): Promise<{ viewerId: string }> {
   const owner = requireShellWindow(sender);
   assertShellRendererOwnerCurrent(sender, ownerLease);
@@ -2160,7 +2184,8 @@ async function openAppViewer(
           assertShellRendererOwnerCurrent(sender, ownerLease);
         },
       });
-    });
+    }, signal);
+    signal.throwIfAborted();
     assertShellRendererOwnerCurrent(sender, ownerLease);
     const surface = preparedSurface as PreparedAppViewerSurface | null;
     if (!surface) throw new Error("App viewer committed without a prepared renderer");
@@ -2470,6 +2495,9 @@ function detachAppViewerRecord(
 ): Promise<unknown>[] {
   if (appViewers.get(viewerId) !== record) return [];
   appViewers.delete(viewerId);
+  for (const [id, opening] of appOpenings) {
+    if (opening.viewerId === viewerId) appOpenings.delete(id);
+  }
   appViewerLifecycle.invalidate(record.appId);
 
   const cleanup: Promise<unknown>[] = [];
@@ -2531,6 +2559,12 @@ function setAppViewerBounds(
 }
 
 async function closeAppViewersForOwner(owner: AppViewerOwner): Promise<void> {
+  for (const [id, opening] of appOpenings) {
+    if (sameAppViewerOwner(opening.owner, owner)) {
+      opening.controller.abort(new Error("App opening owner retired"));
+      appOpenings.delete(id);
+    }
+  }
   const ids = [...appViewers.entries()]
     .filter(([, record]) => sameAppViewerOwner(record.ownerLease, owner))
     .map(([viewerId]) => viewerId);
@@ -2969,11 +3003,33 @@ app.whenReady().then(async () => {
     }
     return { ok: true as const };
   });
-  ipcMain.handle("app-viewer:open", async (event, appId: string) => {
+  ipcMain.on("app-viewer:cancel-opening", (event, openingId: string) => {
+    let owner: AppViewerOwner;
+    try { owner = requireShellRendererOwner(event); } catch { return; }
+    const opening = appOpenings.get(openingId);
+    if (!opening || !sameAppViewerOwner(opening.owner, owner)) return;
+    opening.controller.abort(new Error("App opening cancelled"));
+    if (opening.viewerId) void closeAppViewer(opening.viewerId, owner).catch((error) => { console.error("App opening cancellation cleanup failed", error); });
+  });
+  ipcMain.handle("app-viewer:open", async (event, appId: string, openingId: string) => {
     const owner = requireShellRendererOwner(event);
+    if (typeof openingId !== "string" || !/^[0-9a-f-]{36}$/.test(openingId)
+      || appOpenings.has(openingId) || appOpenings.size >= 64) throw new Error("Invalid or excessive App opening handles");
+    const opening: { owner: AppViewerOwner; controller: AbortController; viewerId?: string } = {
+      owner, controller: new AbortController(),
+    };
+    appOpenings.set(openingId, opening);
     try {
       await awaitShellRendererRetirement(event.sender, owner);
-      const opened = await openAppViewer(event.sender, owner, appId);
+      opening.controller.signal.throwIfAborted();
+      const opened = await openAppViewer(event.sender, owner, appId, opening.controller.signal);
+      // If cancellation arrived after Manager publication but before this reply,
+      // the operation handle still closes only this exact viewer generation.
+      if (opening.controller.signal.aborted) {
+        await closeAppViewer(opened.viewerId, owner);
+        opening.controller.signal.throwIfAborted();
+      }
+      opening.viewerId = opened.viewerId;
       return { ok: true as const, viewerId: opened.viewerId };
     } catch (error) {
       return {
@@ -2991,6 +3047,8 @@ app.whenReady().then(async () => {
           restartRequired: isCapsuleRestartRequiredError(error),
         },
       };
+    } finally {
+      if (!opening.viewerId && appOpenings.get(openingId) === opening) appOpenings.delete(openingId);
     }
   });
   ipcMain.on("app-viewer:bounds", (event, payload: {

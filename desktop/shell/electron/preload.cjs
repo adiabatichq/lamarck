@@ -34,7 +34,8 @@ contextBridge.exposeInMainWorld("lamarckHost", {
     ipcRenderer.on("shell:open-launcher", listener);
     return () => ipcRenderer.removeListener("shell:open-launcher", listener);
   },
-  openAppViewer: (appId) => ipcRenderer.invoke("app-viewer:open", appId),
+  openAppViewer: (appId, openingId) => ipcRenderer.invoke("app-viewer:open", appId, openingId),
+  cancelAppOpening: (openingId) => ipcRenderer.send("app-viewer:cancel-opening", openingId),
   setAppViewerBounds: (viewerId, bounds) => ipcRenderer.send("app-viewer:bounds", { viewerId, bounds }),
   closeAppViewer: (viewerId) => ipcRenderer.invoke("app-viewer:close", viewerId),
   reloadAppRuntime: (appId) => ipcRenderer.invoke("app-runtime:reload", appId),
