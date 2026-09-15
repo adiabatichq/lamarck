@@ -81,15 +81,15 @@ describe("enforced Runtime grants and complete launch reservations", () => {
       expect(actual).toBe(256 * MiB);
       await sample();
       expect(actual).toBe(320 * MiB);
-      for (let target = 384 * MiB; target <= 1024 * MiB; target += 64 * MiB) {
+      for (let target = 384 * MiB; target <= 2048 * MiB; target += 64 * MiB) {
         working = actual; await sample();
         expect(actual).toBe(target - 64 * MiB);
         await sample();
         expect(actual).toBe(target);
       }
       working = actual; await sample(); await sample();
-      expect(actual).toBe(1024 * MiB);
-      expect(kernel.writeLimit).toHaveBeenCalledTimes(12);
+      expect(actual).toBe(2048 * MiB);
+      expect(kernel.writeLimit).toHaveBeenCalledTimes(28);
     } finally {
       await controller.stop(); grant.release(); clock.mockRestore(); vi.useRealTimers();
     }

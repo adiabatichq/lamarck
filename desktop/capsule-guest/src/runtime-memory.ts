@@ -5,9 +5,9 @@ import type { GuestResourceLease } from "./resource-admission";
 import { GuestMemoryContainmentError, GuestResourceAdmissionError } from "./resource-admission";
 
 export const RUNTIME_MEMORY_STEP_BYTES = 64 * 1024 * 1024;
-// Initial grants stay 256/512 MiB. This ceiling is below the 2 GiB App parent;
+// Initial grants stay 256/512 MiB. This ceiling matches the 2 GiB App parent;
 // every increase must also fit the authoritative global ledger.
-export const RUNTIME_MEMORY_POLICY_BYTES = 1024 * 1024 * 1024;
+export const RUNTIME_MEMORY_POLICY_BYTES = 2 * 1024 * 1024 * 1024;
 interface Measurement {
   usageBytes: number; anonBytes: number; kernelBytes: number;
   pressureTotalUs: number; highEvents: number; maxEvents: number;
@@ -72,7 +72,6 @@ export class RuntimeMemoryController {
   #sampleAt = 0;
   #highSamples = 0;
   #lowSamples = 0;
-  #pressureSamples = 0;
   #reconcile = false;
   #target = 0;
   #waitingSince = 0;
@@ -118,7 +117,6 @@ export class RuntimeMemoryController {
       : { usageBytes: used!, anonBytes: used!, kernelBytes: 0, pressureTotalUs: 0, highEvents: 0, maxEvents: 0 };
     if (this.#stopped) return;
     const needsGrowth = runtimeNeedsHeadroom(sample, this.#sample, this.lease.memoryBytes);
-    this.#pressureSamples = needsGrowth && runtimeUnderPressure(sample, this.#sample) ? this.#pressureSamples + 1 : 0;
     this.#sample = sample;
     this.#sampleAt = performance.now();
     this.#highSamples = needsGrowth ? this.#highSamples + 1 : 0;
@@ -133,7 +131,7 @@ export class RuntimeMemoryController {
         await this.kernel.writeHigh(Math.floor(this.lease.memoryBytes * 0.9));
         this.#reconcile = false;
         this.#target = 0; this.#wait = "none"; this.#waitingSince = 0; this.#error = null;
-        this.#highSamples = 0; this.#pressureSamples = 0;
+        this.#highSamples = 0;
       } catch (error) {
         if (error instanceof GuestMemoryContainmentError) throw error;
         this.#wait = "exhausted";
@@ -150,12 +148,8 @@ export class RuntimeMemoryController {
     if (this.#highSamples < 2 || !this.lease.growMemory) return;
     const target = Math.min(this.ceiling, this.lease.memoryBytes + RUNTIME_MEMORY_STEP_BYTES);
     if (target === this.lease.memoryBytes) {
-      // Observation only: never evict a running App. Host can reject a still
-      // unpublished candidate; kernel OOM remains local to this cgroup.
-      if (this.#pressureSamples >= 8) {
-        this.#wait = "exhausted";
-        this.#error = { code: "CAPSULE_RESOURCE_EXHAUSTED", message: "Runtime memory ceiling reached with sustained pressure" };
-      }
+      // Pressure at the enforced ceiling does not establish startup failure.
+      // Keep the existing startup deadline, cancellation and process-exit paths.
       return;
     }
     if (this.#sampleAt - this.#lastAttempt < 500) return;
@@ -171,7 +165,7 @@ export class RuntimeMemoryController {
         if (effective === target) await this.kernel.writeHigh(Math.floor(target * 0.9));
         return effective;
       });
-      this.#target = 0; this.#wait = "none"; this.#waitingSince = 0; this.#error = null; this.#highSamples = 0; this.#pressureSamples = 0;
+      this.#target = 0; this.#wait = "none"; this.#waitingSince = 0; this.#error = null; this.#highSamples = 0;
       // The next poll reads the cgroup anew; no decision reuses the old sample.
     } catch (error) {
       if (error instanceof GuestMemoryContainmentError) throw error;
