@@ -142,11 +142,11 @@ describe("replacement commitments", () => {
     a.reserveLaunch("update", 256 * MiB, 512 * MiB, replacement);
     const candidate = await a.reserve("candidate", { kind: "runtime", memoryBytes: 256 * MiB, launchKey: "update", ownerKey: "owner" });
     const grant = target === "old" ? apps[0]! : candidate;
-    await expect(grant.growMemory!(320 * MiB, async () => { throw new Error("readback lost"); })).rejects.toThrow(/lost/);
+    await expect(grant.resizeMemory!(320 * MiB, async () => { throw new Error("readback lost"); })).rejects.toThrow(/lost/);
     expect(grant.memoryBytes).toBe(320 * MiB);
     expect(a.snapshot()).toMatchObject({ projectedRuntimeMemoryBytes: 2880 * MiB, reservedMemoryBytes: (target === "old" ? 3392 : 3328) * MiB });
     const apply = vi.fn(async () => 512 * MiB);
-    await expect(grant.growMemory!(512 * MiB, apply)).rejects.toThrow(/Build reserve|supplied/);
+    await expect(grant.resizeMemory!(512 * MiB, apply)).rejects.toThrow(/Build reserve|supplied/);
     expect(apply).not.toHaveBeenCalled();
     candidate.release(); a.releaseLaunch("update"); // Abort preserves the old grant.
     expect(a.snapshot().reservedMemoryBytes).toBe((target === "old" ? 2880 : 2816) * MiB);
@@ -171,7 +171,7 @@ describe("replacement commitments", () => {
     const candidate = await a.reserve("candidate", { kind: "runtime", memoryBytes: 256 * MiB, launchKey: "update", ownerKey: "owner" });
     expect(() => a.reserveLaunch("nested", 256 * MiB, 0, { ...replacement, workloadKey: "candidate" })).toThrow(/active/);
     let finish!: (value: number) => void;
-    const growing = apps[0]!.growMemory!(320 * MiB, () => new Promise(resolve => { finish = resolve; }));
+    const growing = apps[0]!.resizeMemory!(320 * MiB, () => new Promise(resolve => { finish = resolve; }));
     apps[0]!.release();
     expect(() => a.releaseLaunch("update")).toThrow(/cleanup/);
     expect(a.snapshot().reservedMemoryBytes).toBe(3136 * MiB);

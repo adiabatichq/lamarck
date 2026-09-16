@@ -1,9 +1,11 @@
-import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import { Agent, createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createServer as createNetServer, connect as netConnect } from "node:net";
 import { randomBytes } from "node:crypto";
 import type { Duplex } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
+import { RUNTIME_STARTUP_TIMEOUT_MS } from "@lamarck/capsule";
 import { APP_VIEWER_CSP } from "./web-policy";
-import { CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE } from "./backend";
+import { CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE, CapsuleViewerCapacityError } from "./backend";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const MAX_HEADER_COUNT = 128;
@@ -39,11 +41,39 @@ export async function createViewerGateway(options: {
   const viewerUrl = `http://${originHost}/`;
   const vfsResources = new Map<string, string>();
   const sockets = new Set<Duplex>();
+  const connectedSockets = new WeakSet<Duplex>();
+  // Reuse bounded Guest HTTP connections. A new stream per module can race
+  // the previous stream's close and exhaust admission during an ordinary load.
+  // Leave two of the instance's connections available for upgraded streams.
+  const httpAgent = new Agent({
+    keepAlive: true,
+    // Reuse a module burst, then release idle Guest slots for other Apps.
+    // Node's Agent destroys timed-out free sockets, not active responses.
+    timeout: 1_000,
+    maxSockets: CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE - 2,
+    maxTotalSockets: CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE - 2,
+  });
+  const lifetime = new AbortController();
 
-  const bridge = createNetServer({ pauseOnConnect: true }, (socket) => {
+  // A client FIN must leave the response pipe alive until the Guest FIN is
+  // consumed; closing it early strands a paused Guest stream in Host accounting.
+  const bridge = createNetServer({ pauseOnConnect: true, allowHalfOpen: true }, (socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
-    void options.transport.openUiStream(options.instanceId).then(
+    const open = async (): Promise<Duplex> => {
+      const deadline = performance.now() + RUNTIME_STARTUP_TIMEOUT_MS;
+      while (!socket.destroyed && !lifetime.signal.aborted) {
+        try { return await options.transport.openUiStream(options.instanceId); }
+        catch (error) {
+          // Only pre-admission exhaustion is retryable; no HTTP bytes have
+          // reached the App. Never replay an admitted or failed request.
+          if (!(error instanceof CapsuleViewerCapacityError) || performance.now() >= deadline) throw error;
+          await delay(100, undefined, { signal: lifetime.signal });
+        }
+      }
+      throw new Error("Viewer closed while waiting for connection capacity");
+    };
+    void open().then(
       (guest) => {
         sockets.add(guest);
         guest.once("close", () => sockets.delete(guest));
@@ -83,7 +113,8 @@ export async function createViewerGateway(options: {
       method: incoming.method,
       path: `${target.pathname}${target.search}`,
       headers,
-      agent: false,
+      agent: httpAgent,
+      signal: lifetime.signal,
     }, (response) => {
       outgoing.writeHead(
         response.statusCode ?? 502,
@@ -110,8 +141,20 @@ export async function createViewerGateway(options: {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
   });
-  proxy.on("connect", (_request, socket) => {
-    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+  proxy.on("connect", (request, socket, head) => {
+    // Chromium uses CONNECT even for ws:// through an HTTP proxy. Unwrap only
+    // this viewer's plaintext origin, then re-enter the SAME policy-enforcing
+    // HTTP parser. This never creates a raw tunnel to Guest or Host targets.
+    if (request.url !== `${originHost}:80` || connectedSockets.has(socket)) {
+      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    connectedSockets.add(socket);
+    socket.pause();
+    socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    if (head.length > 0) socket.unshift(head);
+    proxy.emit("connection", socket);
+    socket.resume();
   });
   proxy.on("upgrade", (request, browserSocket, head) => {
     const target = parseProxyTarget(request.url, request.headers.host);
@@ -174,6 +217,8 @@ export async function createViewerGateway(options: {
     async close() {
       if (closed) return;
       closed = true;
+      lifetime.abort();
+      httpAgent.destroy();
       vfsResources.clear();
       await Promise.all([
         closeServer(proxy, sockets),
@@ -393,7 +438,7 @@ function sanitizeRequestHeaders(
   for (const [name, value] of Object.entries(raw)) {
     const lower = name.toLowerCase();
     if (value === undefined || connectionTokens.has(lower)) continue;
-    if (["proxy-authorization", "proxy-connection", "forwarded", "via"].includes(lower)) continue;
+    if (["connection", "keep-alive", "proxy-authorization", "proxy-connection", "forwarded", "via"].includes(lower)) continue;
     headers[lower] = value;
   }
   headers.host = originHost;

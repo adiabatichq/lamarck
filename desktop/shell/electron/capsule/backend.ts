@@ -3,6 +3,9 @@ import type { AppManifestDigest } from "../../../capsule/src/app-manifest-author
 
 export const CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE = 8;
 
+/** Host-only admission signal: no ticket or Guest stream has been created. */
+export class CapsuleViewerCapacityError extends Error {}
+
 export interface CapsuleUiSpec {
   appId: string;
   /** Exact Core activation authority which must match every launch input. */

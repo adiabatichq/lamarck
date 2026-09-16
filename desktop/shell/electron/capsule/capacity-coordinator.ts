@@ -1,6 +1,6 @@
 import { CapsuleVmHostError } from "../capsule-vm/launcher";
 import { CapsuleGuestRequestError, type RequestBodyFor } from "./guest-session";
-import type { HostOperation, JsonValue, RuntimeMemoryStatus } from "@lamarck/capsule";
+import { RUNTIME_STARTUP_TIMEOUT_MS, type HostOperation, type JsonValue, type RuntimeMemoryStatus } from "@lamarck/capsule";
 import type { CapsuleStorageBudgetLike } from "./storage-budget";
 
 const MiB = 1024 ** 2, GiB = 1024 ** 3;
@@ -97,7 +97,6 @@ export class VmCapacityCoordinator {
   #previousReserved?: number;
   #pressure: BuildPressureState = { deferred: false, high: 0, low: 0, observedAt: -Infinity };
   onAvailable: () => void = () => {};
-  onObserved: (state: GuestCapacity) => void = () => {};
   onFailure: (error: unknown) => void = () => {};
   readonly #building = new Set<string>();
   #timer?: ReturnType<typeof setInterval>;
@@ -218,7 +217,6 @@ export class VmCapacityCoordinator {
       this.#observePressure(state);
       if (this.#previousReserved !== undefined && state.reservedMemoryBytes < this.#previousReserved) this.onAvailable();
       this.#previousReserved = state.reservedMemoryBytes;
-      this.onObserved(state);
       const pendingGrowth = Math.max(0, ...(state.workloads ?? []).filter(workload => workload.sampleAgeMs !== null
         && workload.sampleAgeMs < 2_000 && workload.growthWait === "supply").map(workload => workload.requestedGrowthBytes));
       // Keep growth headroom supplied even when the balloon was previously idle.
@@ -227,7 +225,6 @@ export class VmCapacityCoordinator {
           await this.#supply(Math.min(state.memoryCeilingBytes, state.reservedMemoryBytes + Math.max(pendingGrowth, CACHE_HEADROOM)), state);
         } catch (error) {
           if (!resourceUnavailable(error)) throw error;
-          this.onObserved(await this.status());
         }
         this.#lastActivity = this.now();
         return;
@@ -288,11 +285,13 @@ function align(value: number, unit: number): number { return Math.ceil(value / u
 interface QueuedLaunch {
   admit(): Promise<void>; signal: AbortSignal; resolve(release: () => void): void; reject(error: unknown): void;
   build: boolean;
+  capacityDeadline?: number;
+  capacityTimer?: ReturnType<typeof setTimeout>;
   cancel(): void;
 }
-/** Only waits for finite Builds/preparations, never for a long-lived App to close. */
+/** Wake on released capacity, including idle Runtime shrink. Exhaustion waits
+ * are bounded; opening another App or closing this one stays independent. */
 export class BuildProgressQueue {
-  #active = 0;
   #activeBuilds = 0;
   #queue: QueuedLaunch[] = [];
   #pumping = false;
@@ -315,6 +314,7 @@ export class BuildProgressQueue {
     const index = this.#queue.indexOf(item);
     if (index >= 0) this.#queue.splice(index, 1);
     item.signal.removeEventListener("abort", item.cancel);
+    clearTimeout(item.capacityTimer);
   }
   wake(): void { void this.#pump(); }
 
@@ -330,24 +330,34 @@ export class BuildProgressQueue {
         if (!item) return;
         if (item.signal.aborted) { item.cancel(); continue; }
         item.signal.removeEventListener("abort", item.cancel);
+        // Admission may acquire a grant before its response arrives. A queued
+        // timeout must not discard ownership while that operation is in flight.
+        clearTimeout(item.capacityTimer);
         attempted.add(item);
         try { await item.admit(); }
         catch (error) {
-          if (error instanceof CapacityExhaustedError && this.#active > 0 && !item.signal.aborted) {
-            item.signal.addEventListener("abort", item.cancel, { once: true });
-            continue;
+          if (error instanceof CapacityExhaustedError && !item.signal.aborted) {
+            item.capacityDeadline ??= performance.now() + RUNTIME_STARTUP_TIMEOUT_MS;
+            const remaining = item.capacityDeadline - performance.now();
+            if (remaining > 0) {
+              item.signal.addEventListener("abort", item.cancel, { once: true });
+              item.capacityTimer = setTimeout(() => {
+                this.#remove(item); item.reject(error); void this.#pump();
+              }, remaining);
+              item.capacityTimer.unref();
+              continue;
+            }
           }
           this.#remove(item); item.reject(error); continue;
         }
         // Cancellation during admission cannot drop a successfully held grant:
         // the caller gets the release handle and owns authoritative cleanup.
         this.#remove(item);
-        this.#active += 1;
         if (item.build) this.#activeBuilds += 1;
         let released = false;
         item.resolve(() => {
           if (released) return;
-          released = true; this.#active -= 1;
+          released = true;
           if (item.build) this.#activeBuilds -= 1;
           void this.#pump();
         });

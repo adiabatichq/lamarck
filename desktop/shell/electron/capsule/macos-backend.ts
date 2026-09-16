@@ -59,6 +59,7 @@ import type {
 } from "./backend";
 import {
   CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE,
+  CapsuleViewerCapacityError,
   CapsuleManifestAuthorityChangedError,
   CapsuleRestartRequiredError,
 } from "./backend";
@@ -700,10 +701,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       if (!instance) throw new Error("App Capsule UI instance is no longer active or prepared");
       if (instance.terminalError) throw instance.terminalError;
       if (instance.viewerStreams.size >= CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE) {
-        throw new Error("App viewer connection limit reached");
+        throw new CapsuleViewerCapacityError("App viewer connection limit reached");
       }
       if (this.#activeViewerStreamCount() >= MAX_VIEWER_STREAMS_GLOBAL) {
-        throw new Error("Capsule viewer connection budget is full");
+        throw new CapsuleViewerCapacityError("Capsule viewer connection budget is full");
       }
       const boot = await this.#requireCurrentBoot(instance.bootGeneration);
       const ticket = boot.session.issueTicket({
@@ -891,6 +892,9 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         if (failures.length > 0) {
           throw new AggregateError(failures, "Capsule preparation cleanup or Guest shutdown was incomplete");
         }
+        // Core can restart after this authoritative teardown and begin a new
+        // activation sequence. Every old candidate has already been retired.
+        this.#latestActivationSequenceByApp.clear();
       }));
     } catch (error) {
       operation = Promise.reject(error);
@@ -1179,24 +1183,8 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         ready.capacity.onFailure = (error) => {
           if (this.#boot === ready && !ready.intentional) this.#loseBoundaryInBackground(error, ready);
         };
-        ready.capacity.onObserved = (state) => {
-          if (this.#boot !== ready || ready.intentional) return;
-          for (const sample of state.workloads ?? []) {
-            const candidate = this.#workloads.get(sample.workloadHandle);
-            if (!candidate || candidate.bootGeneration !== ready.generation || candidate.appHandle !== sample.appHandle) continue;
-            if (!["launching", "prepared"].includes(candidate.lifecycle) || candidate.terminalError
-              || sample.sampleAgeMs === null || sample.sampleAgeMs > 2_000
-              || sample.error?.code !== "CAPSULE_RESOURCE_EXHAUSTED") continue;
-            // Recoverable supply/release waits use the original startup deadline,
-            // even when an individual supply attempt fails.
-            if (sample.growthWait !== "exhausted") continue;
-            const error = new CapacityExhaustedError(`${sample.error.message}; Runtime capacity unavailable. Retry after capacity is available.`);
-            // Reject only an unpublished candidate. Existing Apps retain their
-            // limits and are never evicted by a resource-policy decision.
-            if (candidate.lifecycle === "launching") this.#abortLaunches(candidate.appId, error);
-            this.#failWorkload(ready, candidate, error);
-          }
-        };
+        // Denied extra headroom does not prove the existing grant cannot run
+        // the App. Startup readiness, process exit and its deadline decide.
         await ready.capacity.status();
         // Recover a backed-but-not-exposed growth after an interrupted prior boot.
         const growth = await session.request("resources.disk.grow", { bytes: stateDiskBytes });
@@ -3457,10 +3445,11 @@ function onAbort(signal: AbortSignal, operation: () => Promise<void>): () => voi
 }
 
 async function raceAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) throw abortError(signal);
   return await new Promise<T>((resolve, reject) => {
     const abort = () => reject(abortError(signal));
-    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+    // The operation already exists, so own its rejection even after cancellation.
     operation.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
   });
 }

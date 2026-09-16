@@ -179,6 +179,26 @@ describe("Capsule VM helper launcher v2", () => {
     }
   });
 
+  test("owns pending DATA bytes across delayed writes and caller buffer reuse", async () => {
+    const stdin = new DelayedPassThrough();
+    const child = new FakeChild(stdin);
+    const client = new CapsuleVmHostClient(child.asChild());
+    const outbound = captureOutbound(child);
+    const stream = await openStream(child, client, CAPSULE_VM_HELPER_STREAM_ID_MIN, "data");
+    const original = Buffer.alloc(CAPSULE_VM_STREAM_CHUNK_BYTES * 2, 0x37);
+    const input = Buffer.from(original);
+    const writing = writeAsync(stream, input);
+    input.fill(0x99);
+    for (let frame = 0; frame < 2; frame += 1) {
+      await waitFor(() => stdin.pendingCount === 1);
+      stdin.releaseNext();
+    }
+    await writing;
+    expect(Buffer.concat(outbound.filter(frame => frame.kind === CapsuleVmFrameKind.Data)
+      .map(frame => frame.payload))).toEqual(original);
+    client.close();
+  });
+
   test("returns receive credit only after Node consumes DATA", async () => {
     const child = new FakeChild();
     const client = new CapsuleVmHostClient(child.asChild());

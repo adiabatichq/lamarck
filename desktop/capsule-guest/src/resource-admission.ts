@@ -19,8 +19,8 @@ export interface GuestResourceLease {
   readonly memoryBytes: number;
   /** Move held disk capacity to a durable output without releasing it first. */
   transferDisk?(key: string, bytes: number): GuestResourceLease;
-  /** Reserve before writing memory.max; apply must READ BACK the effective limit. */
-  growMemory?(bytes: number, apply: () => Promise<number>): Promise<void>;
+  /** Hold the larger grant until apply READS BACK the effective memory.max. */
+  resizeMemory?(bytes: number, apply: () => Promise<number>): Promise<void>;
   growthWaitReason?(bytes: number): "supply" | "release" | "exhausted";
   release(): void;
 }
@@ -164,17 +164,19 @@ export class GuestResourceAdmission implements GuestResourceAdmissionLike {
           && (item.kind === "build" || item.futureRuntime > 0))) return "release";
         return "exhausted";
       },
-      growMemory: async (bytes: number, apply: () => Promise<number>) => {
+      resizeMemory: async (bytes: number, apply: () => Promise<number>) => {
         positive(bytes, "memory grant");
         if (record.releaseRequested || !this.#reservations.has(key) || record.busy) throw new Error("Grant is closing or already changing");
-        if (bytes < record.memoryBytes) throw new Error("Live memory grants cannot shrink");
         if (bytes === record.memoryBytes) return;
         const previous = record.memoryBytes;
-        const delta = bytes - previous;
         const parent = record.launchKey ? this.#reservations.get(record.launchKey) : undefined;
+        if (bytes < previous && (record.kind !== "runtime" || parent)) {
+          throw new GuestResourceAdmissionError("Only an independent Runtime grant can shrink");
+        }
+        const delta = Math.max(0, bytes - previous);
         const borrowed = Math.min(parent?.memoryBytes ?? 0, delta);
         if (parent) parent.memoryBytes -= borrowed;
-        record.memoryBytes = bytes; // Capacity is held BEFORE the kernel can observe a larger hard limit.
+        record.memoryBytes = Math.max(previous, bytes); // Never credit a decrease before kernel acknowledgement.
         try { this.#check(); }
         catch (error) {
           record.memoryBytes = previous;

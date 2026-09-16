@@ -28,6 +28,8 @@ import {
 import { runFixedCommand } from "./fixed-command";
 import { GuestResourceAdmission, type GuestResourceLease } from "./resource-admission";
 import { GuestResourceManager } from "./resource-manager";
+import { configureGuestMemoryPages, linuxRuntimeMemoryKernel, RuntimeMemoryController } from "./runtime-memory";
+import { setTimeout as delay } from "node:timers/promises";
 
 export const RELEASE_RUNC_SMOKE_MARKER = "LAMARCK_RELEASE_RUNC_SMOKE_OK";
 export const RELEASE_RUNC_SMOKE_COW = "release-runc-smoke-cow.txt";
@@ -103,6 +105,8 @@ export const RELEASE_RUNC_SMOKE_WORKLOAD_SOURCE = `
 import { writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createConnection } from "node:net";
+import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 
 if (execFileSync("/usr/bin/lamarck", [], { encoding: "utf8" }) !== "managed-cli-mount-smoke-ok") throw new Error("Host CLI mount is not executable");
 for (const path of ["/usr/bin/lamarck", "/run/lamarck/lamarck-managed.mjs"]) {
@@ -131,6 +135,18 @@ if (sdkPath !== "/run/lamarck/system.sock") {
   throw new Error("fixed workload SDK socket is unavailable after npm launch");
 }
 const sdk = createConnection(sdkPath);
+let proceed = once(sdk, "data");
+sdk.write("memory-ready\\n");
+await proceed;
+const pages = [];
+for (let i = 0; i < 25; i++) {
+  pages.push(Buffer.alloc(8 * 1024 * 1024, 1));
+  await delay(25);
+}
+proceed = once(sdk, "data");
+sdk.write("memory-grown\\n");
+await proceed;
+if (pages.reduce((sum, page) => sum + page[0], 0) !== 25) throw new Error("smoke allocation was lost");
 await new Promise((resolve, reject) => {
   sdk.once("error", reject);
   sdk.end(${JSON.stringify(`${RELEASE_RUNC_SMOKE_MARKER}\n`)}, resolve);
@@ -188,6 +204,10 @@ export async function runReleaseRuncSmoke(): Promise<void> {
   if (process.platform !== "linux" || process.arch !== "arm64") {
     throw new Error("release runc smoke requires the signed Linux arm64 Guest");
   }
+  await configureGuestMemoryPages();
+  if (!(await readFile("/sys/kernel/mm/transparent_hugepage/enabled", "utf8")).includes("[never]")) {
+    throw new Error("Guest huge-page policy was not applied");
+  }
   await rm(SMOKE_ROOT, { recursive: true, force: true });
   await mkdir(ARTIFACT_SOURCE, { recursive: true, mode: 0o755 });
   const workloadSourcePath = `${ARTIFACT_SOURCE}/release-runc-smoke.mjs`;
@@ -227,6 +247,7 @@ export async function runReleaseRuncSmoke(): Promise<void> {
   let execution: RuncExecution | undefined;
   let executionDeleted = false;
   let workloadLease: GuestResourceLease | undefined;
+  let memoryController: RuntimeMemoryController | undefined;
   let sockets: UnixSocketPair | undefined;
   const cleanupFailures: unknown[] = [];
   let primaryFailure: unknown;
@@ -274,6 +295,7 @@ export async function runReleaseRuncSmoke(): Promise<void> {
     });
     workloadLease = await admission.reserve(`workload:${workloadHandle}`, {
       memoryBytes: expectedIdentity.resources.memoryBytes,
+      kind: "runtime",
     });
     execution = await runc.start({
       plan,
@@ -288,10 +310,37 @@ export async function runReleaseRuncSmoke(): Promise<void> {
         consumedTicket: consumedCliTicket,
       },
     });
-    const [exit, marker] = await Promise.all([
+    const kernel = linuxRuntimeMemoryKernel(`/sys/fs/cgroup/${plan.config.linux.cgroupsPath}`);
+    // Seed spare headroom. A cold npm launch also owns file-cache pages and
+    // must not be forced below the controller's measured-use safety margin.
+    await workloadLease.resizeMemory!(320 * 1024 * 1024, async () => {
+      await kernel.writeLimit(320 * 1024 * 1024);
+      return kernel.readLimit();
+    });
+    memoryController = new RuntimeMemoryController(workloadLease, kernel);
+    const waitForGrant = async (matches: (bytes: number) => boolean) => {
+      const deadline = Date.now() + 30_000;
+      while (!matches(workloadLease!.memoryBytes)) {
+        if (Date.now() >= deadline) throw new Error(`production Runtime memory adjustment timed out at ${workloadLease!.memoryBytes} bytes`);
+        await delay(100);
+      }
+      if (await kernel.readLimit() !== workloadLease!.memoryBytes) throw new Error("Runtime ledger/kernel mismatch");
+    };
+    if (await readExactLine(sockets.peer, 15_000) !== "memory-ready") throw new Error("memory smoke did not become ready");
+    await memoryController.start();
+    await waitForGrant(bytes => bytes >= 192 * 1024 * 1024 && bytes < 320 * 1024 * 1024);
+    const grown = readExactLine(sockets.peer, 15_000);
+    sockets.peer.write("grow\n");
+    if (await grown !== "memory-grown") throw new Error("memory smoke failed to allocate");
+    await waitForGrant(bytes => bytes > 256 * 1024 * 1024);
+    await memoryController.stop();
+    memoryController = undefined;
+    const finished = Promise.all([
       execution.wait(),
       readExactLine(sockets.peer, 15_000),
     ]);
+    sockets.peer.write("finish\n");
+    const [exit, marker] = await finished;
     if (exit.exitCode !== 0 || exit.signal !== null) {
       throw new Error(`production runc smoke workload exited ${exit.exitCode ?? exit.signal}`);
     }
@@ -323,6 +372,7 @@ export async function runReleaseRuncSmoke(): Promise<void> {
   } catch (error) {
     primaryFailure = error;
   } finally {
+    await memoryController?.stop();
     if (execution && !executionDeleted) {
       try {
         await runc.stop(execution.containerId, 0);

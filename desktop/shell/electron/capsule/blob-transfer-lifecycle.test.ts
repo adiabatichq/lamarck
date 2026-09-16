@@ -152,6 +152,30 @@ async function importSession() {
 }
 
 describe("Host blob source cancellation", () => {
+  test.each(["before iteration", "during next"])("owns source rejection when cancelled %s", async (timing) => {
+    const controller = new AbortController();
+    const error = new Error("App stop requested");
+    if (timing === "before iteration") controller.abort(error);
+    const returned = vi.fn(async () => ({ done: true as const, value: undefined }));
+    const source: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: () => {
+          controller.abort(error);
+          return Promise.reject(error);
+        },
+        return: returned,
+      }),
+    };
+    const consuming = (async () => {
+      for await (const _chunk of abortableIterable(source, controller.signal, () => {})) {
+        throw new Error("Cancelled source must not yield");
+      }
+    })();
+    await expect(consuming).rejects.toBe(error);
+    await nextTurn(); // Allow Node/Vitest to detect an abandoned source rejection.
+    expect(returned).toHaveBeenCalledOnce();
+  });
+
   test("aborts a never-yielding AsyncIterator and invokes return at the idle deadline", async () => {
     vi.useFakeTimers();
     const destination = new PassThrough();

@@ -30,6 +30,7 @@ import type { AppCliStreamServer } from "./app-cli-broker";
 import { CapsuleGuestRequestError } from "./guest-session";
 import {
   CapsuleRestartRequiredError,
+  CapsuleViewerCapacityError,
   isCapsuleRestartRequiredError,
   type CapsuleUiPreparation,
 } from "./backend";
@@ -644,6 +645,17 @@ describe("MacOsCapsuleBackend orchestration", () => {
       .resolves.toEqual({ instanceId: current.instanceId });
     await expect(harness.backend.commitPreparedUi(stale.preparationId))
       .rejects.toThrow("Prepared App activation is stale");
+    await harness.backend.stopAll();
+  });
+
+  test("accepts a restarted Core sequence only after confirmed full teardown", async () => {
+    const harness = createHarness();
+    await harness.backend.startUi(spec("sender-old", PACKAGE_A, 7));
+    const stale = await harness.backend.prepareUi(spec("sender-pending", PACKAGE_A, 8));
+    await harness.backend.stopAll();
+    await expect(harness.backend.commitPreparedUi(stale.preparationId)).rejects.toThrow("already aborted");
+    await expect(harness.backend.startUi(spec("sender-restarted", PACKAGE_A, 1)))
+      .resolves.toMatchObject({ instanceId: expect.any(String) });
     await harness.backend.stopAll();
   });
 
@@ -1584,11 +1596,29 @@ describe("MacOsCapsuleBackend orchestration", () => {
     );
 
     await expect(harness.backend.openUiStream(instance.instanceId))
-      .rejects.toThrow("viewer connection limit");
+      .rejects.toBeInstanceOf(CapsuleViewerCapacityError);
     expect(harness.session.operations.filter((operation) => operation === "viewer.attach"))
       .toHaveLength(8);
     for (const stream of streams) stream.destroy();
     await harness.backend.stopAll();
+  });
+
+  test("global viewer exhaustion is retryable only before admission and recovers after stream close", async () => {
+    const harness = createHarness();
+    const instances = [];
+    for (let index = 0; index < 5; index++) {
+      instances.push(await harness.backend.startUi({ ...spec(`sender-${index}`), appId: `app-${index}` }));
+    }
+    const streams = [];
+    for (const instance of instances.slice(0, 4)) {
+      for (let index = 0; index < 8; index++) streams.push(await harness.backend.openUiStream(instance.instanceId));
+    }
+    await expect(harness.backend.openUiStream(instances[4]!.instanceId)).rejects.toBeInstanceOf(CapsuleViewerCapacityError);
+    expect(harness.session.operations.filter(operation => operation === "viewer.attach")).toHaveLength(32);
+    streams[0]!.destroy(); await new Promise(resolve => setImmediate(resolve));
+    const recovered = await harness.backend.openUiStream(instances[4]!.instanceId);
+    expect(harness.session.operations.filter(operation => operation === "viewer.attach")).toHaveLength(33);
+    recovered.destroy(); streams.forEach(stream => stream.destroy()); await harness.backend.stopAll();
   });
 
   test("cannot publish a boot boundary that faults as ping completes", async () => {
@@ -2185,6 +2215,39 @@ function enableCapacity(h: ReturnType<typeof createHarness>) {
 }
 
 describe("replacement reservation ownership through Host preparation", () => {
+  test("allows startup to become ready after additional memory admission is exhausted", async () => {
+    const h = createHarness();
+    enableCapacity(h);
+    let ready: JsonValue | undefined;
+    const emit = h.session.guestEvent.bind(h.session);
+    vi.spyOn(h.session, "guestEvent").mockImplementation((type, body) => {
+      if (type === "workload.ready") ready = body;
+      else emit(type, body);
+    });
+    const observed = Promise.withResolvers<void>();
+    const request = h.session.request.bind(h.session);
+    h.session.request = async (op, body) => {
+      const result = await request(op, body);
+      if (op !== "resources.status" || !ready) return result;
+      const identity = ready as Record<string, JsonValue>;
+      observed.resolve();
+      return { ...result, workloads: [{ appHandle: identity.appHandle, workloadHandle: identity.workloadHandle,
+        sampleAgeMs: 0, requestedGrowthBytes: 64 * 1024 ** 2, waitingMs: 0, growthWait: "exhausted",
+        error: { code: "CAPSULE_RESOURCE_EXHAUSTED", message: "shared Build reserve must remain available" } }] };
+    };
+    const opening = h.backend.startUi(spec("bounded-memory"));
+    void opening.catch(() => {});
+    try {
+      await observed.promise;
+      // Let the production observer finish processing the denied-growth sample.
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(h.session.stoppedApps).toEqual([]);
+      emit("workload.ready", ready!);
+      await expect(opening).resolves.toMatchObject({ instanceId: expect.any(String) });
+      expect(h.vm.stopCalls).toBe(0);
+    } finally { await h.backend.stopAll(); }
+  });
+
   test.each(["cached", "warm", "cold", "warm-fallback"])("%s replacement retains its real grant until commit", async mode => {
     const h = createHarness(), c = enableCapacity(h);
     const first = await h.backend.startUi(spec("old"));

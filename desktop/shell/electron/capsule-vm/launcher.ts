@@ -229,7 +229,7 @@ export class CapsuleVmHostStream extends Duplex {
     encoding: BufferEncoding,
     callback: (error?: Error | null) => void,
   ): void {
-    const bytes = typeof chunk === "string" ? Buffer.from(chunk, encoding) : Buffer.from(chunk);
+    const bytes = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
     this.owner.writeStreamData(this.streamId, bytes, callback);
   }
 

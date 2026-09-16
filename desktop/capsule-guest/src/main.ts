@@ -11,6 +11,7 @@ import { LvrmDuplex } from "./lvrm-duplex";
 import { GuestResourceAdmission } from "./resource-admission";
 import { GuestResourceManager } from "./resource-manager";
 import { CapsuleGuestSupervisor } from "./supervisor";
+import { configureGuestMemoryPages } from "./runtime-memory";
 
 const CONTROL_SOCKET = "/run/lamarck/supervisor-control.sock";
 const DATA_SOCKET = "/run/lamarck/supervisor-data.sock";
@@ -30,6 +31,7 @@ export function parseTrustedImageDigestFromCmdline(cmdline: string): string {
 
 export async function startGuestSupervisor(): Promise<void> {
   const imageDigest = parseTrustedImageDigestFromCmdline(await readFile("/proc/cmdline", "utf8"));
+  await configureGuestMemoryPages();
   // Do not advertise resource-management-v1 on an image whose kernel cannot
   // reclaim RAM or report pressure, even if its program overlay is current.
   if (!(await readdir("/sys/bus/virtio/drivers/virtio_balloon")).some((name) => /^virtio[0-9]+$/.test(name))) {

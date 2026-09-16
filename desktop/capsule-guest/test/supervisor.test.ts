@@ -28,7 +28,7 @@ import {
   GuestResourceAdmission,
   type GuestResourceAdmissionLike,
 } from "../src/resource-admission";
-import type { GuestProtocolStream } from "../src/lvrm-duplex";
+import { LvrmResetError, type GuestProtocolStream } from "../src/lvrm-duplex";
 import { BoundedTtlTombstones, CapsuleGuestSupervisor } from "../src/supervisor";
 
 const BOOT_ID = "B".repeat(22);
@@ -172,6 +172,85 @@ describe("Capsule Guest supervisor data routing", () => {
     const failed = await harness.inbox.next((value) => eventType(value) === "blob.failed");
     expect(failed.body.message).toContain("idle deadline");
     expect(harness.inbox.count((value) => eventType(value) === "blob.imported")).toBe(0);
+  });
+
+  test("cancels an import before DATA attachment without publishing or faulting", async () => {
+    const h = await createHarness({ blobPresent: false });
+    await h.request("blob.import.prepare", { blobHandle: BLOB, blobKind: "package",
+      format: "capsule-tree-v1", digest: DIGEST, bytes: 3, streamTicket: SDK_TICKET });
+    expect(await h.request("blob.import.release", { ownerKey: OWNER, blobHandle: BLOB,
+      blobKind: "package", digest: DIGEST, bytes: 3 })).toMatchObject({ ok: true });
+    const data = await h.dialer.nextHostSocket();
+    data.end(Buffer.concat([encodeJsonFrame(dataPrelude(SDK_TICKET, "package-in")), Buffer.from("abc")]));
+    await h.inbox.next((value) => eventType(value) === "blob.failed");
+    expect(await h.request("ping", { nonce: 1 })).toMatchObject({ ok: true });
+    expect(h.blobs.receive).not.toHaveBeenCalled();
+    expect(h.inbox.count((value) => eventType(value) === "blob.imported")).toBe(0);
+    expect(h.dialer.closed).toBe(false);
+  });
+
+  test("waits for cancelled import partial-file cleanup before acknowledging release", async () => {
+    const h = await createHarness({ blobPresent: false });
+    const cleanupStarted = controllablePromise();
+    const cleanupDone = controllablePromise();
+    const receive = h.blobs.receive.getMockImplementation()!;
+    h.blobs.receive.mockImplementation(async (...args) => {
+      try { return await receive(...args); }
+      catch (error) { cleanupStarted.resolve(); await cleanupDone.promise; throw error; }
+    });
+    await h.request("blob.import.prepare", { blobHandle: BLOB, blobKind: "package",
+      format: "capsule-tree-v1", digest: DIGEST, bytes: 3, streamTicket: SDK_TICKET });
+    const data = await h.dialer.nextHostSocket();
+    data.write(Buffer.concat([encodeJsonFrame(dataPrelude(SDK_TICKET, "package-in")), Buffer.from("a")]));
+    await eventually(() => expect(h.blobs.receive).toHaveBeenCalledOnce());
+    let released = false;
+    const releasing = h.request("blob.import.release", { ownerKey: OWNER, blobHandle: BLOB,
+      blobKind: "package", digest: DIGEST, bytes: 3 }).then((result) => { released = true; return result; });
+    try {
+      await cleanupStarted.promise;
+      expect(released).toBe(false);
+      expect(h.blobs.releaseExpected).not.toHaveBeenCalled();
+    } finally { cleanupDone.resolve(); }
+    expect(await releasing).toMatchObject({ ok: true });
+    expect(await h.request("ping", { nonce: 2 })).toMatchObject({ ok: true });
+    expect(h.resources.drain).not.toHaveBeenCalled();
+    expect(h.inbox.count((value) => eventType(value) === "blob.imported")).toBe(0);
+  });
+
+  test.each([false, true])("handles Host import RESET after publication with cleanup failure=%s", async (cleanupFails) => {
+    const protocolClose = Promise.withResolvers<void>();
+    const h = await createHarness({ blobPresent: false, dataProtocolClosePromise: protocolClose.promise });
+    if (cleanupFails) h.blobs.releaseExpected.mockRejectedValueOnce(new Error("cannot prove import cleanup"));
+    await h.request("blob.import.prepare", { blobHandle: BLOB, blobKind: "package",
+      format: "capsule-tree-v1", digest: DIGEST, bytes: 3, streamTicket: SDK_TICKET });
+    const data = await h.dialer.nextHostSocket();
+    data.end(Buffer.concat([encodeJsonFrame(dataPrelude(SDK_TICKET, "package-in")), Buffer.from("abc")]));
+    await eventually(() => expect(h.received).toEqual([Buffer.from("abc")]));
+    protocolClose.reject(new LvrmResetError("explicit-reset", "Host reset the native relay direction"));
+    await eventually(() => expect(h.blobs.releaseExpected).toHaveBeenCalledWith({
+      ownerKey: OWNER, referenceId: `import:${BLOB}`, kind: "package", digest: DIGEST, bytes: 3,
+    }));
+    if (cleanupFails) {
+      await eventually(() => expect(h.supervisor.snapshot().status).toBe("faulted"));
+    } else {
+      await h.inbox.next((value) => eventType(value) === "blob.failed");
+      expect(await h.request("ping", { nonce: 3 })).toMatchObject({ ok: true });
+      expect(h.resources.drain).not.toHaveBeenCalled();
+    }
+    expect(h.inbox.count((value) => eventType(value) === "blob.imported")).toBe(0);
+  });
+
+  test("rejects mismatched import cancellation without retiring its valid transfer", async () => {
+    const h = await createHarness({ blobPresent: false });
+    await h.request("blob.import.prepare", { blobHandle: BLOB, blobKind: "package",
+      format: "capsule-tree-v1", digest: DIGEST, bytes: 3, streamTicket: SDK_TICKET });
+    expect(await h.request("blob.import.release", { ownerKey: "f".repeat(64), blobHandle: BLOB,
+      blobKind: "package", digest: DIGEST, bytes: 3 })).toMatchObject({ ok: false });
+    const data = await h.dialer.nextHostSocket();
+    data.end(Buffer.concat([encodeJsonFrame(dataPrelude(SDK_TICKET, "package-in")), Buffer.from("abc")]));
+    await h.inbox.next((value) => eventType(value) === "blob.imported");
+    expect(h.blobs.releaseExpected).not.toHaveBeenCalled();
+    expect(h.dialer.closed).toBe(false);
   });
 
   test("lets an attached import make byte progress beyond the ticket TTL", async () => {

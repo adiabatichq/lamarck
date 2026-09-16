@@ -6,6 +6,7 @@ import {
 import { connect as netConnect } from "node:net";
 import { Duplex } from "node:stream";
 import { afterEach, describe, expect, test } from "vitest";
+import { CapsuleViewerCapacityError } from "./backend";
 import {
   attachViewerBridge,
   createViewerGateway,
@@ -19,6 +20,90 @@ afterEach(async () => {
 });
 
 describe("App viewer gateway", () => {
+  test("ten viewers share the global Guest connection budget without failing module requests", async () => {
+    const upstream = createHttpServer((request, response) => setTimeout(() => response.end(request.url), 20));
+    const port = await listen(upstream);
+    closers.push(() => closeServer(upstream));
+    const streams = new Set<import("node:net").Socket>();
+    let peak = 0;
+    const gateways = await Promise.all(Array.from({ length: 10 }, (_, index) => createViewerGateway({
+      instanceId: `app-${index}`, coreOrigin: `http://127.0.0.1:${port}`,
+      transport: { openUiStream: async () => {
+        if (streams.size >= 32) throw new CapsuleViewerCapacityError("Capsule viewer connection budget is full");
+        const stream = netConnect(port, "127.0.0.1"); streams.add(stream);
+        peak = Math.max(peak, streams.size);
+        stream.once("close", () => streams.delete(stream));
+        return stream;
+      } },
+    })));
+    closers.push(...gateways.map(gateway => () => gateway.close()));
+    const results = await Promise.all(gateways.flatMap((gateway, app) => Array.from({ length: 6 }, (_, module) =>
+      proxyGet(gateway, `/app-${app}/module-${module}.js`))));
+    expect(results.filter(response => response.status !== 200)).toEqual([]);
+    expect(peak).toBeLessThanOrEqual(32);
+    await Promise.all(gateways.map(gateway => gateway.close()));
+    await waitFor(() => streams.size === 0);
+  });
+
+  test("idle connection expiry leaves slow active responses intact and releases their slots afterwards", async () => {
+    const upstream = createHttpServer((_request, response) => setTimeout(() => response.end("finished"), 1_200));
+    const port = await listen(upstream); closers.push(() => closeServer(upstream));
+    let released!: () => void;
+    const closed = new Promise<void>(resolve => { released = resolve; });
+    const gateway = await createViewerGateway({
+      instanceId: "slow-active", coreOrigin: `http://127.0.0.1:${port}`,
+      transport: { openUiStream: async () => {
+        const stream = netConnect(port, "127.0.0.1"); stream.once("close", released); return stream;
+      } },
+    });
+    closers.push(() => gateway.close());
+    expect(await proxyGet(gateway, "/slow")).toMatchObject({ status: 200, body: "finished" });
+    await withTimeout(closed, 2_000);
+  });
+
+  test("idle TCP close still consumes a delayed Guest FIN and releases its Host slot", async () => {
+    let finishRead!: () => void, responded = false;
+    const ended = new Promise<void>(resolve => { finishRead = resolve; });
+    const guest = new Duplex({ allowHalfOpen: true, autoDestroy: false,
+      read() {},
+      write(_bytes, _encoding, done) {
+        if (!responded) {
+          responded = true;
+          this.push("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok");
+        }
+        done();
+      },
+      final(done) { done(); setTimeout(() => this.push(null), 30); },
+    });
+    guest.once("end", finishRead);
+    const gateway = await createViewerGateway({ instanceId: "delayed-fin", coreOrigin: "http://127.0.0.1:32100",
+      transport: { openUiStream: async () => guest } });
+    closers.push(() => gateway.close());
+    expect(await proxyGet(gateway, "/module.js")).toMatchObject({ status: 200, body: "ok" });
+    await withTimeout(ended, 2_000);
+  });
+
+  test("closing a capacity-blocked viewer stops retries; non-capacity errors are never retried", async () => {
+    let attempts = 0;
+    const gateway = await createViewerGateway({
+      instanceId: "blocked", coreOrigin: "http://127.0.0.1:32100",
+      transport: { openUiStream: async () => { attempts++; throw new CapsuleViewerCapacityError("occupied"); } },
+    });
+    closers.push(() => gateway.close());
+    const pending = observeProxyTermination(gateway, "/pending");
+    await waitFor(() => attempts > 0); await gateway.close();
+    await withTimeout(pending, 1_000);
+    const stoppedAt = attempts; await new Promise(resolve => setTimeout(resolve, 150));
+    expect(attempts).toBe(stoppedAt);
+    let failures = 0;
+    const failed = await createViewerGateway({
+      instanceId: "failed", coreOrigin: "http://127.0.0.1:32100",
+      transport: { openUiStream: async () => { failures++; throw new Error("boundary lost"); } },
+    });
+    closers.push(() => failed.close());
+    expect((await proxyGet(failed, "/one-attempt")).status).toBe(502); expect(failures).toBe(1);
+  });
+
   test("streams bound-origin HTTP responses and applies security headers", async () => {
     const upstream = createHttpServer((_request, response) => {
       response.writeHead(200, {
@@ -56,6 +141,82 @@ describe("App viewer gateway", () => {
     const tunneled = await rawProxyRequest(gateway.proxyUrl,
       "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
     expect(tunneled).toContain("403 Forbidden");
+  });
+
+  test("reuses bounded Guest connections across module-loading bursts", async () => {
+    const upstream = createHttpServer((request, response) => response.end(request.url));
+    const port = await listen(upstream);
+    closers.push(() => closeServer(upstream));
+    let opened = 0;
+    const streams = new Set<import("node:net").Socket>();
+    const gateway = await createViewerGateway({
+      instanceId: "module-burst", coreOrigin: `http://127.0.0.1:${port}`,
+      transport: { openUiStream: async () => {
+        if (streams.size >= 8) throw new Error("App viewer connection limit reached");
+        opened += 1;
+        const stream = netConnect(port, "127.0.0.1");
+        streams.add(stream);
+        stream.once("close", () => streams.delete(stream));
+        return stream;
+      } },
+    });
+    closers.push(() => gateway.close());
+    for (let batch = 0; batch < 8; batch++) {
+      const results = await Promise.all(Array.from({ length: 6 }, (_, index) =>
+        proxyGet(gateway, `/module-${batch}-${index}.js`)));
+      results.forEach((result, index) => {
+        expect(result.status).toBe(200);
+        expect(result.body).toBe(`/module-${batch}-${index}.js`);
+      });
+    }
+    expect(opened).toBeLessThanOrEqual(6);
+    await gateway.close();
+    await waitFor(() => streams.size === 0);
+  });
+
+  test("enforces origin and response policy inside Chromium's CONNECT envelope", async () => {
+    let requests = 0;
+    const upstream = createHttpServer((_request, response) => {
+      requests++;
+      response.end("bound app");
+    });
+    const port = await listen(upstream);
+    closers.push(() => closeServer(upstream));
+    const gateway = await createGateway(port);
+    const authority = `${new URL(gateway.viewerUrl).host}:80`;
+    const connect = `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`;
+    const allowed = await rawProxyRequest(gateway.proxyUrl, connect
+      + `GET / HTTP/1.1\r\nHost: ${authority}\r\nConnection: close\r\n\r\n`);
+    expect(allowed).toContain("200 Connection Established");
+    expect(allowed).toContain("bound app");
+    expect(allowed).toContain("content-security-policy:");
+    expect(allowed).toContain("cache-control: no-store");
+    const denied = await rawProxyRequest(gateway.proxyUrl, connect
+      + "GET http://127.0.0.1:32100/ HTTP/1.1\r\nHost: 127.0.0.1:32100\r\nConnection: close\r\n\r\n");
+    expect(denied).toContain("403 Forbidden");
+    expect(requests).toBe(1);
+    const nested = await rawProxyRequest(gateway.proxyUrl, connect + connect);
+    expect(nested).toContain("403 Forbidden");
+  });
+
+  test("closing a viewer cancels requests queued behind its occupied HTTP pool", async () => {
+    let received = 0;
+    const upstreamSockets = new Set<import("node:net").Socket>();
+    const upstream = createHttpServer(() => { received++; });
+    upstream.on("connection", (socket) => {
+      upstreamSockets.add(socket);
+      socket.once("close", () => upstreamSockets.delete(socket));
+    });
+    const port = await listen(upstream);
+    closers.push(() => closeServer(upstream));
+    const gateway = await createGateway(port);
+    const results = Array.from({ length: 8 }, (_, index) =>
+      observeProxyTermination(gateway, `/pending-${index}`));
+    await waitFor(() => received === 6);
+    await gateway.close();
+    await withTimeout(Promise.all(results), 1000);
+    await waitFor(() => upstreamSockets.size === 0);
+    expect(received).toBe(6);
   });
 
   test("streams Host-owned VFS resources without forwarding the reserved path to Guest", async () => {
@@ -221,7 +382,7 @@ describe("App viewer gateway", () => {
     expect(directCore).toContain("403 Forbidden");
   });
 
-  test("carries a WebSocket-style upgrade as raw bidirectional bytes", async () => {
+  test.each([false, true])("carries bidirectional WebSocket bytes (CONNECT: %s)", async (connect) => {
     const upstream = createHttpServer();
     const upstreamSockets = new Set<import("node:stream").Duplex>();
     upstream.on("upgrade", (_request, socket) => {
@@ -242,6 +403,10 @@ describe("App viewer gateway", () => {
     const socket = netConnect(Number(proxy.port), proxy.hostname);
     closers.push(async () => { socket.destroy(); });
     await onceConnected(socket);
+    if (connect) {
+      socket.write(`CONNECT ${viewer.host}:80 HTTP/1.1\r\nHost: ${viewer.host}:80\r\n\r\n`);
+      expect(await readUntil(socket, "\r\n\r\n")).toContain("200 Connection Established");
+    }
     socket.write(
       `GET ws://${viewer.host}/socket HTTP/1.1\r\n`
       + `Host: ${viewer.host}\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n`,
@@ -447,7 +612,7 @@ function rawProxyRequest(proxyUrl: string, request: string): Promise<string> {
     socket.once("error", reject);
     socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
     socket.once("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    socket.once("connect", () => socket.end(request));
+    socket.once("connect", () => socket.write(request));
   });
 }
 

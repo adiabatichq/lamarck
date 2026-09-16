@@ -1,10 +1,50 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { BuildProgressQueue, CapacityExhaustedError, VmCapacityCoordinator, parseGuestCapacity } from "./capacity-coordinator";
 import type { CapsuleStorageBudgetLike } from "./storage-budget";
 const MiB = 1024 ** 2, GiB = 1024 ** 3;
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe("Build progress scheduling", () => {
+  afterEach(() => vi.useRealTimers());
+
+  test("idle Runtime recovery wakes a cached launch after all finite preparations have ended", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+    const queue = new BuildProgressQueue();
+    let capacity = false, settled = false;
+    const admit = vi.fn(async () => { if (!capacity) throw new CapacityExhaustedError("occupied"); });
+    const outcome = queue.acquire(admit, new AbortController().signal, false)
+      .then(release => { settled = true; return release; }, error => { settled = true; return error; });
+    await tick(); expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(20_000);
+    capacity = true; queue.wake();
+    const release = await outcome;
+    expect(release).toBeTypeOf("function"); release();
+    expect(admit).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("cancelling an idle-capacity wait removes the timer and cannot reopen on recovery", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+    const queue = new BuildProgressQueue(), abort = new AbortController();
+    const admit = vi.fn(async () => { throw new CapacityExhaustedError("occupied"); });
+    const outcome = queue.acquire(admit, abort.signal, false).catch(error => error);
+    await tick(); abort.abort(new Error("closed"));
+    expect((await outcome).message).toBe("closed");
+    queue.wake(); await vi.advanceTimersByTimeAsync(180_000);
+    expect(admit).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("recovery admission crossing the queued deadline still returns a successfully acquired grant", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+    const queue = new BuildProgressQueue();
+    let acknowledge!: () => void;
+    const admit = vi.fn().mockRejectedValueOnce(new CapacityExhaustedError("occupied"))
+      .mockImplementationOnce(() => new Promise<void>(resolve => { acknowledge = resolve; }));
+    const outcome = queue.acquire(admit, new AbortController().signal, false);
+    await tick(); await vi.advanceTimersByTimeAsync(179_000);
+    queue.wake(); await tick(); await vi.advanceTimersByTimeAsync(2_000);
+    acknowledge(); const release = await outcome; release(); release();
+    expect(vi.getTimerCount()).toBe(0);
+  });
   test("cached D bypasses queued Build C while A/B retain both slots; Builds then resume FIFO", async () => {
     const queue = new BuildProgressQueue(), signal = new AbortController().signal;
     const a = await queue.acquire(async () => {}, signal), b = await queue.acquire(async () => {}, signal);
@@ -20,6 +60,7 @@ describe("Build progress scheduling", () => {
   });
 
   test.each([false, true])("cached bypass still waits for capacity and has a finite outcome (capacity returns: %s)", async available => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     const queue = new BuildProgressQueue(), signal = new AbortController().signal;
     const a = await queue.acquire(async () => {}, signal), b = await queue.acquire(async () => {}, signal);
     const c = queue.acquire(async () => {}, signal);
@@ -30,6 +71,7 @@ describe("Build progress scheduling", () => {
     await tick(); await tick(); expect(admit).toHaveBeenCalledTimes(1);
     capacity = available; a(); const releaseC = await c;
     await tick(); b(); releaseC();
+    if (!available) await vi.advanceTimersByTimeAsync(180_000);
     const result = await outcome;
     if (available) result(); else expect(result).toBeInstanceOf(CapacityExhaustedError);
     const attempts = admit.mock.calls.length;
@@ -102,10 +144,16 @@ describe("Build progress scheduling", () => {
   });
 
   test("genuine exhaustion has a finite outcome without waiting for an App to close", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     const queue = new BuildProgressQueue();
     const admit = vi.fn(async () => { throw new CapacityExhaustedError("Runtime capacity exhausted"); });
-    await expect(queue.acquire(admit, new AbortController().signal)).rejects.toThrow(/Runtime/);
-    expect(admit).toHaveBeenCalledTimes(1);
+    let settled = false;
+    const outcome = queue.acquire(admit, new AbortController().signal).catch(error => { settled = true; return error; });
+    await tick(); await vi.advanceTimersByTimeAsync(179_000);
+    queue.wake(); await tick(); expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await outcome).toBeInstanceOf(CapacityExhaustedError);
+    expect(admit).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
   });
 
   test("queued cancellation does not start work", async () => {
@@ -121,6 +169,7 @@ describe("Build progress scheduling", () => {
   });
 
   test("non-head cancellation during admission returns ownership so the caller can release the grant", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     const queue = new BuildProgressQueue();
     const signal = new AbortController();
     const a = await queue.acquire(async () => {}, new AbortController().signal);
@@ -131,9 +180,10 @@ describe("Build progress scheduling", () => {
     signal.abort(new Error("cancelled")); done(); const release = await request; release(); release();
     expect(admitC).not.toHaveBeenCalled();
     a(); (await c)(); b();
-    // No phantom finite owner may leave an exhausted request waiting forever.
-    await expect(queue.acquire(async () => { throw new CapacityExhaustedError("full"); }, new AbortController().signal))
-      .rejects.toThrow("full");
+    const full = queue.acquire(async () => { throw new CapacityExhaustedError("full"); }, new AbortController().signal)
+      .catch(error => error);
+    await tick(); await vi.advanceTimersByTimeAsync(180_000);
+    expect((await full).message).toBe("full");
   });
 });
 

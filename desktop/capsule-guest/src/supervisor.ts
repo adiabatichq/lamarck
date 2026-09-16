@@ -44,7 +44,7 @@ import { VsockDataDialer, type GuestDataDialer } from "./data-dialer";
 import { readDataStreamPrelude } from "./data-prelude";
 import { GuestResourceManager } from "./resource-manager";
 import { GuestContainmentError } from "./containment-error";
-import type { GuestProtocolStream } from "./lvrm-duplex";
+import { LvrmResetError, type GuestProtocolStream } from "./lvrm-duplex";
 import {
   UNBOUNDED_GUEST_RESOURCE_ADMISSION,
   type GuestResourceAdmissionLike,
@@ -89,6 +89,9 @@ interface PendingImport {
   bytes: number;
   blobHandle: string;
   phase: "prepared" | "attached" | "terminal";
+  cancelled?: boolean;
+  stream?: GuestProtocolStream;
+  completion?: Promise<void>;
 }
 
 interface PendingExport {
@@ -264,6 +267,9 @@ export class CapsuleGuestSupervisor {
     socket.once("close", () => this.dataSockets.delete(socket));
     void this.routeDataSocket(socket).catch((error) => {
       socket.destroy(error instanceof Error ? error : new Error(String(error)));
+      // Host may cancel a neutral or authenticated DATA stream. Its RESET
+      // terminates that stream; malformed authority still faults the session.
+      if (error instanceof LvrmResetError && error.reason === "explicit-reset") return;
       this.failSession(error instanceof Error ? error : new Error(String(error)));
     });
   }
@@ -374,6 +380,18 @@ export class CapsuleGuestSupervisor {
       case "blob.import.prepare":
         return await this.prepareBlobImport(request.body);
       case "blob.import.release": {
+        const pending = [...this.pendingImports.values()].find((item) => item.blobHandle === request.body.blobHandle);
+        if (pending) {
+          if (pending.ownerKey !== request.body.ownerKey || pending.kind !== request.body.blobKind
+            || pending.digest !== request.body.digest || pending.bytes !== request.body.bytes) {
+            throw new Error("Import release does not match its prepared authority");
+          }
+          pending.cancelled = true;
+          pending.stream?.destroy(new LvrmResetError("explicit-reset", "Host cancelled the prepared import"));
+          // A release racing DATA must not acknowledge before CAS cleanup.
+          if (pending.completion) await pending.completion;
+          else this.finishBlob(pending, "blob.failed", "Host cancelled the prepared import");
+        }
         const released = await this.options.blobs.releaseExpected({
           ownerKey: request.body.ownerKey,
           referenceId: `import:${request.body.blobHandle}`,
@@ -807,7 +825,9 @@ export class CapsuleGuestSupervisor {
     const resources = {
       memoryBytes: (record.body.memoryProfile === "lightweight" ? 256 : 512) * 1024 * 1024,
       pids: 256,
-      cpuQuotaMicros: 100_000,
+      // Node and its compiler children share the existing four-CPU App/VM
+      // ceiling; a nested one-CPU cap throttles ordinary parallel startup.
+      cpuQuotaMicros: 400_000,
     };
     const plan = createOciBundlePlan({
       appHandle,
@@ -1188,34 +1208,20 @@ export class CapsuleGuestSupervisor {
     if (prelude.kind === "package-in" || prelude.kind === "dependency-in" || prelude.kind === "artifact-in") {
       const pending = this.pendingImports.get(prelude.ticket);
       if (!pending) throw new Error("import ticket has no prepared CAS operation");
-      // Attachment atomically moves this operation out of the ticket-TTL phase.
-      // No await may occur before the prepared record is removed.
-      this.pendingImports.delete(prelude.ticket);
+      if (pending.cancelled) {
+        this.pendingImports.delete(prelude.ticket);
+        socket.destroy();
+        return;
+      }
+      // Ticket consumption already ended the TTL phase. Retain the operation
+      // through cleanup so a concurrent exact release can join it.
       pending.phase = "attached";
+      pending.stream = socket;
+      pending.completion = this.receiveImport(socket, pending);
       try {
-        await withBlobTransferDeadline(
-          socket,
-          pending.bytes,
-          this.blobTransferPolicy,
-          async () => {
-            await this.options.blobs.receive(
-              pending.kind,
-              pending.digest,
-              pending.bytes,
-              socket,
-              {
-                ownerKey: pending.ownerKey,
-                referenceId: `import:${pending.blobHandle}`,
-              },
-            );
-            await endSocketWriteDirection(socket);
-            await socket.waitForProtocolClose();
-          },
-        );
-        this.finishBlob(pending, "blob.imported");
-      } catch (error) {
-        this.finishBlob(pending, "blob.failed", boundedMessage(error));
-        throw error;
+        await pending.completion;
+      } finally {
+        this.pendingImports.delete(prelude.ticket);
       }
       return;
     }
@@ -1319,6 +1325,35 @@ export class CapsuleGuestSupervisor {
       return;
     }
     throw new Error(`unhandled data stream kind ${prelude.kind}`);
+  }
+
+  private async receiveImport(socket: GuestProtocolStream, pending: PendingImport): Promise<void> {
+    try {
+      await withBlobTransferDeadline(socket, pending.bytes, this.blobTransferPolicy, async () => {
+        await this.options.blobs.receive(pending.kind, pending.digest, pending.bytes, socket, {
+          ownerKey: pending.ownerKey, referenceId: `import:${pending.blobHandle}`,
+        });
+        await endSocketWriteDirection(socket);
+        await socket.waitForProtocolClose();
+      });
+      this.finishBlob(pending, "blob.imported");
+    } catch (error) {
+      if (error instanceof LvrmResetError && error.reason === "explicit-reset") {
+        // receive() has settled its partial-file cleanup. It may have published
+        // before RESET arrived, so retire any exact import reference as well.
+        try {
+          await this.options.blobs.releaseExpected({ ownerKey: pending.ownerKey,
+            referenceId: `import:${pending.blobHandle}`, kind: pending.kind,
+            digest: pending.digest, bytes: pending.bytes });
+        } catch (cleanupError) {
+          throw new GuestContainmentError("Cancelled import cleanup was not authoritative", { cause: cleanupError });
+        }
+        this.finishBlob(pending, "blob.failed", boundedMessage(error));
+        return;
+      }
+      this.finishBlob(pending, "blob.failed", boundedMessage(error));
+      throw error;
+    }
   }
 
   private issueTicket(options: Parameters<TicketRegistry["issue"]>[0]): TicketBinding {

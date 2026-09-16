@@ -551,6 +551,49 @@ describe("CapsuleManager", () => {
     expect(manager.getViewer(replacement.viewerId, replacementOwner)).toBe(replacement);
   });
 
+  test.each([404, 403, 500])("cancellation accepts only already-revoked channels (HTTP %s)", async (status) => {
+    const backend = new FakeBackend();
+    const { fetch: normalFetch } = createFetch();
+    let appWideRevoked!: () => void;
+    const revocation = new Promise<void>((resolve) => { appWideRevoked = resolve; });
+    let channelDeletes = 0;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if (init?.method === "DELETE" && url.includes("/channels/channel-app-a-")) {
+        channelDeletes++;
+        await revocation;
+        return Response.json({ error: "channel revocation result" }, { status });
+      }
+      if (init?.method === "DELETE" && url.endsWith("/apps/app-a/channels")) appWideRevoked();
+      return normalFetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace",
+      coreBaseUrl: () => "http://127.0.0.1:32100", coreToken: "host-token", fetch, ...systemBindings() });
+    const owner = viewerOwner(7);
+    const other = await manager.openViewer("app-b", owner, verifyPreparedViewer);
+    const controller = new AbortController();
+    let verificationStarted!: () => void;
+    const verifying = new Promise<void>((resolve) => { verificationStarted = resolve; });
+    const opening = manager.openViewer("app-a", owner, async (binding) => {
+      verificationStarted();
+      await new Promise<void>((_resolve, reject) => binding.signal.addEventListener("abort",
+        () => reject(binding.signal.reason), { once: true }));
+    }, controller.signal);
+    const failed = expect(opening).rejects.toThrow();
+    await verifying;
+    controller.abort();
+    await failed;
+    expect(channelDeletes).toBeGreaterThan(0);
+    if (status === 404) {
+      expect(backend.stopAllCalls).toBe(0);
+      expect(manager.getViewer(other.viewerId, owner)).toBe(other);
+      await expect(manager.openViewer("app-a", owner, verifyPreparedViewer)).resolves.toMatchObject({ appId: "app-a" });
+    } else {
+      expect(backend.stopAllCalls).toBeGreaterThan(0);
+      expect(manager.getViewer(other.viewerId, owner)).toBeNull();
+    }
+  });
+
   test("aborts a failed prepared launch without publishing its viewer", async () => {
     const backend = new FakeBackend();
     const { fetch, calls } = createFetch();

@@ -1470,9 +1470,11 @@ export class CapsuleManager {
   }
 
   async #revokeCapability(channelId: string): Promise<void> {
+    // App-wide revocation may win this race. Core's channel DELETE returns
+    // 404 after an already-closed channel has drained, so teardown succeeded.
     await this.#hostRequest(`/api/app-runtime/channels/${encodeURIComponent(channelId)}`, {
       method: "DELETE",
-    });
+    }, true);
   }
 
   async #revokeAppCapabilities(appId: string): Promise<void> {
@@ -1481,7 +1483,7 @@ export class CapsuleManager {
     });
   }
 
-  async #hostRequest(path: string, init: RequestInit = {}): Promise<Response> {
+  async #hostRequest(path: string, init: RequestInit = {}, allowNotFound = false): Promise<Response> {
     const controlPlane = this.#controlPlaneRequests.signal;
     if (controlPlane.aborted) throw controlPlane.reason;
     const headers = new Headers(init.headers);
@@ -1495,7 +1497,7 @@ export class CapsuleManager {
       }),
       controlPlane,
     );
-    if (response.ok) return response;
+    if (response.ok || (allowNotFound && response.status === 404)) return response;
     const body = await response.json().catch(() => ({})) as {
       error?: string | { code?: unknown; message?: unknown };
     };
