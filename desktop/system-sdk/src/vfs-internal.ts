@@ -22,7 +22,7 @@ export interface ParsedVfsCommand {
 }
 
 const FLAGS: Record<VfsCommandName, ReadonlySet<string>> = {
-  ls: new Set(["a", "l", "1", "R"]),
+  ls: new Set(["a", "l", "1", "0", "R"]),
   cat: new Set(),
   stat: new Set(),
   tee: new Set(["a"]),
@@ -35,7 +35,7 @@ const FLAGS: Record<VfsCommandName, ReadonlySet<string>> = {
 };
 
 const FLAG_ORDER: Record<VfsCommandName, readonly string[]> = {
-  ls: ["a", "l", "1", "R"],
+  ls: ["a", "l", "1", "0", "R"],
   cat: [],
   stat: [],
   tee: ["a"],
@@ -48,10 +48,8 @@ const FLAG_ORDER: Record<VfsCommandName, readonly string[]> = {
 };
 
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
-const PORTABLE_PATH_CHARS = /[<>:"|?*]/;
+const WINDOWS_PATH_CHARS = /[<>:"|?*]/;
 const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
-const MAX_PATH_BYTES = 768;
-const MAX_SEGMENT_BYTES = 240;
 const VFS_READ_CHUNK_BYTES = 64 * 1024;
 
 export function parseVfsCommand(command: string): ParsedVfsCommand {
@@ -168,7 +166,7 @@ export async function executeReadVfsCommand(
         throw new Error(`stat: ${path}: unsupported filesystem entry`);
       }
       if (entry.isFile() && entry.nlink !== 1) throw new Error(`stat: ${path}: hard links are unsupported`);
-      lines.push(`${path}\t${entry.isDirectory() ? "directory" : "file"}\t${entry.size}`);
+      lines.push(`${displayD1Path(path)}\t${entry.isDirectory() ? "directory" : "file"}\t${entry.size}`);
     }
     return Buffer.from(lines.length ? `${lines.join("\n")}\n` : "");
   }
@@ -182,9 +180,8 @@ export function validateD1Path(path: string): string {
     || path.length === 0
     || isAbsolute(path)
     || path.startsWith("/")
-    || path.includes("\\")
-    || CONTROL_CHARS.test(path)
-    || Buffer.byteLength(path, "utf8") > MAX_PATH_BYTES
+    || path.includes("\0")
+    || (sep === "\\" && path.includes("\\"))
   ) {
     throw new Error(`Invalid D1 path: ${JSON.stringify(path)}`);
   }
@@ -193,11 +190,15 @@ export function validateD1Path(path: string): string {
     segment === ""
     || segment === "."
     || segment === ".."
-    || segment.endsWith(" ")
-    || segment.endsWith(".")
-    || PORTABLE_PATH_CHARS.test(segment)
-    || WINDOWS_RESERVED_NAME.test(segment)
-    || Buffer.byteLength(segment, "utf8") > MAX_SEGMENT_BYTES
+    // On Windows these names can alias another path, a device, or an ADS.
+    // On POSIX they are literal filenames, not a portability admission rule.
+    || (sep === "\\" && (
+      segment.endsWith(" ")
+      || segment.endsWith(".")
+      || CONTROL_CHARS.test(segment)
+      || WINDOWS_PATH_CHARS.test(segment)
+      || WINDOWS_RESERVED_NAME.test(segment)
+    ))
   )) {
     throw new Error(`Invalid D1 path: ${JSON.stringify(path)}`);
   }
@@ -361,6 +362,7 @@ async function readStableFile(
 async function formatListing(filesRoot: string, parsed: ParsedVfsCommand): Promise<string> {
   const operands = parsed.operands.length > 0 ? parsed.operands : [""];
   const lines: string[] = [];
+  const displayPath = parsed.flags.has("0") ? (path: string) => path : displayD1Path;
   for (const operand of operands) {
     if (operand) validateD1Path(operand);
     if (operand) await assertSafeD1Parents(filesRoot, operand);
@@ -368,7 +370,7 @@ async function formatListing(filesRoot: string, parsed: ParsedVfsCommand): Promi
     const info = await lstat(absolute);
     if (info.isFile()) {
       if (info.nlink !== 1) throw new Error(`ls: ${operand}: hard links are unsupported`);
-      lines.push(parsed.flags.has("l") ? `-${info.size}\t${operand}` : operand);
+      lines.push(parsed.flags.has("l") ? `-${info.size}\t${displayPath(operand)}` : displayPath(operand));
       continue;
     }
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`ls: ${operand}: unsupported entry`);
@@ -384,14 +386,19 @@ async function formatListing(filesRoot: string, parsed: ParsedVfsCommand): Promi
         const entryInfo = await lstat(join(directoryPath, entry.name));
         if (entryInfo.isSymbolicLink() || (entryInfo.isFile() && entryInfo.nlink !== 1)) continue;
         lines.push(parsed.flags.has("l")
-          ? `${entry.isDirectory() ? "d" : "-"}${entryInfo.size}\t${path}`
-          : path);
+          ? `${entry.isDirectory() ? "d" : "-"}${entryInfo.size}\t${displayPath(path)}`
+          : displayPath(path));
         if (entry.isDirectory() && parsed.flags.has("R")) await walk(join(directoryPath, entry.name), path);
       }
     };
     await walk(absolute, operand);
   }
-  return lines.length ? `${lines.join("\n")}\n` : "";
+  const separator = parsed.flags.has("0") ? "\0" : "\n";
+  return lines.length ? `${lines.join(separator)}${separator}` : "";
+}
+
+function displayD1Path(path: string): string {
+  return CONTROL_CHARS.test(path) || path.includes("\\") ? JSON.stringify(path) : path;
 }
 
 function splitWords(input: string): string[] {

@@ -139,13 +139,77 @@ describe("D1 VFS", () => {
     expect(() => parseVfsCommand("ls -z")).toThrow("Unsupported ls flag");
   });
 
-  test("validates real portable paths and reserved paths", () => {
+  test("validates relative paths without imposing Windows naming rules on POSIX", () => {
     expect(validateD1Path("health/records/xray.PNG")).toBe("health/records/xray.PNG");
     expect(d1PathsConflict("Notes/a.md", "notes/b.md")).toBe(true);
     expect(d1PathsConflict("notes/a.md", "notes/deep/b.md")).toBe(false);
-    for (const path of ["/absolute.md", "../escape.md", "a\\b.md", "a//b.md", "CON.txt", "x. ", ".obsidian/x", "a/.DS_Store"]) {
+    for (const path of ["", "/absolute.md", "../escape.md", "a/../escape.md", "a/./b.md", "a//b.md", "a\0b.md", ".obsidian/x", "a/.DS_Store"]) {
       expect(() => validateD1Path(path)).toThrow();
     }
+    for (const path of ["question?.md", "a|b.md", "time:12.md", "CON.txt", "x. ", "a\\b.md", "line\nbreak.md"]) {
+      if (process.platform === "win32") expect(() => validateD1Path(path)).toThrow();
+      else expect(validateD1Path(path)).toBe(path);
+    }
+  });
+
+  test("Host file listings and reads include punctuation in filenames", async () => {
+    mkdirSync(join(filesRoot, "myKB"));
+    writeFileSync(join(filesRoot, "myKB/why?.md"), "question note");
+    writeFileSync(join(filesRoot, "myKB/a|b.md"), "pipe note");
+    writeFileSync(join(filesRoot, "myKB/note.md"), "readable note");
+    const caller = hostCaller(guard);
+
+    const listing = await vfs.command(caller, "ls -R -- myKB");
+    expect(listing.success, Buffer.from(listing.stderrBase64, "base64").toString()).toBe(true);
+    expect(Buffer.from(listing.stdoutBase64, "base64").toString()).toBe("myKB/a|b.md\nmyKB/note.md\nmyKB/why?.md\n");
+    const read = await vfs.command(caller, "cat -- 'myKB/why?.md' 'myKB/a|b.md'");
+    expect(read.success).toBe(true);
+    expect(Buffer.from(read.stdoutBase64, "base64").toString()).toBe("question notepipe note");
+    expect(guard.events).toHaveLength(0);
+  });
+
+  test.each(["why?.md", "a|b.md", "CON.txt", "line\nbreak.md", "back\\slash.md"])(
+    "observes and records exact paths with local filename %j",
+    async (name) => {
+      mkdirSync(join(filesRoot, "myKB"));
+      const path = `myKB/${name}`;
+      writeFileSync(join(filesRoot, path), "external note");
+      const observer = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs, sequencer);
+      await observer.observe();
+      expect(state.listFiles()).toEqual([expect.objectContaining({ path })]);
+      expect(guard.events[0]!.payload).toMatchObject({ changes: [{ kind: "added", path }] });
+
+      const denied = await vfs.command(appCaller(guard, ["elsewhere/"]), `tee -- '${path}'`, {
+        stdin: { encoding: "utf8", data: "denied" },
+      });
+      expect(denied.success).toBe(false);
+      expect(readFileSync(join(filesRoot, path), "utf8")).toBe("external note");
+      const updated = await vfs.command(appCaller(guard, [path]), `tee -- '${path}'`, {
+        stdin: { encoding: "utf8", data: "updated note" },
+      });
+      expect(updated.success, Buffer.from(updated.stderrBase64, "base64").toString()).toBe(true);
+      expect(readFileSync(join(filesRoot, path), "utf8")).toBe("updated note");
+      expect(guard.events[1]!.payload).toMatchObject({
+        argv: ["tee", "--", path],
+        changes: [{ kind: "modified", path }],
+      });
+      const url = await vfs.open(workloadCaller(guard, "filename-workload", [path]), path, "http://localhost:1234");
+      expect(url).toContain("/api/vfs/open/");
+    },
+  );
+
+  test("copies, moves and removes directories containing question-mark filenames", async () => {
+    mkdirSync(join(filesRoot, "myKB"));
+    writeFileSync(join(filesRoot, "myKB/why?.md"), "note");
+    const caller = appCaller(guard, ["myKB/", "copied?/", "moved|/"]);
+    for (const command of ["cp -R -- myKB 'copied?'", "mv -- 'copied?' 'moved|'", "rm -R -- 'moved|'"]) {
+      const result = await vfs.command(caller, command);
+      expect(result.success, Buffer.from(result.stderrBase64, "base64").toString()).toBe(true);
+    }
+    expect(readFileSync(join(filesRoot, "myKB/why?.md"), "utf8")).toBe("note");
+    expect(existsSync(join(filesRoot, "copied?"))).toBe(false);
+    expect(existsSync(join(filesRoot, "moved|"))).toBe(false);
+    expect(guard.events).toHaveLength(3);
   });
 
   test("streams opaque digests without retaining bytes and preserves Markdown baselines", async () => {
