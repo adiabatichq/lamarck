@@ -25,8 +25,8 @@ NUL separators and terminators. Shell expansion, traversal outside Workspace
 Files, and access through filesystem links remain unsupported.
 
 File commands execute in the running Desktop Core. These filename behaviors
-require a Desktop build containing the VFS fix from System SDK 0.1.3; upgrading
-the npm CLI alone does not update an already installed Desktop runtime.
+require Lamarck Desktop Alpha 0.1.0-alpha.202609171438 or later; upgrading the
+npm CLI alone does not update an already installed Desktop runtime.
 
 ## Query errors
 
