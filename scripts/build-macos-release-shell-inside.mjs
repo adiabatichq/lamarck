@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { stageMacOsAiRuntimesFromLock } from './stage-ai-runtimes.mjs';
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
@@ -154,6 +155,8 @@ run(process.execPath, [
   cwd: source,
   env: environment,
 });
+
+await stageMacOsAiRuntimesFromLock(source, join(source, 'desktop/shell/dist-electron'));
 
 await copyOutputTree(join(source, "desktop/shell/dist"), join(exportRoot, "dist"));
 await copyOutputTree(

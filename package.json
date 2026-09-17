@@ -40,7 +40,11 @@
     "package:macos:test": "node --test scripts/package-macos-release.test.mjs",
     "package:patch": "node scripts/package-os-patch.mjs",
     "capsule-guest:os-base": "desktop/capsule-guest/scripts/build-guest-image.sh --os-base-only",
-    "capsule-guest:test-os-base": "node --test desktop/capsule-guest/scripts/test-os-base.mjs"
+    "capsule-guest:test-os-base": "node --test desktop/capsule-guest/scripts/test-os-base.mjs",
+    "test:ai-integration": "vitest run --config scripts/ai-integration.vitest.config.ts",
+    "test:ai-assets": "node --test scripts/stage-ai-runtimes.test.mjs",
+    "test:ai-electron": "node scripts/test-ai-electron.mjs",
+    "test:ai-native": "LAMARCK_AI_NATIVE_SMOKE=1 vitest run --config scripts/ai-integration.vitest.config.ts test/ai/native-smoke.test.ts"
   },
   "workspaces": [
     "desktop/cli",

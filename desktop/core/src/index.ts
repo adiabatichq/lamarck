@@ -1,3 +1,6 @@
+import { AiService } from './ai/service';
+import { handleAiRequest } from './ai/routes';
+import { AiError } from './ai/errors';
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdir, readFile, rm, stat } from "fs/promises";
@@ -184,6 +187,7 @@ const deviceIdentity = await resolveDeviceIdentity(coreSettings.vaultId ?? "");
 const vaultKey = process.env.LAMARCK_VAULT_KEY ?? encodeVaultKey(randomBytes(32));
 const secretStore = new SqliteEncryptedSecretStore(systemDb, vaultKey);
 const credentialStore = new CredentialStore(systemDb);
+const aiService = new AiService(systemDb, credentialStore, secretStore, join(workspacePath, '.lamarck', 'ai'));
 const lamarckSessionManager = new LamarckSessionManager(secretStore, {
   credentialStore,
   apiOrigin: lamarckApiOrigin,
@@ -1287,6 +1291,7 @@ const server = await serve<{ cwd: string }>({
     if (path.startsWith("/api/") && !admission) {
       return json({ error: "unauthorized" }, 401);
     }
+    let aiRetainedAdmission = false;
     const auth = admission?.context ?? null;
     const requestGuardSignal = admission
       ? AbortSignal.any([req.signal, admission.signal])
@@ -1306,6 +1311,11 @@ const server = await serve<{ cwd: string }>({
     }
 
     try {
+      if (path.startsWith('/api/ai/')) {
+        const result = await handleAiRequest(aiService, req, admission!);
+        aiRetainedAdmission = result.retained === true;
+        return json(result.body);
+      }
       // Host lifecycle probes must not depend on App registry scans, Connector
       // state, or any other feature domain. A healthy Core can report those
       // domains independently without being torn down as a startup failure.
@@ -2187,7 +2197,7 @@ const server = await serve<{ cwd: string }>({
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[lamarck] Error: ${message}`);
-      const status = err instanceof HttpStatusError
+      const status = err instanceof AiError ? 400 : err instanceof HttpStatusError
         ? err.status
         : err instanceof ConnectorLifecycleConflictError
           ? 409
@@ -2196,7 +2206,7 @@ const server = await serve<{ cwd: string }>({
     } finally {
       // App revocation closes admission immediately, then waits on this lease.
       // Every successful admission is released exactly once on all route exits.
-      admission?.release();
+      if (!aiRetainedAdmission) admission?.release();
     }
   },
   websocket: {
@@ -2309,6 +2319,7 @@ async function shutdown(): Promise<void> {
   shuttingDown = true;
   console.log("\n[lamarck] Shutting down...");
   clearInterval(connectorUpdateTimer);
+  await aiService.close();
   const vfsClosed = vfs.close();
   const serverStopped = server.stop().catch(() => {});
   await connectorScheduler.stop();

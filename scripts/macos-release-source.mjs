@@ -47,6 +47,8 @@ export const MACOS_RELEASE_SOURCE_FILES = Object.freeze([
   "scripts/package-macos-release-contract.mjs",
   "scripts/rename-excl.c",
   "scripts/stage-capsule-native.mjs",
+  "scripts/stage-ai-runtimes.mjs",
+  "scripts/ai-runtime-licenses/CODEX-LICENSE",
 ]);
 
 export const MACOS_RELEASE_SOURCE_DIRECTORIES = Object.freeze([

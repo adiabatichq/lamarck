@@ -1,3 +1,4 @@
+import { stageAiRuntimes } from './stage-ai-runtimes.mjs';
 import { createHash } from "node:crypto";
 import { cp, mkdir, rm, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -101,3 +102,5 @@ await writeFile(resolve(outDir, "managed-cli.json"), `${JSON.stringify({
   digest: `sha256:${createHash("sha256").update(managedCli).digest("hex")}`,
   bytes: managedCli.byteLength,
 })}\n`);
+
+await stageAiRuntimes(outDir);

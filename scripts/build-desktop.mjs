@@ -32,6 +32,9 @@ const GENERATED_HOST_PATHS = [
   "managed-cli.json",
   "pty-helper.cjs",
   "marketplace-trust-roots.json",
+  "ai-runtimes/manifest.json",
+  "ai-runtimes/CODEX-LICENSE",
+  "ai-runtimes/CLAUDE-LICENSE.md",
 ];
 const APP_SCAFFOLD_FILES = [
   "index.html",

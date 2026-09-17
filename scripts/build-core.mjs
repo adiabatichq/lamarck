@@ -1,3 +1,4 @@
+import { stageAiRuntimes } from './stage-ai-runtimes.mjs';
 import { cp, mkdir, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
@@ -80,3 +81,5 @@ await Promise.all([
     nativeRoot: resolve(outDir, "native"),
   }),
 ]);
+
+await stageAiRuntimes(outDir);

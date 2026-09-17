@@ -1,3 +1,5 @@
+import { createAi, type SystemAi } from './ai/client.js';
+export type { SystemAi } from './ai/client.js';
 import type {
   ContentBlobRef,
   MutationResult,
@@ -26,6 +28,7 @@ export interface VfsCommandResult {
 }
 
 export interface System {
+  ai: SystemAi;
   query(sql: string, params?: SqlParams): Promise<{ rows: unknown[] }>;
   resolveContentRef(ref: ContentBlobRef): Promise<ResolveContentRefResult>;
   mutate(sql: string, params?: SqlParams): Promise<MutationResult>;
@@ -43,6 +46,7 @@ const VFS_UPLOAD_MAX_BYTES = 1024 * 1024 * 1024;
 
 export function createSystem(invoke: SystemInvoke): System {
   return Object.freeze({
+    ai: createAi(invoke),
     query: (sql: string, params?: SqlParams) => invoke(
       "query",
       params === undefined ? { sql } : { sql, params },

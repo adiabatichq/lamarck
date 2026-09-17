@@ -38,6 +38,8 @@ describe("greenfield data.db and system.db V1 schemas", () => {
 
     const systemDb = openSystemDatabase(workspace);
     expect(readDatabaseVersion(systemDb, SYSTEM_DB_FILENAME)).toBe(SYSTEM_DATABASE_VERSION);
+    expect(schemaObject(systemDb, "ai_models")).toBeTruthy();
+    expect(schemaObject(systemDb, "ai_access_sources")).toBeTruthy();
     expect(schemaObject(systemDb, "d1_observer_files")).toBeTruthy();
     expect(schemaObject(systemDb, "d1_observer_cursor")).toBeTruthy();
     expect(schemaObject(systemDb, "d1_history_exclusions")).toBeTruthy();
@@ -58,7 +60,7 @@ describe("greenfield data.db and system.db V1 schemas", () => {
     expect(sha256(DATA_SCHEMA_V1))
       .toBe("0dad836ef5969c2dc2eb71202881ca802281de079ec73866a62dfa19c5ed0979");
     expect(sha256(SYSTEM_SCHEMA_V1))
-      .toBe("46622e4fb3b0700737c90ea17e4044798842bc0396bc1928cbec2dd4b3046079");
+      .toBe("a82816540fdace4f0060b8445a56ae5bb46e06f676cef8a8b126e2cf035a811c");
   });
 
   test("persists current Marketplace Connector release metadata across restart", () => {

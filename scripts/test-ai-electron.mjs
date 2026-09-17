@@ -1,0 +1,14 @@
+import { build } from 'esbuild';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { resolve, join } from 'node:path';
+import { spawn } from 'node:child_process';
+import electron from 'electron';
+const out = resolve('.lamarck/build/ai-electron-smoke'); await mkdir(out, { recursive: true });
+await build({ entryPoints: ['test/ai/electron-main.ts'], bundle: true, platform: 'node', format: 'esm', target: 'node24', external: ['electron'], banner: { js: 'import { createRequire as __createRequire } from "node:module"; const require = __createRequire(import.meta.url);' }, outfile: join(out, 'main.mjs') });
+await build({ entryPoints: ['desktop/shell/electron/app-preload.ts'], bundle: true, platform: 'node', format: 'cjs', external: ['electron'], outfile: join(out, 'preload.cjs') });
+await build({ entryPoints: ['test/ai/electron-renderer.ts'], bundle: true, platform: 'browser', format: 'iife', jsx: 'automatic', define: { 'import.meta.env': '{}' }, outfile: join(out, 'renderer.js') });
+await writeFile(join(out, 'index.html'), '<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="renderer.css"><script src="renderer.js"></script>');
+const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
+const child = spawn(electron, [join(out, 'main.mjs')], { env, stdio: 'inherit' });
+const timeout = setTimeout(() => child.kill('SIGKILL'), 45000);
+child.once('exit', code => { clearTimeout(timeout); process.exitCode = code ?? 1; });

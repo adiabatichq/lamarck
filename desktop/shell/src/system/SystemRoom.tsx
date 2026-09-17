@@ -1,3 +1,4 @@
+import { AiSources } from './AiSources';
 import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
 import { WorkspacePanel } from "../components/WorkspacePanel";
 import { ActivityView } from "../content/ActivityView";
@@ -21,7 +22,7 @@ import {
 import styles from "./SystemRoom.module.css";
 import { AppsManager } from "./AppsManager";
 
-type SystemSection = "shape" | "sources" | "apps" | "data" | "timeline" | "workspace";
+type SystemSection = "ai" | "shape" | "sources" | "apps" | "data" | "timeline" | "workspace";
 
 interface RecentEvent {
   id: string;
@@ -192,7 +193,7 @@ export function SystemRoom({
             onClick={() => setSection("workspace")}
             aria-current={section === "workspace" ? "page" : undefined}
           >
-            <span className={styles.navIndex}>06</span>
+            <span className={styles.navIndex}>07</span>
             <WorkspaceIcon />
             <span>Workspace</span>
           </button>
@@ -217,6 +218,7 @@ export function SystemRoom({
             onInspectEvent={inspectEvent}
           />
         )}
+        {section === "ai" && <AiSources apps={apps} />}
         {section === "sources" && (
           <div className={styles.fullSurface}>
             <ConnectorsView />
@@ -258,6 +260,7 @@ export function SystemRoom({
 }
 
 const SECTION_LABELS: Record<SystemSection, string> = {
+  ai: "AI",
   shape: "Shape",
   sources: "Sources",
   apps: "Apps",
@@ -276,6 +279,7 @@ const PRIMARY_SECTIONS: Array<{
   { id: "apps", label: "Apps", icon: AppsIcon },
   { id: "data", label: "Data", icon: DataIcon },
   { id: "timeline", label: "Timeline", icon: TimelineIcon },
+  { id: "ai", label: "AI", icon: SystemIcon },
 ];
 
 function SystemOverview({

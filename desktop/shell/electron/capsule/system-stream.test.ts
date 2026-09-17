@@ -4,6 +4,70 @@ import { SystemBroker } from "./system-broker";
 import { SystemStreamServer } from "./system-stream";
 
 describe("Node System SDK stream termination", () => {
+  test.each(['ai.cancel', 'ai.toolResult'] as const)("admits %s as request 17 while ordinary requests are saturated", async operation => {
+    const release: (() => void)[] = [];
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith('/api/query')) return new Promise<Response>((resolve, reject) => {
+        release.push(() => resolve(Response.json({ rows: [] })));
+        init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+      });
+      return Response.json({ ok: true });
+    });
+    const broker = new SystemBroker({ coreBaseUrl: 'http://127.0.0.1:32100', fetch: fetchMock, revokeCapability: () => {} });
+    broker.bindSender('node-control', { channelId: 'channel-control', capability: 'secret-control' });
+    const { client, server } = duplexPair();
+    const onClose = vi.fn();
+    new SystemStreamServer(broker).attach('node-control', server, { onClose });
+    try {
+      client.write(Buffer.concat(Array.from({ length: 16 }, (_, i) => frame({ version: 1, requestId: i + 1, operation: 'query', input: { sql: 'select 1' } }))));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(16));
+      const response = readFrame(client);
+      client.write(frame({ version: 1, requestId: 17, operation, input: { invocationId: 'ai-fixture', ...(operation === 'ai.toolResult' ? { toolCallId: 'tool', value: 'answer', failed: false } : {}) } }));
+      expect(await response).toEqual({ version: 1, requestId: 17, ok: true, result: { ok: true } });
+      expect(fetchMock).toHaveBeenCalledTimes(17);
+      expect(new Headers(fetchMock.mock.calls[16][1]?.headers).get('x-lamarck-app-capability')).toBe('secret-control');
+      expect(onClose).not.toHaveBeenCalled();
+      expect(server.destroyed).toBe(false);
+      expect(broker.size).toBe(1);
+    } finally {
+      for (const resolve of release) resolve();
+      client.destroy();
+    }
+  });
+
+  test.each(['query', 'ai.next'] as const)('does not let %s consume the control reserve', async operation => {
+    const broker = new SystemBroker({
+      coreBaseUrl: 'http://127.0.0.1:32100', revokeCapability: () => {},
+      fetch: async (_url, init) => new Promise<Response>((_resolve, reject) => { init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true }); }),
+    });
+    broker.bindSender('node-overflow', { channelId: 'channel-overflow', capability: 'secret-overflow' });
+    const { client, server } = duplexPair();
+    const onClose = vi.fn();
+    new SystemStreamServer(broker).attach('node-overflow', server, { onClose });
+    client.write(Buffer.concat(Array.from({ length: 17 }, (_, i) => frame({ version: 1, requestId: i + 1, operation, input: operation === 'query' ? { sql: 'select 1' } : { invocationId: 'ai-fixture', sequence: i } }))));
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ message: 'too many in-flight System SDK requests' })));
+    expect(server.destroyed).toBe(true);
+    expect(broker.size).toBe(0);
+    client.destroy();
+  });
+
+  test('bounds the control reserve to four extra requests', async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => { init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true }); }));
+    const broker = new SystemBroker({ coreBaseUrl: 'http://127.0.0.1:32100', fetch: fetchMock, revokeCapability: () => {} });
+    broker.bindSender('node-reserve', { channelId: 'channel-reserve', capability: 'secret-reserve' });
+    const { client, server } = duplexPair();
+    const onClose = vi.fn();
+    new SystemStreamServer(broker).attach('node-reserve', server, { onClose });
+    client.write(Buffer.concat(Array.from({ length: 20 }, (_, i) => frame({ version: 1, requestId: i + 1, operation: i < 16 ? 'query' : 'ai.cancel', input: i < 16 ? { sql: 'select 1' } : { invocationId: 'ai-fixture' } }))));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(20));
+    expect(onClose).not.toHaveBeenCalled();
+    client.write(frame({ version: 1, requestId: 21, operation: 'ai.cancel', input: { invocationId: 'ai-fixture' } }));
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ message: 'too many in-flight System SDK requests' })));
+    expect(fetchMock).toHaveBeenCalledTimes(20);
+    expect(broker.size).toBe(0);
+    client.destroy();
+  });
+
   test("maps framed requests through the sender-bound Host broker", async () => {
     const fetchMock = vi.fn(async (
       _input: string | URL | Request,

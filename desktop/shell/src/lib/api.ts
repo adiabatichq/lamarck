@@ -774,3 +774,19 @@ export function rejectSchemaRequest(id: string): Promise<{ request: SchemaReques
     body: JSON.stringify({}),
   });
 }
+
+// AI access is managed only by the trusted System Console.
+export type { AiSourceInput, ManagedAiSource, AiOptions, AiAccessSource } from '@lamarck/system/protocol';
+export function listAiSources(): Promise<import('@lamarck/system/protocol').AiOptions & { sources: import('@lamarck/system/protocol').ManagedAiSource[] }> {
+  return request('/api/ai/sources');
+}
+export function saveAiSource(input: import('@lamarck/system/protocol').AiSourceInput, id?: string): Promise<import('@lamarck/system/protocol').ManagedAiSource> {
+  return request('/api/ai/sources', { method: 'POST', body: JSON.stringify({ ...input, ...(id ? { id } : {}) }) });
+}
+export function removeAiSource(id: string): Promise<{ ok: true }> {
+  return request(`/api/ai/sources/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+export interface AiLoginStatus { status: 'pending' | 'ready' | 'cancelled' | 'failed'; url?: string; message?: string }
+export function aiSourceLogin(id: string, action: 'login' | 'login-status' | 'cancel-login'): Promise<AiLoginStatus> {
+  return request(`/api/ai/sources/${encodeURIComponent(id)}/${action}`, { method: action === 'login-status' ? 'GET' : 'POST', ...(action === 'login-status' ? {} : { body: '{}' }) });
+}

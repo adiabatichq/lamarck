@@ -25,11 +25,21 @@
     "test:guard-service": "node test-node/run-guard-service.mjs"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "4.0.56",
+    "@ai-sdk/openai": "4.0.69",
+    "@ai-sdk/openai-compatible": "3.0.51",
+    "@ai-sdk/provider": "4.0.17",
+    "@anthropic-ai/claude-agent-sdk": "0.3.263",
     "@lamarck/cli": "0.1.2",
     "@lamarck/system": "0.1.2",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@openai/codex": "0.154.0",
+    "ai": "7.0.105",
+    "ai-sdk-provider-claude-code": "4.3.1",
     "diff": "^5.2.2",
     "isomorphic-git": "^1.41.9",
-    "node-pty": "^1.0.0"
+    "node-pty": "^1.0.0",
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",

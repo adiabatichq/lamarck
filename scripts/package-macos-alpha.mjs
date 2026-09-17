@@ -15,6 +15,7 @@
 //   npm run package:macos:alpha              # version <shell>-alpha.<UTCstamp>
 //   npm run package:macos:alpha -- --version 0.1.0-alpha.3
 
+import { validateAiRuntimes, smokeAiRuntimes } from './stage-ai-runtimes.mjs';
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -179,6 +180,8 @@ try {
   await cp(scaffoldRoot, join(electronResources, "scaffolds", "app-v1"), {
     recursive: true,
   });
+  await validateAiRuntimes(join(electronOutRoot, 'ai-runtimes'), 'darwin', 'arm64');
+  await cp(join(electronOutRoot, 'ai-runtimes'), join(electronResources, 'ai-runtimes'), { recursive: true });
   await cp(nativeRoot, join(electronResources, "native"), { recursive: true });
   assertDeviceIdentityNativeResourceLayout(
     electronResources,
@@ -226,6 +229,7 @@ try {
     timeoutMs: 60_000,
   });
 
+  await smokeAiRuntimes(join(electronResources, 'ai-runtimes'));
   console.log("[alpha] Archiving");
   const stagingArchive = join(stagingRoot, archiveName);
   run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, stagingArchive]);

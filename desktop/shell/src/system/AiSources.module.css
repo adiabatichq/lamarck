@@ -1,0 +1,29 @@
+.page { padding: 36px; max-width: 1100px; margin: 0 auto; min-height: 100%; background: var(--system-ground); color: var(--system-text); }
+.header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 28px; }
+.header span { color: var(--system-active); text-transform: uppercase; letter-spacing: .12em; font-size: 11px; }
+.header h1 { font-size: 32px; margin: 8px 0; font-weight: 500; }
+.page p, .page small { color: var(--system-muted); line-height: 1.6; }
+.page button, .page input, .page select { font: inherit; color: inherit; background: var(--system-raised); border: 1px solid var(--system-line-strong); border-radius: 6px; padding: 9px 12px; }
+.page button { cursor: pointer; }
+.page button:disabled { opacity: .5; cursor: default; }
+.page button:hover:not(:disabled) { border-color: var(--system-active); }
+.form, .source, .login { border: 1px solid var(--system-line); padding: 24px; border-radius: 10px; margin-bottom: 16px; background: var(--system-panel); }
+.form h2, .source h2 { font-weight: 500; font-size: 18px; margin: 0 0 10px; }
+.form > label, .fields label { display: grid; gap: 8px; margin: 16px 0; font-size: 13px; }
+.fields { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.form fieldset { border: 1px solid var(--system-line); padding: 16px; margin: 20px 0; }
+.choice { display: flex; align-items: center; gap: 9px; margin: 10px 0; font-size: 13px; }
+.apps { padding: 4px 0 0 24px; }
+.actions { align-self: start; align-items: flex-start; display: flex; gap: 8px; flex-wrap: wrap; }
+.source { display: grid; grid-template-columns: 1fr auto; gap: 12px; }
+.source p { margin: 0 0 6px; font-size: 13px; }
+.source details { grid-column: 1 / -1; border-top: 1px solid var(--system-line); padding-top: 14px; }
+.page summary { font-size: 13px; cursor: pointer; color: var(--system-muted); }
+.page ul { list-style: none; padding: 0; }
+.page li { padding: 7px 0; display: flex; gap: 16px; justify-content: space-between; font-size: 13px; }
+.catalog { margin-top: 28px; }
+.error { color: var(--system-danger) !important; }
+.empty { padding: 40px 0; }
+.login { display: flex; gap: 20px; align-items: center; }
+.login a { color: var(--system-link); }
+@media (max-width: 700px) { .page { padding: 20px; } .header, .login { align-items: flex-start; flex-direction: column; } .source, .fields { grid-template-columns: 1fr; } }

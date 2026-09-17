@@ -1,3 +1,6 @@
+import type { AiOptions, AiStart, AiEvent } from './ai/types.js';
+export * from './ai/types.js';
+export { encodeAi, decodeAi, AI_MAX_VALUE_BYTES } from './ai/codec.js';
 export type JsonValue =
   | null
   | string
@@ -71,6 +74,11 @@ export interface VfsCommandWireResult {
 }
 
 export interface SystemOperationMap {
+  "ai.listOptions": { input: Record<string, never>; output: AiOptions };
+  "ai.start": { input: AiStart; output: { invocationId: string } };
+  "ai.next": { input: { invocationId: string; sequence: number }; output: { events: AiEvent[] } };
+  "ai.cancel": { input: { invocationId: string }; output: { ok: true } };
+  "ai.toolResult": { input: { invocationId: string; toolCallId: string; value: JsonValue; failed: boolean }; output: { ok: true } };
   query: {
     input: { sql: string; params?: SqlParams };
     output: { rows: unknown[] };
@@ -118,6 +126,7 @@ export interface SystemOperationMap {
 }
 
 export const SYSTEM_OPERATIONS = Object.freeze([
+  "ai.listOptions", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
   "query",
   "resolveContentRef",
   "mutate",

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { validateAiRuntimes, smokeAiRuntimes } from './stage-ai-runtimes.mjs';
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
@@ -180,6 +181,8 @@ async function packageRelease(releaseConfig, signingIdentity) {
       signingIdentity,
       releaseConfig.expectedGuestArchitecture,
     );
+
+    await smokeAiRuntimes(join(appPath, 'Contents', 'Resources', 'app', 'dist-electron', 'ai-runtimes'));
 
     run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, submissionArchive]);
     const notarization = capture("xcrun", [
@@ -501,6 +504,8 @@ async function assembleApplication(
     join(shellBuildExport, "dist-electron", "scaffolds"),
     join(electronResources, "scaffolds"),
   );
+  await validateAiRuntimes(join(shellBuildExport, 'dist-electron', 'ai-runtimes'), 'darwin', 'arm64');
+  await copyRealTree(join(shellBuildExport, 'dist-electron', 'ai-runtimes'), join(electronResources, 'ai-runtimes'));
   await copyRealTree(nativeRoot, join(electronResources, "native"));
   assertDeviceIdentityNativeResourceLayout(
     electronResources,
@@ -520,6 +525,7 @@ async function validatePackagedApplication(appPath, releaseConfig) {
   );
   const electronResources = join(appResources, "dist-electron");
   assertExactList(await sortedEntries(electronResources), [
+    "ai-runtimes",
     "app-preload.cjs",
     "connector-runner.cjs",
     "core.mjs",
@@ -811,6 +817,9 @@ async function signElectronApplication(appPath, capsuleHelper, identity, sign) {
     if (!signableCode.has(resolve(path))) {
       throw new Error("packaged node-pty code is missing from the Electron signing set");
     }
+  }
+  for (const name of ['codex', 'claude']) {
+    if (!signableCode.has(resolve(appPath, 'Contents', 'Resources', 'app', 'dist-electron', 'ai-runtimes', name))) throw new Error('AI runtime is missing from the release signing set');
   }
   const bundleSuffixes = [".app", ".framework"];
   await sign({

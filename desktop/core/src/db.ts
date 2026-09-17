@@ -14,6 +14,21 @@ export const SYSTEM_DB_FILENAME = "system.db";
 
 // Greenfield V1 includes the control plane and rebuildable D1 observer state.
 export const SYSTEM_SCHEMA_V1 = `
+CREATE TABLE IF NOT EXISTS ai_models (
+  id TEXT PRIMARY KEY,
+  metadata_json JSON NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_access_sources (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('api-key', 'subscription', 'local')),
+  name TEXT NOT NULL,
+  allow_json JSON NOT NULL,
+  config_json JSON NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation > 0)
+);
+
 CREATE TABLE IF NOT EXISTS connector_sources (
   id            TEXT PRIMARY KEY,
   connector_id  TEXT NOT NULL,

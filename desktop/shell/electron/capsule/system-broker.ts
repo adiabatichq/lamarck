@@ -6,6 +6,11 @@ import {
 } from "@lamarck/system/protocol";
 export { SYSTEM_OPERATIONS };
 
+export const AI_CONTROL_REQUEST_RESERVE_PER_SENDER = 4;
+export function isAiControlOperation(operation: SystemOperation): boolean {
+  return operation === 'ai.cancel' || operation === 'ai.toolResult';
+}
+
 const SYSTEM_OPERATION_SET: ReadonlySet<string> = new Set(SYSTEM_OPERATIONS);
 const APP_CAPABILITY_HEADER = "x-lamarck-app-capability";
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -106,6 +111,9 @@ export class SystemBroker {
   #maxAggregateBytesPerSender: number;
   #maxAggregateBytesGlobal: number;
   #revokeCapability: SystemBrokerOptions["revokeCapability"];
+  #aiCalls = new Map<SenderId, Set<string>>();
+  #nextConnectionEpoch = 1;
+  #connectionEpoch = new Map<SenderId, number>();
   #bindingsBySender = new Map<SenderId, PrivateBinding>();
   #senderByChannel = new Map<string, SenderId>();
   #inFlightBySender = new Map<SenderId, Set<InvocationLease>>();
@@ -169,6 +177,7 @@ export class SystemBroker {
       capability: binding.capability,
       ...(viewerResources ? { viewerResources } : {}),
     });
+    this.#connectionEpoch.set(senderId, this.#nextConnectionEpoch++);
     this.#bindingsBySender.set(senderId, stored);
     this.#senderByChannel.set(stored.channelId, senderId);
   }
@@ -294,6 +303,7 @@ export class SystemBroker {
       );
     }
 
+    const epoch = this.#connectionEpoch.get(senderId) ?? 0;
     const coreRequest = mapCoreRequest(operation, input);
     const serializedForSize = serializeJson(coreRequest.sizeValue);
     const coreRequestBytes = byteLength(serializedForSize);
@@ -301,7 +311,7 @@ export class SystemBroker {
       throw new SystemBrokerError("request_too_large", "System SDK request exceeds the size limit");
     }
     const body = coreRequest.body === undefined ? undefined : serializeJson(coreRequest.body);
-    const lease = this.#acquireLease(senderId, outerRequestBytes + coreRequestBytes);
+    const lease = this.#acquireLease(senderId, outerRequestBytes + coreRequestBytes, isAiControlOperation(operation));
     const controller = lease.controller;
     const timeout = setTimeout(() => {
       controller.abort(new SystemBrokerError("request_timeout", "System SDK request timed out"));
@@ -364,6 +374,17 @@ export class SystemBroker {
       const boundData = operation === "vfs.open"
         ? viewerVfsOpenResult(data, binding.viewerResources!)
         : data;
+      if (operation === 'ai.start' && isRecord(data) && typeof data.invocationId === 'string') {
+        if (epoch !== this.#connectionEpoch.get(senderId)) {
+          this.#cancelAiCall(binding, data.invocationId);
+          throw new SystemBrokerError('request_aborted', 'AI channel disconnected');
+        }
+        const calls = this.#aiCalls.get(senderId) ?? new Set<string>();
+        calls.add(data.invocationId); this.#aiCalls.set(senderId, calls);
+      }
+      if (operation === 'ai.cancel' || (operation === 'ai.next' && isRecord(data) && Array.isArray(data.events) && data.events.some((event: any) => event.type === 'complete' || event.type === 'error'))) {
+        this.#aiCalls.get(senderId)?.delete((input as { invocationId: string }).invocationId);
+      }
       return finish({ data: boundData }, lease);
     } finally {
       clearTimeout(timeout);
@@ -379,8 +400,29 @@ export class SystemBroker {
     return binding;
   }
 
+  cancelAi(senderId: SenderId): void {
+    if (this.#bindingsBySender.has(senderId)) this.#connectionEpoch.set(senderId, this.#nextConnectionEpoch++);
+    const calls = this.#aiCalls.get(senderId);
+    this.#aiCalls.delete(senderId);
+    const binding = this.#bindingsBySender.get(senderId);
+    if (binding) for (const invocationId of calls ?? []) this.#cancelAiCall(binding, invocationId);
+  }
+
+  #cancelAiCall(binding: PrivateBinding, invocationId: string): void {
+    void (async () => {
+      const base = typeof this.#coreBaseUrl === 'function' ? await this.#coreBaseUrl() : this.#coreBaseUrl;
+      const response = await this.#fetch(new URL('/api/ai/invoke/cancel', base), {
+        method: 'POST', headers: { 'Content-Type': 'application/json', [APP_CAPABILITY_HEADER]: binding.capability },
+        body: JSON.stringify({ invocationId }), signal: AbortSignal.timeout(5000), redirect: 'error',
+      });
+      await response.body?.cancel();
+    })().catch(() => {});
+  }
+
   #detach(senderId: SenderId, binding: PrivateBinding): void {
+    this.cancelAi(senderId);
     this.#bindingsBySender.delete(senderId);
+    this.#connectionEpoch.delete(senderId);
     this.#senderByChannel.delete(binding.channelId);
     const leases = this.#inFlightBySender.get(senderId);
     if (!leases) return;
@@ -389,9 +431,9 @@ export class SystemBroker {
     }
   }
 
-  #acquireLease(senderId: SenderId, bytes: number): InvocationLease {
+  #acquireLease(senderId: SenderId, bytes: number, control = false): InvocationLease {
     const leases = this.#inFlightBySender.get(senderId) ?? new Set<InvocationLease>();
-    if (leases.size >= this.#maxInFlightPerSender || this.#inFlightGlobal >= this.#maxInFlightGlobal) {
+    if (leases.size >= this.#maxInFlightPerSender + (control ? AI_CONTROL_REQUEST_RESERVE_PER_SENDER : 0) || this.#inFlightGlobal >= this.#maxInFlightGlobal + (control ? 32 : 0)) {
       throw new SystemBrokerError("too_many_requests", "Too many in-flight System SDK requests");
     }
     this.#assertByteBudget(senderId, bytes);
@@ -510,6 +552,15 @@ function mapCoreRequest(operation: string, input: unknown): CoreRequest {
   const value = expectRecord(input);
 
   switch (operation as SystemOperation) {
+    case 'ai.listOptions':
+    case 'ai.start':
+    case 'ai.next':
+    case 'ai.cancel':
+    case 'ai.toolResult': {
+      const route = { 'ai.listOptions': 'options', 'ai.start': 'invoke/start', 'ai.next': 'invoke/next', 'ai.cancel': 'invoke/cancel', 'ai.toolResult': 'invoke/tool-result' }[operation as 'ai.start'];
+      const body = expectJson(value, operation);
+      return { method: 'POST', path: `/api/ai/${route}`, body, sizeValue: body };
+    }
     case "query":
     case "mutate": {
       const sql = expectString(value.sql, `${operation}.sql`);

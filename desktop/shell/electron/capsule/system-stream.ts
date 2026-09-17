@@ -6,6 +6,8 @@ import type {
 } from "@lamarck/system/protocol";
 import {
   SYSTEM_OPERATIONS,
+  AI_CONTROL_REQUEST_RESERVE_PER_SENDER,
+  isAiControlOperation,
   SystemBrokerError,
   type SenderId,
   type SystemBroker,
@@ -88,6 +90,7 @@ export class SystemStreamServer {
       requestPayload = undefined;
       requestPayloadBytes = 0;
       releaseAllResponseFrames();
+      this.#broker.cancelAi(senderId);
       if (this.#unbindOnClose) this.#broker.unbindSender(senderId);
       if (!stream.destroyed) stream.destroy();
       try {
@@ -143,7 +146,8 @@ export class SystemStreamServer {
           requestPayloadBytes = 0;
           const request = parseRequest(payload);
           if (inFlight.has(request.requestId)) throw new Error("duplicate in-flight System SDK request id");
-          if (inFlight.size >= this.#maxInFlight) throw new Error("too many in-flight System SDK requests");
+          const reserve = isAiControlOperation(request.operation) ? AI_CONTROL_REQUEST_RESERVE_PER_SENDER : 0;
+          if (inFlight.size >= this.#maxInFlight + reserve) throw new Error("too many in-flight System SDK requests");
           inFlight.add(request.requestId);
           void this.#invoke(senderId, request)
             .then((response) => {

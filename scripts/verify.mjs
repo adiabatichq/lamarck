@@ -31,6 +31,8 @@ const gates = [
   ["Core tests", ["--workspace", "@lamarck/core", "run", "test"]],
   ["Shell tests", ["--workspace", "@lamarck/shell", "run", "test"]],
   ["System SDK typecheck", ["--workspace", "@lamarck/system", "run", "typecheck"]],
+  ["AI runtime asset integrity", ["run", "test:ai-assets"]],
+  ["AI channel integration", ["run", "test:ai-integration"]],
   ["System SDK tests", ["--workspace", "@lamarck/system", "run", "test"]],
   ["Capsule typecheck", ["--workspace", "@lamarck/capsule", "run", "typecheck"]],
   ["Capsule tests", ["--workspace", "@lamarck/capsule", "run", "test"]],

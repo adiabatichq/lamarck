@@ -44,6 +44,12 @@ if (!firstTarball.equals(secondTarball)) {
 const expectedFiles = [
   "LICENSE",
   "README.md",
+  "dist/ai/client.d.ts",
+  "dist/ai/client.js",
+  "dist/ai/codec.d.ts",
+  "dist/ai/codec.js",
+  "dist/ai/types.d.ts",
+  "dist/ai/types.js",
   "dist/browser.d.ts",
   "dist/browser.js",
   "dist/create-system.d.ts",
@@ -83,6 +89,7 @@ async function verifyConsumer(tarballPath) {
     await writeFile(join(consumer, "package.json"), `${JSON.stringify({
       private: true,
       type: "module",
+      dependencies: { ai: "7.0.105" },
     })}\n`);
     await run("npm", [
       "install",
@@ -109,6 +116,14 @@ async function verifyConsumer(tarballPath) {
       import { system as browserSystem } from "@lamarck/system/browser";
       import { system as nodeSystem } from "@lamarck/system/node";
       import { SYSTEM_OPERATIONS, type SystemOperation } from "@lamarck/system/protocol";
+      import { generateText, streamText, embed, embedMany, type LanguageModel, type EmbeddingModel } from 'ai';
+      const selection = { model: 'openai:gpt-5-mini', accessSource: 'opaque-source' };
+      const language: LanguageModel = browserSystem.ai.languageModel(selection);
+      const embedding: EmbeddingModel = nodeSystem.ai.embeddingModel(selection);
+      void (() => generateText({ model: language, prompt: 'hello' }));
+      void (() => streamText({ model: language, prompt: 'hello' }));
+      void (() => embed({ model: embedding, value: 'hello' }));
+      void (() => embedMany({ model: embedding, values: ['hello'] }));
       const systems: readonly System[] = [system, browserSystem, nodeSystem];
       const operation: SystemOperation = SYSTEM_OPERATIONS[0];
       const nodeOnlyRootExport: "LAMARCK_SDK_SOCKET" = LAMARCK_SDK_SOCKET_ENV;
