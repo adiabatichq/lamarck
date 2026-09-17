@@ -12,6 +12,22 @@ Core token, gateway token, Workspace selector, or managed socket path.
 
 Use `lamarck --help` for the complete local command surface.
 
+## Filenames
+
+Workspace filenames follow the local filesystem, so macOS and Linux names such
+as `myKB/why?.md` remain accessible through the public file commands. Quote paths
+to pass punctuation literally: `lamarck file cat -- 'myKB/why?.md'`.
+
+`lamarck file ls -R myKB` lists these entries without dropping them. Paths with
+control characters or backslashes are displayed as JSON string literals. For
+programmatic enumeration, `lamarck file ls -0R myKB` returns exact raw paths with
+NUL separators and terminators. Shell expansion, traversal outside Workspace
+Files, and access through filesystem links remain unsupported.
+
+File commands execute in the running Desktop Core. These filename behaviors
+require a Desktop build containing the VFS fix from System SDK 0.1.3; upgrading
+the npm CLI alone does not update an already installed Desktop runtime.
+
 ## Query errors
 
 `lamarck query` accepts one read-only relational query. Policy rejections return

@@ -14,6 +14,10 @@ The package supplies the client and protocol contract. At runtime, Lamarck binds
 
 The D1 surface is `system.vfs.command(command, options?)`, using explicit real paths under the Workspace `files/` authority, plus `system.vfs.open(path)` for brokered browser display. There are no document IDs, implicit `.md` suffixes, or legacy document compatibility methods. D2 mutations require an existing granted table with an explicit non-null primary key; primary-key values are immutable.
 
+D1 filenames follow the local filesystem. On macOS and Linux, names containing `?`, `|`, `:`, backslashes, or Windows device names remain accessible; VFS does not impose Windows naming restrictions or an extra portable path-length limit. Paths must stay relative to `files/`, without empty, `.` or `..` segments or NUL. Reserved operational paths and link protections still apply. Quote literal paths in commands, for example `system.vfs.command("cat -- 'myKB/why?.md'")`; quoting does not enable shell expansion.
+
+`ls` and `stat` display paths containing control characters or backslashes as JSON string literals. Use `ls -0` (or `ls -0R`) for exact, unescaped paths separated and terminated by NUL, including names containing newlines or tabs. Filenames are not silently omitted for lacking cross-platform portability.
+
 ## Release
 
 Publishing a GitHub Release whose tag is `system-sdk-v<version>` publishes the exact tarball produced by `scripts/pack-system-sdk.mjs`. The release gate verifies the SDK, reproducible tarball contents, clean consumer installation, and registry bytes without depending on Core, Shell, or first-party App lockfiles. It accepts an existing immutable version only when the registry integrity and tarball URL match the locally verified artifact.
