@@ -627,6 +627,7 @@ test("macOS release source snapshot is exact, private, and excludes ambient outp
     "desktop/capsule-guest/scripts/release-contract.mjs",
     "desktop/capsule-vm-macos/Package.swift",
     "desktop/capsule-vm-macos/Sources/fixture.txt",
+    "desktop/capsule-vm-macos/Tests/fixture.txt",
     "desktop/shell/assets/Lamarck.icns",
     "scripts/build-desktop.mjs",
     "scripts/build-capsule-vm-macos.mjs",

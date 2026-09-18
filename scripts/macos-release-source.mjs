@@ -61,6 +61,7 @@ export const MACOS_RELEASE_SOURCE_DIRECTORIES = Object.freeze([
   "desktop/cli/src",
   "desktop/capsule/src",
   "desktop/capsule-vm-macos/Sources",
+  "desktop/capsule-vm-macos/Tests",
   "desktop/core/src",
   "desktop/core/scaffolds/app-v1",
   "desktop/shell/electron",
