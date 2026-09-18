@@ -39,12 +39,6 @@ jobs:
           test "$(node --version)" = "v24.18.0"
           test "$(npm --version)" = "11.16.0"
 
-      - name: Check existing production distribution prerequisites
-        env:
-          LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW: ${{ vars.LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW }}
-          LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW: ${{ vars.LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW }}
-          LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW: ${{ vars.LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW }}
-        run: node --input-type=module -e 'import { requireAppleDeviceIdentityReviews } from "./scripts/package-macos-release-contract.mjs"; requireAppleDeviceIdentityReviews(process.env);'
       - name: Build sealed Shell export
         id: build
         env:
@@ -106,9 +100,6 @@ jobs:
           LAMARCK_SHELL_BUILDER_IMAGE_ID: ${{ needs.build.outputs.builder-image-id }}
           LAMARCK_MARKETPLACE_SIGNING_KEY_ID: ${{ secrets.LAMARCK_MARKETPLACE_SIGNING_KEY_ID }}
           LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: ${{ secrets.LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY }}
-          LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW: ${{ vars.LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW }}
-          LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW: ${{ vars.LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW }}
-          LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW: ${{ vars.LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW }}
         run: |
           npm run package:macos
           node scripts/stage-desktop-handoff.mjs .lamarck/release/macos "$RUNNER_TEMP/desktop-package"

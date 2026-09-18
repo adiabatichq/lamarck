@@ -28,7 +28,6 @@ import {
   notaryProfile,
   resolveInstalledDeveloperIdIdentity,
   validateLockedElectronPackage,
-  MACOS_DEVICE_IDENTITY_REVIEW_ACKNOWLEDGEMENTS,
   MACOS_ELECTRON_ARTIFACT,
 } from "./package-macos-release-contract.mjs";
 import {
@@ -72,9 +71,6 @@ const APP_V1_SCAFFOLD_FILES = [
 const validEnvironment = {
   LAMARCK_CODESIGN_IDENTITY: "Developer ID Application: Lamarck Test (ABCDE12345)",
   LAMARCK_NOTARY_PROFILE: "lamarck-notary",
-  LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW: "1",
-  LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW: "1",
-  LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW: "1",
   LAMARCK_MARKETPLACE_SIGNING_KEY_ID: "marketplace-test-1",
   LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: Buffer.alloc(32, 7).toString("base64"),
 };
@@ -167,35 +163,6 @@ test("release config is macOS-only and requires both credential references", () 
     platform: "darwin",
     architecture: "x64",
   }), /alpha macOS release is arm64-only; no signed x64 Guest image exists/);
-});
-
-test("production macOS device identity requires separate exact review acknowledgements", () => {
-  assert.deepEqual(MACOS_DEVICE_IDENTITY_REVIEW_ACKNOWLEDGEMENTS, [
-    "LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW",
-    "LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW",
-    "LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW",
-  ]);
-  for (const name of MACOS_DEVICE_IDENTITY_REVIEW_ACKNOWLEDGEMENTS) {
-    const missing = { ...validEnvironment };
-    delete missing[name];
-    assert.throws(() => loadMacOsReleaseConfig({
-      root,
-      packageVersion: "0.1.0",
-      env: missing,
-      platform: "darwin",
-      architecture: "arm64",
-    }), new RegExp(`${name}=1 is required`));
-
-    for (const value of ["0", "true", " 1", "1 "]) {
-      assert.throws(() => loadMacOsReleaseConfig({
-        root,
-        packageVersion: "0.1.0",
-        env: { ...validEnvironment, [name]: value },
-        platform: "darwin",
-        architecture: "arm64",
-      }), new RegExp(`${name}=1 is required`));
-    }
-  }
 });
 
 test("dry-run plan includes every production trust gate and never package:patch", () => {

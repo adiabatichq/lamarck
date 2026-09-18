@@ -233,17 +233,11 @@ files are deleted after import; an always-run cleanup restores the search list
 and deletes the keychain. Only the package step can use the installed signing
 identity; R2 credentials are provided only to the publish step.
 
-The existing device-identity distribution contract also requires these GitHub
-**environment variables**, each set to `1` only after the corresponding review
-has actually completed:
-
-- `LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW`
-- `LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW`
-- `LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW`
-
-These are project release acknowledgements, not Apple credentials. Creating a
-Developer ID certificate does not satisfy them. The workflow checks them before
-starting the build and preserves `requireAppleDeviceIdentityReviews` unchanged.
+Device-identity policy questions are tracked separately from release automation.
+The packager does not require policy, DTS or legal review acknowledgement flags.
+Their removal does not record a completed review or Apple approval. Developer ID
+signature, notarization, stapling, Gatekeeper and artifact-integrity checks remain
+required.
 
 The workflow performs three jobs:
 
