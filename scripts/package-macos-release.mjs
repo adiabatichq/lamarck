@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import { assertMacOsReleaseHandoffIdentity, buildShellFromSnapshot } from "./macos-release-builder.mjs";
 import { hashFile } from "./r2-object-store.mjs";
+import { copyRealFile } from "./macos-release-output.mjs";
 
 import { validateAiRuntimes, smokeAiRuntimes } from './stage-ai-runtimes.mjs';
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import {
-  chmod,
   copyFile,
   cp,
   lstat,
@@ -936,13 +936,6 @@ async function copyRealTree(source, destination) {
     else if (entry.isFile()) await copyRealFile(sourcePath, destinationPath);
     else throw new Error(`release copy source contains unsupported entry: ${sourcePath}`);
   }
-}
-
-async function copyRealFile(source, destination) {
-  const details = await requireRealFile(source, "release copy source");
-  await mkdir(dirname(destination), { recursive: true, mode: 0o755 });
-  await copyFile(source, destination, constants.COPYFILE_FICLONE);
-  await chmod(destination, (details.mode & 0o111) === 0 ? 0o644 : 0o755);
 }
 
 async function listMachOFiles(rootPath) {

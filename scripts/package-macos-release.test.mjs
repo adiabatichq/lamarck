@@ -49,7 +49,7 @@ import {
   deviceIdentityNativeRequired,
 } from "../desktop/core/src/device-identity/native/build.mjs";
 import { resolveBuildSystemIdentity } from "./build-system-identity.mjs";
-import { copyStableOutputFile, maxOutputFileBytes } from "./macos-release-output.mjs";
+import { copyRealFile, copyStableOutputFile, maxOutputFileBytes } from "./macos-release-output.mjs";
 import {
   marketplaceTrustRootDocument,
   validateMarketplaceTrustRootResource,
@@ -76,6 +76,22 @@ const validEnvironment = {
   LAMARCK_MARKETPLACE_SIGNING_KEY_ID: "marketplace-test-1",
   LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: Buffer.alloc(32, 7).toString("base64"),
 };
+
+test("release resource copying preserves empty dependency files but rejects links", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "lamarck-empty-release-resource-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, "nothing.c");
+  const destination = join(directory, "app", "node-addon-api", "nothing.c");
+  await writeFile(source, "");
+  await copyRealFile(source, destination);
+  assert.equal((await lstat(destination)).size, 0);
+  assert.equal((await lstat(destination)).mode & 0o777, 0o644);
+  const alias = join(directory, "alias");
+  await symlink(source, alias);
+  await assert.rejects(copyRealFile(alias, join(directory, "symlink-copy")), /regular file/);
+  await link(source, join(directory, "hard-link"));
+  await assert.rejects(copyRealFile(source, join(directory, "hardlink-copy")), /regular file/);
+});
 
 test("release export copies large AI binaries while retaining ordinary file and link bounds", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "lamarck-large-release-output-"));

@@ -1,5 +1,18 @@
 import { constants } from "node:fs";
-import { open } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open } from "node:fs/promises";
+import { dirname } from "node:path";
+
+export async function copyRealFile(source, destination) {
+  const details = await lstat(source);
+  // Locked dependencies may contain empty files (for example node-addon-api's
+  // nothing.c). Executable/resource validators enforce nonempty inputs separately.
+  if (!details.isFile() || details.isSymbolicLink() || details.nlink !== 1) {
+    throw new Error(`release copy source is not a single-link regular file: ${source}`);
+  }
+  await mkdir(dirname(destination), { recursive: true, mode: 0o755 });
+  await copyFile(source, destination, constants.COPYFILE_FICLONE);
+  await chmod(destination, (details.mode & 0o111) === 0 ? 0o644 : 0o755);
+}
 
 export function maxOutputFileBytes(path) {
   return /^dist-electron\/ai-runtimes\/(?:codex|claude|codex-code-mode-host)$/.test(path)
@@ -58,4 +71,3 @@ export async function copyStableOutputFile(sourcePath, destinationPath, mode, ma
     await sourceHandle.close();
   }
 }
-
