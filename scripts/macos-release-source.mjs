@@ -9,6 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { maxOutputFileBytes } from "./macos-release-output.mjs";
 
 export const MACOS_RELEASE_SOURCE_MANIFEST = "macos-release-source-v1.json";
 
@@ -46,6 +47,7 @@ export const MACOS_RELEASE_SOURCE_FILES = Object.freeze([
   "scripts/build-capsule-vm-macos.mjs",
   "scripts/build-macos-release-shell-inside.mjs",
   "scripts/marketplace-trust-roots.mjs",
+  "scripts/macos-release-output.mjs",
   "scripts/macos-release-signer.mjs",
   "scripts/macos-release-runtime.mjs",
   "scripts/package-macos-release-contract.mjs",
@@ -70,10 +72,6 @@ const MAX_SOURCE_FILES = 20_000;
 const MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_SOURCE_TOTAL_BYTES = 512 * 1024 * 1024;
 const MAX_OUTPUT_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
-function maxOutputFileBytes(path) {
-  return /^dist-electron\/ai-runtimes\/(?:codex|claude|codex-code-mode-host)$/.test(path)
-    ? 512 * 1024 * 1024 : MAX_SOURCE_FILE_BYTES;
-}
 const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
 
 export async function createMacOsReleaseSourceSnapshot(

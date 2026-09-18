@@ -7,6 +7,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   readFile,
   rm,
@@ -48,6 +49,7 @@ import {
   deviceIdentityNativeRequired,
 } from "../desktop/core/src/device-identity/native/build.mjs";
 import { resolveBuildSystemIdentity } from "./build-system-identity.mjs";
+import { copyStableOutputFile, maxOutputFileBytes } from "./macos-release-output.mjs";
 import {
   marketplaceTrustRootDocument,
   validateMarketplaceTrustRootResource,
@@ -74,6 +76,39 @@ const validEnvironment = {
   LAMARCK_MARKETPLACE_SIGNING_KEY_ID: "marketplace-test-1",
   LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: Buffer.alloc(32, 7).toString("base64"),
 };
+
+test("release export copies large AI binaries while retaining ordinary file and link bounds", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "lamarck-large-release-output-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = join(directory, "source");
+  const destination = join(directory, "claude");
+  const size = 65 * 1024 * 1024;
+  const handle = await open(source, "wx");
+  await handle.truncate(size);
+  await handle.write(Buffer.from("runtime-end"), 0, 11, size - 11);
+  await handle.close();
+
+  await assert.rejects(copyStableOutputFile(source, destination, 0o755), /bounded single-link/);
+  await copyStableOutputFile(source, destination, 0o755,
+    maxOutputFileBytes("dist-electron/ai-runtimes/claude"));
+  assert.equal((await lstat(destination)).size, size);
+  assert.equal((await lstat(destination)).mode & 0o777, 0o755);
+  assert.equal(createHash("sha256").update(await readFile(source)).digest("hex"),
+    createHash("sha256").update(await readFile(destination)).digest("hex"));
+  for (const path of ["dist/claude", "host-tools/ai-runtimes/claude", "dist-electron/ai-runtimes/unknown"]) {
+    await assert.rejects(copyStableOutputFile(source, join(directory, "ordinary"), 0o644,
+      maxOutputFileBytes(path)), /bounded single-link/);
+  }
+  await link(source, join(directory, "hard-link"));
+  await assert.rejects(copyStableOutputFile(source, join(directory, "linked"), 0o755,
+    maxOutputFileBytes("dist-electron/ai-runtimes/claude")), /bounded single-link/);
+  await rm(join(directory, "hard-link"));
+  const oversized = await open(source, "r+");
+  await oversized.truncate(513 * 1024 * 1024);
+  await oversized.close();
+  await assert.rejects(copyStableOutputFile(source, join(directory, "oversized"), 0o755,
+    maxOutputFileBytes("dist-electron/ai-runtimes/claude")), /bounded single-link/);
+});
 
 test("CI handoff binds the source, version, commit and independently supplied builder", () => {
   const expected = { sourceManifestDigest: `sha256:${"a".repeat(64)}`, version: "0.1.0", commit: "b".repeat(40), builderImageId: `sha256:${"c".repeat(64)}` };

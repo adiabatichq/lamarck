@@ -14,7 +14,8 @@ import {
   readFile,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { copyStableOutputFile, maxOutputFileBytes } from "./macos-release-output.mjs";
 
 const [snapshotValue, exportValue] = process.argv.slice(2);
 if (!snapshotValue || !exportValue || process.argv.length !== 4) {
@@ -207,13 +208,15 @@ async function copyOutputTree(sourcePath, destinationPath, options = {}) {
     if (sourceDetails.isSymbolicLink()) throw new Error(`macOS release build output contains link: ${from}`);
     if (sourceDetails.isDirectory()) await copyOutputTree(from, to);
     else if (sourceDetails.isFile()) {
-      if (sourceDetails.nlink !== 1 || sourceDetails.size > (/\/ai-runtimes\/(?:codex|claude|codex-code-mode-host)$/.test(from) ? 512 : 64) * 1024 * 1024) {
+      const maximumBytes = maxOutputFileBytes(relative(exportRoot, to));
+      if (sourceDetails.nlink !== 1 || sourceDetails.size > maximumBytes) {
         throw new Error(`macOS release build output is not a bounded single-link file: ${from}`);
       }
       await copyStableOutputFile(
         from,
         to,
         (sourceDetails.mode & 0o111) === 0 ? 0o644 : 0o755,
+        maximumBytes,
       );
     } else throw new Error(`macOS release build output contains special file: ${from}`);
   }
@@ -311,59 +314,6 @@ function findInstalledPackage(installedRoot, fromPath, packageName) {
   throw new Error(`Host signing tool dependency ${packageName} is absent from the clean install`);
 }
 
-async function copyStableOutputFile(sourcePath, destinationPath, mode) {
-  const sourceHandle = await open(sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW);
-  let destinationHandle;
-  try {
-    const before = await sourceHandle.stat({ bigint: true });
-    if (!before.isFile() || before.nlink !== 1n || before.size > 64n * 1024n * 1024n) {
-      throw new Error(`macOS release build output is not a bounded single-link file: ${sourcePath}`);
-    }
-    destinationHandle = await open(
-      destinationPath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      mode,
-    );
-    const buffer = Buffer.allocUnsafe(1024 * 1024);
-    let offset = 0;
-    while (offset < Number(before.size)) {
-      const { bytesRead } = await sourceHandle.read(
-        buffer,
-        0,
-        Math.min(buffer.byteLength, Number(before.size) - offset),
-        offset,
-      );
-      if (bytesRead < 1) throw new Error(`macOS release build output ended during copy: ${sourcePath}`);
-      let written = 0;
-      while (written < bytesRead) {
-        const result = await destinationHandle.write(
-          buffer,
-          written,
-          bytesRead - written,
-          offset + written,
-        );
-        if (result.bytesWritten < 1) throw new Error("macOS release output copy made no progress");
-        written += result.bytesWritten;
-      }
-      offset += bytesRead;
-    }
-    await destinationHandle.sync();
-    await destinationHandle.chmod(mode);
-    await destinationHandle.sync();
-    const after = await sourceHandle.stat({ bigint: true });
-    if (
-      before.dev !== after.dev
-      || before.ino !== after.ino
-      || before.size !== after.size
-      || before.mtimeNs !== after.mtimeNs
-      || before.ctimeNs !== after.ctimeNs
-    ) throw new Error(`macOS release build output changed during copy: ${sourcePath}`);
-  } finally {
-    await destinationHandle?.close();
-    await sourceHandle.close();
-  }
-}
-
 async function describeOutputTrees(root, directories) {
   const paths = [];
   for (const directory of directories) await collectFiles(root, directory, paths);
@@ -375,7 +325,7 @@ async function describeOutputTrees(root, directories) {
       path: relativePath,
       size: details.size,
       mode: details.mode & 0o777,
-      sha256: `sha256:${await sha256File(path)}`,
+      sha256: `sha256:${await sha256File(path, maxOutputFileBytes(relativePath))}`,
     };
   }));
 }
@@ -414,11 +364,11 @@ async function assertEmptyDirectory(path) {
   }
 }
 
-async function sha256File(path) {
+async function sha256File(path, maximumBytes = 256 * 1024 * 1024) {
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const before = await handle.stat({ bigint: true });
-    if (!before.isFile() || before.nlink !== 1n || before.size > 256n * 1024n * 1024n) {
+    if (!before.isFile() || before.nlink !== 1n || before.size > BigInt(maximumBytes)) {
       throw new Error(`${path} is not a bounded single-link regular file`);
     }
     const bytes = await handle.readFile();
