@@ -255,7 +255,7 @@ export function macOsReleaseEntitlementsForPath(filePath, { appPath, capsuleHelp
   ) return MACOS_RELEASE_ENTITLEMENTS.aiJit;
   if (
     resolvedFile === resolvedApp
-    || resolvedFile === join(resolvedApp, "Contents", "MacOS", "Electron")
+    || resolvedFile === join(resolvedApp, "Contents", "MacOS", "Lamarck")
   ) return MACOS_RELEASE_ENTITLEMENTS.electronJit;
   const pathComponents = appRelativePath.split(sep);
   if (pathComponents.includes("Electron Helper (Plugin).app")) {

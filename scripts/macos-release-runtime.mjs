@@ -1,9 +1,76 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants, lstatSync, realpathSync } from "node:fs";
-import { open } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { copyFile, cp, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+
+/** Exercise Electron's real packaged-app detection without opening a Workspace. */
+export async function verifyPackagedElectronIdentity(appPath) {
+  const contents = join(appPath, "Contents");
+  const plist = join(contents, "Info.plist");
+  const plistResult = spawnSync("plutil", ["-extract", "CFBundleExecutable", "raw", "-o", "-", plist], {
+    encoding: "utf8", timeout: 10000,
+  });
+  if (plistResult.status !== 0) throw new Error("Cannot read the packaged application executable");
+  const name = plistResult.stdout.trim();
+  if (!name || basename(name) !== name) throw new Error("Invalid packaged application executable");
+  const directory = await mkdtemp(join(tmpdir(), "lamarck-packaged-identity-"));
+  try {
+    const probeContents = join(directory, "Probe.app", "Contents");
+    const probeResources = join(probeContents, "Resources", "app");
+    const executable = join(probeContents, "MacOS", name);
+    await mkdir(join(probeContents, "MacOS"), { recursive: true });
+    await mkdir(probeResources, { recursive: true });
+    await copyFile(join(contents, "MacOS", name), executable);
+    await copyFile(plist, join(probeContents, "Info.plist"));
+    // A Frameworks symlink makes Electron resolve Resources against the source
+    // bundle, which would start the real Host instead of this isolated probe.
+    await cp(join(contents, "Frameworks"), join(probeContents, "Frameworks"), {
+      recursive: true, verbatimSymlinks: true, mode: constants.COPYFILE_FICLONE,
+    });
+    const metadata = JSON.parse(await readFile(join(contents, "Resources", "app", "package.json"), "utf8"));
+    await writeFile(join(probeResources, "package.json"), JSON.stringify({ ...metadata, main: "probe.cjs" }));
+    await writeFile(join(probeResources, "probe.cjs"), `
+      const { app } = require('electron');
+      const { mkdirSync, writeSync } = require('node:fs');
+      const { join } = require('node:path');
+      const profile = join(process.env.HOME, 'profile');
+      mkdirSync(profile, { recursive: true });
+      app.setPath('userData', profile);
+      app.setPath('sessionData', profile);
+      app.disableHardwareAcceleration();
+      app.whenReady().then(() => {
+        writeSync(1, JSON.stringify({ packaged: app.isPackaged, platform: process.platform,
+          architecture: process.arch, version: app.getVersion(),
+          channel: require('./package.json').desktopUpdateChannel }));
+        app.exit(0);
+      });
+    `);
+    // Replacing the entry point invalidates the copied resource seal. Sign only
+    // this disposable probe; the release retains its verified Developer ID.
+    const signature = spawnSync("codesign", ["--force", "--deep", "--sign", "-", join(directory, "Probe.app")], {
+      encoding: "utf8", timeout: 30000,
+    });
+    if (signature.status !== 0) throw new Error(`Cannot sign isolated identity probe: ${signature.stderr}`);
+    const result = spawnSync(executable, [], {
+      cwd: directory,
+      env: { HOME: directory, PATH: "/usr/bin:/bin:/usr/sbin:/sbin", TMPDIR: tmpdir() },
+      encoding: "utf8", timeout: 30000, maxBuffer: 65536,
+    });
+    if (result.error || result.status !== 0) {
+      throw new Error(`Packaged Electron identity probe failed: ${result.error?.message ?? result.status ?? result.signal}: ${result.stderr}`);
+    }
+    const evidence = JSON.parse(result.stdout);
+    if (evidence.packaged !== true || evidence.platform !== "darwin" || evidence.architecture !== "arm64"
+      || evidence.version !== metadata.version || evidence.channel !== "alpha") {
+      throw new Error(`Electron did not recognize the release as a packaged Alpha application: ${result.stdout}`);
+    }
+    return evidence;
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
 
 export async function validatePackagedManagedCli(electronResources) {
   const descriptor = JSON.parse(await readBounded("managed-cli.json", 4096));

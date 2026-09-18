@@ -37,7 +37,7 @@ import {
   publishDirectoryNoReplace,
 } from "./macos-release-publication.mjs";
 import { loadFrozenOsxSign, readSigningCertificateSha1 } from "./macos-release-signer.mjs";
-import { runPackagedNodePtySmoke, validatePackagedManagedCli } from "./macos-release-runtime.mjs";
+import { runPackagedNodePtySmoke, validatePackagedManagedCli, verifyPackagedElectronIdentity } from "./macos-release-runtime.mjs";
 import { resolveBuildSystemIdentity } from "./build-system-identity.mjs";
 import {
   requireMarketplaceTrustRoot,
@@ -196,6 +196,7 @@ async function packageRelease(releaseConfig, signingIdentity) {
     );
 
     await smokeAiRuntimes(join(appPath, 'Contents', 'Resources', 'app', 'dist-electron', 'ai-runtimes'));
+    await verifyPackagedElectronIdentity(appPath);
 
     run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, submissionArchive]);
     const notarization = capture("xcrun", [
@@ -428,6 +429,9 @@ async function assembleApplication(
   const appResources = join(resources, "app");
   const electronResources = join(appResources, "dist-electron");
   const plist = join(contents, "Info.plist");
+  // Electron treats an executable named "Electron" as an unpackaged app,
+  // which disables Desktop updates and packaged protocol registration.
+  await rename(join(contents, "MacOS", "Electron"), join(contents, "MacOS", "Lamarck"));
   const appIconSource = join(
     sourceSnapshotRoot,
     "desktop",
@@ -452,6 +456,7 @@ async function assembleApplication(
     ["CFBundleIdentifier", releaseConfig.bundleIdentifier],
     ["CFBundleName", "Lamarck"],
     ["CFBundleDisplayName", "Lamarck"],
+    ["CFBundleExecutable", "Lamarck"],
     ["CFBundleIconFile", "Lamarck.icns"],
     ["CFBundleShortVersionString", releaseConfig.version],
     ["CFBundleVersion", releaseConfig.version],
@@ -565,8 +570,10 @@ async function validatePackagedApplication(appPath, releaseConfig) {
     throw new Error("packaged app package.json does not match the release contract");
   }
   await validatePackagedNodePtyRuntime(appResources);
+  assertExactList(await sortedEntries(join(appPath, "Contents", "MacOS")), ["Lamarck"],
+    "packaged application executable");
   runPackagedNodePtySmoke(appResources, {
-    executable: join(appPath, "Contents", "MacOS", "Electron"),
+    executable: join(appPath, "Contents", "MacOS", "Lamarck"),
     expectedPlatform: "darwin",
     expectedArchitecture: releaseConfig.expectedGuestArchitecture,
   });
@@ -578,7 +585,7 @@ async function validatePackagedApplication(appPath, releaseConfig) {
     ["CFBundleIconFile", "Lamarck.icns"],
     ["CFBundleShortVersionString", releaseConfig.version],
     ["CFBundleVersion", releaseConfig.version],
-    ["CFBundleExecutable", "Electron"],
+    ["CFBundleExecutable", "Lamarck"],
   ]) {
     const actual = capture("plutil", ["-extract", key, "raw", "-o", "-", plist]).trim();
     if (actual !== expected) throw new Error(`packaged Info.plist ${key} is incorrect`);

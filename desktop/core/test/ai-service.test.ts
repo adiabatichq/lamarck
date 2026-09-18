@@ -10,14 +10,14 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { z } from 'zod';
 import { createSystem } from '@lamarck/system/browser';
 import { decodeAi } from '@lamarck/system/protocol';
-import { SYSTEM_SCHEMA_V1 } from '../src/db';
+import { SYSTEM_SCHEMA } from '../src/db';
 import { CredentialStore } from '../src/credentials/credential-store';
 import { SqliteEncryptedSecretStore } from '../src/credentials/secret-store';
 import { AiService, type AiAdapter } from '../src/ai/service';
 import { AI_CATALOG } from '../src/ai/catalog';
 let db: DatabaseSync, root: string, service: AiService;
 const caller = { kind: 'app', appId: 'fixture', channelId: 'fixture', workload: 'ui', authorization: {} } as any;
-beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'ai-service-')); db = new DatabaseSync(join(root, 'system.db')); db.exec(SYSTEM_SCHEMA_V1); service = createService(); });
+beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'ai-service-')); db = new DatabaseSync(join(root, 'system.db')); db.exec(SYSTEM_SCHEMA); service = createService(); });
 afterEach(async () => { vi.unstubAllGlobals(); await service.close(); db.close(); await rm(root, { recursive: true, force: true }); });
 function createService(adapter?: AiAdapter) { return new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter); }
 async function restartService() { await service.close(); db.close(); db = new DatabaseSync(join(root, 'system.db')); service = createService(); }

@@ -1,11 +1,11 @@
 import { DatabaseSync } from 'node:sqlite';
 import { describe, test, expect, vi } from 'vitest';
-import { SYSTEM_SCHEMA_V1, SYSTEM_DATABASE_VERSION } from '../src/db';
+import { SYSTEM_SCHEMA, SYSTEM_DATABASE_VERSION } from '../src/db';
 import { AiSourceStore, allowed, validateAllow } from '../src/ai/source-store';
 import { CredentialStore } from '../src/credentials/credential-store';
 import { SqliteEncryptedSecretStore } from '../src/credentials/secret-store';
 function fixture() {
-  const db = new DatabaseSync(':memory:'); db.exec('PRAGMA foreign_keys=ON'); db.exec(SYSTEM_SCHEMA_V1);
+  const db = new DatabaseSync(':memory:'); db.exec('PRAGMA foreign_keys=ON'); db.exec(SYSTEM_SCHEMA);
   const secrets = new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(7)); const changed = vi.fn();
   const store = new AiSourceStore(db, new CredentialStore(db), secrets, changed);
   return { db, secrets, store, changed };
@@ -16,7 +16,7 @@ describe('v1 AI source store', () => {
     try {
       const first = await store.save({ name: 'Personal', provider: 'openai', kind: 'api-key', apiKey: 'personal-secret' });
       const second = await store.save({ name: 'Work', provider: 'openai', kind: 'api-key', apiKey: 'work-secret', allow: { mode: 'apps', appIds: [] } });
-      expect(SYSTEM_DATABASE_VERSION).toBe(1);
+      expect(SYSTEM_DATABASE_VERSION).toBe(2);
       expect(first.allow).toEqual({ mode: 'all' }); expect(allowed(first, 'app-created-later')).toBe(true);
       expect(allowed(second, 'any-app')).toBe(false);
       const updated = await store.save({ name: 'Renamed', provider: 'openai', kind: 'api-key', apiKey: 'rotated' }, second.id);

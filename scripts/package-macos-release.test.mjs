@@ -291,6 +291,14 @@ test("release signing policy gives each native runtime only its required entitle
     "com.apple.security.cs.allow-jit",
   ]);
   assert.deepEqual(macOsReleaseEntitlementsForPath(resolve(
+    appPath, "Contents", "MacOS", "Lamarck",
+  ), options), ["com.apple.security.cs.allow-jit"]);
+  for (const name of ["Electron", "Lamarck-backup"]) {
+    assert.deepEqual(macOsReleaseEntitlementsForPath(resolve(
+      appPath, "Contents", "MacOS", name,
+    ), options), []);
+  }
+  assert.deepEqual(macOsReleaseEntitlementsForPath(resolve(
     appPath,
     "Contents", "Frameworks", "Electron Helper (Renderer).app",
   ), options), ["com.apple.security.cs.allow-jit"]);
