@@ -94,6 +94,8 @@ jobs:
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: node scripts/ci-macos-signing.mjs setup
+      - name: Verify real macOS signing commands
+        run: node --test scripts/package-macos-release.test.mjs
       - name: Sign, notarize and verify production application
         env:
           LAMARCK_SHELL_BUILD_HANDOFF: ${{ runner.temp }}/shell-handoff

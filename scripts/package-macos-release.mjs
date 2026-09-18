@@ -22,7 +22,6 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
 import { validateGuestRelease } from "../desktop/capsule-guest/scripts/release-contract.mjs";
 import {
   assertDeviceIdentityNativeResourceLayout,
@@ -37,7 +36,7 @@ import {
   compileRenameExclHelper,
   publishDirectoryNoReplace,
 } from "./macos-release-publication.mjs";
-import { loadFrozenOsxSign } from "./macos-release-signer.mjs";
+import { loadFrozenOsxSign, readSigningCertificateSha1 } from "./macos-release-signer.mjs";
 import { runPackagedNodePtySmoke, validatePackagedManagedCli } from "./macos-release-runtime.mjs";
 import { resolveBuildSystemIdentity } from "./build-system-identity.mjs";
 import {
@@ -849,17 +848,8 @@ async function verifyDistributionSignature(path, expectedIdentity, entitlementKe
     throw new Error(`${path} is not distribution signed`);
   }
   assertExactCodeSignatureIdentity(details, expectedIdentity, path);
-  const certificateRoot = await mkdtemp(join(tmpdir(), "lamarck-signature-certificate-"));
-  try {
-    const prefix = join(certificateRoot, "certificate-");
-    run("codesign", ["-d", "--extract-certificates", prefix, path]);
-    const leafCertificate = await readFile(`${prefix}0`);
-    const leafSha1 = createHash("sha1").update(leafCertificate).digest("hex").toUpperCase();
-    if (leafSha1 !== expectedIdentity.hash) {
-      throw new Error(`${path} leaf signing certificate does not match the resolved identity`);
-    }
-  } finally {
-    await rm(certificateRoot, { recursive: true, force: true });
+  if (await readSigningCertificateSha1(path) !== expectedIdentity.hash) {
+    throw new Error(`${path} leaf signing certificate does not match the resolved identity`);
   }
 
   const entitlementXml = capture("codesign", ["-d", "--entitlements", ":-", path]);

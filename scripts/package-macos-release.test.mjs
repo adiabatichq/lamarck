@@ -42,7 +42,7 @@ import {
   compileRenameExclHelper,
   publishDirectoryNoReplace,
 } from "./macos-release-publication.mjs";
-import { loadFrozenOsxSign } from "./macos-release-signer.mjs";
+import { loadFrozenOsxSign, readSigningCertificateSha1 } from "./macos-release-signer.mjs";
 import { runPackagedNodePtySmoke, validatePackagedManagedCli } from "./macos-release-runtime.mjs";
 import {
   buildDeviceIdentityNative,
@@ -76,6 +76,33 @@ const validEnvironment = {
   LAMARCK_MARKETPLACE_SIGNING_KEY_ID: "marketplace-test-1",
   LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: Buffer.alloc(32, 7).toString("base64"),
 };
+
+test("macOS Developer ID postflight extracts the actual signing certificate and entitlements", {
+  skip: process.platform !== "darwin" || !process.env.LAMARCK_CODESIGN_IDENTITY,
+}, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "lamarck-signing-integration-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const executable = join(directory, "probe");
+  const entitlements = join(directory, "entitlements.plist");
+  const invoke = (command, args, options = {}) => {
+    const result = spawnSync(command, args, { encoding: "utf8", timeout: 30000, ...options });
+    assert.equal(result.status, 0, `${command}: ${result.error ?? result.stderr}`);
+    return result;
+  };
+  const identity = resolveInstalledDeveloperIdIdentity(process.env.LAMARCK_CODESIGN_IDENTITY,
+    invoke("security", ["find-identity", "-v", "-p", "codesigning"]).stdout);
+  invoke("xcrun", ["clang", "-x", "c", "-o", executable, "-"], { input: "int main(void) { return 0; }\n" });
+  await writeFile(entitlements, '<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/></dict></plist>');
+  invoke("codesign", ["--force", "--sign", identity.hash, "--options", "runtime", "--timestamp", "--entitlements", entitlements, executable]);
+  invoke("codesign", ["--verify", "--strict", executable]);
+  const details = invoke("codesign", ["-dv", "--verbose=4", executable]);
+  assertExactCodeSignatureIdentity(`${details.stdout}\n${details.stderr}`, identity);
+  assert.equal(await readSigningCertificateSha1(executable), identity.hash);
+  const xml = invoke("codesign", ["-d", "--entitlements", ":-", executable]).stdout;
+  const actual = JSON.parse(invoke("plutil", ["-convert", "json", "-o", "-", "--", "-"], { input: xml }).stdout);
+  assertExactBooleanEntitlements(actual, ["com.apple.security.cs.allow-jit"]);
+  invoke(executable, []);
+});
 
 test("release resource copying preserves empty dependency files but rejects links", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "lamarck-empty-release-resource-"));

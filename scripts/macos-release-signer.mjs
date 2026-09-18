@@ -1,8 +1,23 @@
 import { constants } from "node:fs";
-import { open, realpath } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtemp, open, readFile, realpath, rm } from "node:fs/promises";
 import { registerHooks } from "node:module";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+export async function readSigningCertificateSha1(path) {
+  const directory = await mkdtemp(join(tmpdir(), "lamarck-signature-certificate-"));
+  try {
+    const prefix = join(directory, "certificate-");
+    execFileSync("codesign", ["-d", `--extract-certificates=${prefix}`, path], { stdio: "pipe" });
+    const certificate = await readFile(`${prefix}0`);
+    return createHash("sha1").update(certificate).digest("hex").toUpperCase();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
 
 export async function loadFrozenOsxSign(shellBuildExport) {
   const hostToolsRoot = await realpath(resolve(shellBuildExport, "host-tools"));
