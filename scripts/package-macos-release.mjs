@@ -459,8 +459,7 @@ async function assembleApplication(
   ]) {
     run("plutil", ["-replace", key, "-string", value, plist]);
   }
-  run("plutil", ["-remove", "CFBundleURLTypes", plist], { allowFailure: true });
-  run("plutil", ["-insert", "CFBundleURLTypes", "-json", JSON.stringify(MARKETPLACE_URL_TYPES), plist]);
+  run("plutil", ["-replace", "CFBundleURLTypes", "-json", JSON.stringify(MARKETPLACE_URL_TYPES), plist]);
 
   await mkdir(electronResources, { recursive: true, mode: 0o755 });
   await writeFile(join(appResources, "package.json"), `${JSON.stringify({
