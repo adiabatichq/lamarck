@@ -9,6 +9,8 @@ import {
   inspectDataSchema,
   listAppVersions,
   listApps,
+  readAppInventory,
+  subscribeCoreRuntime,
   query,
   rebuildAppVersionHistory,
   restoreAppVersion,
@@ -18,6 +20,75 @@ import {
 } from "./api";
 
 describe("Core endpoint resolution", () => {
+  test("resolves token once and retains one authoritative Host check per subsequent inventory read", async () => {
+    const host = inventoryHost();
+    vi.stubGlobal("window", { lamarckHost: host });
+    // Each response body is consumed exactly once.
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(Response.json({ apps: [] }))));
+    await expect(readAppInventory(new AbortController().signal)).resolves.toMatchObject({ status: "connected" });
+    expect(host.getCoreRuntimeState).toHaveBeenCalledTimes(2);
+    await readAppInventory(new AbortController().signal);
+    expect(host.getCoreRuntimeState).toHaveBeenCalledTimes(3);
+    expect(host.getCoreToken).toHaveBeenCalledTimes(1);
+    expect(host.getCoreBaseUrl).toHaveBeenCalledTimes(1);
+  });
+
+  test("discards old inventory even when the generation notification has not arrived", async () => {
+    const host = inventoryHost();
+    host.getCoreRuntimeState.mockResolvedValueOnce({ generation: 1, phase: "ready", error: null });
+    host.getCoreRuntimeState.mockResolvedValue({ generation: 2, phase: "ready", error: null });
+    vi.stubGlobal("window", { lamarckHost: host });
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(Response.json({ apps: [{ id: "old" }] }))));
+    await expect(readAppInventory(new AbortController().signal)).resolves.toEqual({ apps: [], status: "checking", error: null });
+  });
+
+  test("does not overwrite a newer notification with an in-flight Host reply", async () => {
+    const host = inventoryHost();
+    let notify!: (state: { generation: number; phase: "failed"; error: string }) => void;
+    host.onCoreRuntimeState.mockImplementation(callback => { notify = callback; return vi.fn(); });
+    let reply!: (state: { generation: number; phase: "ready"; error: null }) => void;
+    host.getCoreRuntimeState.mockResolvedValueOnce({ generation: 1, phase: "ready", error: null });
+    host.getCoreRuntimeState.mockImplementationOnce(() => new Promise(resolve => { reply = resolve; }));
+    vi.stubGlobal("window", { lamarckHost: host });
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(Response.json({ apps: [{ id: "old" }] }))));
+    const unsubscribe = subscribeCoreRuntime(vi.fn());
+    try {
+      const read = readAppInventory(new AbortController().signal);
+      await vi.waitFor(() => expect(reply).toBeTypeOf("function"));
+      notify({ generation: 1, phase: "failed", error: "Guard lost" });
+      reply({ generation: 1, phase: "ready", error: null });
+      await expect(read).resolves.toEqual({ apps: [], status: "offline", error: "Guard lost" });
+    } finally { unsubscribe(); }
+  });
+
+  test("shares one removable Host subscription among all mounted pollers", () => {
+    const host = inventoryHost();
+    const remove = vi.fn();
+    host.onCoreRuntimeState.mockReturnValue(remove);
+    vi.stubGlobal("window", { lamarckHost: host });
+    const subscriptions = Array.from({ length: 100 }, () => subscribeCoreRuntime(vi.fn()));
+    expect(host.onCoreRuntimeState).toHaveBeenCalledTimes(1);
+    for (const unsubscribe of subscriptions.slice(0, -1)) unsubscribe();
+    expect(remove).not.toHaveBeenCalled();
+    subscriptions.at(-1)!();
+    expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not accumulate Host state calls when inventory polling repeatedly times out", async () => {
+    vi.useFakeTimers();
+    const host = inventoryHost();
+    host.getCoreRuntimeState.mockReturnValue(new Promise(() => {}));
+    vi.stubGlobal("window", { lamarckHost: host });
+    const first = readAppInventory(new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(CORE_READ_TIMEOUT_MS);
+    await expect(first).resolves.toMatchObject({ status: "offline" });
+    for (let attempt = 0; attempt < 100; attempt++) {
+      await expect(readAppInventory(new AbortController().signal)).resolves.toMatchObject({ status: "offline" });
+    }
+    expect(host.getCoreRuntimeState).toHaveBeenCalledTimes(1);
+    expect(host.getCoreToken).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
   beforeEach(() => {
     clearCoreBaseUrlCache();
   });
@@ -62,7 +133,8 @@ describe("Core endpoint resolution", () => {
 
   test.each(["url", "token", "fetch", "body"])("bounds stalled %s reads and permits a fresh read", async (stage) => {
     vi.useFakeTimers();
-    const never = new Promise<never>(() => {});
+    let finish!: (value: string) => void;
+    const never = new Promise<string>((resolve) => { finish = resolve; });
     const host = {
       getCoreBaseUrl: vi.fn().mockResolvedValue("http://localhost:32100"),
       getCoreToken: vi.fn().mockResolvedValue("test-token"),
@@ -81,6 +153,14 @@ describe("Core endpoint resolution", () => {
     await failed;
     if (stage === "fetch" || stage === "body") {
       expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    }
+    if (stage === "url" || stage === "token") {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        await expect(listApps()).rejects.toThrow("Core did not respond within 15 seconds");
+      }
+      expect(stage === "url" ? host.getCoreBaseUrl : host.getCoreToken).toHaveBeenCalledTimes(1);
+      finish(stage === "url" ? "http://localhost:32100" : "test-token");
+      await vi.advanceTimersByTimeAsync(0);
     }
     await expect(listApps()).resolves.toEqual({ apps: [] });
     expect(vi.getTimerCount()).toBe(0);
@@ -127,8 +207,12 @@ describe("Core endpoint resolution", () => {
     vi.stubGlobal("window", { lamarckHost: { getCoreBaseUrl: hostBaseUrl } });
     const stale = getCoreBaseUrl();
     clearCoreBaseUrlCache();
+    // A caller joining the same physical IPC after invalidation must not
+    // attribute its old result to the new generation and cache the old port.
+    const joinedAfterInvalidation = getCoreBaseUrl();
+    await Promise.resolve();
     finish("http://localhost:32100");
-    await stale;
+    await Promise.all([stale, joinedAfterInvalidation]);
     await expect(getCoreBaseUrl()).resolves.toBe("http://localhost:32101");
   });
 
@@ -325,3 +409,13 @@ describe("Core endpoint resolution", () => {
     });
   });
 });
+
+function inventoryHost() {
+  return {
+    getCoreBaseUrl: vi.fn().mockResolvedValue("http://localhost:32100"),
+    getCoreToken: vi.fn().mockResolvedValue("test-token"),
+    getCoreRuntimeState: vi.fn().mockResolvedValue({ generation: 1, phase: "ready", error: null }),
+    onCoreRuntimeState: vi.fn<(callback: (state: { generation: number; phase: "ready" | "failed"; error: string | null }) => void) => () => void>()
+      .mockReturnValue(() => {}),
+  };
+}

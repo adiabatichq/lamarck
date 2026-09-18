@@ -9,7 +9,8 @@ import {
   approveSchemaRequest,
   clearCoreBaseUrlCache,
   getLamarckSession,
-  listApps,
+  readAppInventory,
+  type CoreStatus,
   listSchemaRequests,
   logoutLamarckSession,
   rejectSchemaRequest,
@@ -20,11 +21,6 @@ import {
 } from "./lib/api";
 import { isUiApp } from "./lib/app-visual";
 import { useCorePolling } from "./hooks/useCorePolling";
-import {
-  coreResponseDisposition,
-  resolveCoreRequestFailure,
-  type CoreStatus,
-} from "./lib/core-availability";
 import {
   closeUseApp,
   loadUseState,
@@ -148,68 +144,13 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
   }, [storageKey, workspaceState]);
 
   const readApps = useCallback(async (signal: AbortSignal) => {
-    const host = window.lamarckHost;
-    const isCurrent = () => !signal.aborted;
-    const publishFailure = (failure: {
-      status: "checking" | "offline";
-      error: string | null;
-    }) => {
-      if (!isCurrent()) return;
-      // Inventory from a prior runtime generation cannot keep a native App
-      // surface mounted while Host authority is restarting or unavailable.
-      setApps([]);
-      setCoreStatus(failure.status);
-      setCoreError(failure.error);
-      setAppsLoading(failure.status === "checking");
-    };
-
-    try {
-      const before = host ? await host.getCoreRuntimeState() : null;
-      if (!isCurrent()) return;
-      if (before && before.phase !== "ready") {
-        publishFailure(await resolveCoreRequestFailure(
-          new Error(before.error ?? "Core runtime is starting"),
-          async () => before,
-        ));
-        return;
-      }
-
-      const result = await listApps(signal);
-      const after = host ? await host.getCoreRuntimeState() : null;
-      if (!isCurrent()) return;
-      if (before && after) {
-        const disposition = coreResponseDisposition(before, after);
-        if (disposition === "retry") {
-          // Discard the old inventory; the next poll resolves the new URL.
-          clearCoreBaseUrlCache();
-          publishFailure({ status: "checking", error: null });
-          return;
-        }
-        if (disposition === "unavailable") {
-          publishFailure(await resolveCoreRequestFailure(
-            new Error(after.error ?? "Core runtime generation changed"),
-            async () => after,
-          ));
-          return;
-        }
-      }
-      setApps(result.apps);
-      setCoreStatus("connected");
-      setCoreError(null);
-      setAppsLoading(false);
-    } catch (error) {
-      if (!isCurrent()) return;
-      const runtime = host
-        ? await host.getCoreRuntimeState().catch(() => null)
-        : null;
-      if (!isCurrent()) return;
-      const failure = await resolveCoreRequestFailure(
-        error,
-        runtime ? async () => runtime : undefined,
-      );
-      publishFailure(failure);
-      throw error;
-    }
+    const result = await readAppInventory(signal);
+    if (signal.aborted) return;
+    setApps(result.apps);
+    setCoreStatus(result.status);
+    setCoreError(result.error);
+    setAppsLoading(result.status === "checking");
+    if (result.status === "offline") throw new Error(result.error ?? "Core is unavailable");
   }, []);
 
   const refreshApps = useCorePolling(readApps, 5_000);

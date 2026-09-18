@@ -2,10 +2,7 @@ import { DesktopUpdate } from "../components/DesktopUpdate";
 import { useState, type FormEvent, type ReactNode } from "react";
 import { createApp, type AppInfo } from "../lib/api";
 import { AppMark } from "../components/AppMark";
-import {
-  emptyWorkspaceCopy,
-  type CoreStatus,
-} from "../lib/core-availability";
+import type { CoreStatus } from "../lib/api";
 import styles from "./UseWorkspace.module.css";
 
 interface UseWorkspaceProps {
@@ -369,4 +366,36 @@ function SystemIcon() {
       <path d="M12 3.8V9.4M5.2 7.8l4.4 2.7M18.8 7.8l-4.4 2.7M12 14.6v5.6" />
     </svg>
   );
+}
+
+export function emptyWorkspaceCopy(
+  status: CoreStatus,
+  hasApps: boolean,
+): { eyebrow: string; title: string; detail: string } {
+  if (status === "checking") {
+    return {
+      eyebrow: "System starting",
+      title: "Preparing your workspace.",
+      detail: "Unlocking local state and starting its services. Apps will appear when it is ready.",
+    };
+  }
+  if (status === "offline") {
+    return {
+      eyebrow: "System unavailable",
+      title: "The workspace is offline.",
+      detail: "Use System to inspect the workspace and retry its runtime.",
+    };
+  }
+  if (hasApps) {
+    return {
+      eyebrow: "Quiet canvas",
+      title: "Open an app.",
+      detail: "Choose an interface when you need it. The workspace stays out of the way otherwise.",
+    };
+  }
+  return {
+    eyebrow: "Empty workspace",
+    title: "Choose your first building block.",
+    detail: "Start with a blank local App, or explore official Apps and Connectors in Marketplace.",
+  };
 }

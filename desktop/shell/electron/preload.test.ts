@@ -6,7 +6,7 @@ import { describe, expect, test, vi } from "vitest";
 const PRELOAD_SOURCE = readFileSync(new URL("./preload.cjs", import.meta.url), "utf8");
 
 interface WorkspacePreloadHost {
-  onCoreResume(callback: () => void): () => void;
+  onCoreRuntimeState(callback: (state: unknown) => void): () => void;
   getWorkspaceState(): Promise<unknown>;
   chooseWorkspacePath(purpose: "create" | "open"): Promise<unknown>;
   createWorkspace(path: string): Promise<unknown>;
@@ -46,13 +46,13 @@ describe("Shell Workspace preload contract", () => {
     const events = new EventEmitter();
     const host = loadPreload(vi.fn(), events);
     const resume = vi.fn();
-    const unsubscribe = host.onCoreResume(resume);
-    events.emit("core:resume", { sender: "private" });
-    expect(resume.mock.calls).toEqual([[]]);
+    const unsubscribe = host.onCoreRuntimeState(resume);
+    events.emit("core:runtimeState", { sender: "private" }, { phase: "ready", generation: 1 });
+    expect(resume.mock.calls).toEqual([[{ phase: "ready", generation: 1 }]]);
     unsubscribe();
-    events.emit("core:resume", { sender: "private" });
+    events.emit("core:runtimeState", { sender: "private" }, { phase: "ready", generation: 1 });
     expect(resume).toHaveBeenCalledTimes(1);
-    expect(events.listenerCount("core:resume")).toBe(0);
+    expect(events.listenerCount("core:runtimeState")).toBe(0);
   });
   test("keeps inspection separate from Create and Open mutations", async () => {
     const ipcInvoke = vi.fn(async () => ({ ok: true }));

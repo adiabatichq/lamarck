@@ -25,24 +25,88 @@ export type {
 let cachedCoreBaseUrl: string | null = null;
 let coreUrlEpoch = 0;
 export const CORE_READ_TIMEOUT_MS = 15_000;
+type Host = NonNullable<Window["lamarckHost"]>;
+type HostRead = "getCoreBaseUrl" | "getCoreToken" | "getCoreRuntimeState" | "getAppRuntimeStates";
+type HostReply<K extends HostRead> = { value: Awaited<ReturnType<Host[K]>>; epoch: number };
+const pendingHostReads = new WeakMap<Host, Map<HostRead, Promise<unknown>>>();
+const coreTokens = new WeakMap<Host, string>();
+const runtimeStates = new WeakMap<Host, HostCoreRuntimeState>();
+const runtimeListeners = new Set<() => void>();
+let unsubscribeRuntime: (() => void) | undefined;
+
+function readHost<K extends HostRead>(method: K): Promise<HostReply<K>> {
+  const host = window.lamarckHost!;
+  let pending = pendingHostReads.get(host);
+  if (!pending) pendingHostReads.set(host, pending = new Map());
+  const existing = pending.get(method);
+  if (existing) return existing as Promise<HostReply<K>>;
+  // invoke cannot be aborted. Keep its slot until the physical call settles,
+  // even after the shared deadline rejects; retries then fail without growing
+  // another IPC call or another chain of callbacks on the stalled operation.
+  const epoch = coreUrlEpoch;
+  const result = new Promise<unknown>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(
+      "Core did not respond within 15 seconds. You can retry the connection.",
+    )), CORE_READ_TIMEOUT_MS);
+    const finish = () => { clearTimeout(timeout); pending!.delete(method); };
+    Promise.resolve().then<unknown>(() => host[method]()).then(
+      value => { finish(); resolve({ value, epoch }); },
+      error => { finish(); reject(error); },
+    );
+  });
+  pending.set(method, result);
+  return result as Promise<HostReply<K>>;
+}
+
+export function subscribeCoreRuntime(listener: () => void): () => void {
+  const host = window.lamarckHost;
+  runtimeListeners.add(listener);
+  if (host && !unsubscribeRuntime) {
+    runtimeStates.delete(host); // We may have missed events while unmounted.
+    unsubscribeRuntime = host.onCoreRuntimeState(state => {
+      const current = runtimeStates.get(host);
+      if (current && state.generation < current.generation) return;
+      clearCoreBaseUrlCache();
+      runtimeStates.set(host, state);
+      for (const notify of runtimeListeners) notify();
+    });
+  }
+  return () => {
+    runtimeListeners.delete(listener);
+    if (!runtimeListeners.size) {
+      unsubscribeRuntime?.();
+      unsubscribeRuntime = undefined;
+      if (host) runtimeStates.delete(host);
+    }
+  };
+}
+
+async function getCoreRuntimeState(fresh = false): Promise<HostCoreRuntimeState | null> {
+  const host = window.lamarckHost;
+  if (!host) return null;
+  const cached = runtimeStates.get(host);
+  if (cached?.phase === "ready" && !fresh) return cached;
+  const { value: state, epoch } = await readHost("getCoreRuntimeState");
+  // A notification received during IPC is more recent than its reply.
+  const current = runtimeStates.get(host);
+  if (current && (epoch !== coreUrlEpoch || current.generation > state.generation)) return current;
+  runtimeStates.set(host, state);
+  return state;
+}
+
+export async function getAppRuntimeStates(): ReturnType<Host["getAppRuntimeStates"]> {
+  return window.lamarckHost ? (await readHost("getAppRuntimeStates")).value : [];
+}
 
 export async function getCoreBaseUrl(): Promise<string> {
   if (cachedCoreBaseUrl) return cachedCoreBaseUrl;
-
-  // In Electron, a rejected host call means Core is still starting or failed
-  // to start. Do not turn that transient state into the browser-dev fallback:
-  // caching localhost:3000 here strands the packaged shell there even after
-  // Core becomes ready on its persisted workspace port.
   if (window.lamarckHost) {
-    const epoch = coreUrlEpoch;
-    const hostBase = await window.lamarckHost.getCoreBaseUrl();
+    const { value: hostBase, epoch } = await readHost("getCoreBaseUrl");
     if (!hostBase) throw new Error("Electron host returned an empty Core URL.");
     if (epoch === coreUrlEpoch) cachedCoreBaseUrl = hostBase;
     return hostBase;
   }
-
-  const resolved = import.meta.env.VITE_LAMARCK_CORE_URL
-    ?? "http://localhost:3000";
+  const resolved = import.meta.env.VITE_LAMARCK_CORE_URL ?? "http://localhost:3000";
   cachedCoreBaseUrl = resolved;
   return resolved;
 }
@@ -53,10 +117,10 @@ export function clearCoreBaseUrlCache(): void {
 }
 
 export async function getCoreToken(): Promise<string> {
-  const token = await window.lamarckHost?.getCoreToken();
-  if (!token) {
-    throw new Error("Core API requires the Electron host security token.");
-  }
+  const host = window.lamarckHost;
+  const token = host && (coreTokens.get(host) ?? (await readHost("getCoreToken")).value);
+  if (!token) throw new Error("Core API requires the Electron host security token.");
+  coreTokens.set(host!, token);
   return token;
 }
 
@@ -828,6 +892,104 @@ export function removeAiSource(id: string): Promise<{ ok: true }> {
   return request(`/api/ai/sources/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 export interface AiLoginStatus { status: 'pending' | 'ready' | 'cancelled' | 'failed'; url?: string; message?: string }
-export function aiSourceLogin(id: string, action: 'login' | 'login-status' | 'cancel-login'): Promise<AiLoginStatus> {
-  return request(`/api/ai/sources/${encodeURIComponent(id)}/${action}`, { method: action === 'login-status' ? 'GET' : 'POST', ...(action === 'login-status' ? {} : { body: '{}' }) });
+export function aiSourceLogin(id: string, action: 'login' | 'login-status' | 'cancel-login', signal?: AbortSignal): Promise<AiLoginStatus> {
+  return request(`/api/ai/sources/${encodeURIComponent(id)}/${action}`, { method: action === 'login-status' ? 'GET' : 'POST', ...(action === 'login-status' ? { signal } : { body: '{}' }) });
+}
+
+export type CoreStatus = "checking" | "connected" | "offline";
+
+export interface CoreFailureState {
+  status: "checking" | "offline";
+  error: string | null;
+}
+
+export interface HostCoreRuntimeState {
+  generation: number;
+  phase: "starting" | "ready" | "restarting" | "failed";
+  error: string | null;
+}
+
+export function coreResponseDisposition(
+  before: HostCoreRuntimeState,
+  after: HostCoreRuntimeState,
+): "publish" | "retry" | "unavailable" {
+  if (
+    before.phase === "ready"
+    && after.phase === "ready"
+    && before.generation === after.generation
+  ) return "publish";
+  if (after.phase === "ready") return "retry";
+  return "unavailable";
+}
+
+/**
+ * A failed Core request is not itself proof that startup failed. The Shell is
+ * created before Keychain access and Core startup, so the Host's explicit
+ * runtime phase is authoritative. It also distinguishes startup from an HTTP
+ * failure after Core was already ready.
+ */
+export async function resolveCoreRequestFailure(
+  requestError: unknown,
+  getRuntimeState?: () => Promise<HostCoreRuntimeState>,
+): Promise<CoreFailureState> {
+  if (getRuntimeState) {
+    try {
+      const runtime = await getRuntimeState();
+      if (runtime.phase === "starting" || runtime.phase === "restarting") {
+        return { status: "checking", error: null };
+      }
+      if (runtime.phase === "failed" && runtime.error?.trim()) {
+        return { status: "offline", error: runtime.error };
+      }
+    } catch {
+      // If the Host cannot report its state, preserve the original request
+      // failure instead of claiming startup is merely pending.
+    }
+  }
+
+  return {
+    status: "offline",
+    error: errorMessage(requestError),
+  };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Owns the inventory's connection and generation checks for every Shell view. */
+export async function readAppInventory(signal: AbortSignal): Promise<
+  { status: "connected"; apps: AppInfo[]; error: null } | (CoreFailureState & { apps: AppInfo[] })
+> {
+  try {
+    const before = await getCoreRuntimeState();
+    signal.throwIfAborted();
+    if (before && before.phase !== "ready") {
+      return { apps: [], ...await resolveCoreRequestFailure(
+        new Error(before.error ?? "Core runtime is starting"), async () => before,
+      ) };
+    }
+    const result = await listApps(signal);
+    // Keep the authoritative post-read check: a delayed notification must not
+    // let an old runtime's inventory retain native App authority.
+    const after = await getCoreRuntimeState(true);
+    signal.throwIfAborted();
+    if (before && after) {
+      const disposition = coreResponseDisposition(before, after);
+      if (disposition === "retry") {
+        clearCoreBaseUrlCache();
+        return { apps: [], status: "checking", error: null };
+      }
+      if (disposition === "unavailable") {
+        return { apps: [], ...await resolveCoreRequestFailure(
+          new Error(after.error ?? "Core runtime generation changed"), async () => after,
+        ) };
+      }
+    }
+    return { ...result, status: "connected", error: null };
+  } catch (error) {
+    signal.throwIfAborted();
+    return { apps: [], ...await resolveCoreRequestFailure(error, window.lamarckHost
+      ? async () => (await getCoreRuntimeState(true))! : undefined) };
+  }
 }

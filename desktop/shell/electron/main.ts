@@ -71,6 +71,7 @@ import {
 import {
   DesktopRuntimeSupervisor,
   type RuntimeState,
+  type RuntimeStartOptions,
 } from "./runtime-supervisor";
 import { GuardHeartbeatMonitor } from "./guard-heartbeat";
 import {
@@ -137,6 +138,15 @@ let workspaceSetupDetail: string | null = null;
 let workspaceSelectionNeedsPersistence = false;
 const runtimeSupervisor = new DesktopRuntimeSupervisor<ChildProcess, UtilityProcess>(
   notifyRuntimeState,
+  {
+    start: startRuntimeProcesses,
+    stopGateway: () => cliGateway.stop(),
+    stopApps: (controlPlaneLost) => controlPlaneLost
+      ? capsuleManager.stopAll({ controlPlaneLost: true })
+      : stopAllAppViewers(),
+    stopCore,
+    stopGuard,
+  },
 );
 const workspaceVault = new WorkspaceVaultStateController();
 let nextTerminalId = 1;
@@ -144,11 +154,8 @@ let isQuitting = false;
 let shutdownComplete = false;
 let shutdownTask: Promise<void> | undefined;
 let desktopUpdater: DesktopUpdater | undefined;
-let runtimeQueue: Promise<void> = Promise.resolve();
 let runtimeRelaunchRequested = false;
 const startedFromRuntimeRelaunch = process.argv.includes(RUNTIME_RELAUNCH_ARG);
-const expectedCoreStops = new WeakSet<ChildProcess>();
-const expectedGuardStops = new WeakSet<UtilityProcess>();
 const exitedCores = new WeakSet<ChildProcess>();
 const exitedGuards = new WeakSet<UtilityProcess>();
 const unspawnedCoreFailures = new WeakSet<ChildProcess>();
@@ -156,7 +163,7 @@ const guardHeartbeat = new GuardHeartbeatMonitor<UtilityProcess>({
   intervalMs: GUARD_HEARTBEAT_INTERVAL_MS,
   timeoutMs: GUARD_HEARTBEAT_TIMEOUT_MS,
   isCurrent: (child) => runtimeSupervisor.guard === child,
-  isExpectedStop: (child) => expectedGuardStops.has(child),
+  isExpectedStop: (child) => runtimeSupervisor.isExpectedGuardStop(child),
   isQuitting: () => isQuitting,
   onFailure: beginUnexpectedGuardTeardown,
 });
@@ -883,10 +890,6 @@ function notifyRuntimeState(state: RuntimeState): void {
   if (state.phase === "ready") flushMarketplaceHandoffs();
 }
 
-function beginRuntimeGeneration(): number {
-  return runtimeSupervisor.begin();
-}
-
 function markRuntimeReady(generation: number): boolean {
   return runtimeSupervisor.ready(generation);
 }
@@ -910,15 +913,6 @@ function unprivilegedEnvironment(
   const env = { ...process.env, ...extra };
   for (const name of PRIVATE_RUNTIME_ENV) delete env[name];
   return env;
-}
-
-function enqueueRuntime<T>(operation: () => Promise<T>): Promise<T> {
-  const result = runtimeQueue.then(operation, operation);
-  runtimeQueue = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  return result;
 }
 
 function relaunchDesktopAfterFailedCleanup(error: unknown): void {
@@ -954,7 +948,7 @@ function scheduleRuntimeRestart(
   // replaces Core, Guard, and Capsule as one reconstructable runtime.
   systemBroker.unbindAll();
   detachAllAppWebContents();
-  void enqueueRuntime(async () => {
+  void runtimeSupervisor.enqueue(async () => {
     const state = runtimeSupervisor.snapshot();
     if (
       isQuitting
@@ -968,7 +962,7 @@ function scheduleRuntimeRestart(
 
     console.log("[electron] Restarting the Desktop runtime after an unexpected failure");
     try {
-      await stopRuntimeAfterFailure(controlPlaneLost);
+      await runtimeSupervisor.stop(controlPlaneLost ? "lost" : "failure");
     } catch (error) {
       const cleanupFailure = markRuntimeFailed(error);
       console.error(`[electron] Runtime cleanup failed: ${cleanupFailure}`);
@@ -976,7 +970,7 @@ function scheduleRuntimeRestart(
       return;
     }
     try {
-      await startRuntime({ expectedVaultId: activeWorkspace.vaultId });
+      await runtimeSupervisor.start({ expectedVaultId: activeWorkspace.vaultId });
     } catch (error) {
       const restartFailure = markRuntimeFailed(error);
       console.error(`[electron] Automatic runtime restart failed: ${restartFailure}`);
@@ -990,7 +984,7 @@ function beginUnexpectedGuardTeardown(
   reason: string,
 ): void {
   if (
-    expectedGuardStops.has(child)
+    runtimeSupervisor.isExpectedGuardStop(child)
     || isQuitting
   ) {
     return;
@@ -1010,7 +1004,7 @@ function beginUnexpectedCoreTeardown(
   reason: string,
 ): void {
   if (
-    expectedCoreStops.has(child)
+    runtimeSupervisor.isExpectedCoreStop(child)
     || isQuitting
   ) {
     return;
@@ -1140,7 +1134,7 @@ async function startGuard(generation: number): Promise<void> {
   child.on("exit", (code) => {
     guardHeartbeat.stop(child);
     exitedGuards.add(child);
-    const expected = expectedGuardStops.has(child);
+    const expected = runtimeSupervisor.isExpectedGuardStop(child);
     console.log(`[electron] Guard utility exited with code ${code}`);
     if (!expected && !isQuitting) {
       beginUnexpectedGuardTeardown(
@@ -1182,6 +1176,7 @@ function startCore(generation: number): void {
       ELECTRON_RUN_AS_NODE: "1",
       PORT: String(corePort),
       LAMARCK_CORE_TOKEN: CORE_TOKEN,
+      LAMARCK_CORE_STOP_TIMEOUT_MS: String(PROCESS_STOP_TIMEOUT_MS),
       LAMARCK_VAULT_KEY: workspaceVault.requireKey(workspace),
       LAMARCK_GUARD_ORIGIN: guardOrigin,
       LAMARCK_GUARD_TOKEN: GUARD_TOKEN,
@@ -1198,7 +1193,7 @@ function startCore(generation: number): void {
   });
   child.on("exit", (code, signal) => {
     exitedCores.add(child);
-    const expected = expectedCoreStops.has(child);
+    const expected = runtimeSupervisor.isExpectedCoreStop(child);
     console.log(`[electron] Node Core exited with code ${code}${signal ? ` (${signal})` : ""}`);
     if (!expected && !isQuitting) {
       beginUnexpectedCoreTeardown(
@@ -1216,7 +1211,7 @@ async function stopCore(
   child: ChildProcess | null = runtimeSupervisor.core,
 ): Promise<void> {
   if (!child) return;
-  expectedCoreStops.add(child);
+  runtimeSupervisor.expectCoreStop(child);
   if (coreExitConfirmed(child)) {
     runtimeSupervisor.detachCore(child);
     return;
@@ -1248,7 +1243,7 @@ async function stopGuard(
 ): Promise<void> {
   if (!child) return;
   guardHeartbeat.stop(child);
-  expectedGuardStops.add(child);
+  runtimeSupervisor.expectGuardStop(child);
   if (exitedGuards.has(child)) {
     runtimeSupervisor.detachGuard(child);
     return;
@@ -1280,109 +1275,17 @@ async function stopGuard(
   );
 }
 
-async function stopControlPlaneProcesses(
-  coreChild: ChildProcess | null = runtimeSupervisor.core,
-  guardChild: UtilityProcess | null = runtimeSupervisor.guard,
+async function startRuntimeProcesses(
+  generation: number,
+  opts?: RuntimeStartOptions,
 ): Promise<void> {
-  const failures: unknown[] = [];
-  try {
-    await stopCore(coreChild);
-  } catch (error) {
-    failures.push(error);
-  }
-  // Guard owns data.db. Always attempt to release it after Core teardown,
-  // including when Core termination could not be confirmed.
-  try {
-    await stopGuard(guardChild);
-  } catch (error) {
-    failures.push(error);
-  }
-  if (failures.length === 0) return;
-  const failure = failures.length === 1
-    ? failures[0]
-    : new AggregateError(failures, "Control-plane process teardown was incomplete");
-  throw failure;
-}
-
-async function startRuntime(opts?: {
-  expectedVaultId?: string;
-  rotatePort?: boolean;
-}): Promise<number> {
-  const generation = beginRuntimeGeneration();
-  try {
-    await ensureWorkspaceRuntimeSettings(opts);
-    if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
-    await startGuard(generation);
-    if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
-    startCore(generation);
-    await waitForCore(generation);
-    await cliGateway.start();
-    return generation;
-  } catch (error) {
-    markRuntimeFailed(error, generation);
-    try {
-      await cliGateway.stop();
-      await stopControlPlaneProcesses();
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [error, cleanupError],
-        "Runtime startup failed and control-plane cleanup was incomplete",
-      );
-    }
-    throw error;
-  }
-}
-
-async function stopRuntime(): Promise<void> {
-  runtimeSupervisor.prepareRestart();
-  await cliGateway.stop();
-  // Intentional replacement keeps Core alive while Capsule revokes its issued
-  // channels, then releases Core before Guard's exclusive data.db ownership.
-  await stopAllAppViewers();
-  await stopControlPlaneProcesses();
-}
-
-async function stopRuntimeAfterFailure(controlPlaneLost: boolean): Promise<void> {
-  const failures: unknown[] = [];
-  try {
-    await cliGateway.stop();
-  } catch (error) {
-    failures.push(error);
-  }
-  if (controlPlaneLost) {
-    // Core can no longer revoke remote channels, so local authority collapse
-    // above is final. Stop Capsule and the exact Core/Guard pair concurrently.
-    let capsuleStop: Promise<void>;
-    try {
-      capsuleStop = capsuleManager.stopAll({ controlPlaneLost: true });
-    } catch (error) {
-      capsuleStop = Promise.reject(error);
-    }
-    const results = await Promise.allSettled([
-      capsuleStop,
-      stopControlPlaneProcesses(),
-    ]);
-    failures.push(...results
-      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-      .map((result) => result.reason));
-  } else {
-    // Keep Core available until Capsule has revoked its channels, even on a
-    // Capsule-originated failure, then replace the control plane too.
-    try {
-      await stopAllAppViewers();
-    } catch (error) {
-      failures.push(error);
-    }
-    try {
-      await stopControlPlaneProcesses();
-    } catch (error) {
-      failures.push(error);
-    }
-  }
-  if (failures.length === 1) throw failures[0];
-  if (failures.length > 1) {
-    throw new AggregateError(failures, "Runtime shutdown was incomplete");
-  }
+  await ensureWorkspaceRuntimeSettings(opts);
+  if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
+  await startGuard(generation);
+  if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
+  startCore(generation);
+  await waitForCore(generation);
+  await cliGateway.start();
 }
 
 async function activateWorkspace(
@@ -1405,7 +1308,7 @@ async function activateWorkspace(
   let candidateSelected = false;
 
   try {
-    await stopRuntime();
+    await runtimeSupervisor.stop();
     oldRuntimeStopped = true;
 
     // Re-read after releasing the old authority to close the inspection/start
@@ -1417,7 +1320,7 @@ async function activateWorkspace(
     workspace = currentCandidate.path;
     workspaceVault.begin(workspace, currentCandidate.vaultId);
     candidateSelected = true;
-    await startRuntime({ expectedVaultId: currentCandidate.vaultId });
+    await runtimeSupervisor.start({ expectedVaultId: currentCandidate.vaultId });
 
     // Persistence is the commit point. The old active descriptor remains
     // authoritative until the candidate runtime is proven ready.
@@ -1441,7 +1344,7 @@ async function activateWorkspace(
     const failures: unknown[] = [error];
     if (candidateSelected) {
       try {
-        await stopRuntime();
+        await runtimeSupervisor.stop();
       } catch (cleanupError) {
         failures.push(cleanupError);
       }
@@ -1461,7 +1364,7 @@ async function activateWorkspace(
 
     if (failures.length === 1 && previous) {
       try {
-        await startRuntime({ expectedVaultId: previous.vaultId });
+        await runtimeSupervisor.start({ expectedVaultId: previous.vaultId });
       } catch (rollbackError) {
         failures.push(rollbackError);
       }
@@ -2727,8 +2630,8 @@ function coreBaseUrl(): string {
 
 async function retryCore(): Promise<{ coreBaseUrl: string }> {
   try {
-    await stopRuntime();
-    await startRuntime();
+    await runtimeSupervisor.stop();
+    await runtimeSupervisor.start();
     return { coreBaseUrl: coreBaseUrl() };
   } catch (error) {
     markRuntimeFailed(error);
@@ -2738,8 +2641,8 @@ async function retryCore(): Promise<{ coreBaseUrl: string }> {
 
 async function rotateCorePort(): Promise<{ coreBaseUrl: string }> {
   try {
-    await stopRuntime();
-    await startRuntime({ rotatePort: true });
+    await runtimeSupervisor.stop();
+    await runtimeSupervisor.start({ rotatePort: true });
     return { coreBaseUrl: coreBaseUrl() };
   } catch (error) {
     markRuntimeFailed(error);
@@ -2855,12 +2758,7 @@ app.whenReady().then(async () => {
   });
   powerMonitor.on("resume", () => {
     guardHeartbeat.resume();
-    for (const window of BrowserWindow.getAllWindows()) {
-      const contents = window.webContents;
-      if (shellWebContents.has(contents.id) && !contents.isDestroyed()) {
-        contents.send("core:resume");
-      }
-    }
+    notifyRuntimeState(runtimeSupervisor.snapshot());
   });
   registerMarketplaceProtocolClient();
   const initialWorkspace = initializeWorkspaceSelection();
@@ -2906,7 +2804,7 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("auth:importRecoveryCode", async (event, recoveryCode: string) => {
     requireShellIpc(event);
-    return enqueueRuntime(async () => {
+    return runtimeSupervisor.enqueue(async () => {
       const targetWorkspace = workspace;
       const selection = workspaceVault.current(targetWorkspace);
       if (!selection?.vaultId) throw new Error("Workspace vault is not initialized");
@@ -2919,8 +2817,8 @@ app.whenReady().then(async () => {
         throw new Error("Workspace changed while its recovery code was being imported");
       }
       try {
-        await stopRuntime();
-        await startRuntime({ expectedVaultId: descriptor.vaultId });
+        await runtimeSupervisor.stop();
+        await runtimeSupervisor.start({ expectedVaultId: descriptor.vaultId });
         return { coreBaseUrl: coreBaseUrl() };
       } catch (error) {
         markRuntimeFailed(error);
@@ -2942,11 +2840,11 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("core:retry", (event) => {
     requireShellIpc(event);
-    return enqueueRuntime(retryCore);
+    return runtimeSupervisor.enqueue(retryCore);
   });
   ipcMain.handle("core:rotatePort", (event) => {
     requireShellIpc(event);
-    return enqueueRuntime(rotateCorePort);
+    return runtimeSupervisor.enqueue(rotateCorePort);
   });
   ipcMain.handle("shell:openExternal", (event, rawUrl: string) => {
     requireShellIpc(event);
@@ -2998,7 +2896,7 @@ app.whenReady().then(async () => {
       throw new Error("Create Workspace request is invalid");
     }
     const nextPath = payload.path;
-    return enqueueRuntime(async () => ({
+    return runtimeSupervisor.enqueue(async () => ({
       status: "ready" as const,
       workspace: await createWorkspace(nextPath),
     }));
@@ -3018,7 +2916,7 @@ app.whenReady().then(async () => {
     ) {
       throw new Error("Open Workspace request is invalid");
     }
-    return enqueueRuntime(() => openWorkspace(
+    return runtimeSupervisor.enqueue(() => openWorkspace(
       payload.path as string,
       payload.recoveryCode as string | undefined,
     ));
@@ -3145,12 +3043,12 @@ app.whenReady().then(async () => {
   // Reserve the first runtime-queue position before renderer IPC becomes
   // usable, but do not touch Keychain until the Shell window is present.
   const initialStartup = initialWorkspace
-    ? enqueueRuntime(async () => {
+    ? runtimeSupervisor.enqueue(async () => {
         await shellReady;
         if (isQuitting) {
           throw new Error("Runtime startup was cancelled because Lamarck is quitting");
         }
-        await startRuntime({ expectedVaultId: initialWorkspace.vaultId });
+        await runtimeSupervisor.start({ expectedVaultId: initialWorkspace.vaultId });
         if (workspaceSelectionNeedsPersistence) {
           saveActiveWorkspace(initialWorkspace);
           workspaceSelectionNeedsPersistence = false;
@@ -3187,7 +3085,7 @@ function prepareDesktopShutdown(): Promise<void> {
   desktopUpdater?.stop();
   disposeAllTerminals();
   // Wait for any in-flight startup/workspace operation before teardown.
-  shutdownTask = enqueueRuntime(() => stopRuntimeAfterFailure(false))
+  shutdownTask = runtimeSupervisor.enqueue(() => runtimeSupervisor.stop("failure"))
     .catch((error) => {
       console.error(`[electron] Runtime shutdown required process exit: ${errorMessage(error)}`);
     })

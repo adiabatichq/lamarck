@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from "vitest";
-import { createReadPoller } from "./read-poller";
+import { createReadPoller } from "../hooks/useCorePolling";
 
 afterEach(() => vi.useRealTimers());
 

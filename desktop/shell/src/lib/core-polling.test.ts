@@ -1,6 +1,6 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { clearCoreBaseUrlCache, CORE_READ_TIMEOUT_MS, listApps } from "./api";
-import { createReadPoller } from "./read-poller";
+import { createReadPoller } from "../hooks/useCorePolling";
 
 afterEach(() => {
   clearCoreBaseUrlCache();

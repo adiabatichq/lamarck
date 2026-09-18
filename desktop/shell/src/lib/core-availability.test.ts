@@ -1,9 +1,9 @@
+import { emptyWorkspaceCopy } from "../layout/UseWorkspace";
 import { describe, expect, test, vi } from "vitest";
 import {
   coreResponseDisposition,
-  emptyWorkspaceCopy,
   resolveCoreRequestFailure,
-} from "./core-availability";
+} from "./api";
 
 describe("Core startup availability", () => {
   test("keeps a rejected request in the starting state while the Host is starting", async () => {

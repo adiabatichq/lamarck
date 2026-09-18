@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useCorePolling } from "./useCorePolling";
 import {
-  listApps,
+  getAppRuntimeStates,
   listAppVersions,
   rebuildAppVersionHistory,
   restoreAppVersion,
@@ -34,7 +34,7 @@ export function useAppsManager(
   onInventoryChanged: () => void | Promise<void>,
   pollMs = 5_000,
 ) {
-  const [apps, setApps] = useState<readonly AppInfo[]>(seedApps);
+  const apps = seedApps;
   const [runtimeByApp, setRuntimeByApp] = useState<ReadonlyMap<string, AppRuntimeView>>(new Map());
   const [selectedAppId, setSelectedAppId] = useState<string | null>(seedApps[0]?.id ?? null);
   const [histories, setHistories] = useState<ReadonlyMap<string, AppHistoryView>>(new Map());
@@ -45,8 +45,8 @@ export function useAppsManager(
   const aliveRef = useRef(true);
 
   useEffect(() => { historiesRef.current = histories; }, [histories]);
+  useEffect(() => { void onInventoryChanged(); }, [onInventoryChanged]);
   useEffect(() => {
-    setApps(seedApps);
     setSelectedAppId((current) => (
       current && seedApps.some((app) => app.id === current)
         ? current
@@ -56,18 +56,9 @@ export function useAppsManager(
 
   const read = useCallback(async (signal: AbortSignal) => {
     try {
-      const [inventory, runtime] = await Promise.all([
-        listApps(signal),
-        window.lamarckHost?.getAppRuntimeStates() ?? Promise.resolve([]),
-      ]);
+      const runtime = await getAppRuntimeStates();
       if (signal.aborted) return;
-      setApps(inventory.apps);
       setRuntimeByApp(new Map(runtime.map((state) => [state.appId, state])));
-      setSelectedAppId((current) => (
-        current && inventory.apps.some((app) => app.id === current)
-          ? current
-          : inventory.apps[0]?.id ?? null
-      ));
       setError(null);
     } catch (cause) {
       if (!signal.aborted) {
@@ -78,7 +69,10 @@ export function useAppsManager(
       if (!signal.aborted) setLoading(false);
     }
   }, []);
-  const refresh = useCorePolling(read, pollMs);
+  const refreshRuntime = useCorePolling(read, pollMs);
+  const refresh = useCallback(async () => {
+    await Promise.all([refreshRuntime(), onInventoryChanged()]);
+  }, [refreshRuntime, onInventoryChanged]);
 
   const loadHistory = useCallback(async (appId: string, append = false) => {
     const existing = historiesRef.current.get(appId) ?? EMPTY_HISTORY;
@@ -125,7 +119,7 @@ export function useAppsManager(
     setBusyByApp((current) => withMapValue(current, appId, action));
     try {
       await operation();
-      await Promise.all([refresh(), onInventoryChanged()]);
+      await refresh();
       await loadHistory(appId, false);
     } finally {
       if (aliveRef.current) {
@@ -136,7 +130,7 @@ export function useAppsManager(
         });
       }
     }
-  }, [loadHistory, onInventoryChanged, refresh]);
+  }, [loadHistory, refresh]);
 
   const restore = useCallback((appId: string, version: string) => (
     mutate(appId, "restore", () => restoreAppVersion(appId, version))

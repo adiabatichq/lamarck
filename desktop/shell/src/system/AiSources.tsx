@@ -1,3 +1,4 @@
+import { useCorePolling } from "../hooks/useCorePolling";
 import { useCallback, useEffect, useState } from 'react';
 import { aiSourceLogin, listAiSources, removeAiSource, saveAiSource, type AiLoginStatus, type AiSourceInput, type AppInfo, type ManagedAiSource } from '../lib/api';
 import styles from './AiSources.module.css';
@@ -13,16 +14,19 @@ export function AiSources({ apps }: { apps: AppInfo[] }) {
   const [login, setLogin] = useState<{ id: string; state: AiLoginStatus }>();
   const refresh = useCallback(async () => setInventory(await listAiSources()), []);
   useEffect(() => { void refresh().catch(reason => setError(String(reason))); }, [refresh]);
-  useEffect(() => {
-    if (login?.state.status !== 'pending') return;
-    let active = true;
-    const timer = setInterval(() => { void aiSourceLogin(login.id, 'login-status').then(state => {
-      if (!active) return;
+  const readLogin = useCallback(async (signal: AbortSignal) => {
+    if (!login?.id) return;
+    try {
+      const state = await aiSourceLogin(login.id, 'login-status', signal);
+      if (signal.aborted) return;
       setLogin({ id: login.id, state });
-      if (state.status === 'ready') void refresh();
-    }).catch(reason => { if (active) setError(String(reason)); }); }, 1500);
-    return () => { active = false; clearInterval(timer); };
-  }, [login?.id, login?.state.status, refresh]);
+      if (state.status === 'ready') await refresh();
+    } catch (reason) {
+      if (!signal.aborted) setError(String(reason));
+      throw reason;
+    }
+  }, [login?.id, refresh]);
+  useCorePolling(readLogin, 1500, login?.state.status === 'pending');
   async function act(run: () => Promise<unknown>) {
     setBusy(true); setError(undefined);
     try { await run(); await refresh(); } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }

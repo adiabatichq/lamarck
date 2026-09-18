@@ -231,6 +231,8 @@ export function SystemRoom({
         {section === "apps" && (
           <AppsManager
             seedApps={apps}
+            inventoryLoading={coreStatus === "checking"}
+            inventoryError={coreStatus === "offline" ? coreError : null}
             onOpenApp={onOpenApp}
             onInventoryChanged={onCoreChanged}
           />

@@ -32,10 +32,14 @@ type PendingAction =
 
 export function AppsManager({
   seedApps,
+  inventoryLoading = false,
+  inventoryError = null,
   onOpenApp,
   onInventoryChanged,
 }: {
   seedApps: readonly AppInfo[];
+  inventoryLoading?: boolean;
+  inventoryError?: string | null;
   onOpenApp: (appId: string) => void;
   onInventoryChanged: () => void | Promise<void>;
 }) {
@@ -68,8 +72,8 @@ export function AppsManager({
       runtimeByApp={manager.runtimeByApp}
       selectedRuntime={runtime}
       history={manager.history}
-      loading={manager.loading}
-      error={actionError ?? manager.error}
+      loading={inventoryLoading || manager.loading}
+      error={actionError ?? inventoryError ?? manager.error}
       busy={manager.busy}
       pending={pending}
       onSelect={manager.select}
