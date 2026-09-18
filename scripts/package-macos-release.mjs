@@ -289,9 +289,23 @@ async function materializePinnedElectronApplication(releaseConfig, stagingRoot) 
   const extracted = join(stagingRoot, "electron-input");
   await mkdir(extracted, { mode: 0o700 });
   run("ditto", ["-x", "-k", archive, extracted]);
-  assertExactList(await sortedEntries(extracted), ["Electron.app"], "pinned Electron archive root");
+  assertExactList(await sortedEntries(extracted), [
+    "Electron.app", "LICENSE", "LICENSES.chromium.html", "version",
+  ], "pinned Electron archive root");
   const app = join(extracted, "Electron.app");
   await requireRealDirectory(app, "pinned Electron.app");
+  await requireRealFile(join(extracted, "version"), "pinned Electron version file");
+  if ((await readFile(join(extracted, "version"), "utf8")).trim() !== artifact.version) {
+    throw new Error("pinned Electron archive version is incorrect");
+  }
+  for (const [sourceName, resourceName] of [
+    ["LICENSE", "LICENSE.electron.txt"],
+    ["LICENSES.chromium.html", "LICENSES.chromium.html"],
+  ]) {
+    const license = join(extracted, sourceName);
+    await requireRealFile(license, "pinned Electron license");
+    await copyFile(license, join(app, "Contents", "Resources", resourceName), constants.COPYFILE_EXCL);
+  }
   const executable = join(app, "Contents", "MacOS", "Electron");
   await requireRealFile(executable, "pinned Electron executable");
   const version = capture("plutil", [
@@ -496,6 +510,9 @@ async function assembleApplication(
 async function validatePackagedApplication(appPath, releaseConfig) {
   await requireRealDirectory(appPath, "packaged Lamarck.app");
   const resources = join(appPath, "Contents", "Resources");
+  for (const name of ["LICENSE.electron.txt", "LICENSES.chromium.html"]) {
+    await requireRealFile(join(resources, name), "packaged Electron license");
+  }
   const appResources = join(resources, "app");
   const actualAppEntries = await sortedEntries(appResources);
   assertExactList(
