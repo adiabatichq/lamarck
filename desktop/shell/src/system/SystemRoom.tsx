@@ -21,6 +21,7 @@ import {
 } from "../lib/api";
 import styles from "./SystemRoom.module.css";
 import { AppsManager } from "./AppsManager";
+import { useCorePolling } from "../hooks/useCorePolling";
 
 type SystemSection = "ai" | "shape" | "sources" | "apps" | "data" | "timeline" | "workspace";
 
@@ -81,17 +82,19 @@ export function SystemRoom({
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    if (coreStatus !== "connected") return;
+  const readSnapshot = useCallback(async (signal: AbortSignal) => {
     setRefreshing(true);
     const results = await Promise.allSettled([
-      listConnectors(),
-      inspectDataSchema(),
-      query("SELECT COUNT(*) AS count FROM events"),
+      listConnectors(signal),
+      inspectDataSchema(signal),
+      query("SELECT COUNT(*) AS count FROM events", undefined, signal),
       query(
         "SELECT id, source, type, started_at FROM events ORDER BY started_at DESC, id DESC LIMIT 6",
+        undefined,
+        signal,
       ),
     ]);
+    if (signal.aborted) return;
 
     const failures = results
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
@@ -114,14 +117,13 @@ export function SystemRoom({
     });
     setSnapshotError(failures[0] ?? null);
     setRefreshing(false);
-  }, [coreStatus]);
+    if (failures.length) throw new Error(failures[0]);
+  }, []);
+  const refresh = useCorePolling(readSnapshot, 12_000, coreStatus === "connected");
 
   useEffect(() => {
-    void refresh();
-    if (coreStatus !== "connected") return;
-    const timer = window.setInterval(() => void refresh(), 12_000);
-    return () => window.clearInterval(timer);
-  }, [coreStatus, refresh]);
+    if (coreStatus !== "connected") setRefreshing(false);
+  }, [coreStatus]);
 
   useEffect(() => {
     setSelectedTable(null);

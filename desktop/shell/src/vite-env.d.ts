@@ -53,6 +53,7 @@ interface Window {
       phase: "starting" | "ready" | "restarting" | "failed";
       error: string | null;
     }) => void): () => void;
+    onCoreResume(callback: () => void): () => void;
     retryCore(): Promise<{ coreBaseUrl: string }>;
     rotateCorePort(): Promise<{ coreBaseUrl: string }>;
     openExternal(url: string): Promise<void>;

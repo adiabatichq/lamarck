@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { runInNewContext } from "node:vm";
 import { describe, expect, test, vi } from "vitest";
 
 const PRELOAD_SOURCE = readFileSync(new URL("./preload.cjs", import.meta.url), "utf8");
 
 interface WorkspacePreloadHost {
+  onCoreResume(callback: () => void): () => void;
   getWorkspaceState(): Promise<unknown>;
   chooseWorkspacePath(purpose: "create" | "open"): Promise<unknown>;
   createWorkspace(path: string): Promise<unknown>;
@@ -12,7 +14,7 @@ interface WorkspacePreloadHost {
   openWorkspaceFiles(application: "finder" | "obsidian"): Promise<unknown>;
 }
 
-function loadPreload(ipcInvoke: ReturnType<typeof vi.fn>): WorkspacePreloadHost {
+function loadPreload(ipcInvoke: ReturnType<typeof vi.fn>, events = new EventEmitter()): WorkspacePreloadHost {
   let exposed: unknown;
   runInNewContext(PRELOAD_SOURCE, {
     require(id: string) {
@@ -26,8 +28,8 @@ function loadPreload(ipcInvoke: ReturnType<typeof vi.fn>): WorkspacePreloadHost 
         },
         ipcRenderer: {
           invoke: ipcInvoke,
-          on: vi.fn(),
-          removeListener: vi.fn(),
+          on: events.on.bind(events),
+          removeListener: events.removeListener.bind(events),
           send: vi.fn(),
         },
       };
@@ -40,6 +42,18 @@ function loadPreload(ipcInvoke: ReturnType<typeof vi.fn>): WorkspacePreloadHost 
 }
 
 describe("Shell Workspace preload contract", () => {
+  test("delivers wake notifications without exposing IPC objects and removes subscriptions", () => {
+    const events = new EventEmitter();
+    const host = loadPreload(vi.fn(), events);
+    const resume = vi.fn();
+    const unsubscribe = host.onCoreResume(resume);
+    events.emit("core:resume", { sender: "private" });
+    expect(resume.mock.calls).toEqual([[]]);
+    unsubscribe();
+    events.emit("core:resume", { sender: "private" });
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(events.listenerCount("core:resume")).toBe(0);
+  });
   test("keeps inspection separate from Create and Open mutations", async () => {
     const ipcInvoke = vi.fn(async () => ({ ok: true }));
     const host = loadPreload(ipcInvoke);

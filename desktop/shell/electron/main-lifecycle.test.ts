@@ -247,6 +247,18 @@ describe("Shell Host configuration", () => {
     expect(mainSource).toContain("new DesktopRuntimeSupervisor<ChildProcess, UtilityProcess>");
   });
 
+  test("notifies Shell readers on wake without restarting the runtime", () => {
+    const resume = mainSource.match(
+      /powerMonitor\.on\("resume", \(\) => \{[\s\S]*?\n  \}\);/,
+    )?.[0];
+    if (!resume) throw new Error("resume lifecycle is missing");
+    expect(resume).toContain("guardHeartbeat.resume()");
+    expect(resume).toContain("shellWebContents.has(contents.id)");
+    expect(resume).toContain("!contents.isDestroyed()");
+    expect(resume).toContain('contents.send("core:resume")');
+    expect(resume).not.toMatch(/app\.(relaunch|exit|quit)\(|startRuntime\(|retryCore\(/);
+  });
+
   test("restarts the whole runtime when a current process is lost", () => {
     const collapse = mainSource.match(
       /function scheduleRuntimeRestart\([\s\S]*?\n\}\n\nfunction beginUnexpectedGuardTeardown/,

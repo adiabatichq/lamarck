@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useCorePolling } from "./useCorePolling";
 import {
   listApps,
   listAppVersions,
@@ -53,13 +54,13 @@ export function useAppsManager(
     ));
   }, [seedApps]);
 
-  const refresh = useCallback(async () => {
+  const read = useCallback(async (signal: AbortSignal) => {
     try {
       const [inventory, runtime] = await Promise.all([
-        listApps(),
+        listApps(signal),
         window.lamarckHost?.getAppRuntimeStates() ?? Promise.resolve([]),
       ]);
-      if (!aliveRef.current) return;
+      if (signal.aborted) return;
       setApps(inventory.apps);
       setRuntimeByApp(new Map(runtime.map((state) => [state.appId, state])));
       setSelectedAppId((current) => (
@@ -69,11 +70,15 @@ export function useAppsManager(
       ));
       setError(null);
     } catch (cause) {
-      if (aliveRef.current) setError(errorMessage(cause));
+      if (!signal.aborted) {
+        setError(errorMessage(cause));
+        throw cause;
+      }
     } finally {
-      if (aliveRef.current) setLoading(false);
+      if (!signal.aborted) setLoading(false);
     }
   }, []);
+  const refresh = useCorePolling(read, pollMs);
 
   const loadHistory = useCallback(async (appId: string, append = false) => {
     const existing = historiesRef.current.get(appId) ?? EMPTY_HISTORY;
@@ -143,13 +148,10 @@ export function useAppsManager(
 
   useEffect(() => {
     aliveRef.current = true;
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), pollMs);
     return () => {
       aliveRef.current = false;
-      window.clearInterval(timer);
     };
-  }, [pollMs, refresh]);
+  }, []);
 
   const selected = apps.find((app) => app.id === selectedAppId) ?? null;
   useEffect(() => {

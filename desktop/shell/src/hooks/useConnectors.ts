@@ -1,6 +1,7 @@
 // useConnectors — polls installed Connector packages and Sources while mounted.
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useCallback } from "react";
+import { useCorePolling } from "./useCorePolling";
 import {
   listConnectors,
   type ConnectorSourceView,
@@ -12,32 +13,23 @@ export function useConnectors(pollMs = 2000) {
   const [packages, setPackages] = useState<InstalledConnectorView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const aliveRef = useRef(true);
-
-  const refresh = useCallback(async () => {
+  const read = useCallback(async (signal: AbortSignal) => {
     try {
-      const { sources, packages } = await listConnectors();
-      if (!aliveRef.current) return;
+      const { sources, packages } = await listConnectors(signal);
+      if (signal.aborted) return;
       setSources(sources);
       setPackages(packages);
       setError(null);
     } catch (err) {
-      if (!aliveRef.current) return;
+      if (signal.aborted) return;
       setError(err instanceof Error ? err.message : String(err));
+      throw err;
     } finally {
-      if (aliveRef.current) setLoading(false);
+      if (!signal.aborted) setLoading(false);
     }
   }, []);
 
-  useEffect(() => {
-    aliveRef.current = true;
-    refresh();
-    const id = window.setInterval(refresh, pollMs);
-    return () => {
-      aliveRef.current = false;
-      window.clearInterval(id);
-    };
-  }, [refresh, pollMs]);
+  const refresh = useCorePolling(read, pollMs);
 
   return { sources, packages, loading, error, refresh };
 }

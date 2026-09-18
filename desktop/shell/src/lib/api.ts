@@ -23,6 +23,8 @@ export type {
 } from "@lamarck/system/protocol";
 
 let cachedCoreBaseUrl: string | null = null;
+let coreUrlEpoch = 0;
+export const CORE_READ_TIMEOUT_MS = 15_000;
 
 export async function getCoreBaseUrl(): Promise<string> {
   if (cachedCoreBaseUrl) return cachedCoreBaseUrl;
@@ -32,9 +34,10 @@ export async function getCoreBaseUrl(): Promise<string> {
   // caching localhost:3000 here strands the packaged shell there even after
   // Core becomes ready on its persisted workspace port.
   if (window.lamarckHost) {
+    const epoch = coreUrlEpoch;
     const hostBase = await window.lamarckHost.getCoreBaseUrl();
     if (!hostBase) throw new Error("Electron host returned an empty Core URL.");
-    cachedCoreBaseUrl = hostBase;
+    if (epoch === coreUrlEpoch) cachedCoreBaseUrl = hostBase;
     return hostBase;
   }
 
@@ -45,6 +48,7 @@ export async function getCoreBaseUrl(): Promise<string> {
 }
 
 export function clearCoreBaseUrlCache(): void {
+  coreUrlEpoch += 1;
   cachedCoreBaseUrl = null;
 }
 
@@ -65,11 +69,47 @@ async function coreHeaders(options?: RequestInit): Promise<Headers> {
   return headers;
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function request<T>(path: string, options?: RequestInit, readOnly = false): Promise<T> {
+  const method = options?.method?.toUpperCase() ?? "GET";
+  if (!readOnly && method !== "GET" && method !== "HEAD") {
+    return performRequest(path, options);
+  }
+
+  const controller = new AbortController();
+  const cancel = () => controller.abort(options?.signal?.reason);
+  const timeout = setTimeout(() => controller.abort(new Error(
+    "Core did not respond within 15 seconds. You can retry the connection.",
+  )), CORE_READ_TIMEOUT_MS);
+  let onAbort: () => void = () => {};
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(controller.signal.reason);
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+  });
+  options?.signal?.addEventListener("abort", cancel, { once: true });
+  if (options?.signal?.aborted) cancel();
+  try {
+    // Include Host URL/token resolution and response-body consumption in the
+    // deadline. Abort alone cannot settle a stalled Host IPC call.
+    return await Promise.race([
+      aborted,
+      performRequest<T>(path, { ...options, signal: controller.signal }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+    options?.signal?.removeEventListener("abort", cancel);
+    controller.signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function performRequest<T>(path: string, options?: RequestInit): Promise<T> {
+  options?.signal?.throwIfAborted();
   const base = await getCoreBaseUrl();
+  options?.signal?.throwIfAborted();
+  const headers = await coreHeaders(options);
+  options?.signal?.throwIfAborted();
   const res = await fetch(`${base}${path}`, {
     ...options,
-    headers: await coreHeaders(options),
+    headers,
   });
   const text = await res.text();
   const data = text ? JSON.parse(text) : {};
@@ -134,8 +174,8 @@ export interface LamarckLoginStart {
   expiresAt: number;
 }
 
-export function getLamarckSession(): Promise<LamarckSessionView> {
-  return request("/api/identity/session");
+export function getLamarckSession(signal?: AbortSignal): Promise<LamarckSessionView> {
+  return request("/api/identity/session", { signal });
 }
 
 export function startLamarckLogin(): Promise<LamarckLoginStart> {
@@ -229,8 +269,8 @@ export interface AppInfo {
   };
 }
 
-export function listApps(): Promise<{ apps: AppInfo[] }> {
-  return request("/api/apps");
+export function listApps(signal?: AbortSignal): Promise<{ apps: AppInfo[] }> {
+  return request("/api/apps", { signal });
 }
 
 export interface AppVersionRecordV1 {
@@ -357,18 +397,19 @@ export async function archiveApp(appId: string): Promise<{ ok: true; id: string 
 
 // -- Query / Mutate (system bridge for components) --
 
-export function query(sql: string, params?: SqlParams): Promise<{ rows: unknown[] }> {
+export function query(sql: string, params?: SqlParams, signal?: AbortSignal): Promise<{ rows: unknown[] }> {
   return request("/api/query", {
     method: "POST",
     body: JSON.stringify({ sql, params }),
-  });
+    signal,
+  }, true);
 }
 
 export function resolveContentRef(ref: ContentBlobRef): Promise<ResolveContentRefResult> {
   return request("/api/content-ref/resolve", {
     method: "POST",
     body: JSON.stringify({ ref }),
-  });
+  }, true);
 }
 
 export function mutate(sql: string, params?: SqlParams): Promise<MutationResult> {
@@ -385,8 +426,8 @@ export function transaction(statements: SqlStatement[]): Promise<TransactionStat
   });
 }
 
-export function inspectDataSchema(): Promise<DataSchemaSnapshot> {
-  return request("/api/schema/inspect");
+export function inspectDataSchema(signal?: AbortSignal): Promise<DataSchemaSnapshot> {
+  return request("/api/schema/inspect", { signal });
 }
 
 // -- Connectors --
@@ -526,12 +567,12 @@ export interface ConnectorSourceView {
   configPanels?: Record<string, ConnectorConfigPanelView>;
 }
 
-export function listConnectors(): Promise<{
+export function listConnectors(signal?: AbortSignal): Promise<{
   sources: ConnectorSourceView[];
   connectors: ConnectorSourceView[];
   packages: InstalledConnectorView[];
 }> {
-  return request("/api/connectors");
+  return request("/api/connectors", { signal });
 }
 
 export function approveConnector(connectorId: string): Promise<{ ok: true }> {
@@ -755,8 +796,8 @@ export interface SchemaRequest {
   error?: string;
 }
 
-export function listSchemaRequests(): Promise<{ requests: SchemaRequest[] }> {
-  return request("/api/schema/requests");
+export function listSchemaRequests(signal?: AbortSignal): Promise<{ requests: SchemaRequest[] }> {
+  return request("/api/schema/requests", { signal });
 }
 
 export function approveSchemaRequest(

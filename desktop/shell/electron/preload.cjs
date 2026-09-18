@@ -7,6 +7,11 @@ contextBridge.exposeInMainWorld("lamarckHost", {
   getCoreBaseUrl: () => ipcRenderer.invoke("core:getBaseUrl"),
   getCoreStartError: () => ipcRenderer.invoke("core:getStartError"),
   getCoreRuntimeState: () => ipcRenderer.invoke("core:getRuntimeState"),
+  onCoreResume: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on("core:resume", listener);
+    return () => ipcRenderer.removeListener("core:resume", listener);
+  },
   onCoreRuntimeState: (callback) => {
     const listener = (_event, state) => callback(state);
     ipcRenderer.on("core:runtimeState", listener);

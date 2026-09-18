@@ -2851,6 +2851,12 @@ app.whenReady().then(async () => {
   });
   powerMonitor.on("resume", () => {
     guardHeartbeat.resume();
+    for (const window of BrowserWindow.getAllWindows()) {
+      const contents = window.webContents;
+      if (shellWebContents.has(contents.id) && !contents.isDestroyed()) {
+        contents.send("core:resume");
+      }
+    }
   });
   registerMarketplaceProtocolClient();
   const initialWorkspace = initializeWorkspaceSelection();

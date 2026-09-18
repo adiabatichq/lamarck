@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppLauncher } from "./components/AppLauncher";
 import { MarketplaceHandoffController } from "./components/MarketplaceHandoffController";
 import { SchemaApprovalModal } from "./components/SchemaApprovalModal";
@@ -7,6 +7,7 @@ import { AppRuntimeView } from "./content/AppRuntimeView";
 import { UseWorkspace } from "./layout/UseWorkspace";
 import {
   approveSchemaRequest,
+  clearCoreBaseUrlCache,
   getLamarckSession,
   listApps,
   listSchemaRequests,
@@ -18,6 +19,7 @@ import {
   type SchemaRequest,
 } from "./lib/api";
 import { isUiApp } from "./lib/app-visual";
+import { useCorePolling } from "./hooks/useCorePolling";
 import {
   coreResponseDisposition,
   resolveCoreRequestFailure,
@@ -123,7 +125,6 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
   const [mountedAppIds, setMountedAppIds] = useState<string[]>(() => (
     workspaceState.activeAppId ? [workspaceState.activeAppId] : []
   ));
-  const appRefreshSequence = useRef(0);
 
   const uiApps = useMemo(() => apps.filter(isUiApp), [apps]);
   const activeApp = useMemo(
@@ -146,10 +147,9 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
     }
   }, [storageKey, workspaceState]);
 
-  const refreshApps = useCallback(async () => {
-    const request = ++appRefreshSequence.current;
+  const readApps = useCallback(async (signal: AbortSignal) => {
     const host = window.lamarckHost;
-    const isCurrent = () => request === appRefreshSequence.current;
+    const isCurrent = () => !signal.aborted;
     const publishFailure = (failure: {
       status: "checking" | "offline";
       error: string | null;
@@ -174,15 +174,15 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
         return;
       }
 
-      const result = await listApps();
+      const result = await listApps(signal);
       const after = host ? await host.getCoreRuntimeState() : null;
       if (!isCurrent()) return;
       if (before && after) {
         const disposition = coreResponseDisposition(before, after);
         if (disposition === "retry") {
-          // The old response is discarded. Read the new generation now even
-          // if its ready notification raced this request.
-          void refreshApps();
+          // Discard the old inventory; the next poll resolves the new URL.
+          clearCoreBaseUrlCache();
+          publishFailure({ status: "checking", error: null });
           return;
         }
         if (disposition === "unavailable") {
@@ -198,6 +198,7 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
       setCoreError(null);
       setAppsLoading(false);
     } catch (error) {
+      if (!isCurrent()) return;
       const runtime = host
         ? await host.getCoreRuntimeState().catch(() => null)
         : null;
@@ -207,24 +208,11 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
         runtime ? async () => runtime : undefined,
       );
       publishFailure(failure);
+      throw error;
     }
   }, []);
 
-  useEffect(() => {
-    let disposed = false;
-    const refresh = () => {
-      if (!disposed) void refreshApps();
-    };
-    const unsubscribe = window.lamarckHost?.onCoreRuntimeState(refresh);
-    void refreshApps();
-    const timer = window.setInterval(() => void refreshApps(), 5_000);
-    return () => {
-      disposed = true;
-      appRefreshSequence.current += 1;
-      unsubscribe?.();
-      window.clearInterval(timer);
-    };
-  }, [refreshApps]);
+  const refreshApps = useCorePolling(readApps, 5_000);
 
   useEffect(() => {
     // An offline startup has no authoritative App inventory. Keep the user's
@@ -245,46 +233,26 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
     ));
   }, [workspaceState.activeAppId]);
 
-  useEffect(() => {
-    if (coreStatus !== "connected") return;
-    let cancelled = false;
-    async function pollSchemaRequests() {
-      try {
-        const { requests } = await listSchemaRequests();
-        if (!cancelled) {
-          setSchemaRequest(requests.find((request) => request.status === "pending") ?? null);
-        }
-      } catch (error) {
-        console.error("[shell] Schema request poll failed:", error);
-      }
+  const readSchemaRequests = useCallback(async (signal: AbortSignal) => {
+    const { requests } = await listSchemaRequests(signal);
+    if (!signal.aborted) {
+      setSchemaRequest(requests.find((request) => request.status === "pending") ?? null);
     }
-    void pollSchemaRequests();
-    const timer = window.setInterval(() => void pollSchemaRequests(), 1_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [coreStatus]);
+  }, []);
+  useCorePolling(readSchemaRequests, 1_000, coreStatus === "connected");
 
-  useEffect(() => {
-    if (coreStatus !== "connected") return;
-    let cancelled = false;
-    async function pollIdentity() {
-      try {
-        const session = await getLamarckSession();
-        if (!cancelled) setLamarckSession(session);
-      } catch (error) {
-        console.error("[shell] Identity session poll failed:", error);
-        if (!cancelled) setLamarckSession({ status: "signed_out" });
+  const readIdentity = useCallback(async (signal: AbortSignal) => {
+    try {
+      const session = await getLamarckSession(signal);
+      if (!signal.aborted) setLamarckSession(session);
+    } catch (error) {
+      if (!signal.aborted) {
+        setLamarckSession({ status: "signed_out" });
+        throw error;
       }
     }
-    void pollIdentity();
-    const timer = window.setInterval(() => void pollIdentity(), 3_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [coreStatus]);
+  }, []);
+  useCorePolling(readIdentity, 3_000, coreStatus === "connected");
 
   const openLauncher = useCallback(() => {
     setMode("use");
