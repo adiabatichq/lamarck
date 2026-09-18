@@ -158,20 +158,38 @@ describe("Host Guest control/data session", () => {
     await expect(unknownFatal).resolves.toMatchObject({ code: "UNKNOWN_RESPONSE" });
   });
 
-  test("never reuses a Host request ID within one boot session", async () => {
-    const requestId = "R".repeat(22);
-    const { session, control } = await readySession({
-      requestIdFactory: () => requestId,
-      maxPendingRequests: 2,
-    });
-    const first = session.request("ping", { nonce: 1 });
+  test("keeps one VM session usable beyond 100,000 completed requests", async () => {
+    const { session, control } = await readySession();
+    let previous = 0n;
+    try {
+      for (let index = 0; index < 100_001; index++) {
+        const result = session.request("ping", { nonce: index });
+        const request = await control.next() as Record<string, unknown>;
+        const id = String(request.requestId);
+        expect(id).toMatch(/^[A-Za-z0-9_-]{22}$/);
+        const bytes = Buffer.from(id, "base64url");
+        const sequence = (bytes.readBigUInt64BE(0) << 64n) | bytes.readBigUInt64BE(8);
+        if (sequence !== previous + 1n) throw new Error("Request sequence was reused or skipped");
+        previous = sequence;
+        control.send(successResponse(id, null));
+        await result;
+      }
+      expect(previous).toBe(100_001n);
+      expect(session.pendingRequestCount).toBe(0);
+      expect(session.state).toBe("ready");
+    } finally {
+      session.close();
+    }
+  }, 30_000);
+
+  test("never wraps the fixed-width request sequence", async () => {
+    const { session, control } = await readySession({ initialRequestSequence: (1n << 128n) - 2n });
+    const last = session.request("ping", { nonce: 1 });
     const request = await control.next() as Record<string, unknown>;
-    await expect(session.request("ping", { nonce: 2 })).rejects.toMatchObject({
-      code: "REQUEST_ID_REUSED",
-    });
-    control.send(successResponse(String(request.requestId), true));
-    await expect(first).resolves.toBe(true);
-    expect(session.state).toBe("ready");
+    expect(Buffer.from(String(request.requestId), "base64url")).toEqual(Buffer.alloc(16, 255));
+    control.send(successResponse(String(request.requestId), null));
+    await last;
+    await expect(session.request("ping", { nonce: 2 })).rejects.toMatchObject({ code: "REQUEST_ID_EXHAUSTED" });
     session.close();
   });
 

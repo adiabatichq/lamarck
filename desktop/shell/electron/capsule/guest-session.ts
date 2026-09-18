@@ -9,7 +9,6 @@ import {
 } from "../../../capsule/src/protocol/codec";
 import {
   TicketRegistry,
-  generateOpaqueId,
   type ConsumedTicketBinding,
   type TicketBinding,
 } from "../../../capsule/src/protocol/tickets";
@@ -31,7 +30,6 @@ import {
   parseGuestReady,
   parseHostInitialize,
   parseHostRequestForSession,
-  validateOpaqueId,
   validateSessionId,
   validateStreamTicket,
 } from "../../../capsule/src/protocol/validate";
@@ -40,13 +38,12 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_DATA_STREAM_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_PENDING_REQUESTS = 32;
-const DEFAULT_MAX_REQUESTS_PER_SESSION = 100_000;
 const DEFAULT_MAX_DATA_STREAMS = 64;
 const MAXIMUM_PROTOCOL_TIMEOUT_MS = 60_000;
 const MAXIMUM_REQUEST_TIMEOUT_MS = 600_000;
 const MAXIMUM_PENDING_REQUESTS = 1_024;
-const MAXIMUM_REQUESTS_PER_SESSION = 1_000_000;
 const MAXIMUM_DATA_STREAMS = 64;
+const MAX_REQUEST_SEQUENCE = (1n << 128n) - 1n;
 
 const GUEST_EVENT_TYPES: ReadonlySet<string> = new Set<GuestEventType>([
   "blob.imported",
@@ -79,8 +76,7 @@ export type CapsuleGuestSessionErrorCode =
   | "UNKNOWN_RESPONSE"
   | "REQUEST_TIMEOUT"
   | "PENDING_REQUEST_LIMIT"
-  | "REQUEST_LIMIT"
-  | "REQUEST_ID_REUSED"
+  | "REQUEST_ID_EXHAUSTED"
   | "DATA_STREAM_LIMIT"
   | "DATA_STREAM_TIMEOUT"
   | "DATA_STREAM_PROTOCOL"
@@ -116,7 +112,6 @@ export interface CapsuleGuestSessionOptions {
   expectedFeatures: readonly string[];
   maxControlFrameBytes?: number;
   maxPendingRequests?: number;
-  maxRequestsPerSession?: number;
   requestTimeoutMs?: number;
   handshakeTimeoutMs?: number;
   /** Bounds both an unmatched neutral DATA stream and an open-data waiter. */
@@ -124,8 +119,8 @@ export interface CapsuleGuestSessionOptions {
   maxDataStreams?: number;
   /** Test seam. Production uses 256 random bits encoded as canonical base64url. */
   sessionIdFactory?: () => string;
-  /** Test seam. Production uses 128 random bits encoded as canonical base64url. */
-  requestIdFactory?: () => string;
+  /** Test seam for the non-wrapping, session-local request sequence. */
+  initialRequestSequence?: bigint;
 }
 
 export interface CapsuleGuestReadySession {
@@ -222,16 +217,14 @@ export class CapsuleGuestSession extends EventEmitter {
   readonly #expectedFeatures: readonly string[];
   readonly #maxControlFrameBytes: number;
   readonly #maxPendingRequests: number;
-  readonly #maxRequestsPerSession: number;
   readonly #requestTimeoutMs: number;
   readonly #dataStreamTimeoutMs: number;
   readonly #maxDataStreams: number;
   readonly #sessionIdFactory: () => string;
-  readonly #requestIdFactory: () => string;
   readonly #tickets = new TicketRegistry();
   readonly #ticketLifecycles = new Map<string, GuestTicketLifecycle>();
   readonly #pendingRequests = new Map<string, PendingRequest>();
-  readonly #issuedRequestIds = new Set<string>();
+  #requestSequence: bigint;
   readonly #dataStreams = new Set<Duplex>();
   readonly #queuedDataStreams: QueuedDataStream[] = [];
   readonly #pendingDataOpens: PendingDataOpen[] = [];
@@ -266,13 +259,6 @@ export class CapsuleGuestSession extends EventEmitter {
       MAXIMUM_PENDING_REQUESTS,
       "maxPendingRequests",
     );
-    this.#maxRequestsPerSession = boundedInteger(
-      options.maxRequestsPerSession,
-      DEFAULT_MAX_REQUESTS_PER_SESSION,
-      this.#maxPendingRequests,
-      MAXIMUM_REQUESTS_PER_SESSION,
-      "maxRequestsPerSession",
-    );
     this.#requestTimeoutMs = boundedInteger(
       options.requestTimeoutMs,
       DEFAULT_REQUEST_TIMEOUT_MS,
@@ -302,7 +288,10 @@ export class CapsuleGuestSession extends EventEmitter {
       "maxDataStreams",
     );
     this.#sessionIdFactory = options.sessionIdFactory ?? generateSessionId;
-    this.#requestIdFactory = options.requestIdFactory ?? generateOpaqueId;
+    this.#requestSequence = options.initialRequestSequence ?? 0n;
+    if (this.#requestSequence < 0n || this.#requestSequence > MAX_REQUEST_SEQUENCE) {
+      throw new RangeError("Initial request sequence must fit in 128 bits");
+    }
 
     const expectedSupervisorVersion = validateSupervisorVersion(
       options.expectedSupervisorVersion,
@@ -413,20 +402,17 @@ export class CapsuleGuestSession extends EventEmitter {
           `Guest session already has ${this.#maxPendingRequests} pending requests`,
         );
       }
-      if (this.#issuedRequestIds.size >= this.#maxRequestsPerSession) {
-        throw new CapsuleGuestSessionError(
-          "REQUEST_LIMIT",
-          "Guest session exhausted its bounded request-ID lifetime",
-        );
+      if (this.#requestSequence === MAX_REQUEST_SEQUENCE) {
+        throw new CapsuleGuestSessionError("REQUEST_ID_EXHAUSTED", "Guest request sequence cannot wrap");
       }
-
-      const requestId = validateOpaqueId(this.#requestIdFactory(), "requestId");
-      if (this.#issuedRequestIds.has(requestId)) {
-        throw new CapsuleGuestSessionError(
-          "REQUEST_ID_REUSED",
-          "Host request ID factory attempted to reuse an ID in one Guest session",
-        );
-      }
+      // Request IDs correlate responses; session IDs and DATA tickets carry
+      // the authority. A non-wrapping sequence guarantees uniqueness without
+      // retaining every completed request for a long-lived VM.
+      const sequence = ++this.#requestSequence;
+      const bytes = Buffer.alloc(16);
+      bytes.writeBigUInt64BE(sequence >> 64n, 0);
+      bytes.writeBigUInt64BE(sequence & ((1n << 64n) - 1n), 8);
+      const requestId = bytes.toString("base64url");
       const request = parseHostRequestForSession({
         v: CAPSULE_PROTOCOL_VERSION,
         sessionId,
@@ -444,7 +430,6 @@ export class CapsuleGuestSession extends EventEmitter {
         "request timeout",
       );
 
-      this.#issuedRequestIds.add(requestId);
       return new Promise<TResult>((resolve, reject) => {
         const timer = setTimeout(() => {
           this.#fail(new CapsuleGuestSessionError(
