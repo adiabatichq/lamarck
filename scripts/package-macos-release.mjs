@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { assertMacOsReleaseHandoffIdentity, buildShellFromSnapshot } from "./macos-release-builder.mjs";
+import { hashFile } from "./r2-object-store.mjs";
 
 import { validateAiRuntimes, smokeAiRuntimes } from './stage-ai-runtimes.mjs';
 import { spawnSync } from "node:child_process";
@@ -7,6 +9,7 @@ import { constants } from "node:fs";
 import {
   chmod,
   copyFile,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
@@ -108,13 +111,24 @@ async function packageRelease(releaseConfig, signingIdentity) {
     validateLockedElectronPackage(
       JSON.parse(await readFile(join(sourceSnapshotRoot, "package-lock.json"), "utf8")),
     );
-    await mkdir(shellBuildExport, { mode: 0o700 });
-    const builderImageId = await buildShellFromSnapshot(
-      sourceSnapshotRoot,
-      shellBuildExport,
-      sourceSnapshot.manifestDigest,
-      buildIdentity,
-    );
+    let builderImageId;
+    if (process.env.LAMARCK_SHELL_BUILD_HANDOFF) {
+      const handoff = resolve(process.env.LAMARCK_SHELL_BUILD_HANDOFF);
+      const identity = JSON.parse(await readFile(join(handoff, "identity.json"), "utf8"));
+      assertMacOsReleaseHandoffIdentity(identity, {
+        sourceManifestDigest: sourceSnapshot.manifestDigest,
+        ...buildIdentity,
+        builderImageId: process.env.LAMARCK_SHELL_BUILDER_IMAGE_ID,
+      });
+      builderImageId = identity.builderImageId;
+      await validateMacOsShellBuildExport(join(handoff, "export"), sourceSnapshotRoot, builderImageId);
+      await cp(join(handoff, "export"), shellBuildExport, { recursive: true, force: false, errorOnExist: true });
+    } else {
+      await mkdir(shellBuildExport, { mode: 0o700 });
+      builderImageId = await buildShellFromSnapshot(
+        sourceSnapshotRoot, shellBuildExport, sourceSnapshot.manifestDigest, buildIdentity,
+      );
+    }
     await validateMacOsReleaseSourceSnapshot(sourceSnapshotRoot);
     await validateMacOsShellBuildExport(
       shellBuildExport,
@@ -188,6 +202,7 @@ async function packageRelease(releaseConfig, signingIdentity) {
     const notarization = capture("xcrun", [
       "notarytool", "submit", submissionArchive,
       "--keychain-profile", releaseConfig.notaryProfile,
+      ...(releaseConfig.notaryKeychain ? ["--keychain", releaseConfig.notaryKeychain] : []),
       "--wait",
       "--output-format", "json",
     ]);
@@ -209,8 +224,22 @@ async function packageRelease(releaseConfig, signingIdentity) {
     await mkdir(publishRoot, { mode: 0o755 });
     await rename(appPath, join(publishRoot, releaseConfig.appName));
     await rename(distributionArchive, join(publishRoot, basename(releaseConfig.finalArchivePath)));
+    const archive = await hashFile(join(publishRoot, basename(releaseConfig.finalArchivePath)));
+    const guest = await validateGuestRelease(releaseConfig.guestReleaseRoot);
+    await writeFile(join(publishRoot, `Lamarck-${releaseConfig.version}.release.json`), `${JSON.stringify({
+      channel: "stable",
+      version: releaseConfig.version,
+      file: basename(releaseConfig.finalArchivePath),
+      sha256: `sha256:${archive.sha256}`,
+      bytes: archive.size,
+      pub_date: new Date().toISOString(),
+      signing: "developer-id-notarized",
+      ...(guest.descriptor.correspondingSource ? {
+        openSource: { purpose: "license-compliance", ...guest.descriptor.correspondingSource },
+      } : {}),
+    }, null, 2)}\n`, { flag: "wx", mode: 0o644 });
     // stagingRoot is created beside outputRoot, so this one RENAME_EXCL
-    // publishes the complete pair or nothing on the same filesystem. Unlike
+    // publishes the app, ZIP and metadata together on the same filesystem. Unlike
     // rename(), it cannot replace even a concurrently-created empty directory.
     await publishDirectoryNoReplace(
       publishRoot,
@@ -373,56 +402,6 @@ async function writeAll(handle, buffer, position) {
   }
 }
 
-async function buildShellFromSnapshot(snapshotRoot, exportRoot, manifestDigest, buildIdentity) {
-  if (!/^sha256:[a-f0-9]{64}$/.test(manifestDigest)) {
-    throw new Error("macOS release source snapshot digest is invalid");
-  }
-  const dockerfile = join(
-    snapshotRoot,
-    "desktop", "capsule-guest", "buildroot", "Dockerfile",
-  );
-  const dockerContext = dirname(dockerfile);
-  const builderImageIdFile = join(dirname(exportRoot), "builder-image-id");
-  run("docker", [
-    "build",
-    "--platform", "linux/arm64",
-    "--file", dockerfile,
-    "--iidfile", builderImageIdFile,
-    dockerContext,
-  ]);
-  await requireRealFile(builderImageIdFile, "pinned builder image identity file");
-  const builderImageId = (await readFile(builderImageIdFile, "utf8")).trim();
-  if (!/^sha256:[a-f0-9]{64}$/.test(builderImageId)) {
-    throw new Error("pinned macOS release builder has an invalid immutable image identity");
-  }
-  const user = `${process.getuid()}:${process.getgid()}`;
-  run("docker", [
-    "run", "--rm",
-    "--platform", "linux/arm64",
-    "--network", "bridge",
-    "--read-only",
-    "--cap-drop=ALL",
-    "--security-opt=no-new-privileges",
-    "--pids-limit", "512",
-    "--memory", "4g",
-    "--user", user,
-    "--tmpfs", "/work:rw,nosuid,nodev,exec,size=3221225472,mode=1777",
-    "--tmpfs", "/tmp:rw,nosuid,nodev,size=268435456,mode=1777",
-    "--volume", `${snapshotRoot}:/snapshot:ro`,
-    "--volume", `${exportRoot}:/export:rw`,
-    "--env", `LAMARCK_BUILDER_IMAGE_ID=${builderImageId}`,
-    "--env", `LAMARCK_BUILD_VERSION=${buildIdentity.version}`,
-    "--env", `LAMARCK_BUILD_COMMIT=${buildIdentity.commit}`,
-    "--env", `LAMARCK_MARKETPLACE_SIGNING_KEY_ID=${process.env.LAMARCK_MARKETPLACE_SIGNING_KEY_ID}`,
-    "--env", `LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY=${process.env.LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY}`,
-    builderImageId,
-    "/usr/local/bin/node",
-    "/snapshot/scripts/build-macos-release-shell-inside.mjs",
-    "/snapshot",
-    "/export",
-  ]);
-  return builderImageId;
-}
 
 async function assembleApplication(
   appPath,
@@ -474,6 +453,7 @@ async function assembleApplication(
     name: "@lamarck/shell",
     version: releaseConfig.version,
     private: true,
+    desktopUpdateChannel: "stable",
     main: "dist-electron/main.cjs",
   })}\n`, { encoding: "utf8", mode: 0o644, flag: "wx" });
   await copyRealTree(join(shellBuildExport, "dist"), join(appResources, "dist"));
@@ -562,6 +542,7 @@ async function validatePackagedApplication(appPath, releaseConfig) {
     name: "@lamarck/shell",
     version: releaseConfig.version,
     private: true,
+    desktopUpdateChannel: "stable",
     main: "dist-electron/main.cjs",
   };
   const actualPackage = JSON.parse(await readFile(join(appResources, "package.json"), "utf8"));

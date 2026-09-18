@@ -1,3 +1,4 @@
+import { DesktopUpdater, supportsDesktopUpdates } from "./desktop-updater";
 import { RUNTIME_STARTUP_TIMEOUT_MS } from "@lamarck/capsule";
 import { loadManagedCliArtifact } from "./capsule/managed-cli-artifact";
 // Electron main process
@@ -7,6 +8,7 @@ import { loadManagedCliArtifact } from "./capsule/managed-cli-artifact";
 
 import {
   app,
+  autoUpdater,
   BrowserWindow,
   dialog,
   ipcMain,
@@ -140,6 +142,8 @@ const workspaceVault = new WorkspaceVaultStateController();
 let nextTerminalId = 1;
 let isQuitting = false;
 let shutdownComplete = false;
+let shutdownTask: Promise<void> | undefined;
+let desktopUpdater: DesktopUpdater | undefined;
 let runtimeQueue: Promise<void> = Promise.resolve();
 let runtimeRelaunchRequested = false;
 const startedFromRuntimeRelaunch = process.argv.includes(RUNTIME_RELAUNCH_ARG);
@@ -2867,6 +2871,31 @@ app.whenReady().then(async () => {
     workspace = "";
     workspaceVault.begin("");
   }
+  let updateChannel: unknown;
+  try {
+    updateChannel = JSON.parse(readFileSync(join(app.getAppPath(), "package.json"), "utf8")).desktopUpdateChannel;
+  } catch { /* Development builds do not carry a production channel. */ }
+  desktopUpdater = new DesktopUpdater({
+    updater: autoUpdater,
+    enabled: supportsDesktopUpdates(process.platform, process.arch, app.isPackaged, updateChannel),
+    version: app.getVersion(),
+    publish: (state) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("desktop:updateState", state);
+    },
+    prepareToQuit: prepareDesktopShutdown,
+  });
+  ipcMain.handle("desktop:getUpdateState", (event) => {
+    requireShellIpc(event);
+    return desktopUpdater!.getState();
+  });
+  ipcMain.handle("desktop:checkUpdate", (event) => {
+    requireShellIpc(event);
+    return desktopUpdater!.check();
+  });
+  ipcMain.handle("desktop:installUpdate", (event) => {
+    requireShellIpc(event);
+    return desktopUpdater!.install();
+  });
   ipcMain.handle("auth:getCoreToken", (event) => {
     requireShellIpc(event);
     return CORE_TOKEN;
@@ -3131,7 +3160,10 @@ app.whenReady().then(async () => {
   // The shell is useful even while Core is starting or unavailable. Create the
   // window first so Keychain prompts and recovery failures never block the UI.
   try {
-    if (!isQuitting) await createWindow();
+    if (!isQuitting) {
+      await createWindow();
+      desktopUpdater.start();
+    }
   } finally {
     releaseInitialStartup();
   }
@@ -3149,20 +3181,23 @@ app.on("window-all-closed", () => {
   app.quit();
 });
 
+function prepareDesktopShutdown(): Promise<void> {
+  if (shutdownTask) return shutdownTask;
+  isQuitting = true;
+  desktopUpdater?.stop();
+  disposeAllTerminals();
+  // Wait for any in-flight startup/workspace operation before teardown.
+  shutdownTask = enqueueRuntime(() => stopRuntimeAfterFailure(false))
+    .catch((error) => {
+      console.error(`[electron] Runtime shutdown required process exit: ${errorMessage(error)}`);
+    })
+    .then(() => { shutdownComplete = true; });
+  return shutdownTask;
+}
+
 app.on("before-quit", (event) => {
   if (shutdownComplete) return;
   event.preventDefault();
   if (isQuitting) return;
-  isQuitting = true;
-  disposeAllTerminals();
-  void stopRuntimeAfterFailure(false)
-    .catch((error) => {
-      console.error(`[electron] Runtime shutdown required process exit: ${errorMessage(error)}`);
-    })
-    .finally(() => {
-      shutdownComplete = true;
-      // Runtime authority is fully torn down above. Use Electron's immediate
-      // exit path without re-entering before-quit.
-      app.exit(0);
-    });
+  void prepareDesktopShutdown().then(() => app.quit());
 });

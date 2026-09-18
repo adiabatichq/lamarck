@@ -1,3 +1,4 @@
+import { DesktopUpdate } from "../components/DesktopUpdate";
 import { AiSources } from './AiSources';
 import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
 import { WorkspacePanel } from "../components/WorkspacePanel";
@@ -199,6 +200,7 @@ export function SystemRoom({
             <WorkspaceIcon />
             <span>Workspace</span>
           </button>
+          <DesktopUpdate />
           <div className={styles.systemFoot}>
             <span>Local control plane</span>
             <span>v0.1</span>

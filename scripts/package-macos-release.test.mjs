@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { assertMacOsReleaseHandoffIdentity } from "./macos-release-builder.mjs";
 import {
   link,
   lstat,
@@ -77,6 +78,15 @@ const validEnvironment = {
   LAMARCK_MARKETPLACE_SIGNING_KEY_ID: "marketplace-test-1",
   LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY: Buffer.alloc(32, 7).toString("base64"),
 };
+
+test("CI handoff binds the source, version, commit and independently supplied builder", () => {
+  const expected = { sourceManifestDigest: `sha256:${"a".repeat(64)}`, version: "0.1.0", commit: "b".repeat(40), builderImageId: `sha256:${"c".repeat(64)}` };
+  assert.doesNotThrow(() => assertMacOsReleaseHandoffIdentity({ ...expected }, expected));
+  for (const key of Object.keys(expected)) {
+    assert.throws(() => assertMacOsReleaseHandoffIdentity({ ...expected, [key]: "different" }, expected));
+  }
+  assert.throws(() => assertMacOsReleaseHandoffIdentity(expected, { ...expected, builderImageId: undefined }));
+});
 
 test("alpha and release packages include and verify the managed CLI before signing", async (t) => {
   for (const name of ["package-macos-alpha.mjs", "package-macos-release.mjs"]) {
@@ -410,9 +420,9 @@ test("Marketplace trust roots are sealed at build time and required by macOS pac
   }
 });
 
-test("Alpha Desktop workflow supplies the sealed Marketplace trust root", async () => {
+test("Desktop Release workflow supplies the sealed Marketplace trust root", async () => {
   const workflow = await readFile(
-    join(root, ".github", "workflows", "alpha-desktop.yml"),
+    join(root, ".github", "workflows", "desktop-release.yml"),
     "utf8",
   );
   assert.match(workflow, /environment: r2-releases/);
@@ -774,6 +784,11 @@ test("Shell builder inventory is bound to exact snapshot, lock, image, and tool 
     lockDigest,
     packageLock,
   ));
+  // Embedded AI runtimes exceed the ordinary source/output file bound.
+  const largeRuntime = { ...inventory.outputs[0], path: "dist-electron/ai-runtimes/codex", size: 256 * 1024 * 1024 };
+  assert.doesNotThrow(() => assertBuilderInventory({ ...inventory, outputs: [largeRuntime] }, source, image, lockDigest, packageLock));
+  assert.throws(() => assertBuilderInventory({ ...inventory, outputs: [{ ...largeRuntime, path: "dist/large.js" }] }, source, image, lockDigest, packageLock));
+  assert.throws(() => assertBuilderInventory({ ...inventory, outputs: [{ ...largeRuntime, size: 513 * 1024 * 1024 }] }, source, image, lockDigest, packageLock));
   assert.throws(() => assertBuilderInventory(
     { ...inventory, builderImageId: `sha256:${"d".repeat(64)}` },
     source,

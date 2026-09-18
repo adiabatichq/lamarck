@@ -20,7 +20,7 @@ export const MACOS_ELECTRON_ARTIFACT = Object.freeze({
 const DEVELOPER_ID_PREFIX = "Developer ID Application:";
 const CERTIFICATE_SHA1_PATTERN = /^[A-Fa-f0-9]{40}$/;
 const BUNDLE_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{1,126}[A-Za-z0-9])?$/;
-const VERSION_PATTERN = /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){1,3}$/;
+const VERSION_PATTERN = /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){2}$/;
 const SAFE_PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$/;
 
 export const MACOS_RELEASE_ENTITLEMENTS = Object.freeze({
@@ -91,6 +91,8 @@ export function loadMacOsReleaseConfig({
     root,
     codesignIdentity,
     notaryProfile: notaryProfileName,
+    notaryKeychain: env.LAMARCK_NOTARY_KEYCHAIN === undefined ? undefined
+      : absoluteResolvedPath(root, env.LAMARCK_NOTARY_KEYCHAIN, "LAMARCK_NOTARY_KEYCHAIN"),
     version,
     bundleIdentifier,
     expectedGuestArchitecture,
@@ -301,7 +303,7 @@ export function notaryProfile(value) {
 export function releaseVersion(value) {
   const version = boundedSingleLine(value, "LAMARCK_RELEASE_VERSION");
   if (!VERSION_PATTERN.test(version)) {
-    throw new Error("LAMARCK_RELEASE_VERSION must contain 2-4 numeric components");
+    throw new Error("LAMARCK_RELEASE_VERSION must contain three numeric components (x.y.z)");
   }
   return version;
 }

@@ -1,0 +1,4 @@
+.update { display: flex; flex-direction: column; gap: 4px; -webkit-app-region: no-drag; }
+.update button { color: inherit; font: inherit; font-size: 12px; background: transparent; border: 1px solid currentColor; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+.update button:disabled { opacity: .6; cursor: default; }
+.error { max-width: 220px; font-size: 11px; }

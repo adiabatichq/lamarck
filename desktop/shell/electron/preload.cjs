@@ -1,6 +1,14 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("lamarckHost", {
+  getDesktopUpdateState: () => ipcRenderer.invoke("desktop:getUpdateState"),
+  checkDesktopUpdate: () => ipcRenderer.invoke("desktop:checkUpdate"),
+  installDesktopUpdate: () => ipcRenderer.invoke("desktop:installUpdate"),
+  onDesktopUpdate: (callback) => {
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on("desktop:updateState", listener);
+    return () => ipcRenderer.removeListener("desktop:updateState", listener);
+  },
   getCoreToken: () => ipcRenderer.invoke("auth:getCoreToken"),
   getRecoveryCode: () => ipcRenderer.invoke("auth:getRecoveryCode"),
   importRecoveryCode: (recoveryCode) => ipcRenderer.invoke("auth:importRecoveryCode", recoveryCode),

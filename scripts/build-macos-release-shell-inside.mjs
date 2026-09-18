@@ -207,7 +207,7 @@ async function copyOutputTree(sourcePath, destinationPath, options = {}) {
     if (sourceDetails.isSymbolicLink()) throw new Error(`macOS release build output contains link: ${from}`);
     if (sourceDetails.isDirectory()) await copyOutputTree(from, to);
     else if (sourceDetails.isFile()) {
-      if (sourceDetails.nlink !== 1 || sourceDetails.size > 64 * 1024 * 1024) {
+      if (sourceDetails.nlink !== 1 || sourceDetails.size > (/\/ai-runtimes\/(?:codex|claude|codex-code-mode-host)$/.test(from) ? 512 : 64) * 1024 * 1024) {
         throw new Error(`macOS release build output is not a bounded single-link file: ${from}`);
       }
       await copyStableOutputFile(

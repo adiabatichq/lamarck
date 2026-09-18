@@ -211,8 +211,14 @@ describe("Shell Host configuration", () => {
       /app\.on\("before-quit", \(event\) => \{[\s\S]*?\n\}\);/,
     )?.[0];
     if (!quit) throw new Error("before-quit lifecycle is missing");
-    expect(quit.indexOf("isQuitting = true")).toBeLessThan(
-      quit.indexOf("void stopRuntimeAfterFailure(false)"),
+    const shutdown = mainSource.match(
+      /function prepareDesktopShutdown\([\s\S]*?\n\}/,
+    )?.[0];
+    if (!shutdown) throw new Error("Desktop shutdown preparation is missing");
+    expect(quit).toContain("void prepareDesktopShutdown()");
+    expect(shutdown.indexOf("isQuitting = true")).toBeGreaterThan(-1);
+    expect(shutdown.indexOf("isQuitting = true")).toBeLessThan(
+      shutdown.indexOf("enqueueRuntime(() => stopRuntimeAfterFailure(false))"),
     );
   });
 
@@ -474,23 +480,26 @@ describe("Shell Host configuration", () => {
     );
   });
 
-  test("exits Electron only after bounded runtime cleanup settles", () => {
+  test("honors explicit quit only after runtime cleanup settles", () => {
     const quit = mainSource.match(
       /app\.on\("before-quit", \(event\) => \{[\s\S]*?\n\}\);/,
     )?.[0];
     if (!quit) throw new Error("before-quit lifecycle is missing");
 
-    const stopRuntime = quit.indexOf("void stopRuntimeAfterFailure(false)");
-    const failureLog = quit.indexOf("Runtime shutdown required process exit");
-    const finallyBlock = quit.indexOf(".finally(() =>");
-    const shutdownComplete = quit.indexOf("shutdownComplete = true");
-    const forcedExit = quit.indexOf("app.exit(0)");
+    const shutdown = mainSource.match(
+      /function prepareDesktopShutdown\([\s\S]*?\n\}/,
+    )?.[0];
+    if (!shutdown) throw new Error("Desktop shutdown preparation is missing");
+    const stopRuntime = shutdown.indexOf("stopRuntimeAfterFailure(false)");
+    const failureLog = shutdown.indexOf("Runtime shutdown required process exit");
+    const shutdownComplete = shutdown.indexOf("shutdownComplete = true");
     expect(stopRuntime).toBeGreaterThan(-1);
     expect(failureLog).toBeGreaterThan(stopRuntime);
-    expect(finallyBlock).toBeGreaterThan(failureLog);
-    expect(shutdownComplete).toBeGreaterThan(finallyBlock);
-    expect(forcedExit).toBeGreaterThan(shutdownComplete);
-    expect(quit).not.toContain("app.quit()");
+    expect(shutdownComplete).toBeGreaterThan(failureLog);
+    expect(quit).toContain("if (shutdownComplete) return;");
+    expect(quit).toContain("event.preventDefault();");
+    expect(quit).toContain("void prepareDesktopShutdown().then(() => app.quit())");
+    expect(quit).not.toContain("app.exit(");
     expect(quit).not.toContain("process.exit(");
   });
 

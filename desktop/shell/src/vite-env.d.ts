@@ -38,6 +38,10 @@ type HostWorkspaceOpenResult =
 
 interface Window {
   lamarckHost?: {
+    getDesktopUpdateState(): Promise<import("../electron/desktop-updater").DesktopUpdateState>;
+    checkDesktopUpdate(): Promise<import("../electron/desktop-updater").DesktopUpdateState>;
+    installDesktopUpdate(): Promise<void>;
+    onDesktopUpdate(callback: (state: import("../electron/desktop-updater").DesktopUpdateState) => void): () => void;
     getCoreToken(): Promise<string>;
     getRecoveryCode(): Promise<string>;
     importRecoveryCode(recoveryCode: string): Promise<{ coreBaseUrl: string }>;

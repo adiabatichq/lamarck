@@ -19,6 +19,10 @@ export const MACOS_RELEASE_SOURCE_FILES = Object.freeze([
   "package.json",
   "package-lock.json",
   "tsconfig.json",
+  "LICENSE",
+  "desktop/cli/package.json",
+  "desktop/cli/tsconfig.build.json",
+  "desktop/cli/scripts/build.mjs",
   "desktop/capsule/package.json",
   "desktop/capsule/tsconfig.json",
   "desktop/capsule-guest/buildroot/Dockerfile",
@@ -52,6 +56,7 @@ export const MACOS_RELEASE_SOURCE_FILES = Object.freeze([
 ]);
 
 export const MACOS_RELEASE_SOURCE_DIRECTORIES = Object.freeze([
+  "desktop/cli/src",
   "desktop/capsule/src",
   "desktop/capsule-vm-macos/Sources",
   "desktop/core/src",
@@ -64,6 +69,11 @@ export const MACOS_RELEASE_SOURCE_DIRECTORIES = Object.freeze([
 const MAX_SOURCE_FILES = 20_000;
 const MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_SOURCE_TOTAL_BYTES = 512 * 1024 * 1024;
+const MAX_OUTPUT_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
+function maxOutputFileBytes(path) {
+  return /^dist-electron\/ai-runtimes\/(?:codex|claude|codex-code-mode-host)$/.test(path)
+    ? 512 * 1024 * 1024 : MAX_SOURCE_FILE_BYTES;
+}
 const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
 
 export async function createMacOsReleaseSourceSnapshot(
@@ -325,13 +335,13 @@ export function assertBuilderInventory(
       || (previous && compareNames(previous, output.path) >= 0)
       || !Number.isSafeInteger(output.size)
       || output.size < 0
-      || output.size > MAX_SOURCE_FILE_BYTES
+      || output.size > maxOutputFileBytes(output.path)
       || ![0o644, 0o755].includes(output.mode)
       || !isSha256(output.sha256)
     ) throw new Error("macOS Shell builder output inventory is invalid");
     previous = output.path;
     totalOutputBytes += output.size;
-    if (totalOutputBytes > MAX_SOURCE_TOTAL_BYTES) {
+    if (totalOutputBytes > MAX_OUTPUT_TOTAL_BYTES) {
       throw new Error("macOS Shell builder output exceeds its total byte limit");
     }
   }
@@ -482,7 +492,7 @@ async function describeOutputTrees(root, directories) {
   const files = await Promise.all(paths.map(async (relativePath) => {
     const path = join(root, relativePath);
     const details = await lstat(path);
-    const bytes = await readStableFile(path, MAX_SOURCE_FILE_BYTES, {
+    const bytes = await readStableFile(path, maxOutputFileBytes(relativePath), {
       allowEmpty: true,
       requireSingleLink: true,
     });

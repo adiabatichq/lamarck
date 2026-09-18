@@ -115,7 +115,7 @@ these non-secret build inputs:
 | `LAMARCK_MARKETPLACE_SIGNING_PUBLIC_KEY` | Canonical base64 for the matching raw 32-byte Ed25519 public key |
 
 Provide both values as GitHub environment secrets under `r2-releases`, which
-the Alpha Desktop package job reads. Their external source of truth and sync
+the Desktop Release build job reads. Their external source of truth and sync
 mechanism are release-operations concerns outside this repository. Export them
 directly for a local release build. Never place the Backend private key in
 GitHub or the Desktop build environment.
@@ -203,46 +203,94 @@ release workflow additionally fetches and verifies the source archive through
 the public domain. The source archive is never staged into the App or consumed
 by Desktop updates.
 
-## Alpha Desktop workflow
+## Signed Desktop releases
 
-Alpha Desktop releases are high-frequency and manually dispatched:
+The **Desktop Release** workflow (`.github/workflows/desktop-release.yml`) replaces
+Alpha Desktop. Dispatch it from protected `main` with a new three-component
+version such as `0.1.0`. The version is embedded in both the application and its
+System identity; the Git commit must match the clean checkout.
 
-1. Ensure `main` contains the intended Guest pin.
-2. Run **Alpha Desktop** from `main`. Optionally provide a full version such as
-   `0.1.0-alpha.12`; otherwise the packager generates a UTC-stamped version.
-3. The macOS arm64 job downloads and verifies the pinned Guest runtime without
-   the optional source archive, builds the VM helper, stages native resources,
-   packages the ad-hoc-signed App, and runs the packaged node-pty smoke.
-4. Exactly the ZIP, its SHA-256 sidecar, and the release JSON are copied to the
-   non-hidden `release-handoff/alpha/` directory and transferred through a
-   three-day GitHub Actions artifact.
-5. After `r2-releases` environment approval, a separate Linux job performs the
-   R2 upload, verifies the ZIP through the public domain, and writes
-   `latest.json` last.
+Doppler project `lamarck-releases`, config `prod`, syncs these additional secrets
+to the GitHub `r2-releases` environment:
 
-Desktop R2 objects:
+| Secret | Value |
+|---|---|
+| `LAMARCK_CODESIGN_P12_BASE64` | Base64 of the Developer ID Application certificate and private key export |
+| `LAMARCK_CODESIGN_P12_PASSWORD` | Password protecting that P12 export |
+| `APPLE_API_KEY_P8_BASE64` | Base64 of the App Store Connect Team API private key |
+| `APPLE_API_KEY_ID` | Team API key ID |
+| `APPLE_API_ISSUER_ID` | Team API issuer UUID |
+| `APPLE_TEAM_ID` | Developer Program team ID matching the signing certificate |
+
+An Apple ID password or app-specific password is not used. The existing
+Marketplace public trust root and R2 secrets remain in the same environment.
+Signing material is imported into a temporary macOS runner keychain. P12/P8
+files are deleted after import; an always-run cleanup restores the search list
+and deletes the keychain. Only the package step can use the installed signing
+identity; R2 credentials are provided only to the publish step.
+
+The existing device-identity distribution contract also requires these GitHub
+**environment variables**, each set to `1` only after the corresponding review
+has actually completed:
+
+- `LAMARCK_DEVICE_IDENTITY_APPLE_POLICY_REVIEW`
+- `LAMARCK_DEVICE_IDENTITY_APPLE_DTS_REVIEW`
+- `LAMARCK_DEVICE_IDENTITY_APPLE_LEGAL_REVIEW`
+
+These are project release acknowledgements, not Apple credentials. Creating a
+Developer ID certificate does not satisfy them. The workflow checks them before
+starting the build and preserves `requireAppleDeviceIdentityReviews` unchanged.
+
+The workflow performs three jobs:
+
+1. Linux arm64 creates a sealed source snapshot and builds the Shell inside the
+   pinned Docker toolchain. A tar handoff preserves file modes and includes the
+   exact source digest, version, commit, builder identity and output inventory.
+2. macOS recreates the source snapshot and verifies the same-run handoff against
+   it and the Linux job's builder identity. It fetches the signed Guest, builds
+   native helpers, signs with Developer ID, submits to Apple notarization,
+   staples the ticket, and runs signature/Gatekeeper/runtime checks. The final
+   ZIP and release metadata are transferred as a three-day Actions artifact.
+3. Linux uploads immutable release files to R2, downloads the public ZIP and
+   verifies its SHA-256 and size, then atomically advances `latest.json`.
+   Downgrading the stable pointer is rejected; publish fixes with a higher
+   version. Retries reuse identical immutable files and reject byte conflicts.
 
 ```text
-desktop/macos/arm64/alpha/<version>/Lamarck-Alpha-<version>-macos-arm64.zip
-desktop/macos/arm64/alpha/<version>/SHA256SUMS
-desktop/macos/arm64/alpha/latest.json
+desktop/macos/arm64/stable/<version>/Lamarck-<version>-macos-arm64.zip
+desktop/macos/arm64/stable/<version>/SHA256SUMS
+desktop/macos/arm64/stable/latest.json
 ```
 
-Version directories are immutable. `latest.json` is the only mutable Desktop
-object and is sent with `Cache-Control: no-cache`. A failed run can be retried
-with the same version: matching immutable objects are retained and publication
-continues. A hash or size conflict always fails closed.
+`latest.json` is the only mutable pointer (`Cache-Control: no-cache`). It
+contains both website release metadata and Squirrel.Mac's `currentRelease` /
+`releases[].updateTo` static feed, so both consumers select the same ZIP. It also
+carries the Guest source archive link for license compliance; that source
+archive is never consumed by the updater. The production updater origin is
+fixed to `https://releases.lamarck.ai`; forks must explicitly change their
+publisher and client together.
 
-`latest.json` also carries the signed Guest source archive metadata used by the
-website's `/open-source/` page. That archive is presented as optional developer
-and license-compliance material, never as a second Desktop download.
+Only the production packager writes `desktopUpdateChannel: stable` into the
+signed app package. The installed Mac arm64 app checks on launch and every six hours,
+downloads the full ZIP with Electron's signed Squirrel.Mac updater, and shows
+**Update & Restart** once ready. System also offers **Check for updates**.
+Before installation the Host drains runtime operations and tears down App
+viewers, terminals, Core, Guard and Capsule resources. Workspace files remain
+outside the application bundle. A downloaded update can also install on the
+next normal application launch. `package:patch` remains a developer artifact,
+not a delta update format.
 
-## Transition-period update behavior
+## First signed release cutover
 
-Alpha packages are ad-hoc signed and are not notarized. The current channel is
-therefore intended for explicit tester distribution, not broad public install.
-The Desktop may check `latest.json` and download an update, but a production
-quality self-replacing updater needs its own signed update manifest, atomic
-replacement helper, rollback path, and permission fallback. Electron's
-Squirrel-based updater becomes the normal path after Developer ID signing and
-notarization are available.
+Deploy the updated website/backend readers before publishing the first stable
+release. They prefer stable and fall back to the existing Alpha channel only
+when the stable pointer returns 404. An invalid stable document or server error
+never falls back. No new Alpha workflow runs are available; old immutable Alpha
+objects and local Alpha tooling remain for historical/testing use.
+
+Existing Alpha installations use a different bundle identifier and ad-hoc
+signing. Users must manually install the first signed `Lamarck.app` in
+Applications. Subsequent signed versions can update in place. Verify the first
+release's download, Gatekeeper launch and existing Workspace access, then ship
+a higher test version and verify check → download → restart → new version.
+Unit/contract tests do not replace this two-version signed Mac acceptance test.
