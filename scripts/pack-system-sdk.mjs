@@ -117,7 +117,7 @@ async function verifyConsumer(tarballPath) {
       import { system as nodeSystem } from "@lamarck/system/node";
       import { SYSTEM_OPERATIONS, type SystemOperation } from "@lamarck/system/protocol";
       import { generateText, streamText, embed, embedMany, type LanguageModel, type EmbeddingModel } from 'ai';
-      const selection = { model: 'openai:gpt-5-mini', accessSource: 'opaque-source' };
+      const selection = { model: 'openai:gpt-5.6-luna', accessSource: 'opaque-source' };
       const language: LanguageModel = browserSystem.ai.languageModel(selection);
       const embedding: EmbeddingModel = nodeSystem.ai.embeddingModel(selection);
       void (() => generateText({ model: language, prompt: 'hello' }));

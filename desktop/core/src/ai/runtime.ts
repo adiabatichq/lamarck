@@ -28,6 +28,7 @@ export function subscriptionEnv(directory: string): NodeJS.ProcessEnv {
     LANG: 'en_US.UTF-8', RUST_LOG: 'off',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', DISABLE_AUTOUPDATER: '1',
     CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1',
+    CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
   };
 }
 export class CodexRpc {

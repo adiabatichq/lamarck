@@ -5,8 +5,14 @@ import { AiError } from './errors';
 
 export const CODEX_CONTAINMENT = Object.freeze({
   'features.shell_tool': false, 'features.unified_exec': false,
-  'features.code_mode': false, 'features.code_mode_host': false,
+  // Model metadata selects direct or code-mode dispatch. The bundled V8 host
+  // has no imports or ambient IO; its tool registry is the same scoped registry.
+  'features.code_mode': false,
+  'features.code_mode_host': { enabled: true, disable_in_process_fallback: true },
+  'features.sleep_tool': false,
   'features.multi_agent': false, 'features.apps': false, 'features.hooks': false,
+  // New model metadata can select the V2 runtime despite the legacy flag.
+  'features.multi_agent_v2': false, 'agents.enabled': false,
   'features.browser_use': false, 'features.computer_use': false,
   'features.image_generation': false, 'features.view_image': false,
   'features.workspace_dependencies': false, 'features.skills': false,
@@ -19,6 +25,21 @@ export const CODEX_CONTAINMENT = Object.freeze({
   'shell_environment_policy.inherit': 'none', 'mcp_servers': {},
 });
 const unknownUsage = (): LanguageModelV4Usage => ({ inputTokens: { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: undefined, text: undefined, reasoning: undefined } });
+interface CodexModelInfo { model: string; displayName?: string; supportedReasoningEfforts: { reasoningEffort: string }[] }
+export async function codexModels(rpc: CodexRpc): Promise<CodexModelInfo[]> {
+  const models: CodexModelInfo[] = [];
+  let cursor: string | undefined;
+  const cursors = new Set<string>();
+  do {
+    const result = await rpc.request('model/list', { includeHidden: false, ...(cursor ? { cursor } : {}) });
+    if (!Array.isArray(result.data) || models.length + result.data.length > 1000 || result.data.some((model: any) => typeof model.model !== 'string' || !model.model || !Array.isArray(model.supportedReasoningEfforts))) throw new AiError('discovery_failed', 'Invalid Codex model discovery');
+    models.push(...result.data);
+    cursor = result.nextCursor ?? undefined;
+    if (cursor && (typeof cursor !== 'string' || cursors.has(cursor))) throw new AiError('discovery_failed', 'Invalid Codex model discovery cursor');
+    if (cursor) cursors.add(cursor);
+  } while (cursor);
+  return models;
+}
 export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationContext): LanguageModelV4 {
   const doStream: LanguageModelV4['doStream'] = async options => {
     if (options.providerOptions && Object.keys(options.providerOptions).length) throw new AiError('unsupported', 'Codex provider overrides are unsupported');
@@ -26,10 +47,23 @@ export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationCo
     // A fresh ephemeral thread receives the complete call's history. Native
     // environment access is disabled in both thread and turn, independently
     // of approval policy. Only invocation-bound dynamic callbacks are exposed.
-    const warnings = ['maxOutputTokens', 'temperature', 'topP', 'topK', 'presencePenalty', 'frequencyPenalty', 'seed', 'stopSequences']
+    const warnings: LanguageModelV4GenerateResult['warnings'] = ['maxOutputTokens', 'temperature', 'topP', 'topK', 'presencePenalty', 'frequencyPenalty', 'seed', 'stopSequences']
       .filter(key => options[key as keyof typeof options] !== undefined)
       .map(feature => ({ type: 'unsupported' as const, feature }));
     if (options.toolChoice && options.toolChoice.type !== 'auto' && options.toolChoice.type !== 'none') throw new AiError('unsupported', 'Codex does not support forced tool selection');
+    const discovered = (await codexModels(rpc)).find(model => model.model === modelId);
+    if (!discovered) throw new AiError('unsupported', 'The selected model is unavailable through this Codex subscription');
+    let effort = options.reasoning === 'provider-default' ? undefined : options.reasoning;
+    if (effort && !discovered.supportedReasoningEfforts.some(option => option.reasoningEffort === effort)) {
+      // Portable minimal maps to native low only when low is advertised.
+      if (effort === 'minimal' && discovered.supportedReasoningEfforts.some(option => option.reasoningEffort === 'low')) {
+        effort = 'low';
+        warnings.push({ type: 'compatibility', feature: 'reasoning', details: 'Codex maps minimal reasoning to the supported low effort.' });
+      } else {
+        warnings.push({ type: 'unsupported', feature: 'reasoning', details: `Codex does not advertise ${effort} reasoning for ${modelId}; using its default.` });
+        effort = undefined;
+      }
+    }
     const system = options.prompt.filter(message => message.role === 'system').map(message => message.content).join('\n\n');
     const history = options.prompt.filter(message => message.role !== 'system');
     const last = history.at(-1);
@@ -47,12 +81,13 @@ export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationCo
     });
     const tools = options.toolChoice?.type === 'none' ? [] : options.tools?.filter(tool => tool.type === 'function') ?? [];
     const declared = new Set(tools.map(tool => tool.name));
-    const { thread } = await rpc.request('thread/start', {
+    const { thread, model: selectedModel } = await rpc.request('thread/start', {
       model: modelId, allowProviderModelFallback: false, ephemeral: true, environments: [],
       approvalPolicy: 'never', sandbox: 'read-only', config: CODEX_CONTAINMENT,
       ...(system ? { baseInstructions: system } : {}),
       dynamicTools: tools.map(tool => ({ type: 'function', name: tool.name, description: tool.description ?? tool.name, inputSchema: tool.inputSchema })),
     });
+    if (selectedModel !== modelId) throw new AiError('unsupported', 'Codex did not retain the explicitly selected model');
     if (items.length) await rpc.request('thread/inject_items', { threadId: thread.id, items });
     let usage = unknownUsage();
     const started = new Set<string>();
@@ -74,7 +109,7 @@ export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationCo
     context.signal.addEventListener('abort', abort, { once: true });
     rpc.onClose = () => rejectDone(new AiError('runtime_closed', 'Codex runtime closed'));
     rpc.onRequest = async (method, params) => {
-      if (method !== 'item/tool/call' || params.threadId !== thread.id || !declared.has(params.tool)) return { decision: 'decline' };
+      if (method !== 'item/tool/call' || params.threadId !== thread.id || params.namespace != null || !declared.has(params.tool)) return { decision: 'decline' };
       const result = await context.tool(params.tool, params.arguments, params.callId);
       emit({ type: 'tool-call', toolCallId: params.callId, toolName: params.tool, input: JSON.stringify(params.arguments), providerExecuted: true });
       emit({ type: 'tool-result', toolCallId: params.callId, toolName: params.tool, result: result as any });
@@ -107,7 +142,7 @@ export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationCo
       threadId: thread.id, environments: [], model: modelId,
       input: [{ type: 'text', text: prompt, text_elements: [] }],
       ...(options.responseFormat?.type === 'json' ? { outputSchema: options.responseFormat.schema ?? { type: 'object' } } : {}),
-      ...(options.reasoning && options.reasoning !== 'provider-default' ? { effort: options.reasoning } : {}),
+      ...(effort ? { effort } : {}),
     });
     void done.then(async () => {
       for (const id of reasoning) emit({ type: 'reasoning-end', id });

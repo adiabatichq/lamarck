@@ -34,12 +34,14 @@ const adapter: AiAdapter = {
   async describe(source) {
     return {
       models: [
-        { id: `${source.provider}:fixture`, name: 'Fixture', provider: source.provider, type: 'language' },
+        { id: `${source.provider}:${source.provider === 'anthropic' ? 'claude-sonnet-5' : 'fixture'}`, name: 'Fixture', provider: source.provider, type: 'language' },
         { id: `${source.provider}:embedding`, name: 'Embedding', provider: source.provider, type: 'embedding' },
+        ...(source.provider === 'anthropic' ? [{ id: 'anthropic:claude-fable-5-1', name: 'Claude Fable 5.1', provider: 'anthropic', type: 'language' as const }] : []),
       ],
       view: { id: source.id, name: source.name, provider: source.provider, kind: source.kind, status: 'ready', discovery: 'known', support: [
-        { model: `${source.provider}:fixture`, streaming: true, structuredOutput: true, tools: true },
+        { model: `${source.provider}:${source.provider === 'anthropic' ? 'claude-sonnet-5' : 'fixture'}`, streaming: true, structuredOutput: true, tools: true },
         { model: `${source.provider}:embedding`, streaming: false, structuredOutput: false, tools: false, maxEmbeddingsPerCall: 2, supportsParallelCalls: true },
+        ...(source.provider === 'anthropic' ? [{ model: 'anthropic:claude-fable-5-1', streaming: true, structuredOutput: true, tools: true }] : []),
       ] },
     };
   },
@@ -129,6 +131,21 @@ async function systemFor(path: 'browser' | 'node', id = 'app-a') {
   return createSystem(client.invoke);
 }
 for (const path of ['browser', 'node'] as const) describe(`${path} Capsule channel`, () => {
+  test('discovered subscription selection and App callbacks are independent of family names', async () => {
+    const source = await service.sources.save({ provider: 'anthropic', kind: 'subscription', name: 'Fixture' });
+    const system = await systemFor(path);
+    const options = await system.ai.listOptions();
+    expect(options.accessSources[0].support.map(support => support.model)).toContain('anthropic:claude-fable-5-1');
+    const execute = vi.fn(async () => 'family-independent');
+    const selection = { model: 'anthropic:claude-fable-5-1', accessSource: source.id };
+    await system.ai.withTools({ ...selection, tools: { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) } }, async ({ model, tools }) => {
+      expect((await generateText({ model, tools, prompt: 'hello' })).text).toBe('family-independent');
+      expect(await streamText({ model, tools, prompt: 'hello' }).text).toBe('family-independent');
+    });
+    expect(execute).toHaveBeenCalledTimes(2);
+    await expect(generateText({ model: system.ai.languageModel({ ...selection, model: 'anthropic:unknown' }), prompt: 'hello', maxRetries: 0 })).rejects.toThrow('does not support');
+    expect(service.invocations.size).toBe(0);
+  });
   test('discovery, text, incremental streaming, structured output, embedding batching', async () => {
     const source = await service.sources.save({ provider: 'openai', kind: 'api-key', name: 'Fixture', apiKey: 'private' });
     const system = await systemFor(path);
@@ -151,7 +168,7 @@ for (const path of ['browser', 'node'] as const) describe(`${path} Capsule chann
       const system = await systemFor(path, id);
       const execute = vi.fn(async () => (await system.query('select identity')).rows[0] && id);
       const tools = { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) };
-      const result = await system.ai.withTools({ model: `${provider}:fixture`, accessSource: source.id, tools }, async ({ model, tools }) => generateText({ model, tools, prompt: 'lookup', stopWhen: stepCountIs(2) }));
+      const result = await system.ai.withTools({ model: `${provider}:${provider === 'anthropic' ? 'claude-sonnet-5' : 'fixture'}`, accessSource: source.id, tools }, async ({ model, tools }) => generateText({ model, tools, prompt: 'lookup', stopWhen: stepCountIs(2) }));
       expect(execute).toHaveBeenCalledTimes(1); expect(result.text).toBe(kind === 'subscription' ? id : 'hello');
     }
   });

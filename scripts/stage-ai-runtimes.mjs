@@ -3,7 +3,8 @@ import { cp, mkdir, readFile, writeFile, chmod, mkdtemp, rm } from 'node:fs/prom
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { spawnSync, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import assert from 'node:assert/strict';
 const require = createRequire(import.meta.url);
 export async function stageAiRuntimes(outputDirectory, platform = process.platform, arch = process.arch) {
   const target = join(outputDirectory, 'ai-runtimes');
@@ -15,8 +16,8 @@ export async function stageAiRuntimes(outputDirectory, platform = process.platfo
     if (JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).version !== version) throw new Error('AI runtime package version differs from the pinned contract');
   }
   const extension = platform === 'win32' ? '.exe' : '';
-  const paths = { codex: join(codexRoot, 'vendor', triple, 'bin', `codex${extension}`), claude: join(claudeRoot, `claude${extension}`) };
-  const versions = { codex: '0.154.0', claude: '2.1.263' };
+  const paths = { 'codex-code-mode-host': join(codexRoot, 'vendor', triple, 'bin', `codex-code-mode-host${extension}`), codex: join(codexRoot, 'vendor', triple, 'bin', `codex${extension}`), claude: join(claudeRoot, `claude${extension}`) };
+  const versions = { 'codex-code-mode-host': '0.154.0', codex: '0.154.0', claude: '2.1.263' };
   const files = {};
   for (const [name, path] of Object.entries(paths)) {
     const bytes = await readFile(path);
@@ -34,7 +35,7 @@ export async function validateAiRuntimes(directory, platform, arch) {
   const manifest = JSON.parse(await readFile(join(directory, 'manifest.json'), 'utf8'));
   if (manifest.schemaVersion !== 1 || manifest.platform !== platform || manifest.arch !== arch) throw new Error('AI runtime target mismatch');
   const extension = platform === 'win32' ? '.exe' : '';
-  const expected = { [`codex${extension}`]: '0.154.0', [`claude${extension}`]: '2.1.263' };
+  const expected = { [`codex-code-mode-host${extension}`]: '0.154.0', [`codex${extension}`]: '0.154.0', [`claude${extension}`]: '2.1.263' };
   if (Object.keys(manifest.files).sort().join() !== Object.keys(expected).sort().join()) throw new Error('Unexpected AI runtime assets');
   for (const [name, version] of Object.entries(expected)) {
     const file = await readFile(join(directory, name)); const descriptor = manifest.files[name];
@@ -48,11 +49,106 @@ export async function smokeAiRuntimes(directory) {
   try {
     const codex = spawnSync(join(directory, 'codex'), ['--version'], { cwd: root, env, encoding: 'utf8', timeout: 15000, maxBuffer: 65536 });
     if (codex.status !== 0 || !codex.stdout.includes('0.154.0')) throw new Error('Packaged Codex runtime did not start');
+    await smokeCodexCodeMode(directory, { cwd: root, env });
     const claude = spawnSync(join(directory, 'claude'), ['auth', 'status', '--json'], { cwd: root, env, encoding: 'utf8', timeout: 15000, maxBuffer: 65536 });
     let auth;
     try { auth = JSON.parse(claude.stdout); } catch { throw new Error('Packaged Claude runtime did not initialize under its signing policy'); }
     if (auth.loggedIn !== false) throw new Error('Packaged Claude inherited an ambient account');
   } finally { await rm(root, { recursive: true, force: true }); }
+}
+
+/** Exercise the pinned host's V1 stdio protocol, V8, and a tool callback after signing. */
+export async function smokeCodexCodeMode(directory, { cwd, env }) {
+  const child = spawn(join(directory, 'codex-code-mode-host'), ['--listen', 'stdio'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const closed = new Promise(resolve => child.once('close', resolve));
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4096); });
+  let timer;
+  try {
+    await new Promise((resolve, reject) => {
+      let buffer = Buffer.alloc(0), callbacks = 0, nextId = 2, finished = false;
+      const content = [];
+      const sessionId = 'release-smoke';
+      const fail = error => reject(new Error(`Packaged Codex code-mode smoke failed: ${error.message}`, { cause: error }));
+      timer = setTimeout(() => fail(new Error('timed out executing the tool callback')), 15000);
+      child.once('error', fail);
+      child.stdin.on('error', fail);
+      child.once('close', (code, signal) => {
+        if (finished && code === 0) resolve();
+        else fail(new Error(`helper exited (${signal ?? code}): ${stderr}`));
+      });
+      const send = message => {
+        const payload = Buffer.from(JSON.stringify(message));
+        const header = Buffer.alloc(4); header.writeUInt32LE(payload.length);
+        child.stdin.write(Buffer.concat([header, payload]));
+      };
+      const request = (id, method, extra = {}) => send({ type: 'operation/request', id, request: { method, sessionId, ...extra } });
+      const output = value => {
+        if (value.Yielded) {
+          content.push(...value.Yielded.content_items);
+          request(++nextId, 'session/wait', { request: { cell_id: value.Yielded.cell_id, yield_time_ms: 1000 } });
+          return;
+        }
+        assert.ok(value.Result, 'execution did not finish');
+        assert.equal(value.Result.error_text, null);
+        assert.equal(callbacks, 1, 'tool callback was not executed exactly once');
+        content.push(...value.Result.content_items);
+        assert.deepEqual(content, [{ type: 'input_text', text: 'release-tool-ok' }]);
+        finished = true;
+        child.stdin.end();
+      };
+      const receive = message => {
+        if (message.type === 'connection/ready') {
+          assert.equal(message.selectedVersion, 1);
+          request(1, 'session/open');
+        } else if (message.type === 'operation/response') {
+          assert.equal(message.result.status, 'ok');
+          const value = message.result.value;
+          if (message.id === 1) {
+            assert.equal(value.type, 'session/ready');
+            request(2, 'session/execute', { request: {
+              tool_call_id: 'release-call', yield_time_ms: 1000, max_output_tokens: 100,
+              source: 'text(await tools.lookup({value: "release-probe"}));',
+              enabled_tools: [{ name: 'lookup', tool_name: { name: 'lookup', namespace: null }, description: 'Release smoke callback', kind: 'function', input_schema: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false }, output_schema: null }],
+            } });
+          } else if (value.type === 'wait/completed') {
+            output(value.outcome.LiveCell ?? value.outcome.MissingCell);
+          } else assert.equal(value.type, 'execution/started');
+        } else if (message.type === 'delegate/request') {
+          assert.equal(message.sessionId, sessionId);
+          assert.equal(message.request.type, 'tool/invoke');
+          const invocation = message.request.invocation;
+          assert.deepEqual(invocation.tool_name, { name: 'lookup', namespace: null });
+          assert.equal(invocation.tool_kind, 'function');
+          assert.deepEqual(invocation.input, { value: 'release-probe' });
+          assert.equal(++callbacks, 1);
+          send({ type: 'delegate/response', id: message.id, result: { status: 'ok', value: { type: 'tool/result', result: 'release-tool-ok' } } });
+        } else if (message.type === 'execute/initialResponse') {
+          assert.equal(message.result.status, 'ok');
+          output(message.result.value);
+        } else assert.equal(message.type, 'cell/closed');
+      };
+      child.stdout.on('data', chunk => {
+        try {
+          buffer = Buffer.concat([buffer, chunk]);
+          assert.ok(buffer.length <= 65536, 'unexpectedly large helper output');
+          while (buffer.length >= 4) {
+            const length = buffer.readUInt32LE(0);
+            assert.ok(length <= 65532, 'unexpectedly large helper frame');
+            if (buffer.length < length + 4) break;
+            const message = JSON.parse(buffer.subarray(4, length + 4).toString('utf8'));
+            buffer = buffer.subarray(length + 4);
+            receive(message);
+          }
+        } catch (error) { fail(error); }
+      });
+      send({ type: 'connection/hello', supportedVersions: [1], requiredCapabilities: [], optionalCapabilities: [] });
+    });
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    await closed;
+  }
 }
 
 /** The hermetic macOS builder runs on Linux; export only locked Darwin assets. */
@@ -82,6 +178,13 @@ export async function stageMacOsAiRuntimesFromLock(sourceRoot, outputDirectory) 
       if (bytes.length < 1024) throw new Error('AI executable is empty');
       await writeFile(join(target, spec.name), bytes, { mode: 0o755 }); await chmod(join(target, spec.name), 0o755);
       files[spec.name] = { version: spec.runtimeVersion, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
+      if (spec.name === 'codex') {
+        const name = 'codex-code-mode-host';
+        const bytes = extract(`package/vendor/aarch64-apple-darwin/bin/${name}`);
+        if (bytes.length < 1024) throw new Error('AI code-mode executable is empty');
+        await writeFile(join(target, name), bytes, { mode: 0o755 }); await chmod(join(target, name), 0o755);
+        files[name] = { version: spec.runtimeVersion, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
+      }
       if (spec.name === 'claude') await writeFile(join(target, 'CLAUDE-LICENSE.md'), extract('package/LICENSE.md'));
     }
     await cp(new URL('./ai-runtime-licenses/CODEX-LICENSE', import.meta.url), join(target, 'CODEX-LICENSE'));

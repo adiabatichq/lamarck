@@ -799,7 +799,7 @@ async function signElectronApplication(appPath, capsuleHelper, identity, sign) {
       throw new Error("packaged node-pty code is missing from the Electron signing set");
     }
   }
-  for (const name of ['codex', 'claude']) {
+  for (const name of ['codex', 'codex-code-mode-host', 'claude']) {
     if (!signableCode.has(resolve(appPath, 'Contents', 'Resources', 'app', 'dist-electron', 'ai-runtimes', name))) throw new Error('AI runtime is missing from the release signing set');
   }
   const bundleSuffixes = [".app", ".framework"];

@@ -24,10 +24,7 @@ export class AiService {
   readonly subscriptions: AiSubscriptions;
   private descriptions = new Map<string, { generation: number; time: number; promise: Promise<AiAccessSource> }>();
   private catalog = new Map(AI_CATALOG.map(model => [model.id, model]));
-  constructor(private db: DatabaseSync, credentials: CredentialStore, secrets: SecretStore, runtimeRoot: string, private adapter?: AiAdapter) {
-    for (const row of db.prepare('SELECT metadata_json FROM ai_models').all() as { metadata_json: string }[]) {
-      const model = JSON.parse(row.metadata_json) as AiModel; this.catalog.set(model.id, model);
-    }
+  constructor(db: DatabaseSync, credentials: CredentialStore, secrets: SecretStore, runtimeRoot: string, private adapter?: AiAdapter) {
     this.sources = new AiSourceStore(db, credentials, secrets, id => {
       this.descriptions.delete(id); this.invocations.cancelSource(id); this.subscriptions.invalidate(id);
     });
@@ -153,10 +150,7 @@ export class AiService {
           result = { models: [], view: { ...base, status: 'ready', discovery: 'known', support: apiSupport(source) } };
         }
         if (this.sources.get(source.id)?.generation !== source.generation) throw new Error('Stale discovery');
-        for (const model of result.models) {
-          this.catalog.set(model.id, model);
-          this.db.prepare('INSERT INTO ai_models (id, metadata_json) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET metadata_json=excluded.metadata_json').run(model.id, JSON.stringify(model));
-        }
+        for (const model of result.models) this.catalog.set(model.id, model);
         return result.view;
       } catch {
         return { ...base, status: 'unavailable', discovery: 'failed', support: [] };

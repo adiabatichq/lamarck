@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createClaudeCode } from 'ai-sdk-provider-claude-code';
-import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type SDKUserMessage, type ModelInfo } from '@anthropic-ai/claude-agent-sdk';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { LanguageModelV4, LanguageModelV4CallOptions, ProviderV4 } from '@ai-sdk/provider';
@@ -12,7 +12,7 @@ import type { AiSourceStore } from './source-store';
 import type { InvocationContext } from './invocations';
 import { AiError } from './errors';
 import { aiExecutable, CodexRpc, subscriptionEnv } from './runtime';
-import { codexModel } from './codex';
+import { codexModel, codexModels } from './codex';
 
 export interface LoginStatus { status: 'pending' | 'ready' | 'cancelled' | 'failed'; url?: string; message?: string }
 interface LoginAttempt { status: LoginStatus; cancel(): void; generation: number }
@@ -86,27 +86,23 @@ export class AiSubscriptions {
           await rpc.initialize();
           const account = await rpc.request('account/read', { refreshToken: false });
           if (account.account?.type !== 'chatgpt') return { status: 'login-required', support: [], models: [] };
-          const result = await rpc.request('model/list', { includeHidden: false });
-          const models = result.data.map((model: any) => ({ id: `openai:${model.model}`, name: model.displayName ?? model.model, provider: 'openai', type: 'language' as const }));
+          const result = await codexModels(rpc);
+          const models = result.map(model => ({ id: `openai:${model.model}`, name: model.displayName ?? model.model, provider: 'openai', type: 'language' as const }));
           await session.save();
           return { status: 'ready', models, support: models.map((model: AiModel) => languageSupport(model.id)) };
         } finally { await rpc.close(); }
       }
       const auth = JSON.parse(await this.command('anthropic', session.directory, ['auth', 'status', '--json']).catch(() => '{}'));
       if (!auth.loggedIn || auth.authMethod !== 'claude.ai') return { status: 'login-required', support: [], models: [] };
-      // Initializing an empty streaming input permits supportedModels without
-      // sending a user prompt or initiating inference.
-      let closeInput!: () => void;
-      const held = new Promise<void>(resolve => { closeInput = resolve; });
-      const prompt = (async function* (): AsyncGenerator<SDKUserMessage> { await held; })();
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15_000);
-      const current = query({ prompt, options: { ...this.claudeOptions(session.directory, session.processes), abortController: controller } });
-      try {
-        const result = await current.supportedModels();
-        const models = result.map(model => ({ id: `anthropic:${model.value}`, name: model.displayName, provider: 'anthropic', type: 'language' as const }));
-        return { status: 'ready', models, support: models.map(model => languageSupport(model.id)) };
-      } finally { clearTimeout(timer); closeInput(); current.close(); }
+      const discovered = await this.claudeModels(session.directory, session.processes);
+      const catalog = new Map<string, AiModel>();
+      for (const model of discovered) {
+        for (const id of [model.value, model.resolvedModel]) {
+          if (id) catalog.set(id, { id: `anthropic:${id}`, name: model.displayName, provider: 'anthropic', type: 'language' });
+        }
+      }
+      const models = [...catalog.values()];
+      return { status: 'ready', models, support: models.map(model => languageSupport(model.id)) };
     } finally { await session.dispose(); }
   }
   async open(source: ManagedAiSource, options: LanguageModelV4CallOptions, context: InvocationContext): Promise<{ provider: ProviderV4; dispose(): Promise<void> }> {
@@ -128,6 +124,7 @@ export class AiSubscriptions {
     context.signal.addEventListener('abort', abort, { once: true });
     try {
       context.signal.throwIfAborted();
+      const discovered = await this.claudeModels(session.directory, session.processes, context.signal);
       const server = new McpServer({ name: 'lamarck', version: '1.0.0' }, { capabilities: { tools: {} } });
       if (options.toolChoice && !['auto', 'none'].includes(options.toolChoice.type)) throw new AiError('unsupported', 'Claude subscription does not support forced tool selection');
       const tools = options.toolChoice?.type === 'none' ? [] : options.tools ?? [];
@@ -147,9 +144,33 @@ export class AiSubscriptions {
           ? { behavior: 'allow', updatedInput: input }
           : { behavior: 'deny', message: 'Tool unavailable' },
       } });
-      const scopedProvider: ProviderV4 = { ...provider, languageModel: id => normalizeClaudeModel(provider.languageModel(id), new Set(tools.map(tool => tool.name)), context.signal) };
+      const scopedProvider: ProviderV4 = { ...provider, languageModel: id => {
+        const match = discovered.find(model => model.value === id || model.resolvedModel === id);
+        if (!match) throw new AiError('unsupported', 'The selected model is unavailable through this Claude subscription');
+        // Preserve native identifiers and use only upstream resolution to bound
+        // the invocation. The allowlist also prevents native refusal fallback.
+        return normalizeClaudeModel(provider.languageModel(id, { settings: { model: id, availableModels: [match.resolvedModel ?? match.value], enforceAvailableModels: true, fallbackModel: [] } }), new Set(tools.map(tool => tool.name)), context.signal);
+      } };
       return { provider: scopedProvider, dispose: async () => { try { context.signal.removeEventListener('abort', abort); await server.close(); } finally { await session.dispose(); } } };
     } catch (error) { context.signal.removeEventListener('abort', abort); await session.dispose(); throw error; }
+  }
+  private async claudeModels(directory: string, processes?: Set<ChildProcess>, signal?: AbortSignal): Promise<ModelInfo[]> {
+    // Empty held input initializes native discovery without initiating inference.
+    let closeInput!: () => void;
+    const held = new Promise<void>(resolve => { closeInput = resolve; });
+    const prompt = (async function* (): AsyncGenerator<SDKUserMessage> { await held; })();
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.throwIfAborted();
+    signal?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(abort, 15_000);
+    let current: ReturnType<typeof query> | undefined;
+    try {
+      current = query({ prompt, options: { ...this.claudeOptions(directory, processes), abortController: controller } });
+      const models = await current.supportedModels();
+      if (!Array.isArray(models) || models.length > 1000 || models.some(model => typeof model.value !== 'string' || !model.value || model.value.length > 256 || (model.resolvedModel !== undefined && (typeof model.resolvedModel !== 'string' || !model.resolvedModel || model.resolvedModel.length > 256)))) throw new AiError('discovery_failed', 'Invalid Claude model discovery');
+      return models;
+    } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); closeInput(); current?.close(); }
   }
   private claudeOptions(directory: string, processes?: Set<ChildProcess>) {
     return {

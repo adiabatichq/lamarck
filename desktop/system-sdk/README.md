@@ -36,7 +36,14 @@ import { system } from '@lamarck/system';
 
 const { models, accessSources } = await system.ai.listOptions();
 // Persist these two independent selections in your App's settings.
-const selection = { model: 'openai:gpt-5-mini', accessSource: settings.accessSource };
+const selection = { model: 'openai:gpt-5.6-luna', accessSource: settings.accessSource };
+const source = accessSources.find(source => source.id === selection.accessSource);
+const selectableModels = models.filter(model =>
+  source?.status === 'ready' && source.discovery === 'known' &&
+  source.support.some(support => support.model === model.id));
+if (!selectableModels.some(model => model.id === selection.model)) {
+  throw new Error('Choose a compatible model and access source.');
+}
 const model = system.ai.languageModel(selection);
 const result = await generateText({ model, prompt: 'Summarize this note.' });
 
@@ -55,6 +62,8 @@ const vector = await embed({
 Console configures API keys, Codex/Claude subscription accounts, and local OpenAI-compatible services. A model ID uses the Vercel registry format `provider:model`; an access-source ID identifies a saved configuration. Multiple accounts or keys may share a provider. Source permissions apply to discovery and every call. New sources allow all Apps, including future Apps; Console can restrict that to selected Apps. Reconfiguring a source preserves its policy. Removing a source preserves the independent model catalog.
 
 Read each source's `status`, `discovery`, and `support` before showing available combinations. Unknown or failed discovery does not mean an empty supported catalog. A source can support language without embeddings, or text without tools/structured output. Current local services advertise text and streaming; subscription adapters do not support embeddings. Unsupported combinations throw; the Host never chooses another source, model, or billing method.
+
+Source discovery and adapter capabilities determine usable model/source combinations; Lamarck has no model-family eligibility policy. Subscription sources use authenticated CLI access and do not promise that every discovered model is included in a subscription allowance. Native model identifiers and upstream resolution are preserved, with fresh selection validation and no automatic source/model/billing fallback. Codex direct and code-mode dispatch share the same scoped App-tool boundary. API options, including Anthropic thinking `blockBinding` with or without a `type`, retain the official provider's semantics, warnings and errors.
 
 Streaming waits for the selected provider to start before returning the model stream, so Vercel's `maxRetries` applies to retryable startup failures. Empty event polls and tool-only batches keep the receive loop active. Once the provider stream has started, failures stay in the stream; startup failures after an App tool callback are marked non-retryable to avoid repeating tool side effects.
 

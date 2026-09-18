@@ -26,6 +26,7 @@ const SAFE_PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$/;
 export const MACOS_RELEASE_ENTITLEMENTS = Object.freeze({
   none: Object.freeze([]),
   electronJit: Object.freeze(["com.apple.security.cs.allow-jit"]),
+  aiJit: Object.freeze(["com.apple.security.cs.allow-jit"]),
   electronPlugin: Object.freeze([
     "com.apple.security.cs.allow-jit",
     "com.apple.security.cs.allow-unsigned-executable-memory",
@@ -263,6 +264,12 @@ export function macOsReleaseEntitlementsForPath(filePath, { appPath, capsuleHelp
   }
 
   if (resolvedFile === resolvedHelper) return MACOS_RELEASE_ENTITLEMENTS.capsuleVmHost;
+  // The pinned arm64 V8 helper and Bun-based Claude runtime need MAP_JIT.
+  const aiRuntimes = join(resolvedApp, "Contents", "Resources", "app", "dist-electron", "ai-runtimes");
+  if (
+    resolvedFile === join(aiRuntimes, "codex-code-mode-host")
+    || resolvedFile === join(aiRuntimes, "claude")
+  ) return MACOS_RELEASE_ENTITLEMENTS.aiJit;
   if (
     resolvedFile === resolvedApp
     || resolvedFile === join(resolvedApp, "Contents", "MacOS", "Electron")

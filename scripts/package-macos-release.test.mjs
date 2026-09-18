@@ -226,13 +226,22 @@ test("dry-run plan includes every production trust gate and never package:patch"
   assert.equal(JSON.stringify(actions).includes("package:patch"), false);
 });
 
-test("release signing policy gives only Electron and Capsule their required entitlements", () => {
+test("release signing policy gives each native runtime only its required entitlements", () => {
   const appPath = resolve(root, ".lamarck", "test", "Lamarck.app");
   const capsuleHelper = resolve(
     appPath,
     "Contents", "Resources", "app", "dist-electron", "native", "lamarck-capsule-vm-host",
   );
   const options = { appPath, capsuleHelper };
+  const aiRuntimes = resolve(appPath, "Contents", "Resources", "app", "dist-electron", "ai-runtimes");
+  for (const name of ["codex-code-mode-host", "claude"]) {
+    assert.deepEqual(macOsReleaseEntitlementsForPath(resolve(aiRuntimes, name), options), [
+      "com.apple.security.cs.allow-jit",
+    ]);
+  }
+  for (const name of ["codex", "codex-code-mode-host-backup", "claude-backup", "other/codex-code-mode-host", "other/claude"]) {
+    assert.deepEqual(macOsReleaseEntitlementsForPath(resolve(aiRuntimes, name), options), []);
+  }
   assert.deepEqual(macOsReleaseEntitlementsForPath(appPath, options), [
     "com.apple.security.cs.allow-jit",
   ]);
