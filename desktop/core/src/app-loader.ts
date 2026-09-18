@@ -101,7 +101,8 @@ export function sourceForAppWorkload(appId: string, workload: AppWorkloadIdentit
   return `app:${appId}:${workload.kind}:${workload.entryId}`;
 }
 
-export async function loadApps(appsDir: string): Promise<AppRegistry> {
+export async function loadApps(appsDir: string, signal?: AbortSignal): Promise<AppRegistry> {
+  signal?.throwIfAborted();
   const apps = new Map<string, LoadedApp>();
 
   let entries;
@@ -116,17 +117,19 @@ export async function loadApps(appsDir: string): Promise<AppRegistry> {
   }
 
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    signal?.throwIfAborted();
     if (!entry.isDirectory()) continue;
 
     const appDir = join(appsDir, entry.name);
     const manifestPath = join(appDir, "manifest.json");
 
-    const validation = await loadSettledManifest(manifestPath, entry.name);
+    const validation = await loadSettledManifest(manifestPath, entry.name, signal);
     if (!validation.ok) {
       console.warn(`[app-loader] Skipping ${entry.name}: ${validation.error}`);
       continue;
     }
 
+    signal?.throwIfAborted();
     await provisionAppD1Home(dirname(appsDir), validation.manifest.id);
     apps.set(validation.manifest.id, {
       manifest: validation.manifest,
@@ -135,6 +138,7 @@ export async function loadApps(appsDir: string): Promise<AppRegistry> {
     });
   }
 
+  signal?.throwIfAborted();
   return createRegistry(apps);
 }
 
@@ -167,10 +171,12 @@ async function ensurePhysicalDirectory(path: string, label: string): Promise<voi
 async function loadSettledManifest(
   path: string,
   directoryName: string,
+  signal?: AbortSignal,
 ): Promise<AppManifestValidationResult> {
   for (let attempt = 0; attempt < MANIFEST_SETTLE_ATTEMPTS; attempt += 1) {
+    signal?.throwIfAborted();
     try {
-      const raw = await readStableManifest(path);
+      const raw = await readStableManifest(path, signal);
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw);
@@ -207,7 +213,7 @@ async function loadSettledManifest(
   throw new Error("manifest.json did not settle");
 }
 
-async function readStableManifest(path: string): Promise<string> {
+async function readStableManifest(path: string, signal?: AbortSignal): Promise<string> {
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const before = await handle.stat({ bigint: true });
@@ -217,7 +223,7 @@ async function readStableManifest(path: string): Promise<string> {
         `manifest.json must be between 1 and ${APP_MANIFEST_MAX_BYTES} bytes`,
       );
     }
-    const bytes = await handle.readFile();
+    const bytes = await handle.readFile({ signal });
     const after = await handle.stat({ bigint: true });
     if (
       before.dev !== after.dev

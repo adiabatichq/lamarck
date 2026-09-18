@@ -21,9 +21,7 @@ import { D1Sequencer } from "./d1-sequencer";
 import { VfsService, type VfsCaller } from "./vfs";
 import {
   archiveApp,
-  loadApps,
   sourceForAppWorkload,
-  type AppRegistry,
   type AppWorkloadIdentity,
 } from "./app-loader";
 import {
@@ -221,15 +219,19 @@ const connectorManifests = await registerWorkspaceConnectors(connectorSupervisor
   },
 });
 await connectorSupervisor.recoverSourceIdentities();
+const coreStopBudgetMs = Number(process.env.LAMARCK_CORE_STOP_TIMEOUT_MS);
 const connectorScheduler = new ConnectorScheduler({
   supervisor: connectorSupervisor,
+  // Reserve time for the remaining Core cleanup inside the Host's deadline.
+  stopTimeoutMs: Number.isSafeInteger(coreStopBudgetMs) && coreStopBudgetMs > 0
+    ? Math.max(1, coreStopBudgetMs - 250)
+    : undefined,
   onError(err, sourceRecord) {
     const message = err instanceof Error ? err.message : String(err);
     console.warn(`[lamarck] Connector ${sourceRecord.connectorId} scheduler error: ${message}`);
   },
 });
-let registry = await loadApps(appsDir);
-let appRegistryTail: Promise<void> = Promise.resolve();
+await appLifecycle.refreshRegistry();
 const marketplaceService = await MarketplaceService.initialize({
   workspacePath,
   apiOrigin: lamarckApiOrigin,
@@ -366,7 +368,7 @@ const schemaApprovals = new Map<string, Promise<SchemaRequest>>();
 const schemaRequestAuthorities = new Map<string, SchemaEventAuthority>();
 
 console.log(`[lamarck] Workspace: ${workspacePath}`);
-console.log(`[lamarck] Apps loaded: ${[...registry.apps.keys()].join(", ") || "(none)"}`);
+console.log(`[lamarck] Apps loaded: ${[...appLifecycle.registry.apps.keys()].join(", ") || "(none)"}`);
 console.log(`[lamarck] Connectors loaded: ${connectorManifests.map((manifest) => manifest.id).join(", ") || "(none)"}`);
 
 // The trusted Shell may call Core over localhost. App viewers never receive a
@@ -461,43 +463,6 @@ function vfsCallerForRequest(auth: AuthContext, req: Request, signal: AbortSigna
     fileGrants: null,
     trustedHost: true,
   };
-}
-
-async function reloadAppRegistry(): Promise<void> {
-  return enqueueAppRegistryUpdate(async () => {
-    const candidate = await loadApps(appsDir);
-    registry = candidate;
-  });
-}
-
-async function refreshAppRegistryIfChanged(): Promise<void> {
-  return enqueueAppRegistryUpdate(async () => {
-    const candidate = await loadApps(appsDir);
-    if (sameAppManifests(registry, candidate)) return;
-
-    // Running workloads retain the activation manifest and grants captured by
-    // their own capability. Draft authoring changes only refresh inventory.
-    registry = candidate;
-  });
-}
-
-function enqueueAppRegistryUpdate(update: () => Promise<void>): Promise<void> {
-  const operation = appRegistryTail.then(update);
-  // Keep the serialization tail usable after an individual scan fails while
-  // returning the real failure to the request that initiated that scan.
-  appRegistryTail = operation.catch(() => {});
-  return operation;
-}
-
-function sameAppManifests(left: AppRegistry, right: AppRegistry): boolean {
-  if (left.apps.size !== right.apps.size) return false;
-  for (const [appId, app] of left.apps) {
-    const candidate = right.apps.get(appId);
-    if (!candidate || app.manifestDigest !== candidate.manifestDigest) {
-      return false;
-    }
-  }
-  return true;
 }
 
 function parseAppWorkload(workload: AppWorkload): AppWorkloadIdentity {
@@ -665,7 +630,7 @@ async function instantiateVerifiedMarketplaceApp(input: {
     initializeRepository: (dir) => appRepository.initializeRepository(input.localId ?? input.packageId, dir),
   });
   try {
-    await reloadAppRegistry();
+    await appLifecycle.refreshRegistry();
     await eventWriter.writeLifecycleEvent({
       type: "app.created",
       startedAt: Date.now(),
@@ -677,7 +642,7 @@ async function instantiateVerifiedMarketplaceApp(input: {
     await rm(created.dir, { recursive: true, force: true }).catch((rollbackError) => {
       failures.push(rollbackError);
     });
-    await reloadAppRegistry().catch((rollbackError) => {
+    await appLifecycle.refreshRegistry().catch((rollbackError) => {
       failures.push(rollbackError);
     });
     if (failures.length > 1) {
@@ -910,9 +875,8 @@ function cliConnectorSummary(snapshot: CliConnectorSnapshot, connectorId: string
   });
 }
 
-async function cliAppShapes(principal: CliCorePrincipal) {
-  await refreshAppRegistryIfChanged();
-  const inventory = await appLifecycle.inventory();
+async function cliAppShapes(principal: CliCorePrincipal, signal: AbortSignal) {
+  const inventory = await appLifecycle.inventory(signal);
   return inventory.map((item) => projectAppShape(
     item,
     false,
@@ -1082,9 +1046,9 @@ async function executeCoreCliOperation(
       return { id, removed: true };
     }
     case "app.list":
-      return (await cliAppShapes(principal)).map(projectAppSummary);
+      return (await cliAppShapes(principal, signal)).map(projectAppSummary);
     case "app.inspect": {
-      const app = (await cliAppShapes(principal)).find((item) => item.id === input.appId);
+      const app = (await cliAppShapes(principal, signal)).find((item) => item.id === input.appId);
       if (!app) throw cliCoded("APP_NOT_FOUND", `App not found: ${String(input.appId)}`);
       return app;
     }
@@ -1101,7 +1065,7 @@ async function executeCoreCliOperation(
         || !description || description.trim() !== description) {
         throw cliCoded("APP_INVALID", "The App id, name, or description is invalid.");
       }
-      if (registry.apps.has(id)) throw cliCoded("APP_INVALID", `App ${id} already exists.`);
+      if (appLifecycle.registry.apps.has(id)) throw cliCoded("APP_INVALID", `App ${id} already exists.`);
       await instantiateBlankApp({
         appsDir,
         scaffoldDir: appScaffoldDir,
@@ -1110,7 +1074,7 @@ async function executeCoreCliOperation(
         description,
         initializeRepository: (dir) => appRepository.initializeRepository(id, dir),
       });
-      await reloadAppRegistry();
+      await appLifecycle.refreshRegistry();
       await requestGuard.writeLifecycleEvent({ type: "app.created", startedAt: Date.now(), payload: { appId: id } });
       return { id, created: true };
     }
@@ -1120,7 +1084,7 @@ async function executeCoreCliOperation(
         ...(input.author === undefined ? {} : { author: input.author as string }),
         ...await cliVersionEventContext(principal, requestGuard),
       });
-      await refreshAppRegistryIfChanged();
+      await appLifecycle.refreshRegistry();
       return { version: result.version, created: result.created };
     }
     case "app.versions": {
@@ -1133,23 +1097,23 @@ async function executeCoreCliOperation(
         ...(input.author === undefined ? {} : { author: input.author as string }),
         ...await cliVersionEventContext(principal, requestGuard),
       });
-      await refreshAppRegistryIfChanged();
+      await appLifecycle.refreshRegistry();
       return { version: result.version, created: result.created };
     }
     case "app.refresh":
       if (principal.kind !== "app") throw cliCoded("CLI_UNSUPPORTED_COMMAND", "app refresh is managed-only.");
-      if (!registry.apps.has(input.appId as string)) {
+      if (!appLifecycle.registry.apps.has(input.appId as string)) {
         throw cliCoded("APP_NOT_FOUND", `App not found: ${String(input.appId)}`);
       }
       return { id: input.appId as string, refreshed: true };
     case "app.archive": {
       const appId = input.appId as string;
-      const app = registry.apps.get(appId);
+      const app = appLifecycle.registry.apps.get(appId);
       if (!app) throw cliCoded("APP_NOT_FOUND", `App not found: ${appId}`);
       await appCapabilities.revokeApp(appId);
       await appRepository.verifyRetainedVersions(appId, app.dir);
       await archiveApp(appsDir, join(lamarckDir, "archived-apps"), appId);
-      await reloadAppRegistry();
+      await appLifecycle.refreshRegistry();
       await requestGuard.writeLifecycleEvent({ type: "app.archived", startedAt: Date.now(), payload: { appId } });
       return { id: appId, archived: true };
     }
@@ -1922,7 +1886,7 @@ const server = await serve<{ cwd: string }>({
                 )
               : {}),
           });
-          await refreshAppRegistryIfChanged();
+          await appLifecycle.refreshRegistry();
           return json({ result, editBase: await appLifecycle.prepareEditBase(appId) });
         } catch (error) {
           if (error instanceof ArchiveHttpError) {
@@ -2017,8 +1981,7 @@ const server = await serve<{ cwd: string }>({
         // The Workspace is intentionally editable outside Lamarck. A coding
         // agent may create an App directory directly, so make this read an
         // authoritative semantic rescan without revoking unchanged Apps.
-        await refreshAppRegistryIfChanged();
-        return json({ apps: await appLifecycle.inventory() });
+        return json({ apps: await appLifecycle.inventory(req.signal) });
       }
 
       const versionsMatch = path.match(/^\/api\/apps\/([^/]+)\/versions$/);
@@ -2049,7 +2012,7 @@ const server = await serve<{ cwd: string }>({
             ...(body.message === undefined ? {} : { message: body.message }),
             ...(body.author === undefined ? {} : { author: body.author }),
           });
-          await refreshAppRegistryIfChanged();
+          await appLifecycle.refreshRegistry();
           return json(result);
         } catch (error) {
           return appLifecycleErrorResponse(error, json);
@@ -2071,7 +2034,7 @@ const server = await serve<{ cwd: string }>({
             ...(body.message === undefined ? {} : { message: body.message }),
             ...(body.author === undefined ? {} : { author: body.author }),
           });
-          await refreshAppRegistryIfChanged();
+          await appLifecycle.refreshRegistry();
           return json(result);
         } catch (error) {
           return appLifecycleErrorResponse(error, json);
@@ -2137,7 +2100,7 @@ const server = await serve<{ cwd: string }>({
           initializeRepository: (dir) => appRepository.initializeRepository(id, dir),
         });
 
-        await reloadAppRegistry();
+        await appLifecycle.refreshRegistry();
         await guard.withExecution({
           signal: requestGuardSignal,
           deadlineMs: HOST_GUARD_DEADLINE_MS,
@@ -2153,14 +2116,14 @@ const server = await serve<{ cwd: string }>({
       const archiveMatch = path.match(/^\/api\/apps\/([^/]+)\/archive$/);
       if (archiveMatch && method === "POST") {
         const appId = decodeURIComponent(archiveMatch[1]);
-        const app = registry.apps.get(appId);
+        const app = appLifecycle.registry.apps.get(appId);
         if (!app) return json({ error: "app not found" }, 404);
 
         // Stop admission and drain active App requests before moving its code.
         await appCapabilities.revokeApp(appId);
         await appRepository.verifyRetainedVersions(appId, app.dir);
         await archiveApp(appsDir, join(lamarckDir, "archived-apps"), appId);
-        await reloadAppRegistry();
+        await appLifecycle.refreshRegistry();
 
         // D0 composition: the capability was retired (recoverable, not deleted).
         // Only the id is recorded — the archive location is conventional
@@ -2319,16 +2282,23 @@ async function shutdown(): Promise<void> {
   shuttingDown = true;
   console.log("\n[lamarck] Shutting down...");
   clearInterval(connectorUpdateTimer);
-  await aiService.close();
-  const vfsClosed = vfs.close();
-  const serverStopped = server.stop().catch(() => {});
-  await connectorScheduler.stop();
+  // Stop every producer before awaiting any one service. A stalled AI close
+  // must not leave polling, HTTP admission, or filesystem scans running.
+  const cleanup = [
+    aiService.close(),
+    vfs.close(),
+    server.stop(),
+    connectorScheduler.stop(),
+    d1Observer.stop(),
+    appLifecycle.close(),
+  ];
   for (const proc of terminalProcs) {
     try { proc.kill(); } catch {}
   }
   terminalProcs.clear();
-  await Promise.all([serverStopped, vfsClosed]);
-  await d1Observer.stop();
+  const results = await Promise.allSettled(cleanup);
+  const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length) throw new AggregateError(failures, "Core cleanup was incomplete");
   systemDb.close();
   process.exit(0);
 }

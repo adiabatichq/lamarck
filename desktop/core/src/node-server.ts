@@ -53,12 +53,14 @@ interface UpgradeContext {
  */
 export async function serve<T = unknown>(options: ServeOptions<T>): Promise<NodeFetchServer> {
   const upgrades = new WeakMap<Request, UpgradeContext>();
+  const handlers = new Set<Promise<void>>();
   let boundPort = options.port;
 
   const httpServer = createServer((incoming, outgoing) => {
-    void handleHttpRequest(incoming, outgoing).catch((error) => {
+    const handler = handleHttpRequest(incoming, outgoing).catch((error) => {
       outgoing.destroy(error instanceof Error ? error : undefined);
-    });
+    }).finally(() => handlers.delete(handler));
+    handlers.add(handler);
   });
 
   const api: NodeFetchServer = {
@@ -76,16 +78,22 @@ export async function serve<T = unknown>(options: ServeOptions<T>): Promise<Node
       context.upgraded = accepted;
       return accepted;
     },
-    stop() {
-      return new Promise<void>((resolve, reject) => {
+    async stop() {
+      await new Promise<void>((resolve, reject) => {
         httpServer.close((error) => error ? reject(error) : resolve());
         httpServer.closeAllConnections();
       });
+      // Disconnecting a caller does not finish its mutation. Keep the owner
+      // alive until handlers drain; shutdown must not close their database.
+      await Promise.allSettled(handlers);
     },
   };
 
   httpServer.on("upgrade", (incoming, socket, head) => {
-    void handleUpgrade(incoming, socket, head).catch(() => socket.destroy());
+    const handler = handleUpgrade(incoming, socket, head)
+      .catch(() => { socket.destroy(); })
+      .finally(() => handlers.delete(handler));
+    handlers.add(handler);
   });
 
   httpServer.requestTimeout = 30_000;
@@ -240,6 +248,10 @@ export async function pipeResponseBody(
   responseBody: ReadableStream<Uint8Array>,
   outgoing: ServerResponse,
 ): Promise<void> {
+  if (outgoing.destroyed || outgoing.writableFinished) {
+    await responseBody.cancel();
+    return;
+  }
   const body = Readable.fromWeb(responseBody as never);
   await new Promise<void>((resolve, reject) => {
     let settled = false;

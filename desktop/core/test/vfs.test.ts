@@ -53,6 +53,7 @@ const require = createRequire(import.meta.url);
 const { applyPatch } = require("diff") as { applyPatch(source: string, patch: string): string | false };
 
 class EventGuard {
+  withExecution() { return this; }
   readonly events: Array<EventInput & { id: string }> = [];
   failNextWrite = false;
   writeAttempts = 0;
@@ -698,6 +699,28 @@ describe("D1 VFS", () => {
     expect(originalListFiles()).toEqual([
       expect.objectContaining({ path: "notes/result.md" }),
     ]);
+  });
+
+  test("stopping observation finishes an already admitted D0 write and its checkpoint", async () => {
+    writeFileSync(join(filesRoot, "external.md"), "external");
+    const observer = new D1Observer(filesRoot, guard as unknown as RemoteGuard, state, blobs, sequencer);
+    const gate = guard.blockNextWrite();
+    const observation = observer.observe();
+    await gate.entered;
+    let stopped = false;
+    const stopping = observer.stop().then(() => { stopped = true; });
+    try {
+      await Promise.resolve();
+      expect(stopped).toBe(false);
+      expect(state.cursor()).toBeNull();
+    } finally {
+      gate.release();
+      await observation;
+      await stopping;
+    }
+    expect(guard.events).toHaveLength(1);
+    expect(state.cursor()).toBe(guard.events[0].id);
+    expect(state.listFiles()).toEqual([expect.objectContaining({ path: "external.md" })]);
   });
 
   test("does not let a VFS mutation enter an observer scan sequence", async () => {

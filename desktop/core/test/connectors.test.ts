@@ -3691,7 +3691,10 @@ auth:
     await scheduler.start();
     expect((await supervisor.list())[0].running).toBe(true);
 
-    const stopped = await waitWithTestTimeout(scheduler.stop(), 2_000);
+    const stopped = await waitWithTestTimeout(
+      expect(scheduler.stop()).rejects.toThrow("unfinished runs"),
+      2_000,
+    );
     expect(stopped).toBe(true);
   });
 

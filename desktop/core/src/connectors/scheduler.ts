@@ -129,9 +129,9 @@ export class ConnectorScheduler {
     const finished = await waitWithTimeout(Promise.all(pending), this.stopTimeoutMs);
     if (!finished) {
       const stuck = [...this.activeRuns.keys()].join(", ");
-      console.error(
-        `[connectors] scheduler stop timed out after ${this.stopTimeoutMs}ms; abandoning runs: ${stuck}`,
-      );
+      // Do not report a successful drain or discard ownership of live runs.
+      // Core must leave shared resources open until process termination.
+      throw new Error(`Connector scheduler stop timed out after ${this.stopTimeoutMs}ms; unfinished runs: ${stuck}`);
     }
     this.activeRuns.clear();
   }

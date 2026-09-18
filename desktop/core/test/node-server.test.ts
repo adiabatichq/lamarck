@@ -6,10 +6,38 @@ import { describe, expect, test } from "vitest";
 import {
   bindClientDisconnectAbort,
   pipeResponseBody,
+  serve,
   WebSocketConnection,
 } from "../src/node-server";
 
 describe("Node Core HTTP adapter", () => {
+  test("shutdown waits for an admitted mutation after disconnecting its client", async () => {
+    let complete!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const mutation = new Promise<void>(resolve => { complete = resolve; });
+    const server = await serve({
+      hostname: "127.0.0.1", port: 0,
+      async fetch() {
+        entered();
+        await mutation;
+        return Response.json({ committed: true });
+      },
+    });
+    const response = fetch(`http://127.0.0.1:${server.port}/mutation`, { method: "POST" }).catch(() => null);
+    await started;
+    let stopped = false;
+    const closing = server.stop().then(() => { stopped = true; });
+    try {
+      await delay(10);
+      expect(stopped).toBe(false);
+    } finally {
+      complete();
+      await closing;
+      await response;
+    }
+    expect(stopped).toBe(true);
+  });
   test("aborts the Fetch request when its HTTP client disconnects before a response", () => {
     const response = new FakeResponseClose();
     const controller = new AbortController();
@@ -70,6 +98,19 @@ describe("Node Core HTTP adapter", () => {
 
     expect(transport.destroyed).toBe(true);
     expect(closed).toBe(true);
+  });
+
+  test("cancels a late response when the client has already disconnected", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() { cancelled = true; },
+    });
+    const sink = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    sink.destroy();
+    await delay(0); // The close event is already gone before the handler returns.
+    await pipeResponseBody(body, sink as unknown as ServerResponse);
+    expect(cancelled).toBe(true);
+    expect(sink.listenerCount("close")).toBe(0);
   });
 });
 

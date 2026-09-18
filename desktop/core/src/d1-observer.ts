@@ -15,7 +15,7 @@ import {
   type D1FileChange,
   type D1FileSnapshot,
 } from "./filesystem-changes";
-import type { RemoteGuard } from "./remote-guard";
+import { BACKGROUND_GUARD_DEADLINE_MS, type RemoteGuard } from "./remote-guard";
 import type { JsonValue } from "./json";
 
 const COALESCE_MS = 120;
@@ -25,7 +25,9 @@ export class D1Observer {
   private watcher: FSWatcher | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private coalesceTimer: ReturnType<typeof setTimeout> | null = null;
-  private tail: Promise<void> = Promise.resolve();
+  private pending: Promise<void> | null = null;
+  private rescan = false;
+  private controller = new AbortController();
   private stopped = true;
 
   constructor(
@@ -38,11 +40,25 @@ export class D1Observer {
 
   async start(): Promise<void> {
     if (!this.stopped) return;
+    if (this.pending) await this.pending.catch(() => {});
+    if (!this.stopped) return;
     this.stopped = false;
-    await this.sequencer.run(async () => {
-      await this.catchUpFromD0();
-      await this.observeExclusive();
+    this.controller = new AbortController();
+    const signal = this.controller.signal;
+    this.pending = this.sequencer.run(async () => {
+      signal.throwIfAborted();
+      await this.catchUpFromD0(signal);
+      await this.observeExclusive(signal);
     });
+    try {
+      await this.pending;
+    } catch (error) {
+      this.stopped = true;
+      throw error;
+    } finally {
+      this.pending = null;
+    }
+    if (this.stopped) return;
     try {
       this.watcher = watch(this.filesRoot, { recursive: true }, () => this.schedule());
       this.watcher.on("error", (error) => {
@@ -56,33 +72,46 @@ export class D1Observer {
   }
 
   async stop(): Promise<void> {
-    if (this.stopped) return;
     this.stopped = true;
+    this.rescan = false;
+    this.controller.abort();
     this.watcher?.close();
     this.watcher = null;
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = null;
     if (this.coalesceTimer) clearTimeout(this.coalesceTimer);
     this.coalesceTimer = null;
-    await this.tail;
+    await this.pending?.catch((error) => {
+      if (!this.controller.signal.aborted) throw error;
+    });
   }
 
   schedule(): void {
-    if (this.stopped || this.coalesceTimer) return;
+    if (this.stopped) return;
+    this.rescan = true;
+    if (this.pending || this.coalesceTimer) return;
     this.coalesceTimer = setTimeout(() => {
       this.coalesceTimer = null;
-      this.tail = this.tail.then(() => this.observe()).catch((error) => {
-        console.warn(`[lamarck:d1] observer scan failed: ${errorMessage(error)}`);
+      this.rescan = false;
+      void this.observe().catch((error) => {
+        if (!this.stopped) console.warn(`[lamarck:d1] observer scan failed: ${errorMessage(error)}`);
       });
     }, COALESCE_MS);
     this.coalesceTimer.unref?.();
   }
 
-  async observe(): Promise<void> {
-    await this.sequencer.run(() => this.observeExclusive());
+  observe(): Promise<void> {
+    if (this.pending) return this.pending;
+    const signal = this.controller.signal;
+    this.pending = this.sequencer.run(() => this.observeExclusive(signal)).finally(() => {
+      this.pending = null;
+      if (this.rescan) this.schedule();
+    });
+    return this.pending;
   }
 
-  private async observeExclusive(): Promise<void> {
+  private async observeExclusive(signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
     const before = observerFilesToSnapshots(this.state.listFiles());
     const deferred = new Set<string>();
     const after = await scanD1Files(this.filesRoot, {
@@ -90,6 +119,7 @@ export class D1Observer {
       onDeferred: (path) => deferred.add(path),
       onWarning: (message) => console.warn(`[lamarck:d1] ${message}`),
       previous: before,
+      signal,
     });
     for (const path of deferred) {
       for (const [recordedPath, snapshot] of before) {
@@ -104,6 +134,7 @@ export class D1Observer {
       this.state.refreshMetadata(metadataUpdates);
       return;
     }
+    signal.throwIfAborted();
     const eventId = await this.guard.writeWorkspaceEvent({
       type: "workspace.files.changed",
       startedAt: Date.now(),
@@ -112,11 +143,12 @@ export class D1Observer {
     this.state.apply(eventId, recordedChanges(changes), after, metadataUpdates);
   }
 
-  private async catchUpFromD0(): Promise<void> {
+  private async catchUpFromD0(signal: AbortSignal): Promise<void> {
     let cursor = this.state.cursor();
     let materialized = observerFilesToSnapshots(this.state.listFiles());
     for (;;) {
-      const rows = await this.guard.query(
+      signal.throwIfAborted();
+      const rows = await this.guard.withExecution({ signal, deadlineMs: BACKGROUND_GUARD_DEADLINE_MS }).query(
         `SELECT id, payload FROM events
          WHERE type = 'workspace.files.changed' AND id > ?
          ORDER BY id LIMIT 256`,
@@ -127,6 +159,7 @@ export class D1Observer {
         isExcluded: (path) => this.state.isExcluded(path),
         onWarning: (message) => console.warn(`[lamarck:d1] ${message}`),
         previous: materialized,
+        signal,
       });
       for (const row of rows) {
         const payload = typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload;

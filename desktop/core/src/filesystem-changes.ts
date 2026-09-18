@@ -44,12 +44,14 @@ export async function scanD1Files(
     onRead?: (path: string) => void;
     previous?: ReadonlyMap<string, D1FileSnapshot>;
     roots?: readonly string[];
+    signal?: AbortSignal;
   } = {},
 ): Promise<Map<string, D1FileSnapshot>> {
   const snapshots = new Map<string, D1FileSnapshot>();
   const admittedPaths: string[] = [];
 
   const visitDirectory = async (relativeDirectory: string): Promise<void> => {
+    options.signal?.throwIfAborted();
     const directory = relativeDirectory ? join(filesRoot, relativeDirectory) : filesRoot;
     let entries;
     try {
@@ -66,6 +68,7 @@ export async function scanD1Files(
   };
 
   const visitPath = async (path: string, deferIfMissing: boolean): Promise<void> => {
+    options.signal?.throwIfAborted();
     if (isReservedD1Path(path) || options.isExcluded?.(path)) return;
     try {
       validateD1Path(path);
@@ -125,7 +128,7 @@ export async function scanD1Files(
 
     try {
       options.onRead?.(path);
-      const snapshot = await readStableD1File(filesRoot, path);
+      const snapshot = await readStableD1File(filesRoot, path, options.signal);
       admittedPaths.push(path);
       snapshots.set(path, snapshot);
     } catch (error) {
@@ -141,14 +144,17 @@ export async function scanD1Files(
       await visitPath(path, false);
     }
   }
+  options.signal?.throwIfAborted();
   return snapshots;
 }
 
-export async function readStableD1File(filesRoot: string, path: string): Promise<D1FileSnapshot> {
+export async function readStableD1File(filesRoot: string, path: string, signal?: AbortSignal): Promise<D1FileSnapshot> {
+  signal?.throwIfAborted();
   validateD1Path(path);
   await assertSafeD1Parents(filesRoot, path);
   const filePath = join(filesRoot, ...path.split("/"));
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    signal?.throwIfAborted();
     const handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const before = await handle.stat({ bigint: true });
@@ -160,13 +166,14 @@ export async function readStableD1File(filesRoot: string, path: string): Promise
       let byteLength = 0;
       let digest: string;
       if (markdownPath) {
-        bytes = Buffer.from(await handle.readFile());
+        bytes = Buffer.from(await handle.readFile({ signal }));
         byteLength = bytes.byteLength;
         digest = digestBytes(bytes);
       } else {
         const hash = createHash("sha256");
         const chunk = Buffer.allocUnsafe(D1_HASH_CHUNK_BYTES);
         for (;;) {
+          signal?.throwIfAborted();
           const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, byteLength);
           if (bytesRead === 0) break;
           hash.update(chunk.subarray(0, bytesRead));

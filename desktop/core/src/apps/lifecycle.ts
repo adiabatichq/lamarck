@@ -1,7 +1,7 @@
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { AppWorkload } from "../auth";
-import type { AppManifest } from "../app-loader";
+import { loadApps, type AppManifest, type AppRegistry } from "../app-loader";
 import { PACKAGE_ID_PATTERN } from "../package-id";
 import { AppLifecycleError } from "./errors";
 import { AppActivationCoordinator } from "./activation";
@@ -41,7 +41,25 @@ export interface AppInventoryItemV1 {
   readonly createdFrom?: AppManifest["createdFrom"];
 }
 
+interface AppReadResult {
+  registry: AppRegistry;
+  inventory?: readonly AppInventoryItemV1[];
+}
+
+interface AppReadWaiter {
+  inventory: boolean;
+  complete(result: AppReadResult): void;
+  fail(error: unknown): void;
+}
+
 export class AppLifecycleService {
+  private currentRegistry: AppRegistry | undefined;
+  private readonly waitingReads = new Set<AppReadWaiter>();
+  private readonly activeReads = new Set<AppReadWaiter>();
+  private readTask: Promise<void> | null = null;
+  private readController: AbortController | null = null;
+  private closed = false;
+
   constructor(
     private readonly appsDir: string,
     private readonly archiveRoot: string,
@@ -49,6 +67,86 @@ export class AppLifecycleService {
     readonly activations: AppActivationCoordinator,
     readonly editMaterializations: AppEditMaterializationCoordinator,
   ) {}
+
+  get registry(): AppRegistry {
+    if (!this.currentRegistry) throw new Error("App registry has not been loaded");
+    return this.currentRegistry;
+  }
+
+  async refreshRegistry(signal?: AbortSignal): Promise<AppRegistry> {
+    return (await this.read(false, signal)).registry;
+  }
+
+  async inventory(signal?: AbortSignal): Promise<readonly AppInventoryItemV1[]> {
+    return (await this.read(true, signal)).inventory!;
+  }
+
+  close(): Promise<void> {
+    this.closed = true;
+    const reason = new Error("App inventory is shutting down");
+    for (const waiter of [...this.waitingReads, ...this.activeReads]) waiter.fail(reason);
+    this.readController?.abort(reason);
+    return this.readTask ?? Promise.resolve();
+  }
+
+  private read(inventory: boolean, signal?: AbortSignal): Promise<AppReadResult> {
+    if (this.closed) return Promise.reject(new Error("App inventory is shutting down"));
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        this.waitingReads.delete(waiter);
+        this.activeReads.delete(waiter);
+        signal?.removeEventListener("abort", abort);
+      };
+      const waiter: AppReadWaiter = {
+        inventory,
+        complete: (result) => { cleanup(); resolve(result); },
+        fail: (error) => { cleanup(); reject(error); },
+      };
+      const abort = () => {
+        waiter.fail(signal!.reason);
+        if (this.activeReads.size === 0) this.readController?.abort(signal!.reason);
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      this.waitingReads.add(waiter);
+      this.startRead();
+    });
+  }
+
+  private startRead(): void {
+    if (this.readTask || this.closed || this.waitingReads.size === 0) return;
+    // Readers arriving after a scan starts wait for one fresh follow-up pass.
+    // Do not attach each reader to the underlying Promise: cancelled readers
+    // must be removable even when an OS read never settles.
+    this.readTask = Promise.resolve().then(async () => {
+      for (const waiter of this.waitingReads) this.activeReads.add(waiter);
+      this.waitingReads.clear();
+      if (this.closed || this.activeReads.size === 0) return;
+      const controller = new AbortController();
+      this.readController = controller;
+      try {
+        const registry = await loadApps(this.appsDir, controller.signal);
+        controller.signal.throwIfAborted();
+        this.currentRegistry = registry;
+        for (const waiter of this.activeReads) {
+          if (!waiter.inventory) waiter.complete({ registry });
+        }
+        if (this.activeReads.size === 0) return;
+        const inventory = await this.scanInventory(controller.signal);
+        controller.signal.throwIfAborted();
+        for (const waiter of this.activeReads) waiter.complete({ registry, inventory });
+      } catch (error) {
+        for (const waiter of this.activeReads) waiter.fail(error);
+      } finally {
+        this.readController = null;
+      }
+    }).finally(() => {
+      // Keep the slot occupied until the real operation settles, even after
+      // every caller has disconnected. A timeout is not I/O completion.
+      this.readTask = null;
+      this.startRead();
+    });
+  }
 
   async save(appId: string, metadata: AppVersionOperationContext = {}) {
     return this.repository.save({
@@ -128,14 +226,16 @@ export class AppLifecycleService {
     });
   }
 
-  async inventory(): Promise<readonly AppInventoryItemV1[]> {
+  private async scanInventory(signal: AbortSignal): Promise<readonly AppInventoryItemV1[]> {
     const apps: AppInventoryItemV1[] = [];
-    for (const { id, path } of await this.currentAppDirectories()) {
+    for (const { id, path } of await this.currentAppDirectories(signal)) {
+      signal.throwIfAborted();
       let draft: ReturnType<typeof validateAppPackageTree> | undefined;
       let draftError: string | undefined;
       try {
-        draft = validateAppPackageTree(await collectAppPackageTree(path), id);
+        draft = validateAppPackageTree(await collectAppPackageTree(path, signal), id);
       } catch (error) {
+        signal.throwIfAborted();
         draftError = errorMessage(error);
       }
 
@@ -144,8 +244,10 @@ export class AppLifecycleService {
       let versionError: string | undefined;
       try {
         version = await this.repository.currentVersion(id, path);
+        signal.throwIfAborted();
         if (version) recorded = await this.repository.readVersionPackage(id, path, version);
       } catch (error) {
+        signal.throwIfAborted();
         versionError = errorMessage(error);
         version = null;
       }
@@ -174,10 +276,12 @@ export class AppLifecycleService {
         ...(details?.createdFrom === undefined ? {} : { createdFrom: details.createdFrom }),
       }));
     }
+    signal.throwIfAborted();
     return Object.freeze(apps);
   }
 
-  private async currentAppDirectories(): Promise<readonly { id: string; path: string }[]> {
+  private async currentAppDirectories(signal?: AbortSignal): Promise<readonly { id: string; path: string }[]> {
+    signal?.throwIfAborted();
     let entries;
     try {
       entries = await readdir(this.appsDir, { withFileTypes: true });
@@ -187,6 +291,7 @@ export class AppLifecycleService {
     }
     const apps: Array<{ id: string; path: string }> = [];
     for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      signal?.throwIfAborted();
       if (!entry.isDirectory() || !PACKAGE_ID_PATTERN.test(entry.name)) continue;
       const path = join(this.appsDir, entry.name);
       const info = await lstat(path);

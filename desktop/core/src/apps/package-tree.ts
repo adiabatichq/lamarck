@@ -46,7 +46,8 @@ export async function* readAppPackageTree(rootValue: string): AsyncIterable<AppP
   for (const entry of await collectAppPackageTree(rootValue)) yield entry;
 }
 
-export async function collectAppPackageTree(rootValue: string): Promise<readonly AppPackageEntry[]> {
+export async function collectAppPackageTree(rootValue: string, signal?: AbortSignal): Promise<readonly AppPackageEntry[]> {
+  signal?.throwIfAborted();
   const root = resolve(rootValue);
   const rootInfo = await lstat(root, { bigint: true });
   if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
@@ -67,6 +68,7 @@ export async function collectAppPackageTree(rootValue: string): Promise<readonly
     const children = await readdir(absoluteDirectory, { withFileTypes: true });
     children.sort((left, right) => compareUtf8(left.name, right.name));
     for (const child of children) {
+      signal?.throwIfAborted();
       if (relativeDirectory === "" && EXCLUDED_NAMES.has(child.name)) continue;
       if (child.name !== child.name.normalize("NFC")) {
         throw new Error(`Package path is not NFC-normalized: ${child.name}`);
@@ -99,7 +101,7 @@ export async function collectAppPackageTree(rootValue: string): Promise<readonly
       if (info.size > BigInt(APP_PACKAGE_MAX_FILE_BYTES)) {
         throw new Error(`Package file exceeds 512 MiB: ${entryPath}`);
       }
-      const bytes = await readStableFile(absolutePath, entryPath, info);
+      const bytes = await readStableFile(absolutePath, entryPath, info, signal);
       totalBytes += bytes.byteLength;
       if (totalBytes > APP_PACKAGE_MAX_BYTES) throw new Error("App package exceeds 1 GiB");
       entries.push(Object.freeze({ path: entryPath, kind: "file", bytes }));
@@ -111,6 +113,7 @@ export async function collectAppPackageTree(rootValue: string): Promise<readonly
   };
 
   await visit(root, "", rootInfo);
+  signal?.throwIfAborted();
   entries.sort(compareEntries);
   return Object.freeze(entries);
 }
@@ -273,12 +276,13 @@ async function readStableFile(
   absolutePath: string,
   entryPath: string,
   expected: BigIntStats,
+  signal?: AbortSignal,
 ): Promise<Buffer> {
   const handle = await open(absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const before = await handle.stat({ bigint: true });
     assertSameFile(expected, before, entryPath);
-    const bytes = await handle.readFile();
+    const bytes = await handle.readFile({ signal });
     const after = await handle.stat({ bigint: true });
     assertSameFile(before, after, entryPath);
     const pathname = await lstat(absolutePath, { bigint: true });
