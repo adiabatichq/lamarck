@@ -1,6 +1,6 @@
 import type { AutoUpdater } from "electron";
 
-export const DESKTOP_UPDATE_FEED = "https://releases.lamarck.ai/desktop/macos/arm64/stable/latest.json";
+export const DESKTOP_UPDATE_FEED = "https://releases.lamarck.ai/desktop/macos/arm64/latest.json";
 
 export interface DesktopUpdateState {
   phase: "unavailable" | "idle" | "checking" | "downloading" | "ready" | "installing" | "error";
@@ -10,7 +10,7 @@ export interface DesktopUpdateState {
 }
 
 export function supportsDesktopUpdates(platform: string, architecture: string, packaged: boolean, channel: unknown) {
-  return platform === "darwin" && architecture === "arm64" && packaged && channel === "stable";
+  return platform === "darwin" && architecture === "arm64" && packaged && channel === "alpha";
 }
 
 // Squirrel verifies the downloaded application's signature against this app's

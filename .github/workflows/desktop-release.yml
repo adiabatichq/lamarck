@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: New stable version (x.y.z), for example 0.1.0
+        description: New desktop version (x.y.z), for example 0.1.0
         required: true
         type: string
 
@@ -147,7 +147,7 @@ jobs:
         with:
           name: desktop-package
           path: ${{ runner.temp }}/desktop-package/
-      - name: Publish verified ZIP and stable update feed
+      - name: Publish verified ZIP and desktop update feed
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_RELEASES_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}

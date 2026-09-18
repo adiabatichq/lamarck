@@ -4,9 +4,9 @@ import { join, resolve } from "node:path";
 import { validateDesktopRelease } from "./desktop-release.mjs";
 import { hashFile } from "./r2-object-store.mjs";
 const source = resolve(process.argv[2] ?? ".lamarck/release/macos");
-const destination = resolve(process.argv[3] ?? "release-handoff/stable");
+const destination = resolve(process.argv[3] ?? "release-handoff/desktop");
 const documents = (await readdir(source)).filter((name) => name.endsWith(".release.json"));
-if (documents.length !== 1) throw new Error("Expected one stable release document");
+if (documents.length !== 1) throw new Error("Expected one desktop release document");
 const release = validateDesktopRelease(JSON.parse(await readFile(join(source, documents[0]), "utf8")));
 for (const name of [release.file, documents[0]]) {
   const stat = await lstat(join(source, name));

@@ -88,13 +88,11 @@ test("CI handoff binds the source, version, commit and independently supplied bu
   assert.throws(() => assertMacOsReleaseHandoffIdentity(expected, { ...expected, builderImageId: undefined }));
 });
 
-test("alpha and release packages include and verify the managed CLI before signing", async (t) => {
-  for (const name of ["package-macos-alpha.mjs", "package-macos-release.mjs"]) {
-    const source = await readFile(join(root, "scripts", name), "utf8");
-    assert.match(source, /"lamarck-managed\.mjs"/);
-    assert.match(source, /"managed-cli\.json"/);
-    assert.match(source, /await validatePackagedManagedCli\(electronResources\)/);
-  }
+test("desktop packages include and verify the managed CLI before signing", async (t) => {
+  const source = await readFile(join(root, "scripts", "package-macos-release.mjs"), "utf8");
+  assert.match(source, /"lamarck-managed\.mjs"/);
+  assert.match(source, /"managed-cli\.json"/);
+  assert.match(source, /await validatePackagedManagedCli\(electronResources\)/);
   const directory = await mkdtemp(join(tmpdir(), "lamarck-packaged-cli-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const bytes = Buffer.from("#!/usr/bin/env node\nconsole.log('managed');\n");
@@ -378,18 +376,7 @@ test("local and hermetic release builds share the canonical Desktop recipe", asy
   assert.ok(MACOS_RELEASE_SOURCE_FILES.includes("scripts/build-desktop.mjs"));
 });
 
-test("alpha packaging passes its selected version into the System build identity", async () => {
-  const alphaPackager = await readFile(
-    join(root, "scripts", "package-macos-alpha.mjs"),
-    "utf8",
-  );
-
-  assert.match(alphaPackager, /run\("npm", \["run", "build"\], \{[\s\S]*?env: \{[\s\S]*?\.\.\.process\.env,[\s\S]*?LAMARCK_BUILD_VERSION: version,[\s\S]*?\}[\s\S]*?\}\);/);
-  assert.match(alphaPackager, /function run\([^)]*\{ cwd = root, allowFailure = false, env = process\.env \}/);
-  assert.match(alphaPackager, /spawnSync\(command, args, \{ cwd, env, stdio: "inherit" \}\)/);
-});
-
-test("Marketplace trust roots are sealed at build time and required by macOS packagers", async (t) => {
+test("Marketplace trust roots are sealed at build time and required by the macOS packager", async (t) => {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "lamarck-marketplace-root-"));
   t.after(async () => await rm(temporaryRoot, { recursive: true, force: true }));
   const resource = join(temporaryRoot, "marketplace-trust-roots.json");
@@ -409,15 +396,10 @@ test("Marketplace trust roots are sealed at build time and required by macOS pac
     /does not match/,
   );
 
-  const [alphaPackager, releasePackager] = await Promise.all([
-    readFile(join(root, "scripts/package-macos-alpha.mjs"), "utf8"),
-    readFile(join(root, "scripts/package-macos-release.mjs"), "utf8"),
-  ]);
-  for (const packager of [alphaPackager, releasePackager]) {
-    assert.match(packager, /requireMarketplaceTrustRoot\(process\.env\)/);
-    assert.match(packager, /marketplace-trust-roots\.json/);
-    assert.match(packager, /CFBundleURLSchemes: \["lamarck"\]/);
-  }
+  const packager = await readFile(join(root, "scripts/package-macos-release.mjs"), "utf8");
+  assert.match(packager, /requireMarketplaceTrustRoot\(process\.env\)/);
+  assert.match(packager, /marketplace-trust-roots\.json/);
+  assert.match(packager, /CFBundleURLSchemes: \["lamarck"\]/);
 });
 
 test("Desktop Release workflow supplies the sealed Marketplace trust root", async () => {
@@ -529,7 +511,6 @@ test("device identity native build and packaged lookup share one exact resource 
     corePackage,
     coreBuilder,
     electronBuilder,
-    alphaPackager,
     releasePackager,
   ] = await Promise.all([
     readFile(join(
@@ -543,7 +524,6 @@ test("device identity native build and packaged lookup share one exact resource 
     readFile(join(root, "desktop/core/package.json"), "utf8"),
     readFile(join(root, "scripts/build-core.mjs"), "utf8"),
     readFile(join(root, "scripts/build-electron-main.mjs"), "utf8"),
-    readFile(join(root, "scripts/package-macos-alpha.mjs"), "utf8"),
     readFile(join(root, "scripts/package-macos-release.mjs"), "utf8"),
   ]);
   for (const adapter of [darwinAdapter, windowsAdapter]) {
@@ -556,10 +536,6 @@ test("device identity native build and packaged lookup share one exact resource 
   for (const builder of [coreBuilder, electronBuilder]) {
     assert.match(builder, /buildDeviceIdentityNative/);
   }
-  assert.match(alphaPackager, /deviceIdentityNativeAddonPath/);
-  for (const name of MACOS_DEVICE_IDENTITY_REVIEW_ACKNOWLEDGEMENTS) {
-    assert.equal(alphaPackager.includes(name), false);
-  }
   assert.match(releasePackager, /\["capsule-guest", "device-identity", "lamarck-capsule-vm-host"\]/);
   assert.ok(MACOS_RELEASE_SOURCE_DIRECTORIES.includes("desktop/core/src"));
 });
@@ -567,16 +543,13 @@ test("device identity native build and packaged lookup share one exact resource 
 test("macOS packages replace Electron branding with the committed Lamarck icon", async () => {
   const iconPath = join(root, "desktop", "shell", "assets", "Lamarck.icns");
   const icon = await readFile(iconPath);
-  const alphaPackager = await readFile(join(root, "scripts", "package-macos-alpha.mjs"), "utf8");
   const releasePackager = await readFile(join(root, "scripts", "package-macos-release.mjs"), "utf8");
 
   assert.equal(icon.subarray(0, 4).toString("ascii"), "icns");
   assert.ok(icon.length > 100_000);
   assert.ok(MACOS_RELEASE_SOURCE_FILES.includes("desktop/shell/assets/Lamarck.icns"));
-  for (const packager of [alphaPackager, releasePackager]) {
-    assert.match(packager, /\["CFBundleIconFile", "Lamarck\.icns"\]/);
-    assert.match(packager, /rm\(join\(resources, "electron\.icns"\)/);
-  }
+  assert.match(releasePackager, /\["CFBundleIconFile", "Lamarck\.icns"\]/);
+  assert.match(releasePackager, /rm\(join\(resources, "electron\.icns"\)/);
 });
 
 test("Desktop and macOS release outputs do not bundle an App System SDK copy", async () => {
@@ -599,19 +572,17 @@ test("Desktop build and packaging checks own exactly the app-v1 scaffold files",
     APP_V1_SCAFFOLD_FILES,
   );
 
-  const [coreBuilder, electronBuilder, desktopBuilder, alphaPackager, releasePackager] =
+  const [coreBuilder, electronBuilder, desktopBuilder, releasePackager] =
     await Promise.all([
       readFile(join(root, "scripts", "build-core.mjs"), "utf8"),
       readFile(join(root, "scripts", "build-electron-main.mjs"), "utf8"),
       readFile(join(root, "scripts", "build-desktop.mjs"), "utf8"),
-      readFile(join(root, "scripts", "package-macos-alpha.mjs"), "utf8"),
       readFile(join(root, "scripts", "package-macos-release.mjs"), "utf8"),
     ]);
   for (const builder of [coreBuilder, electronBuilder]) {
     assert.match(builder, /scaffolds\/app-v1/);
   }
   assert.match(desktopBuilder, /APP_SCAFFOLD_FILES/);
-  assert.match(alphaPackager, /requireExactEntries\(scaffoldRoot, APP_SCAFFOLD_FILES/);
   assert.match(releasePackager, /"packaged blank App scaffold"/);
 });
 

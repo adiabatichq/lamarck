@@ -227,7 +227,7 @@ async function packageRelease(releaseConfig, signingIdentity) {
     const archive = await hashFile(join(publishRoot, basename(releaseConfig.finalArchivePath)));
     const guest = await validateGuestRelease(releaseConfig.guestReleaseRoot);
     await writeFile(join(publishRoot, `Lamarck-${releaseConfig.version}.release.json`), `${JSON.stringify({
-      channel: "stable",
+      channel: "alpha",
       version: releaseConfig.version,
       file: basename(releaseConfig.finalArchivePath),
       sha256: `sha256:${archive.sha256}`,
@@ -453,7 +453,7 @@ async function assembleApplication(
     name: "@lamarck/shell",
     version: releaseConfig.version,
     private: true,
-    desktopUpdateChannel: "stable",
+    desktopUpdateChannel: "alpha",
     main: "dist-electron/main.cjs",
   })}\n`, { encoding: "utf8", mode: 0o644, flag: "wx" });
   await copyRealTree(join(shellBuildExport, "dist"), join(appResources, "dist"));
@@ -542,7 +542,7 @@ async function validatePackagedApplication(appPath, releaseConfig) {
     name: "@lamarck/shell",
     version: releaseConfig.version,
     private: true,
-    desktopUpdateChannel: "stable",
+    desktopUpdateChannel: "alpha",
     main: "dist-electron/main.cjs",
   };
   const actualPackage = JSON.parse(await readFile(join(appResources, "package.json"), "utf8"));

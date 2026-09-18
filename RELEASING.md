@@ -106,7 +106,7 @@ not change merely because the canonical artifact contract changes.
 Desktop resolves Marketplace identities through `https://api.lamarck.ai` by
 default. `LAMARCK_API_ORIGIN` may point local development at another API, but a
 signed artifact path is always resolved against the pinned
-`https://releases.lamarck.ai` origin. Alpha and release builds must set both of
+`https://releases.lamarck.ai` origin. Desktop builds must set both of
 these non-secret build inputs:
 
 | Variable | Value |
@@ -205,10 +205,14 @@ by Desktop updates.
 
 ## Signed Desktop releases
 
-The **Desktop Release** workflow (`.github/workflows/desktop-release.yml`) replaces
-Alpha Desktop. Dispatch it from protected `main` with a new three-component
-version such as `0.1.0`. The version is embedded in both the application and its
-System identity; the Git commit must match the clean checkout.
+The **Desktop Release** workflow (`.github/workflows/desktop-release.yml`) is the
+only desktop packaging and publishing flow. The product is still **Alpha**;
+Developer ID signing and Apple notarization do not change that status. The old
+ad-hoc Alpha workflow and its packaging, handoff and publishing scripts are removed.
+Dispatch Desktop Release from protected `main` with a new three-component version
+such as `0.1.0`. Numeric versions support native macOS update ordering; Alpha is
+the product label. The version is embedded in both the application and its System
+identity; the Git commit must match the clean checkout.
 
 Doppler project `lamarck-releases`, config `prod`, syncs these additional secrets
 to the GitHub `r2-releases` environment:
@@ -253,13 +257,13 @@ The workflow performs three jobs:
    ZIP and release metadata are transferred as a three-day Actions artifact.
 3. Linux uploads immutable release files to R2, downloads the public ZIP and
    verifies its SHA-256 and size, then atomically advances `latest.json`.
-   Downgrading the stable pointer is rejected; publish fixes with a higher
+   Downgrading the desktop pointer is rejected; publish fixes with a higher
    version. Retries reuse identical immutable files and reject byte conflicts.
 
 ```text
-desktop/macos/arm64/stable/<version>/Lamarck-<version>-macos-arm64.zip
-desktop/macos/arm64/stable/<version>/SHA256SUMS
-desktop/macos/arm64/stable/latest.json
+desktop/macos/arm64/<version>/Lamarck-<version>-macos-arm64.zip
+desktop/macos/arm64/<version>/SHA256SUMS
+desktop/macos/arm64/latest.json
 ```
 
 `latest.json` is the only mutable pointer (`Cache-Control: no-cache`). It
@@ -270,8 +274,9 @@ archive is never consumed by the updater. The production updater origin is
 fixed to `https://releases.lamarck.ai`; forks must explicitly change their
 publisher and client together.
 
-Only the production packager writes `desktopUpdateChannel: stable` into the
-signed app package. The installed Mac arm64 app checks on launch and every six hours,
+Release metadata carries `channel: alpha`. Only the signed desktop packager
+writes `desktopUpdateChannel: alpha` into the signed app package. The installed
+Mac arm64 app checks on launch and every six hours,
 downloads the full ZIP with Electron's signed Squirrel.Mac updater, and shows
 **Update & Restart** once ready. System also offers **Check for updates**.
 Before installation the Host drains runtime operations and tears down App
@@ -282,14 +287,14 @@ not a delta update format.
 
 ## First signed release cutover
 
-Deploy the updated website/backend readers before publishing the first stable
-release. They prefer stable and fall back to the existing Alpha channel only
-when the stable pointer returns 404. An invalid stable document or server error
-never falls back. No new Alpha workflow runs are available; old immutable Alpha
-objects and local Alpha tooling remain for historical/testing use.
+The website, backend and updater use the single desktop pointer above. There
+are no separate stable/Alpha download paths or fallback reads. Coordinate the
+website/backend deployment with the first signed publication: downloads are
+unavailable until that pointer exists. Existing immutable ad-hoc Alpha objects
+are no longer referenced by the download flow.
 
-Existing Alpha installations use a different bundle identifier and ad-hoc
-signing. Users must manually install the first signed `Lamarck.app` in
+Existing ad-hoc Alpha installations use a different bundle identifier.
+Users must manually install the first signed `Lamarck.app` in
 Applications. Subsequent signed versions can update in place. Verify the first
 release's download, Gatekeeper launch and existing Workspace access, then ship
 a higher test version and verify check → download → restart → new version.

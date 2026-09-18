@@ -8,7 +8,7 @@ import { desktopReleasePointer, publishDesktopRelease, validateDesktopRelease } 
 
 const bytes = Buffer.from("signed ZIP fixture");
 const release = {
-  channel: "stable", version: "0.2.0", file: "Lamarck-0.2.0-macos-arm64.zip",
+  channel: "alpha", version: "0.2.0", file: "Lamarck-0.2.0-macos-arm64.zip",
   signing: "developer-id-notarized", pub_date: "2026-09-18T00:00:00Z",
   sha256: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, bytes: bytes.length,
 };
@@ -17,10 +17,10 @@ test("website and native update feed point to the same immutable ZIP", () => {
   assert.equal(pointer.currentRelease, release.version);
   assert.equal(pointer.releases[0].updateTo.url, pointer.url);
   assert.equal(pointer.releases[0].updateTo.version, release.version);
-  assert.match(pointer.url, /\/stable\/0\.2\.0\/Lamarck-0\.2\.0-macos-arm64.zip$/);
+  assert.match(pointer.url, /\/desktop\/macos\/arm64\/0\.2\.0\/Lamarck-0\.2\.0-macos-arm64.zip$/);
 });
-test("stable metadata rejects ad-hoc packages and path injection", () => {
-  for (const patch of [{ signing: "ad-hoc" }, { channel: "alpha" }, { version: "0.2.0-alpha.1" }, { file: "../bad.zip" }, { bytes: 0 }, { sha256: "bad" }]) {
+test("signed desktop metadata rejects ad-hoc packages and path injection", () => {
+  for (const patch of [{ signing: "ad-hoc" }, { channel: "stable" }, { version: "0.2.0-alpha.1" }, { file: "../bad.zip" }, { bytes: 0 }, { sha256: "bad" }]) {
     assert.throws(() => validateDesktopRelease({ ...release, ...patch }));
   }
 });
@@ -39,7 +39,7 @@ test("pointer is written last after public ZIP verification", async (t) => {
   const context = await fixture(t);
   await publishDesktopRelease({ release, ...context });
   assert.deepEqual(context.writes.map(([method]) => method), ["putFileImmutable", "putBufferImmutable", "putBuffer"]);
-  assert.match(context.writes[2][1], /stable\/latest.json$/);
+  assert.match(context.writes[2][1], /desktop\/macos\/arm64\/latest.json$/);
   assert.equal(context.writes[2][3].cacheControl, "no-cache");
 });
 test("corrupted public download never changes the update pointer", async (t) => {

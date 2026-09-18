@@ -12,8 +12,8 @@ function fixture(enabled = true, prepareToQuit = vi.fn(async () => {})) {
 
 describe("desktop updates", () => {
   test("only the production macOS arm64 package enables updates", () => {
-    expect(supportsDesktopUpdates("darwin", "arm64", true, "stable")).toBe(true);
-    for (const args of [["darwin", "arm64", false, "stable"], ["darwin", "arm64", true, undefined], ["darwin", "x64", true, "stable"], ["linux", "arm64", true, "stable"]] as const) {
+    expect(supportsDesktopUpdates("darwin", "arm64", true, "alpha")).toBe(true);
+    for (const args of [["darwin", "arm64", false, "alpha"], ["darwin", "arm64", true, undefined], ["darwin", "x64", true, "alpha"], ["linux", "arm64", true, "alpha"]] as const) {
       expect(supportsDesktopUpdates(args[0], args[1], args[2], args[3])).toBe(false);
     }
     const { update, native } = fixture(false);

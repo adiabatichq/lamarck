@@ -2,21 +2,21 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { hashFile } from "./r2-object-store.mjs";
 
-export const DESKTOP_RELEASE_PREFIX = "desktop/macos/arm64/stable";
+export const DESKTOP_RELEASE_PREFIX = "desktop/macos/arm64";
 export const DESKTOP_RELEASE_ORIGIN = "https://releases.lamarck.ai";
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 export function validateDesktopRelease(release) {
-  if (!release || release.channel !== "stable" || !VERSION.test(release.version ?? "")
+  if (!release || release.channel !== "alpha" || !VERSION.test(release.version ?? "")
     || release.file !== `Lamarck-${release.version}-macos-arm64.zip`
     || release.signing !== "developer-id-notarized"
     || !/^sha256:[a-f0-9]{64}$/.test(release.sha256 ?? "")
     || !Number.isSafeInteger(release.bytes) || release.bytes < 1 || release.bytes > 8 * 1024 ** 3
     || typeof release.pub_date !== "string" || !Number.isFinite(Date.parse(release.pub_date))) {
-    throw new Error("Invalid signed stable desktop release metadata");
+    throw new Error("Invalid signed desktop release metadata");
   }
   return {
-    channel: "stable", version: release.version, file: release.file,
+    channel: "alpha", version: release.version, file: release.file,
     signing: release.signing, sha256: release.sha256, bytes: release.bytes, pub_date: release.pub_date,
     ...(release.openSource === undefined ? {} : { openSource: validatedOpenSource(release.openSource, DESKTOP_RELEASE_ORIGIN) }),
   };
@@ -44,7 +44,7 @@ export async function publishDesktopRelease({ release: value, directory, store, 
   });
   if (previous.ok) {
     const current = validateDesktopRelease(await previous.json());
-    if (compareVersions(release.version, current.version) < 0) throw new Error("Refusing to downgrade the stable release pointer");
+    if (compareVersions(release.version, current.version) < 0) throw new Error("Refusing to downgrade the desktop release pointer");
   } else {
     await previous.body?.cancel();
     if (previous.status !== 404) throw new Error(`Cannot check current release: HTTP ${previous.status}`);
