@@ -23,6 +23,7 @@
     "electron:dev": "npm run dev"
   },
   "dependencies": {
+    "@lamarck/capsule": "0.1.0",
     "@lamarck/cli": "0.1.2",
     "@lamarck/system": "0.1.2",
     "react": "^19.0.0",
