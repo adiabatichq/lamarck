@@ -14,6 +14,16 @@ export const SYSTEM_DB_FILENAME = "system.db";
 
 // Greenfield V1 includes the control plane and rebuildable D1 observer state.
 export const SYSTEM_SCHEMA_V1 = `
+CREATE TABLE IF NOT EXISTS ai_access_sources (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('api-key', 'subscription', 'local')),
+  name TEXT NOT NULL,
+  allow_json JSON NOT NULL,
+  config_json JSON NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation > 0)
+);
+
 CREATE TABLE IF NOT EXISTS connector_sources (
   id            TEXT PRIMARY KEY,
   connector_id  TEXT NOT NULL,
@@ -147,39 +157,8 @@ CREATE TABLE IF NOT EXISTS connector_installations (
 );
 `;
 
-const AI_ACCESS_SCHEMA = `
-CREATE TABLE IF NOT EXISTS ai_access_sources (
-  id TEXT PRIMARY KEY,
-  provider TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('api-key', 'subscription', 'local')),
-  name TEXT NOT NULL,
-  allow_json JSON NOT NULL,
-  config_json JSON NOT NULL,
-  generation INTEGER NOT NULL CHECK (generation > 0)
-);
-`;
-
-// Early Alpha builds changed V1 in place. Accept only those exact published
-// shapes so existing Workspaces can enter the numbered migration sequence.
-const RETIRED_AI_CATALOG_SCHEMA = `
-CREATE TABLE IF NOT EXISTS ai_models (
-  id TEXT PRIMARY KEY,
-  metadata_json JSON NOT NULL
-);
-`;
-export const SYSTEM_SCHEMA_V2 = SYSTEM_SCHEMA_V1 + AI_ACCESS_SCHEMA;
-export const SYSTEM_SCHEMA = SYSTEM_SCHEMA_V2;
-export const SYSTEM_DATABASE_VERSION = 2;
-
-function validatePublishedV1(db: DatabaseSync): void {
-  const hasObject = (name: string) => Boolean(db.prepare(
-    "SELECT 1 FROM sqlite_schema WHERE name = ?",
-  ).get(name));
-  const schema = hasObject("ai_access_sources")
-    ? SYSTEM_SCHEMA_V2 + (hasObject("ai_models") ? RETIRED_AI_CATALOG_SCHEMA : "")
-    : SYSTEM_SCHEMA_V1;
-  assertSchemaCompatible(db, schema, SYSTEM_DB_FILENAME, { allowUnknownObjects: false });
-}
+export const SYSTEM_SCHEMA = SYSTEM_SCHEMA_V1;
+export const SYSTEM_DATABASE_VERSION = 1;
 
 const SYSTEM_MIGRATIONS: readonly DatabaseMigration[] = [
   {
@@ -188,19 +167,8 @@ const SYSTEM_MIGRATIONS: readonly DatabaseMigration[] = [
     up(db) {
       db.exec(SYSTEM_SCHEMA_V1);
     },
-    validate: validatePublishedV1,
-  },
-  {
-    version: 2,
-    name: "preserve AI access sources and retire the cached model catalog",
-    up(db) {
-      db.exec(AI_ACCESS_SCHEMA);
-      // This table held only the rebuildable model catalog. Source policies and
-      // encrypted credentials remain in their existing tables without rewriting.
-      db.exec("DROP TABLE IF EXISTS ai_models");
-    },
     validate(db) {
-      assertSchemaCompatible(db, SYSTEM_SCHEMA_V2, SYSTEM_DB_FILENAME, {
+      assertSchemaCompatible(db, SYSTEM_SCHEMA_V1, SYSTEM_DB_FILENAME, {
         allowUnknownObjects: false,
       });
     },
