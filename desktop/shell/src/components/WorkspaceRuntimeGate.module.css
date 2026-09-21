@@ -1,0 +1,16 @@
+.reconnecting {
+  position: fixed;
+  z-index: 100;
+  top: 50px;
+  left: 50%;
+  max-width: calc(100% - 32px);
+  transform: translateX(-50%);
+  padding: 10px 16px;
+  border: 1px solid var(--use-line-strong);
+  border-radius: 6px;
+  background: var(--use-chrome);
+  color: var(--use-muted);
+  box-shadow: 0 4px 16px rgba(48, 43, 34, 0.1);
+  font-size: 12px;
+  pointer-events: none;
+}

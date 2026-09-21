@@ -11,6 +11,7 @@ function fixture(mode = 'text') {
   const calls = new Map<string, any>();
   const cancelled: string[] = [];
   const invoke = vi.fn(async (op: string, input: any): Promise<any> => {
+    if (op === 'ai.capture') return { ok: true };
     if (op === 'ai.listOptions') return { models: [], accessSources: [{ id: 'source', support: [{ model: 'openai:embedding', maxEmbeddingsPerCall: 2, supportsParallelCalls: true }] }] };
     if (op === 'ai.start') { const invocationId = String(++id); calls.set(invocationId, { input, sequence: 0, polls: 0 }); return { invocationId }; }
     if (op === 'ai.cancel') { cancelled.push(input.invocationId); return { ok: true }; }
@@ -115,9 +116,9 @@ describe('official Vercel operations through System model proxies', () => {
   test('pre-aborted calls do not start and URL inputs never download in App', async () => {
     const { model, invoke } = fixture();
     await expect(generateText({ model, prompt: 'stop', abortSignal: AbortSignal.abort() })).rejects.toThrow();
-    expect(invoke).not.toHaveBeenCalled();
+    expect(invoke.mock.calls.filter(([operation]) => operation !== 'ai.capture')).toHaveLength(0);
     await expect(generateText({ model, messages: [{ role: 'user', content: [{ type: 'image', image: new URL('https://example.invalid/image.png') }] }] })).rejects.toThrow('URL inputs');
-    expect(invoke).not.toHaveBeenCalled();
+    expect(invoke.mock.calls.filter(([operation]) => operation !== 'ai.capture')).toHaveLength(0);
   });
 });
 describe('AI codec', () => {

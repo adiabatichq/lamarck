@@ -33,7 +33,7 @@ export function isDeclaredWorkload(manifest: AppManifest, workload: AppWorkload)
  * added here and covered by policy tests.
  */
 export function isAppSystemRoute(path: string, method: string): boolean {
-  if (method === "POST" && ["/api/ai/options", "/api/ai/invoke/start", "/api/ai/invoke/next", "/api/ai/invoke/cancel", "/api/ai/invoke/tool-result"].includes(path)) return true;
+  if (method === "POST" && ["/api/ai/capture", "/api/ai/options", "/api/ai/invoke/start", "/api/ai/invoke/next", "/api/ai/invoke/cancel", "/api/ai/invoke/tool-result"].includes(path)) return true;
   if (path === "/api/query" && method === "POST") return true;
   if (path === "/api/content-ref/resolve" && method === "POST") return true;
   if (path === "/api/mutate" && method === "POST") return true;

@@ -73,5 +73,8 @@
   "dependencies": {
     "@ai-sdk/provider": "4.0.17",
     "@ai-sdk/provider-utils": "5.0.43"
+  },
+  "peerDependencies": {
+    "ai": "7.0.105"
   }
 }

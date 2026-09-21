@@ -1,3 +1,4 @@
+import { isStartupFailure, startupFailureText, type StartupFailureMessage } from "../startup-failure";
 import { fork, type ChildProcess } from "node:child_process";
 import { GuardServiceError } from "./engine";
 import type { GuardRpcMethod } from "./protocol";
@@ -301,6 +302,7 @@ export class GuardProcessExecutor {
 
     return new Promise<ChildProcess>((resolve, reject) => {
       let settled = false;
+      let startupFailure: StartupFailureMessage | null = null;
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
@@ -312,12 +314,14 @@ export class GuardProcessExecutor {
         else resolve(child);
       };
       const onReady = (message: unknown) => {
-        if (isReadyMessage(message)) finish();
+        if (isStartupFailure(message)) startupFailure = message;
+        else if (isReadyMessage(message) && !startupFailure) finish();
       };
       const onEarlyExit = (code: number | null, signal: NodeJS.Signals | null) => {
         finish(new GuardServiceError(
-          "GUARD_EXECUTOR_START",
-          `Guard executor exited before readiness (${exitDetail(code, signal)})`,
+          startupFailure?.code ?? "GUARD_EXECUTOR_START",
+          startupFailure ? startupFailureText(startupFailure)
+            : `Guard executor exited before readiness (${exitDetail(code, signal)})`,
         ));
       };
       const onEarlyError = (error: Error) => finish(new GuardServiceError(

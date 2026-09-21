@@ -13,6 +13,9 @@ import { decodeAi } from '@lamarck/system/protocol';
 import { SYSTEM_SCHEMA_V1 } from '../../desktop/core/src/db';
 import { CredentialStore } from '../../desktop/core/src/credentials/credential-store';
 import { SqliteEncryptedSecretStore } from '../../desktop/core/src/credentials/secret-store';
+import { AiTurns } from '../../desktop/core/src/ai/turns';
+import { GuardEngine } from '../../desktop/core/src/guard-service/engine';
+import { ContentBlobStore } from '../../desktop/core/src/blob-store';
 import { AiService, type AiAdapter } from '../../desktop/core/src/ai/service';
 const native = process.env.LAMARCK_AI_NATIVE_SMOKE === '1';
 test.runIf(native)('pinned subscription runtimes start with isolated, logged-out sources', async () => {
@@ -170,9 +173,14 @@ function codexResponse(output: any[]): Response {
 
 async function fixtureHost(root: string, adapter: AiAdapter) {
   const db = new DatabaseSync(':memory:'); db.exec(SYSTEM_SCHEMA_V1);
-  const service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter);
+  const captureRoot = await mkdtemp(join(tmpdir(), 'ai-native-capture-'));
+  const guard = new GuardEngine({ workspacePath: captureRoot });
+  const principal = { source: 'app:fixture:ui', producerRef: `producer:v1:sha256:${'4'.repeat(64)}`, tableGrants: [] };
+  const captureErrors: unknown[] = [];
+  const service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter, new AiTurns(captureRoot, () => ({ publishAiTurn: input => guard.publishAiTurn(principal, input) }), error => captureErrors.push(error)));
   const caller = { kind: 'app', appId: 'fixture', channelId: 'native-fixture', workload: 'ui', authorization: {} } as any;
   const system = createSystem(async (operation, input: any): Promise<any> => {
+    if (operation === 'ai.capture') return service.turns!.request({ context: caller, signal: new AbortController().signal, release() {} }, input);
     if (operation === 'ai.listOptions') return service.options(caller);
     if (operation === 'ai.start') return service.start({ context: caller, signal: new AbortController().signal, release() {} }, input);
     if (operation === 'ai.next') return service.invocations.next(caller, input.invocationId, input.sequence);
@@ -184,7 +192,7 @@ async function fixtureHost(root: string, adapter: AiAdapter) {
     throw new Error('Unexpected operation');
   });
   let closed = false;
-  return { service, system, async close() { if (!closed) { closed = true; await service.close(); db.close(); } } };
+  return { service, system, async close() { if (!closed) { closed = true; await service.close(); db.close(); try { expect(captureErrors).toEqual([]); const events = guard.query(principal, 'SELECT payload FROM events WHERE type = ?', ['ai.turn']); expect(events.length).toBeGreaterThan(0); for (const event of events) expect(new ContentBlobStore(captureRoot).resolve(JSON.parse(event.payload as string).raw.contentRef).status).toBe('resolved'); } finally { guard.close(); await rm(captureRoot, { recursive: true, force: true }); } } } };
 }
 
 test.runIf(native).each([

@@ -1,3 +1,4 @@
+import { isStartupFailure, startupFailureText, type StartupFailureMessage } from "../../core/src/startup-failure";
 import { DesktopUpdater, supportsDesktopUpdates } from "./desktop-updater";
 import { RUNTIME_STARTUP_TIMEOUT_MS } from "@lamarck/capsule";
 import { loadManagedCliArtifact } from "./capsule/managed-cli-artifact";
@@ -1030,6 +1031,7 @@ function isGuardReadyMessage(message: unknown): message is GuardReadyMessage {
 function waitForGuardReady(child: UtilityProcess): Promise<number> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let startupFailure: StartupFailureMessage | null = null;
     const finish = (error?: Error, port?: number) => {
       if (settled) return;
       settled = true;
@@ -1041,11 +1043,12 @@ function waitForGuardReady(child: UtilityProcess): Promise<number> {
       else resolve(port!);
     };
     const onMessage = (message: unknown) => {
-      if (!isGuardReadyMessage(message)) return;
-      finish(undefined, message.port);
+      if (isStartupFailure(message)) startupFailure = message;
+      else if (isGuardReadyMessage(message) && !startupFailure) finish(undefined, message.port);
     };
     const onExit = (code: number) => {
-      finish(new Error(`Guard utility exited before it was ready (code ${code})`));
+      finish(new Error(startupFailure ? startupFailureText(startupFailure)
+        : `Guard utility exited before it was ready (code ${code})`));
     };
     const onError = (type: "FatalError", location: string) => {
       finish(new Error(`Guard utility ${type} at ${location}`));
@@ -1170,7 +1173,7 @@ function startCore(generation: number): void {
 
   console.log(`[electron] Starting Node Core on port ${corePort}...`);
   const child = spawn(process.execPath, [CORE_ENTRY, workspace], {
-    stdio: "inherit",
+    stdio: ["inherit", "inherit", "inherit", "ipc"],
     env: {
       ...process.env,
       ELECTRON_RUN_AS_NODE: "1",
@@ -1183,6 +1186,12 @@ function startCore(generation: number): void {
     },
   });
   runtimeSupervisor.attachCore(generation, child);
+  let startupFailure: StartupFailureMessage | null = null;
+  child.on("message", (message: unknown) => {
+    const state = runtimeSupervisor.snapshot();
+    if (state.generation === generation && state.phase === "starting"
+      && runtimeSupervisor.core === child && isStartupFailure(message)) startupFailure = message;
+  });
   child.on("error", (error) => {
     if (child.pid === undefined) unspawnedCoreFailures.add(child);
     beginUnexpectedCoreTeardown(
@@ -1199,7 +1208,8 @@ function startCore(generation: number): void {
       beginUnexpectedCoreTeardown(
         child,
         generation,
-        `Node Core exited unexpectedly${code === null ? "" : ` (code ${code})`}`,
+        startupFailure ? startupFailureText(startupFailure)
+          : `Node Core exited unexpectedly${code === null ? "" : ` (code ${code})`}`,
       );
     } else {
       runtimeSupervisor.detachCore(child);

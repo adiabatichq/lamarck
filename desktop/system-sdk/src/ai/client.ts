@@ -1,3 +1,4 @@
+import { createCaptureOwner } from './capture.js';
 import { APICallError, type EmbeddingModelV4, type LanguageModelV4, type LanguageModelV4CallOptions, type LanguageModelV4StreamPart } from '@ai-sdk/provider';
 import { validateTypes, type Tool } from '@ai-sdk/provider-utils';
 import type { SystemInvoke } from '../protocol.js';
@@ -15,17 +16,29 @@ export interface SystemAi {
 type SystemInvokeForOptions = () => Promise<import('./types.js').AiOptions>;
 
 export function createAi(invoke: SystemInvoke): SystemAi {
+  const capture = createCaptureOwner(invoke);
   function languageModel(selection: ModelSelection, scope?: Scope): LanguageModelV4 {
     return {
-      specificationVersion: 'v4', provider: 'lamarck', modelId: selection.model,
+      specificationVersion: 'v4', provider: capture.provider, modelId: selection.model,
       // Prevent AI SDK from downloading on the App's network. The codec then
       // rejects URL input explicitly; callers supply bounded bytes instead.
       supportedUrls: { '*': [/^https?:\/\//] },
       doGenerate: options => collect(selection, 'generate', options, scope) as ReturnType<LanguageModelV4['doGenerate']>,
-      doStream: async options => ({ stream: await stream(selection, options, scope) }),
+      doStream: async options => {
+        const binding = capture.forPrompt(options.prompt);
+        const deferred = binding ? undefined : capture.deferred();
+        try {
+          const result = { stream: await stream(selection, options, scope, deferred) };
+          deferred?.outcome(result);
+          return result;
+        } catch (error) {
+          if (error && typeof error === 'object') deferred?.outcome(error);
+          throw error;
+        }
+      },
     };
   }
-  async function open(selection: ModelSelection, operation: AiStart['operation'], options: { abortSignal?: AbortSignal }, scope?: Scope) {
+  async function open(selection: ModelSelection, operation: AiStart['operation'], options: { abortSignal?: AbortSignal }, scope?: Scope, deferred?: ReturnType<typeof capture.deferred>) {
     if (scope && !scope.open) throw new Error('AI tool scope is closed');
     const controller = new AbortController();
     scope?.active.add(controller);
@@ -48,7 +61,8 @@ export function createAi(invoke: SystemInvoke): SystemAi {
     };
     try {
       signal.throwIfAborted();
-      const started = await invoke('ai.start', { ...selection, operation, options: encodeAi(data), callbacks: !!scope });
+      const correlation = operation !== 'embed' && 'prompt' in options ? capture.forPrompt(options.prompt as object) : undefined;
+      const started = await invoke('ai.start', { ...selection, operation, options: encodeAi(data), callbacks: !!scope, ...(deferred ? { captureToken: deferred.token } : {}), ...(correlation ? { capture: correlation } : {}) });
       invocationId = started.invocationId;
       if (signal.aborted) { cancel(); signal.throwIfAborted(); }
     } catch (error) { finish(); throw error; }
@@ -100,8 +114,8 @@ export function createAi(invoke: SystemInvoke): SystemAi {
       }
     } finally { call.cancel(); }
   }
-  async function stream(selection: ModelSelection, options: LanguageModelV4CallOptions, scope?: Scope): Promise<ReadableStream<LanguageModelV4StreamPart>> {
-    const call = await open(selection, 'stream', options, scope);
+  async function stream(selection: ModelSelection, options: LanguageModelV4CallOptions, scope?: Scope, deferred?: ReturnType<typeof capture.deferred>): Promise<ReadableStream<LanguageModelV4StreamPart>> {
+    const call = await open(selection, 'stream', options, scope, deferred);
     let pending: Awaited<ReturnType<typeof call.next>> = [];
     try {
       for (;;) {
@@ -113,11 +127,14 @@ export function createAi(invoke: SystemInvoke): SystemAi {
         break;
       }
     } catch (error) { call.cancel(); throw error; }
+    let cancelled = false;
     return new ReadableStream({
       async pull(controller) {
         try {
+          await deferred?.release();
           for (;;) {
             const events = pending.length ? pending.splice(0) : await call.next();
+            if (cancelled) return;
             let emitted = false;
             for (const event of events) {
               if (event.type === 'part') {
@@ -133,9 +150,18 @@ export function createAi(invoke: SystemInvoke): SystemAi {
             // Keep polling until data arrives or the invocation terminates.
             if (emitted) return;
           }
-        } catch (error) { controller.error(error); call.cancel(); }
+        } catch (error) {
+          // Vercel cancels an attempt before retrying an error part. That also
+          // aborts any outstanding poll; only the generation's own lifecycle
+          // may close its turn in this case. A live stream read failure below
+          // remains terminal, and user aborts still reach telemetry.onAbort.
+          if (cancelled) return;
+          const failure = options.abortSignal?.aborted ? options.abortSignal.reason : error;
+          if (deferred) await deferred.failed(failure); else await capture.streamFailed(options.prompt, failure);
+          controller.error(failure); call.cancel();
+        }
       },
-      cancel() { call.cancel(); },
+      cancel() { cancelled = true; call.cancel(); },
     }, { highWaterMark: 0 });
   }
   return Object.freeze({

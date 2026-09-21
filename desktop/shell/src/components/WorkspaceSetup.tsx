@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { DesktopUpdate } from "./DesktopUpdate";
 import styles from "./WorkspaceSetup.module.css";
 
 export interface WorkspaceDescriptor {
@@ -8,7 +9,7 @@ export interface WorkspaceDescriptor {
 
 export interface WorkspaceSetupState {
   status: "setup";
-  reason: "first-run" | "missing" | "invalid";
+  reason: "first-run" | "missing" | "invalid" | "startup-failed";
   suggestedPath: string;
   previousWorkspace?: {
     lastKnownPath: string;
@@ -20,9 +21,10 @@ export interface WorkspaceSetupState {
 export interface WorkspaceSetupProps {
   state: WorkspaceSetupState;
   onReady: (workspace: WorkspaceDescriptor) => void | Promise<void>;
+  onRetry?: () => Promise<void>;
 }
 
-type PendingAction = "browse-create" | "create" | "open" | "recover" | null;
+type PendingAction = "browse-create" | "create" | "open" | "recover" | "retry" | null;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -33,6 +35,13 @@ function setupCopy(reason: WorkspaceSetupState["reason"]): {
   title: string;
   introduction: string;
 } {
+  if (reason === "startup-failed") {
+    return {
+      eyebrow: "Workspace couldn’t open",
+      title: "Choose how to continue.",
+      introduction: "Try opening your Workspace again, or choose another Workspace below.",
+    };
+  }
   if (reason === "missing") {
     return {
       eyebrow: "Workspace not found",
@@ -57,7 +66,7 @@ function setupCopy(reason: WorkspaceSetupState["reason"]): {
   };
 }
 
-export function WorkspaceSetup({ state, onReady }: WorkspaceSetupProps) {
+export function WorkspaceSetup({ state, onReady, onRetry }: WorkspaceSetupProps) {
   const [createPath, setCreatePath] = useState(state.suggestedPath);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
   const [error, setError] = useState<string | null>(null);
@@ -78,6 +87,21 @@ export function WorkspaceSetup({ state, onReady }: WorkspaceSetupProps) {
 
   async function finish(workspace: WorkspaceDescriptor) {
     await onReady(workspace);
+  }
+
+  async function retryWorkspace() {
+    if (!onRetry) return;
+    setPendingAction("retry");
+    setError(null);
+    setRecoveryWorkspace(null);
+    setRecoveryCode("");
+    try {
+      await onRetry();
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setPendingAction(null);
+    }
   }
 
   async function browseCreateLocation() {
@@ -161,7 +185,9 @@ export function WorkspaceSetup({ state, onReady }: WorkspaceSetupProps) {
     <main className={styles.screen}>
       <header className={styles.titlebar}>
         <div className={styles.wordmark}>Lamarck</div>
-        <div className={styles.titlebarContext}>Workspace setup</div>
+        {state.reason === "startup-failed"
+          ? <DesktopUpdate />
+          : <div className={styles.titlebarContext}>Workspace setup</div>}
       </header>
 
       <div className={styles.canvas}>
@@ -179,6 +205,19 @@ export function WorkspaceSetup({ state, onReady }: WorkspaceSetupProps) {
             <h1>{copy.title}</h1>
             <p>{copy.introduction}</p>
           </div>
+
+          {state.reason === "startup-failed" && (
+            <div className={styles.startupNotice}>
+              <code>{state.previousWorkspace?.lastKnownPath}</code>
+              <p role="alert">{state.detail}</p>
+              {onRetry && (
+                <button type="button" className={styles.secondaryButton}
+                  disabled={busy} onClick={() => void retryWorkspace()}>
+                  {pendingAction === "retry" ? "Opening…" : "Try again"}
+                </button>
+              )}
+            </div>
+          )}
 
           {state.reason === "missing" && state.previousWorkspace && (
             <div className={styles.previousNotice}>

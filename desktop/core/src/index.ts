@@ -1,3 +1,4 @@
+import { AiTurns } from './ai/turns';
 import { AiService } from './ai/service';
 import { handleAiRequest } from './ai/routes';
 import { AiError } from './ai/errors';
@@ -7,6 +8,7 @@ import { mkdir, readFile, rm, stat } from "fs/promises";
 import { randomBytes } from "crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { openSystemDatabase } from "./db";
+import { sendStartupFailure } from "./startup-failure";
 import { ContentBlobStore } from "./blob-store";
 import {
   APP_GUARD_DEADLINE_MS,
@@ -131,7 +133,10 @@ const lamarckApiOrigin = process.env.LAMARCK_API_ORIGIN ?? "https://api.lamarck.
 await mkdir(lamarckDir, { recursive: true });
 
 // Boot
-const systemDb = openSystemDatabase(workspacePath);
+const systemDb = await Promise.resolve().then(() => openSystemDatabase(workspacePath)).catch(async (error) => {
+  await sendStartupFailure(error);
+  throw error;
+});
 const systemIdentity = systemIdentityFromBuild();
 const producerDescriptorStore = new ProducerDescriptorStore(workspacePath);
 const systemProducer = createProducerBinding(
@@ -185,7 +190,7 @@ const deviceIdentity = await resolveDeviceIdentity(coreSettings.vaultId ?? "");
 const vaultKey = process.env.LAMARCK_VAULT_KEY ?? encodeVaultKey(randomBytes(32));
 const secretStore = new SqliteEncryptedSecretStore(systemDb, vaultKey);
 const credentialStore = new CredentialStore(systemDb);
-const aiService = new AiService(systemDb, credentialStore, secretStore, join(workspacePath, '.lamarck', 'ai'));
+const aiService = new AiService(systemDb, credentialStore, secretStore, join(workspacePath, '.lamarck', 'ai'), undefined, new AiTurns(workspacePath, caller => guardForRequest(caller)));
 const lamarckSessionManager = new LamarckSessionManager(secretStore, {
   credentialStore,
   apiOrigin: lamarckApiOrigin,

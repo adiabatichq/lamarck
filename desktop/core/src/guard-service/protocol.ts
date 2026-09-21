@@ -81,7 +81,13 @@ export interface GuardSchemaPlan {
 export const SCHEMA_CHANGE_AUTHOR_MAX_CHARS = 200;
 export const SCHEMA_CHANGE_CONTEXT_MAX_CHARS = 2_000;
 
+export interface AiTurnPublication {
+  token: string; callId: string; operation: 'generateText' | 'streamText';
+  status: 'completed' | 'failed' | 'interrupted'; startedAt: number; endedAt: number;
+  recordCount: number; usage?: JsonValue;
+}
 export interface GuardRpcMethods {
+  publishAiTurn: { params: { principal: GuardPrincipal; input: AiTurnPublication }; result: string };
   query: {
     params: GuardStatement & { principal: GuardPrincipal };
     result: Array<Record<string, unknown>>;
@@ -188,6 +194,7 @@ export const GUARD_RPC_DESCRIPTOR = Object.freeze({
     "mutate",
     "transaction",
     "writeEvent",
+    "publishAiTurn",
     "writeLifecycleEvent",
     "writeWorkspaceEvent",
     "schema.inspect",

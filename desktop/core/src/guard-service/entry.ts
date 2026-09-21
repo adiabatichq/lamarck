@@ -1,3 +1,4 @@
+import { sendStartupFailure, startupFailure } from "../startup-failure";
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { GuardServiceError } from "./engine";
@@ -399,12 +400,14 @@ if (require.main === module) {
     } catch (error) {
       const failure = rpcError(error);
       console.error(`[guard-executor] ${failure.code}: ${failure.message}`);
-      process.exit(1);
+      void sendStartupFailure(error).finally(() => process.exit(1));
     }
   } else {
     void main().catch((error) => {
       const failure = rpcError(error);
       console.error(`[guard-service] ${failure.code}: ${failure.message}`);
+      const parentPort = (process as NodeJS.Process & { parentPort?: ElectronParentPort | null }).parentPort;
+      parentPort?.postMessage(startupFailure(error));
       process.exitCode = 1;
     });
   }

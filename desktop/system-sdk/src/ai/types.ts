@@ -56,4 +56,15 @@ export interface AiStart extends ModelSelection {
   operation: 'generate' | 'stream' | 'embed';
   options: JsonValue;
   callbacks: boolean;
+  capture?: { callId: string; stepNumber: number };
+  captureToken?: string;
 }
+
+/** Private capture operations carried on the existing authenticated v1 channel. */
+export type AiCaptureRequest =
+  | { action: 'link'; callId: string; token: string; stepNumber?: number }
+  | { action: 'start'; callId: string; operation: 'generateText' | 'streamText'; time: number; recordInputs: boolean; recordOutputs: boolean }
+  | { action: 'record'; callId: string; record: JsonValue }
+  | { action: 'end'; callId: string; status: 'completed' | 'interrupted' | 'failed'; time: number; usage?: JsonValue }
+  | { action: 'discard'; callId: string; message: string }
+  | { action: 'disconnect'; callId: string };

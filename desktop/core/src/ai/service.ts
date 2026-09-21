@@ -1,3 +1,4 @@
+import { AiTurns, type TurnCall } from './turns';
 import { createProviderRegistry } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
@@ -24,7 +25,7 @@ export class AiService {
   readonly subscriptions: AiSubscriptions;
   private descriptions = new Map<string, { generation: number; time: number; promise: Promise<AiAccessSource> }>();
   private catalog = new Map(AI_CATALOG.map(model => [model.id, model]));
-  constructor(db: DatabaseSync, credentials: CredentialStore, secrets: SecretStore, runtimeRoot: string, private adapter?: AiAdapter) {
+  constructor(db: DatabaseSync, credentials: CredentialStore, secrets: SecretStore, runtimeRoot: string, private adapter?: AiAdapter, readonly turns?: AiTurns) {
     this.sources = new AiSourceStore(db, credentials, secrets, id => {
       this.descriptions.delete(id); this.invocations.cancelSource(id); this.subscriptions.invalidate(id);
     });
@@ -59,7 +60,26 @@ export class AiService {
     } else if (!Array.isArray(options.prompt)) throw new AiError('invalid_request', 'Language prompt is required');
     return this.invocations.start(admission, input, async context => {
       let handle: Awaited<ReturnType<AiAdapter['open']>> | undefined;
+      let capture: TurnCall | undefined;
+      let capturedFinish = false;
+      const deferred = input.captureToken ? this.turns?.deferInvocation(context.caller, input, context.id, options.prompt) : undefined;
       try {
+        if ((input.capture || input.captureToken) && !this.turns) throw new AiError('capture_unavailable', 'AI content capture is unavailable');
+        try { capture = await this.turns?.invocation(context.caller, input, context.id); }
+        catch { throw new AiError('capture_failed', 'AI content capture correlation/staging failed'); }
+        if (capture && input.operation !== 'embed') {
+          // Input recording is filtered by the Host capture policy.
+          for (const message of options.prompt) await capture.record({ kind: 'model-input', message });
+          const originalTool = context.tool;
+          context.tool = (name, value, id) => capture!.tool(name, value, id, () => originalTool(name, value, id));
+        }
+        if (deferred) {
+          const originalTool = context.tool;
+          context.tool = async (name, value, id) => {
+            const linked = await deferred.promise;
+            return linked ? linked.tool(name, value, id, () => originalTool(name, value, id)) : originalTool(name, value, id);
+          };
+        }
         const view = await this.describe(source);
         context.signal.throwIfAborted();
         if (this.sources.get(source.id)?.generation !== source.generation) throw new AiError('source_changed', 'AI source configuration changed');
@@ -79,7 +99,7 @@ export class AiService {
         } else {
           const model = registry.languageModel(input.model as `${string}:${string}`);
           const callOptions = { ...options, abortSignal: context.signal };
-          if (input.operation === 'generate') { result = await model.doGenerate(callOptions); }
+          if (input.operation === 'generate') { result = await model.doGenerate(callOptions); for (const part of result.content) await capture?.content(part); }
           else {
             const response = await model.doStream(callOptions);
             const reader = response.stream.getReader();
@@ -90,10 +110,13 @@ export class AiService {
               // Keep doStream startup failures outside the App's returned stream
               // so Vercel can apply maxRetries before streaming has begun.
               await context.streamReady();
+              if (deferred) capture = await deferred.promise;
               for (;;) {
                 context.signal.throwIfAborted();
                 const { done, value } = await reader.read();
                 if (done) { completed = true; break; }
+                await capture?.content(value.type === 'error' ? { type: 'error', error: aiFailure(value.error) } : value);
+                if (value.type === 'finish') { await capture?.finish(value); capturedFinish = true; }
                 if (value.type === 'raw') throw new AiError('unsupported', 'Raw provider output is unsupported');
                 await context.part(value.type === 'error' ? { type: 'error', error: aiFailure(value.error) } : value.type === 'finish' ? { ...value, providerMetadata: { ...value.providerMetadata, lamarck: { invocationId: context.id } } } : value);
               }
@@ -108,8 +131,11 @@ export class AiService {
           delete result.request;
           if (result.response) result.response = { id: result.response.id, modelId: result.response.modelId, timestamp: result.response.timestamp };
         }
+        if (!capturedFinish) { await capture?.finish(result); capturedFinish = true; }
         return result;
       } catch (error) {
+        if (deferred && !capture) deferred.failed(aiFailure(error, context.signal));
+        if (!capturedFinish) { await capture?.finish(undefined, aiFailure(error, context.signal)); capturedFinish = true; }
         const failure = aiFailure(error, context.signal);
         if ((failure.statusCode === 401 || failure.statusCode === 403 || failure.code === 'login_required') && this.sources.get(source.id)?.generation === source.generation) {
           const cached = this.descriptions.get(source.id);
@@ -122,7 +148,7 @@ export class AiService {
     });
   }
   refreshSource(id: string): void { this.descriptions.delete(id); }
-  async close(): Promise<void> { this.subscriptions.close(); await this.invocations.close(); await this.subscriptions.settled(); }
+  async close(): Promise<void> { this.subscriptions.close(); await this.invocations.close(); await this.subscriptions.settled(); await this.turns?.close(); }
   private async describe(source: ManagedAiSource): Promise<AiAccessSource> {
     const current = this.descriptions.get(source.id);
     if (current?.generation === source.generation && (Date.now() - current.time < 15_000 || this.invocations.hasSource(source.id))) return current.promise;

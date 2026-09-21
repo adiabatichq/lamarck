@@ -1,4 +1,3 @@
-import { DesktopUpdate } from "../components/DesktopUpdate";
 import { useState, type FormEvent, type ReactNode } from "react";
 import { createApp, type AppInfo } from "../lib/api";
 import { AppMark } from "../components/AppMark";
@@ -65,7 +64,6 @@ export function UseWorkspace({
           )}
         </div>
         <div className={styles.titleStatus}>
-          <DesktopUpdate />
           {coreStatus !== "connected" && (
             <span className={`${styles.coreState} ${styles[coreStatus]}`}>
               <span />

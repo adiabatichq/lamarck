@@ -20,6 +20,7 @@ if (!/^\d+\.\d+\.\d+$/.test(packageDocument.version)) {
 if (packageDocument.lamarckSystemProtocol !== 1) {
   throw new Error("System SDK releases must declare System protocol V1 compatibility");
 }
+if (packageDocument.peerDependencies?.ai !== "7.0.105") throw new Error("SDK capture requires the pinned official ai peer");
 const expectedTag = `system-sdk-v${packageDocument.version}`;
 
 if (verifyRelease) {
@@ -44,6 +45,10 @@ if (!firstTarball.equals(secondTarball)) {
 const expectedFiles = [
   "LICENSE",
   "README.md",
+  "dist/ai/capture-data.d.ts",
+  "dist/ai/capture-data.js",
+  "dist/ai/capture.d.ts",
+  "dist/ai/capture.js",
   "dist/ai/client.d.ts",
   "dist/ai/client.js",
   "dist/ai/codec.d.ts",
@@ -109,7 +114,24 @@ async function verifyConsumer(tarballPath) {
         import("@lamarck/system/browser"),
         import("@lamarck/system/node"),
         import("@lamarck/system/protocol"),
-      ]);`,
+      ]);
+      const { createSystem } = await import("@lamarck/system/browser");
+      const { generateText } = await import("ai");
+      const { encodeAi } = await import("@lamarck/system/protocol");
+      const captures = [];
+      const invoke = async (operation, input) => {
+        if (operation === "ai.capture") { captures.push(input); return { ok: true }; }
+        if (operation === "ai.start") { if (!input.capture?.callId) throw new Error("Missing packaged correlation"); return { invocationId: "fixture" }; }
+        if (operation === "ai.cancel") return { ok: true };
+        if (operation === "ai.next") return { events: [{ sequence: 0, type: "complete", value: encodeAi({ content: [{ type: "text", text: "packaged" }], finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } }, warnings: [] }) }] };
+        throw new Error(operation);
+      };
+      for (let i = 0; i < 2; i++) {
+        const system = createSystem(invoke);
+        const result = await generateText({ model: system.ai.languageModel({ model: "openai:fixture", accessSource: "fixture" }), prompt: "hello" });
+        if (result.text !== "packaged") throw new Error("Packaged generation changed");
+      }
+      if (captures.filter(value => value.action === "start").length !== 2 || captures.filter(value => value.action === "end").length !== 2) throw new Error("Missing or duplicated packaged collector");`,
     ], consumer);
     await writeFile(join(consumer, "index.ts"), `
       import { LAMARCK_SDK_SOCKET_ENV, system, type System } from "@lamarck/system";

@@ -46,7 +46,7 @@ function createBroker(
 describe("SystemBroker", () => {
   test("exposes the closed System operation allowlist and rejects unknown operations", async () => {
     expect(SYSTEM_OPERATIONS).toEqual([
-      "ai.listOptions", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
+      "ai.capture", "ai.listOptions", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
       "query",
       "resolveContentRef",
       "mutate",

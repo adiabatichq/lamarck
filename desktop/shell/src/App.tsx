@@ -3,6 +3,7 @@ import { AppLauncher } from "./components/AppLauncher";
 import { MarketplaceHandoffController } from "./components/MarketplaceHandoffController";
 import { SchemaApprovalModal } from "./components/SchemaApprovalModal";
 import { WorkspaceSetup } from "./components/WorkspaceSetup";
+import { WorkspaceRuntimeGate } from "./components/WorkspaceRuntimeGate";
 import { AppRuntimeView } from "./content/AppRuntimeView";
 import { UseWorkspace } from "./layout/UseWorkspace";
 import {
@@ -95,10 +96,9 @@ export function App() {
   }
 
   return (
-    <ActiveWorkspaceShell
-      key={hostWorkspaceState.workspace.vaultId}
-      workspace={hostWorkspaceState.workspace}
-    />
+    <WorkspaceRuntimeGate key={hostWorkspaceState.workspace.vaultId} workspace={hostWorkspaceState.workspace}>
+      <ActiveWorkspaceShell workspace={hostWorkspaceState.workspace} />
+    </WorkspaceRuntimeGate>
   );
 }
 

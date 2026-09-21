@@ -36,6 +36,10 @@
   text-transform: uppercase;
 }
 
+.titlebar button {
+  -webkit-app-region: no-drag;
+}
+
 .canvas {
   display: grid;
   width: min(1040px, calc(100% - 72px));
@@ -137,6 +141,7 @@
 
 .previousNotice,
 .invalidNotice,
+.startupNotice,
 .hostNotice,
 .error {
   margin-bottom: 16px;
@@ -146,6 +151,23 @@
   color: var(--use-muted, #77736b);
   font-size: 11px;
   line-height: 1.55;
+}
+
+.startupNotice code {
+  display: block;
+  color: var(--use-ink-soft, #3f403a);
+  font-family: var(--font-mono, "SFMono-Regular", monospace);
+  overflow-wrap: anywhere;
+}
+
+.startupNotice p {
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+.startupNotice .secondaryButton {
+  width: auto;
+  margin-top: 12px;
 }
 
 .previousNotice {
