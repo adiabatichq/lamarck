@@ -35,12 +35,15 @@ async function fixture(t, { publicBytes = bytes, current = null } = {}) {
     : new Response(publicBytes);
   return { directory, store, fetchImpl, writes };
 }
-test("pointer is written last after public ZIP verification", async (t) => {
+test("both feeds publish after public ZIP verification, with the rollback guard pointer first", async (t) => {
   const context = await fixture(t);
   await publishDesktopRelease({ release, ...context });
-  assert.deepEqual(context.writes.map(([method]) => method), ["putFileImmutable", "putBufferImmutable", "putBuffer"]);
+  assert.deepEqual(context.writes.map(([method]) => method), ["putFileImmutable", "putBufferImmutable", "putBuffer", "putBuffer"]);
   assert.match(context.writes[2][1], /desktop\/macos\/arm64\/latest.json$/);
   assert.equal(context.writes[2][3].cacheControl, "no-cache");
+  assert.match(context.writes[3][1], /desktop\/macos\/arm64\/latest-mac.yml$/);
+  assert.equal(context.writes[3][3].cacheControl, "no-cache");
+  assert.equal(context.writes[3][2].toString(), `version: 0.2.0\nreleaseDate: "2026-09-18T00:00:00Z"\nfiles:\n  - url: "${desktopReleasePointer(release).url}"\n    sha512: ${createHash("sha512").update(bytes).digest("base64")}\n    size: ${bytes.length}\n`);
 });
 test("corrupted public download never changes the update pointer", async (t) => {
   const context = await fixture(t, { publicBytes: Buffer.from("corrupt") });

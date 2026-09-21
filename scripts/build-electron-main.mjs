@@ -30,6 +30,7 @@ await esbuild.build({
   format: "cjs",
   target: "node24",
   external: ["electron"],
+  banner: { js: `/*!\n${await readFile(resolve(shellDir, "electron/desktop-updater-NOTICES.txt"), "utf8")}\n*/` },
   define: buildIdentityDefine,
 });
 await esbuild.build({

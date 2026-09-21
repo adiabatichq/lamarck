@@ -20,10 +20,11 @@ export function DesktopUpdate() {
     return () => { live = false; unsubscribe(); };
   }, []);
   if (!state || state.phase === "unavailable") return null;
-  const busy = ["checking", "downloading", "installing"].includes(state.phase);
+  const busy = ["checking", "downloading", "verifying", "installing"].includes(state.phase);
   const label = state.phase === "ready" ? "Update & Restart"
     : state.phase === "checking" ? "Checking…"
-    : state.phase === "downloading" ? "Downloading update…"
+    : state.phase === "downloading" ? `Downloading update${state.downloadPercent === null ? "…" : ` ${Math.floor(state.downloadPercent)}%`}`
+    : state.phase === "verifying" ? "Preparing update…"
     : state.phase === "installing" ? "Restarting…"
     : state.phase === "error" ? "Retry update" : "Check for updates";
   return (
@@ -38,7 +39,7 @@ export function DesktopUpdate() {
         }}>
         <span aria-live="polite">{label}</span>
       </button>
-      {error && <span className={styles.error} role="alert">{error}</span>}
+      {(error ?? state.error) && <span className={styles.error} role="alert">{error ?? state.error}</span>}
     </div>
   );
 }

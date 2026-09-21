@@ -1,5 +1,6 @@
 import { isStartupFailure, startupFailureText, type StartupFailureMessage } from "../../core/src/startup-failure";
 import { DesktopUpdater, supportsDesktopUpdates } from "./desktop-updater";
+import { MacUpdater } from "electron-updater";
 import { RUNTIME_STARTUP_TIMEOUT_MS } from "@lamarck/capsule";
 import { loadManagedCliArtifact } from "./capsule/managed-cli-artifact";
 // Electron main process
@@ -2783,11 +2784,14 @@ app.whenReady().then(async () => {
   try {
     updateChannel = JSON.parse(readFileSync(join(app.getAppPath(), "package.json"), "utf8")).desktopUpdateChannel;
   } catch { /* Development builds do not carry a production channel. */ }
+  const updatesEnabled = supportsDesktopUpdates(process.platform, process.arch, app.isPackaged, updateChannel);
   desktopUpdater = new DesktopUpdater({
-    updater: autoUpdater,
-    enabled: supportsDesktopUpdates(process.platform, process.arch, app.isPackaged, updateChannel),
+    updater: updatesEnabled ? new MacUpdater() : undefined,
+    nativeUpdater: autoUpdater,
+    enabled: updatesEnabled,
     version: app.getVersion(),
     publish: (state) => {
+      console.info("[desktop-update]", JSON.stringify(state));
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("desktop:updateState", state);
     },
     prepareToQuit: prepareDesktopShutdown,

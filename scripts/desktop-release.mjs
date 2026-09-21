@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { join } from "node:path";
 import { hashFile } from "./r2-object-store.mjs";
 
 export const DESKTOP_RELEASE_PREFIX = "desktop/macos/arm64";
 export const DESKTOP_RELEASE_ORIGIN = "https://releases.lamarck.ai";
+export const DESKTOP_UPDATER_CONFIG = `provider: generic\nurl: ${DESKTOP_RELEASE_ORIGIN}/${DESKTOP_RELEASE_PREFIX}/\nupdaterCacheDirName: lamarck-updater\n`;
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 export function validateDesktopRelease(release) {
@@ -25,7 +27,7 @@ export function validateDesktopRelease(release) {
 export function desktopReleasePointer(value) {
   const release = validateDesktopRelease(value);
   const url = `${DESKTOP_RELEASE_ORIGIN}/${DESKTOP_RELEASE_PREFIX}/${release.version}/${release.file}`;
-  // One atomic pointer serves both the website and Squirrel's static JSON feed.
+  // Retain the website and older Squirrel clients' static JSON feed.
   return { ...release, url, currentRelease: release.version, releases: [{
     version: release.version,
     updateTo: { version: release.version, name: release.version, pub_date: release.pub_date, notes: "", url },
@@ -38,6 +40,9 @@ export async function publishDesktopRelease({ release: value, directory, store, 
   const archivePath = join(directory, release.file);
   const local = await hashFile(archivePath);
   if (`sha256:${local.sha256}` !== release.sha256 || local.size !== release.bytes) throw new Error("Local archive does not match release metadata");
+  const sha512 = createHash("sha512");
+  for await (const chunk of createReadStream(archivePath)) sha512.update(chunk);
+  const updaterFeed = `version: ${release.version}\nreleaseDate: ${JSON.stringify(release.pub_date)}\nfiles:\n  - url: ${JSON.stringify(pointer.url)}\n    sha512: ${sha512.digest("base64")}\n    size: ${release.bytes}\n`;
   const pointerKey = `${DESKTOP_RELEASE_PREFIX}/latest.json`;
   const previous = await fetchImpl(`${DESKTOP_RELEASE_ORIGIN}/${pointerKey}`, {
     redirect: "error", headers: { "cache-control": "no-cache" }, signal: AbortSignal.timeout(30000),
@@ -64,6 +69,11 @@ export async function publishDesktopRelease({ release: value, directory, store, 
   if (`sha256:${hash.digest("hex")}` !== release.sha256 || bytes !== release.bytes) throw new Error("Public release digest or size mismatch");
   await store.putBuffer(pointerKey, Buffer.from(`${JSON.stringify(pointer, null, 2)}\n`), {
     contentType: "application/json", cacheControl: "no-cache",
+  });
+  // Publish both feeds only after public ZIP verification. JSON goes first so
+  // the existing monotonic version guard also protects retries of YAML writes.
+  await store.putBuffer(`${DESKTOP_RELEASE_PREFIX}/latest-mac.yml`, Buffer.from(updaterFeed), {
+    contentType: "application/yaml", cacheControl: "no-cache",
   });
   return pointer;
 }

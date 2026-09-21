@@ -10,8 +10,8 @@ if (import.meta.env.DEV && !window.lamarckHost) {
   const base = import.meta.env.VITE_LAMARCK_CORE_URL ?? "http://localhost:3000";
   const coreToken = import.meta.env.VITE_LAMARCK_CORE_TOKEN ?? "devtoken";
   window.lamarckHost = {
-    getDesktopUpdateState: async () => ({ phase: "unavailable", currentVersion: "dev", nextVersion: null, error: null }),
-    checkDesktopUpdate: async () => ({ phase: "unavailable", currentVersion: "dev", nextVersion: null, error: null }),
+    getDesktopUpdateState: async () => ({ phase: "unavailable", currentVersion: "dev", nextVersion: null, error: null, downloadPercent: null }),
+    checkDesktopUpdate: async () => ({ phase: "unavailable", currentVersion: "dev", nextVersion: null, error: null, downloadPercent: null }),
     installDesktopUpdate: async () => { throw new Error("Updates are available in the installed desktop app."); },
     onDesktopUpdate: () => () => {},
     getCoreToken: async () => coreToken,

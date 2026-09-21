@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { assertMacOsReleaseHandoffIdentity, buildShellFromSnapshot } from "./macos-release-builder.mjs";
 import { hashFile } from "./r2-object-store.mjs";
+import { DESKTOP_UPDATER_CONFIG } from "./desktop-release.mjs";
 import { copyRealFile } from "./macos-release-output.mjs";
 
 import { validateAiRuntimes, smokeAiRuntimes } from './stage-ai-runtimes.mjs';
@@ -55,6 +56,11 @@ import {
 } from "./package-macos-release-contract.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+// electron-updater hands its verified ZIP to Squirrel over loopback HTTP.
+// Keep ATS enforced for all remote hosts.
+const UPDATER_TRANSPORT_SECURITY = {
+  NSExceptionDomains: { "127.0.0.1": { NSExceptionAllowsInsecureHTTPLoads: true } },
+};
 const MARKETPLACE_URL_TYPES = [{
   CFBundleURLName: "ai.lamarck.marketplace",
   CFBundleURLSchemes: ["lamarck"],
@@ -443,6 +449,7 @@ async function assembleApplication(
   await rm(join(resources, "default_app.asar"), { force: true });
   await rm(join(resources, "electron.icns"), { force: true });
   await copyRealFile(appIconSource, join(resources, "Lamarck.icns"));
+  await writeFile(join(resources, "app-update.yml"), DESKTOP_UPDATER_CONFIG, { encoding: "utf8", mode: 0o644, flag: "wx" });
   for (const key of [
     "ElectronAsarIntegrity",
     "NSAppTransportSecurity",
@@ -464,6 +471,7 @@ async function assembleApplication(
     run("plutil", ["-replace", key, "-string", value, plist]);
   }
   run("plutil", ["-replace", "CFBundleURLTypes", "-json", JSON.stringify(MARKETPLACE_URL_TYPES), plist]);
+  run("plutil", ["-replace", "NSAppTransportSecurity", "-json", JSON.stringify(UPDATER_TRANSPORT_SECURITY), plist]);
 
   await mkdir(electronResources, { recursive: true, mode: 0o755 });
   await writeFile(join(appResources, "package.json"), `${JSON.stringify({
@@ -515,6 +523,9 @@ async function validatePackagedApplication(appPath, releaseConfig) {
   const resources = join(appPath, "Contents", "Resources");
   for (const name of ["LICENSE.electron.txt", "LICENSES.chromium.html"]) {
     await requireRealFile(join(resources, name), "packaged Electron license");
+  }
+  if (await readFile(join(resources, "app-update.yml"), "utf8") !== DESKTOP_UPDATER_CONFIG) {
+    throw new Error("Packaged desktop update configuration is incorrect");
   }
   const appResources = join(resources, "app");
   const actualAppEntries = await sortedEntries(appResources);
@@ -596,10 +607,15 @@ async function validatePackagedApplication(appPath, releaseConfig) {
   if (JSON.stringify(packagedUrlTypes) !== JSON.stringify(MARKETPLACE_URL_TYPES)) {
     throw new Error("packaged Info.plist Marketplace URL scheme is incorrect");
   }
+  const transportSecurity = JSON.parse(capture("plutil", [
+    "-extract", "NSAppTransportSecurity", "json", "-o", "-", plist,
+  ]));
+  if (JSON.stringify(transportSecurity) !== JSON.stringify(UPDATER_TRANSPORT_SECURITY)) {
+    throw new Error("Packaged update transport exception must allow only loopback HTTP");
+  }
   const plistDescription = capture("plutil", ["-p", plist]);
   for (const forbiddenKey of [
     "ElectronAsarIntegrity",
-    "NSAppTransportSecurity",
     "NSAudioCaptureUsageDescription",
     "NSBluetoothAlwaysUsageDescription",
     "NSBluetoothPeripheralUsageDescription",
