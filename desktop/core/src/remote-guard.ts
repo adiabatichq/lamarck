@@ -237,11 +237,6 @@ export class RemoteGuard {
     });
   }
 
-  async publishAiTurn(input: import('./guard-service/protocol').AiTurnPublication): Promise<string> {
-    await this.prepareProducer();
-    return this.call<string>('publishAiTurn', { principal: this.principal(), input });
-  }
-
   async writeEvent(event: EventInput): Promise<string> {
     await this.prepareProducer();
     return this.call<string>("writeEvent", { principal: this.principal(), event });

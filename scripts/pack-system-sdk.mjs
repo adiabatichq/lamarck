@@ -20,7 +20,6 @@ if (!/^\d+\.\d+\.\d+$/.test(packageDocument.version)) {
 if (packageDocument.lamarckSystemProtocol !== 1) {
   throw new Error("System SDK releases must declare System protocol V1 compatibility");
 }
-if (packageDocument.peerDependencies?.ai !== "7.0.105") throw new Error("SDK capture requires the pinned official ai peer");
 const expectedTag = `system-sdk-v${packageDocument.version}`;
 
 if (verifyRelease) {
@@ -45,10 +44,6 @@ if (!firstTarball.equals(secondTarball)) {
 const expectedFiles = [
   "LICENSE",
   "README.md",
-  "dist/ai/capture-data.d.ts",
-  "dist/ai/capture-data.js",
-  "dist/ai/capture.d.ts",
-  "dist/ai/capture.js",
   "dist/ai/client.d.ts",
   "dist/ai/client.js",
   "dist/ai/codec.d.ts",
@@ -94,7 +89,7 @@ async function verifyConsumer(tarballPath) {
     await writeFile(join(consumer, "package.json"), `${JSON.stringify({
       private: true,
       type: "module",
-      dependencies: { ai: "7.0.105" },
+      dependencies: {},
     })}\n`);
     await run("npm", [
       "install",
@@ -106,6 +101,13 @@ async function verifyConsumer(tarballPath) {
       "--no-save",
       tarballPath,
     ], consumer);
+    // The SDK must import without installing the App's optional Vercel package.
+    await run(process.execPath, ["--input-type=module", "--eval", `
+      await Promise.all([import("@lamarck/system/browser"), import("@lamarck/system/node"), import("@lamarck/system/protocol")]);
+      try { import.meta.resolve("ai"); throw new Error("Unexpected ai runtime dependency"); }
+      catch (error) { if (error.code !== "ERR_MODULE_NOT_FOUND") throw error; }
+    `], consumer);
+    await run("npm", ["install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--no-save", tarballPath, "ai@7.0.105"], consumer);
     await run(process.execPath, [
       "--input-type=module",
       "--eval",
@@ -116,22 +118,32 @@ async function verifyConsumer(tarballPath) {
         import("@lamarck/system/protocol"),
       ]);
       const { createSystem } = await import("@lamarck/system/browser");
-      const { generateText } = await import("ai");
+      const { generateText, streamText } = await import("ai");
       const { encodeAi } = await import("@lamarck/system/protocol");
-      const captures = [];
+      const calls = new Map(); let id = 0;
       const invoke = async (operation, input) => {
-        if (operation === "ai.capture") { captures.push(input); return { ok: true }; }
-        if (operation === "ai.start") { if (!input.capture?.callId) throw new Error("Missing packaged correlation"); return { invocationId: "fixture" }; }
+        if (operation === "ai.start") {
+          if (JSON.stringify(Object.keys(input).sort()) !== JSON.stringify(["accessSource", "callbacks", "model", "operation", "options"])) throw new Error("Unexpected model-call fields");
+          const invocationId = String(++id); calls.set(invocationId, input.operation); return { invocationId };
+        }
         if (operation === "ai.cancel") return { ok: true };
-        if (operation === "ai.next") return { events: [{ sequence: 0, type: "complete", value: encodeAi({ content: [{ type: "text", text: "packaged" }], finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } }, warnings: [] }) }] };
-        throw new Error(operation);
+        if (operation === "ai.next") {
+          const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
+          const finishReason = { unified: "stop", raw: "stop" };
+          if (calls.get(input.invocationId) === "generate") return { events: [{ sequence: 0, type: "complete", value: encodeAi({ content: [{ type: "text", text: "packaged" }], finishReason, usage, warnings: [] }) }] };
+          const parts = [{ type: "stream-start", warnings: [] }, { type: "text-start", id: "t" }, { type: "text-delta", id: "t", delta: "packaged" }, { type: "text-end", id: "t" }, { type: "finish", usage, finishReason }];
+          return { events: [{ sequence: 0, type: "ready" }, ...parts.map((value, i) => ({ sequence: i + 1, type: "part", value: encodeAi(value) })), { sequence: parts.length + 1, type: "complete", value: null }] };
+        }
+        throw new Error(operation); // No capture operation or handshake is served.
       };
       for (let i = 0; i < 2; i++) {
         const system = createSystem(invoke);
-        const result = await generateText({ model: system.ai.languageModel({ model: "openai:fixture", accessSource: "fixture" }), prompt: "hello" });
-        if (result.text !== "packaged") throw new Error("Packaged generation changed");
+        const model = system.ai.languageModel({ model: "openai:fixture", accessSource: "fixture" });
+        if (model.provider !== "lamarck") throw new Error("Unstable provider identity");
+        if ((await generateText({ model, prompt: "hello" })).text !== "packaged") throw new Error("Packaged generation changed");
+        if (await streamText({ model, prompt: "hello" }).text !== "packaged") throw new Error("Packaged streaming changed");
       }
-      if (captures.filter(value => value.action === "start").length !== 2 || captures.filter(value => value.action === "end").length !== 2) throw new Error("Missing or duplicated packaged collector");`,
+      if (id !== 4) throw new Error("Unexpected model replay");`,
     ], consumer);
     await writeFile(join(consumer, "index.ts"), `
       import { LAMARCK_SDK_SOCKET_ENV, system, type System } from "@lamarck/system";

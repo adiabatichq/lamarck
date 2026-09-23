@@ -8,7 +8,7 @@ export { SYSTEM_OPERATIONS };
 
 export const AI_CONTROL_REQUEST_RESERVE_PER_SENDER = 4;
 export function isAiControlOperation(operation: SystemOperation): boolean {
-  return operation === 'ai.capture' || operation === 'ai.cancel' || operation === 'ai.toolResult';
+  return operation === 'ai.cancel' || operation === 'ai.toolResult';
 }
 
 const SYSTEM_OPERATION_SET: ReadonlySet<string> = new Set(SYSTEM_OPERATIONS);
@@ -111,8 +111,6 @@ export class SystemBroker {
   #maxAggregateBytesPerSender: number;
   #maxAggregateBytesGlobal: number;
   #revokeCapability: SystemBrokerOptions["revokeCapability"];
-  #captureShutdown = new Set<Promise<void>>();
-  #aiTurns = new Map<SenderId, Set<string>>();
   #aiCalls = new Map<SenderId, Set<string>>();
   #nextConnectionEpoch = 1;
   #connectionEpoch = new Map<SenderId, number>();
@@ -376,17 +374,6 @@ export class SystemBroker {
       const boundData = operation === "vfs.open"
         ? viewerVfsOpenResult(data, binding.viewerResources!)
         : data;
-      if (operation === 'ai.capture') {
-        const capture = input as { action: string; callId: string };
-        if (capture.action === 'start') {
-          if (epoch !== this.#connectionEpoch.get(senderId)) {
-            this.#disconnectTurn(binding, capture.callId);
-            throw new SystemBrokerError('request_aborted', 'AI capture channel disconnected');
-          }
-          const turns = this.#aiTurns.get(senderId) ?? new Set<string>();
-          turns.add(capture.callId); this.#aiTurns.set(senderId, turns);
-        } else if (['end', 'discard', 'disconnect'].includes(capture.action)) this.#aiTurns.get(senderId)?.delete(capture.callId);
-      }
       if (operation === 'ai.start' && isRecord(data) && typeof data.invocationId === 'string') {
         if (epoch !== this.#connectionEpoch.get(senderId)) {
           this.#cancelAiCall(binding, data.invocationId);
@@ -415,30 +402,10 @@ export class SystemBroker {
 
   cancelAi(senderId: SenderId): void {
     if (this.#bindingsBySender.has(senderId)) this.#connectionEpoch.set(senderId, this.#nextConnectionEpoch++);
-    const turns = this.#aiTurns.get(senderId);
-    this.#aiTurns.delete(senderId);
-    const turnBinding = this.#bindingsBySender.get(senderId);
-    if (turnBinding) for (const callId of turns ?? []) this.#disconnectTurn(turnBinding, callId);
     const calls = this.#aiCalls.get(senderId);
     this.#aiCalls.delete(senderId);
     const binding = this.#bindingsBySender.get(senderId);
     if (binding) for (const invocationId of calls ?? []) this.#cancelAiCall(binding, invocationId);
-  }
-
-  async settledCaptures(): Promise<void> { await Promise.allSettled([...this.#captureShutdown]); }
-
-  #disconnectTurn(binding: PrivateBinding, callId: string): void {
-    const pending = (async () => {
-      const base = typeof this.#coreBaseUrl === 'function' ? await this.#coreBaseUrl() : this.#coreBaseUrl;
-      const response = await this.#fetch(new URL('/api/ai/capture', base), {
-        method: 'POST', headers: { 'Content-Type': 'application/json', [APP_CAPABILITY_HEADER]: binding.capability },
-        body: JSON.stringify({ action: 'disconnect', callId }), signal: AbortSignal.timeout(15000), redirect: 'error',
-      });
-      if (!response.ok) throw new Error('Failed to persist disconnected AI capture');
-      await response.body?.cancel();
-    })().catch(error => console.error('AI content capture failed', error));
-    this.#captureShutdown.add(pending);
-    void pending.finally(() => this.#captureShutdown.delete(pending));
   }
 
   #cancelAiCall(binding: PrivateBinding, invocationId: string): void {
@@ -585,13 +552,12 @@ function mapCoreRequest(operation: string, input: unknown): CoreRequest {
   const value = expectRecord(input);
 
   switch (operation as SystemOperation) {
-    case 'ai.capture':
     case 'ai.listOptions':
     case 'ai.start':
     case 'ai.next':
     case 'ai.cancel':
     case 'ai.toolResult': {
-      const route = { 'ai.capture': 'capture', 'ai.listOptions': 'options', 'ai.start': 'invoke/start', 'ai.next': 'invoke/next', 'ai.cancel': 'invoke/cancel', 'ai.toolResult': 'invoke/tool-result' }[operation as 'ai.start'];
+      const route = { 'ai.listOptions': 'options', 'ai.start': 'invoke/start', 'ai.next': 'invoke/next', 'ai.cancel': 'invoke/cancel', 'ai.toolResult': 'invoke/tool-result' }[operation as 'ai.start'];
       const body = expectJson(value, operation);
       return { method: 'POST', path: `/api/ai/${route}`, body, sizeValue: body };
     }

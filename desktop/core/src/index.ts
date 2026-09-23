@@ -1,4 +1,3 @@
-import { AiTurns } from './ai/turns';
 import { AiService } from './ai/service';
 import { handleAiRequest } from './ai/routes';
 import { AiError } from './ai/errors';
@@ -190,7 +189,7 @@ const deviceIdentity = await resolveDeviceIdentity(coreSettings.vaultId ?? "");
 const vaultKey = process.env.LAMARCK_VAULT_KEY ?? encodeVaultKey(randomBytes(32));
 const secretStore = new SqliteEncryptedSecretStore(systemDb, vaultKey);
 const credentialStore = new CredentialStore(systemDb);
-const aiService = new AiService(systemDb, credentialStore, secretStore, join(workspacePath, '.lamarck', 'ai'), undefined, new AiTurns(workspacePath, caller => guardForRequest(caller)));
+const aiService = new AiService(systemDb, credentialStore, secretStore, join(workspacePath, '.lamarck', 'ai'));
 const lamarckSessionManager = new LamarckSessionManager(secretStore, {
   credentialStore,
   apiOrigin: lamarckApiOrigin,

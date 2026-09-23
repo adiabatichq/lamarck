@@ -1,12 +1,7 @@
-import { createAppProducerDescriptor, deriveProducerRef, ProducerDescriptorStore } from '../../desktop/core/src/producer-descriptor';
-import { AiTurns } from '../../desktop/core/src/ai/turns';
-import { GuardEngine } from '../../desktop/core/src/guard-service/engine';
-import { ContentBlobStore } from '../../desktop/core/src/blob-store';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
-import { createHash } from 'node:crypto';
-import { redactString } from '../../desktop/core/src/ai/capture-redaction.mjs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createConnection, createServer, type Socket } from 'node:net';
@@ -15,9 +10,18 @@ import { buildSync } from 'esbuild';
 import { runInNewContext } from 'node:vm';
 import { generateText, streamText, embedMany, tool, stepCountIs, Output } from 'ai';
 import { z } from 'zod';
-import { APICallError } from '@ai-sdk/provider';
 import { createSystem } from '@lamarck/system/browser';
-import { decodeAi } from '@lamarck/system/protocol';
+import { decodeAi, SYSTEM_OPERATIONS } from '@lamarck/system/protocol';
+import { APICallError } from '@ai-sdk/provider';
+import { GuardEngine } from '../../desktop/core/src/guard-service/engine';
+import { RemoteGuard, type GuardRpcClient } from '../../desktop/core/src/remote-guard';
+import { ContentBlobStore } from '../../desktop/core/src/blob-store';
+import { VfsService } from '../../desktop/core/src/vfs';
+import { D1ObserverState } from '../../desktop/core/src/d1-observer-state';
+import { D1Sequencer } from '../../desktop/core/src/d1-sequencer';
+import { createAppProducerDescriptor, deriveProducerRef, ProducerDescriptorStore } from '../../desktop/core/src/producer-descriptor';
+import { isAppSystemRoute } from '../../desktop/core/src/app-runtime-policy';
+import { D0_SCHEMA_VERSION } from '../../desktop/core/src/schema';
 import { FramedRpcClient } from '../../desktop/system-sdk/dist/node-transport.js';
 import { SystemBroker } from '../../desktop/shell/electron/capsule/system-broker';
 import { SystemStreamServer } from '../../desktop/shell/electron/capsule/system-stream';
@@ -33,12 +37,17 @@ import type { AppAuthContext } from '../../desktop/core/src/auth';
 const usage = { inputTokens: { total: 3, noCache: 3, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 2, text: 2, reasoning: 0 } };
 const finishReason = { unified: 'stop' as const, raw: 'stop' };
 const cleanup: (() => unknown | Promise<unknown>)[] = [];
-let service: AiService, broker: SystemBroker, db: DatabaseSync, root: string, server: NodeFetchServer;
-let guard: GuardEngine;
+let guard: GuardEngine, vfs: VfsService;
+let expectedTurns: unknown[] = [], expectedBlobs: string[] = [];
 const descriptor = (id = 'app-a') => createAppProducerDescriptor(id, '1'.repeat(40), { version: '0.1.0', commit: '2'.repeat(40), platform: 'darwin-arm64' });
-const principal = (id = 'app-a') => ({ source: `app:${id}:ui`, producerRef: deriveProducerRef(descriptor(id)), tableGrants: [] });
-function captured(id = 'app-a') { return guard.query(principal(id), 'SELECT * FROM events WHERE type = ? AND source = ? ORDER BY created_at, id', ['ai.turn', `app:${id}:ui`]).map((row: any) => ({ ...row, payload: JSON.parse(row.payload) })); }
-function raw(event: any) { const value = new ContentBlobStore(root).resolve(event.payload.raw.contentRef); if (value.status !== 'resolved') throw new Error(JSON.stringify(value)); return JSON.parse(value.text); }
+const principal = (id = 'app-a') => ({ source: `app:${id}:ui`, producerRef: deriveProducerRef(descriptor(id)), tableGrants: ['answers'] });
+const turnRows = () => guard.query(principal(), 'SELECT * FROM events WHERE type = ?', ['ai.turn']);
+const blobFiles = () => readdir(join(root, '.lamarck', 'blobs'), { recursive: true }).then(paths => paths.sort()).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
+function writer(id: string) {
+  return new RemoteGuard({ call: async (method: string, params: Record<string, unknown>) => guard.dispatch(method, params) } as GuardRpcClient,
+    { source: principal(id).source, producerRef: principal(id).producerRef, writeTables: ['answers'], schemaGrant: false, prepareProducer: () => { new ProducerDescriptorStore(root).publish(descriptor(id)); } });
+}
+let service: AiService, broker: SystemBroker, db: DatabaseSync, root: string, server: NodeFetchServer;
 let outstanding = 0;
 const disposed = vi.fn();
 const callers = new Map<string, AppAuthContext>();
@@ -93,8 +102,9 @@ beforeEach(async () => {
   disposed.mockClear(); callers.clear(); signals.clear(); outstanding = 0;
   root = await mkdtemp(join(tmpdir(), 'ai-path-'));
   db = new DatabaseSync(':memory:'); db.exec(SYSTEM_SCHEMA_V1);
-  guard = new GuardEngine({ workspacePath: root });
-  service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter, new AiTurns(root, caller => ({ publishAiTurn: input => { new ProducerDescriptorStore(root).publish(descriptor(caller.appId)); return guard.publishAiTurn(principal(caller.appId), input); } })));
+  guard = new GuardEngine({ workspacePath: root }); expectedTurns = []; expectedBlobs = [];
+  vfs = new VfsService(root, new D1ObserverState(db), new ContentBlobStore(root), new D1Sequencer()); await vfs.initialize();
+  service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter);
   server = await serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     const token = request.headers.get('x-lamarck-app-capability')!;
     const caller = callers.get(token);
@@ -105,6 +115,11 @@ beforeEach(async () => {
     let retained = false;
     try {
       if (new URL(request.url).pathname === '/api/query') return Response.json({ rows: [{ appId: caller.appId }] });
+      const path = new URL(request.url).pathname;
+      if (path === '/api/events') return Response.json({ ok: true, id: await writer(caller.appId).writeEvent(await request.json()) });
+      if (path === '/api/mutate') { const body = await request.json(); return Response.json(await writer(caller.appId).mutate(body.sql, body.params)); }
+      if (path === '/api/content-ref/resolve') return Response.json(new ContentBlobStore(root).resolve((await request.json()).ref));
+      if (path === '/api/vfs/command') { const body = await request.json(); return Response.json(await vfs.command({ guard: writer(caller.appId), fileGrants: ['answer.txt'], trustedHost: false, workloadId: caller.channelId }, body.command, body.options)); }
       const result = await handleAiRequest(service, request, admission); retained = !!result.retained;
       return Response.json(result.body);
     } catch (error) { return Response.json({ error: String(error) }, { status: 400 }); }
@@ -114,8 +129,13 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   for (const run of cleanup.splice(0).reverse()) await run();
-  broker.unbindAll(); await service.close(); await broker.settledCaptures(); await server.stop();
-  await vi.waitFor(() => expect(outstanding).toBe(0)); db.close(); guard.close(); await rm(root, { recursive: true, force: true });
+  broker.unbindAll(); await service.close(); await server.stop();
+  await vi.waitFor(() => expect(outstanding).toBe(0)); await vfs.close();
+  try {
+    expect(turnRows()).toEqual(expectedTurns);
+    expect(existsSync(join(root, '.lamarck', 'ai-capture'))).toBe(false);
+    expect(await blobFiles()).toEqual(expectedBlobs);
+  } finally { db.close(); guard.close(); await rm(root, { recursive: true, force: true }); }
 });
 function bind(id: string) {
   const caller = { kind: 'app', appId: id, workload: 'ui', channelId: `ch-${id}`, authorization: {} } as AppAuthContext;
@@ -184,26 +204,6 @@ for (const path of ['browser', 'node'] as const) describe(`${path} Capsule chann
       const tools = { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) };
       const result = await system.ai.withTools({ model: `${provider}:${provider === 'anthropic' ? 'claude-sonnet-5' : 'fixture'}`, accessSource: source.id, tools }, async ({ model, tools }) => generateText({ model, tools, prompt: 'lookup', stopWhen: stepCountIs(2) }));
       expect(execute).toHaveBeenCalledTimes(1); expect(result.text).toBe(kind === 'subscription' ? id : 'hello');
-      const events = captured(id); expect(events).toHaveLength(1);
-      expect(events[0].payload.status).toBe('completed');
-      expect(events[0].payload.content.text).toBe(result.text);
-      expect(events[0].producer_ref).toBe(principal(id).producerRef);
-      const records = raw(events[0]).records;
-      expect(new ProducerDescriptorStore(root).resolve(events[0].producer_ref)).toEqual(descriptor(id));
-      if (path === 'node' && kind === 'api-key' && process.env.LAMARCK_CAPTURE_EXAMPLE_DIR) {
-        const { mkdir, writeFile, copyFile } = await import('node:fs/promises'); const directory = process.env.LAMARCK_CAPTURE_EXAMPLE_DIR;
-        await mkdir(directory, { recursive: true });
-        await writeFile(join(directory, 'event.json'), JSON.stringify(events[0], null, 2) + '\n');
-        const resolvedRaw = new ContentBlobStore(root).resolve(events[0].payload.raw.contentRef);
-        if (resolvedRaw.status !== 'resolved') throw new Error('Missing evidence raw content');
-        await writeFile(join(directory, 'raw.json'), resolvedRaw.text);
-        await writeFile(join(directory, 'producer.json'), JSON.stringify(descriptor(id), null, 2) + '\n');
-        const digest = events[0].payload.raw.contentRef.digest.slice(7);
-        await copyFile(join(root, '.lamarck', 'blobs', 'content', 'v1', 'sha256', digest.slice(0, 2), digest.slice(2, 4), `${digest}.gz`), join(directory, 'raw.json.gz'));
-      }
-      expect(records.filter((r: any) => r.kind === 'tool-end')).toHaveLength(1);
-      expect(records.filter((r: any) => r.kind === 'model-start')).toHaveLength(kind === 'subscription' ? 1 : 2);
-      expect(Object.keys(events[0].payload).sort()).toEqual(['callId', 'content', 'input', 'operation', 'raw', 'status', 'usage']);
     }
   });
   test('same discovery/invocation permission, policy withdrawal, cancellation and no fallback', async () => {
@@ -242,7 +242,7 @@ test('socket disconnect cancels calls while capability remains bound', async () 
   expect(broker.size).toBe(1);
 });
 
-test('stream startup retry retains both actual invocations in one completed event', async () => {
+test('stream startup failure follows the official retry policy', async () => {
   const source = await service.sources.save({ provider: 'openai', kind: 'api-key', name: 'Fixture', apiKey: 'private' });
   const system = await systemFor('node');
   const original = adapter.open.bind(adapter);
@@ -259,12 +259,7 @@ test('stream startup retry retains both actual invocations in one completed even
   });
   try {
     expect(await streamText({ model: system.ai.languageModel({ model: 'openai:fixture', accessSource: source.id }), prompt: 'retry', maxRetries: 1 }).text).toBe('hello');
-    await vi.waitFor(() => expect(captured()).toHaveLength(1));
-    const events = captured(); expect(events).toHaveLength(1); expect(events[0].payload.status).toBe('completed');
-    const records = raw(events[0]).records;
-    expect(records.filter((r: any) => r.kind === 'model-start')).toHaveLength(2);
-    expect(records.filter((r: any) => r.kind === 'model-end')).toHaveLength(2);
-    expect(new Set(records.filter((r: any) => r.kind === 'model-start').map((r: any) => r.invocationId)).size).toBe(2);
+    expect(attempts).toBe(2);
   } finally { spy.mockRestore(); }
 });
 
@@ -282,7 +277,7 @@ function replaceModel(change: (model: any, context: any) => any) {
   });
 }
 
-test.each(['accept', 'reject'] as const)('persisted completed content precedes async validation %s without replay', async validation => {
+test.each(['accept', 'reject'] as const)('async output validation %s runs once without automatic recording', async validation => {
   const { model } = await fixtureModel();
   let release!: () => void, entered!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
@@ -295,12 +290,9 @@ test.each(['accept', 'reject'] as const)('persisted completed content precedes a
   const generation = generateText({ model, prompt: 'JSON', output: Output.object({ schema: z.object({ answer: z.number() }).superRefine(validator) }) }).then(value => ({ output: value.output }), error => ({ error: error.name })).finally(() => { settled = true; });
   try {
     await validating;
-    const events = captured(); expect(events).toHaveLength(1); expect(settled).toBe(false);
-    expect(events[0].payload.status).toBe('completed'); expect(events[0].payload.content.text).toBe('{"answer":42}');
-    expect(raw(events[0]).records.at(-1).status).toBe('completed');
-    const snapshot = JSON.stringify(events);
+    expect(settled).toBe(false); expect(turnRows()).toEqual([]);
     release(); expect(await generation).toEqual(validation === 'accept' ? { output: { answer: 42 } } : { error: 'AI_NoObjectGeneratedError' });
-    expect(validator).toHaveBeenCalledTimes(1); expect(JSON.stringify(captured())).toBe(snapshot);
+    expect(validator).toHaveBeenCalledTimes(1);
   } finally { release(); }
 });
 
@@ -309,125 +301,42 @@ test('concurrent calls and prepareStep model/source changes preserve actual attr
   const other = await service.sources.save({ provider: 'anthropic', kind: 'api-key', name: 'Other', apiKey: 'private' });
   const next = system.ai.languageModel({ model: 'anthropic:claude-sonnet-5', accessSource: other.id });
   const execute = vi.fn(async () => 'tool output');
-  await Promise.all([
-    generateText({ model, prompt: 'multi', tools: { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) }, stopWhen: stepCountIs(2), prepareStep: ({ stepNumber }) => stepNumber ? { model: next } : undefined }),
-    generateText({ model: next, prompt: 'concurrent' }),
-  ]);
-  const events = captured(); expect(events).toHaveLength(2); expect(execute).toHaveBeenCalledTimes(1);
-  const multi = events.find((event: any) => event.payload.input.text.includes('multi'));
-  const starts = raw(multi).records.filter((record: any) => record.kind === 'model-start');
-  expect(starts.map((record: any) => [record.model, record.accessSource])).toEqual([['openai:fixture', source.id], ['anthropic:claude-sonnet-5', other.id]]);
-  expect(new Set(events.map((event: any) => event.payload.callId)).size).toBe(2);
-  expect(raw(events.find((event: any) => event !== multi)).records.filter((r: any) => r.kind === 'model-start')).toHaveLength(1);
+  const opened = vi.spyOn(adapter, 'open');
+  try {
+    await Promise.all([
+      generateText({ model, prompt: 'multi', tools: { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) }, stopWhen: stepCountIs(2), prepareStep: ({ stepNumber }) => stepNumber ? { model: next } : undefined }),
+      generateText({ model: next, prompt: 'concurrent' }),
+    ]);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(opened.mock.calls.map(([source]) => source.id).sort()).toEqual([source.id, other.id, other.id].sort());
+  } finally { opened.mockRestore(); }
 });
 
-test('handled App tool error is retained once and does not terminate generation', async () => {
+test('handled App tool error executes once and does not terminate generation', async () => {
   const { model } = await fixtureModel();
   const execute = vi.fn(async () => { throw new Error('fixture tool error'); });
   await generateText({ model, prompt: 'tools', tools: { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) }, stopWhen: stepCountIs(2) });
   expect(execute).toHaveBeenCalledTimes(1);
-  const [event] = captured(); expect(event.payload.status).toBe('completed');
-  const ends = raw(event).records.filter((r: any) => r.kind === 'tool-end');
-  expect(ends).toHaveLength(1); expect(ends[0]).toMatchObject({ failed: true, output: { message: 'fixture tool error' } });
 });
 
-test('recording controls suppress content and disabled telemetry produces no event', async () => {
-  const { model } = await fixtureModel();
-  await generateText({ model, prompt: 'private input', telemetry: { recordInputs: false, recordOutputs: false } });
-  const [event] = captured(); expect(event.payload.input).toBeUndefined(); expect(event.payload.content).toBeUndefined();
-  expect(JSON.stringify(raw(event))).not.toContain('private input'); expect(JSON.stringify(raw(event))).not.toContain('hello');
-  await generateText({ model, prompt: 'disabled', telemetry: { isEnabled: false } });
-  await streamText({ model, prompt: 'disabled stream', telemetry: { isEnabled: false } }).consumeStream();
-  expect(captured()).toHaveLength(1);
-});
-
-test('long UTF-8 content has truthful previews and resolvable redacted blobs', async () => {
-  const { model } = await fixtureModel();
-  const text = '語🙂 '.repeat(15000) + 'sk-' + 'x'.repeat(30);
-  const spy = replaceModel(m => ({ ...m, doGenerate: async () => ({ content: [{ type: 'text', text }], usage, finishReason, warnings: [] }) }));
-  try {
-    await generateText({ model, prompt: '長🙂'.repeat(6000) });
-    const [event] = captured();
-    expect(event.payload.content.truncated).toBe(true); expect(Buffer.byteLength(event.payload.content.text)).toBeLessThanOrEqual(8192);
-    expect(event.payload.content.text).not.toContain('\uFFFD');
-    const content = new ContentBlobStore(root).resolve(event.payload.content.contentRef);
-    expect(content.status).toBe('resolved'); if (content.status !== 'resolved') throw new Error('missing content');
-    expect(content.text).toBe(text.replace(/sk-x+/, '[REDACTED_SECRET]'));
-    expect(event.payload.content.bytes).toBe(Buffer.byteLength(content.text)); expect(event.payload.content.chars).toBe(content.text.length);
-    expect(raw(event).records.filter((r: any) => r.kind === 'model-content').map((r: any) => r.content.text).join('')).toBe(content.text);
-    if (process.env.LAMARCK_CAPTURE_EVIDENCE) {
-      const { writeFile } = await import('node:fs/promises');
-      await writeFile(process.env.LAMARCK_CAPTURE_EVIDENCE, JSON.stringify({ event, resolvedRaw: raw(event), resolvedContent: content.text }, null, 2));
-    }
-  } finally { spy.mockRestore(); }
-});
-
-test.each(['split footer', 'every marker character', 'multiple blocks and long surroundings'])('streamed private-key redaction: %s', async scenario => {
-  const { model } = await fixtureModel();
-  const key = '-----BEGIN PRIVATE KEY-----\nREVIEWFAKESECRETCONTENT\n-----END PRIVATE KEY-----\n';
-  const second = '-----BEGIN RSA PRIVATE KEY-----\nSECONDFAKECONTENT\n-----END RSA PRIVATE KEY-----';
-  const chunks = scenario === 'split footer' ? [key.slice(0, key.indexOf('END ') + 4), 'PRIVATE KEY-----\n']
-    : scenario === 'every marker character' ? [...`before ${key}between ${second} after`]
-    : ['語🙂 '.repeat(3000), key + 'between -----BEGIN RSA PRI', 'VATE KEY-----\nSECONDFAKECONTENT\n-----END RSA PRIVATE KEY--', '---', ' after -----BEGIN CERTIFICATE----- ordinary text'];
-  const text = chunks.join(''); const expected = redactString(text);
-  const handler = vi.fn(); vi.stubGlobal('reportError', handler);
-  const spy = replaceModel(m => ({ ...m, doStream: async () => ({ stream: new ReadableStream({ start(stream) {
-    stream.enqueue({ type: 'stream-start', warnings: [] }); stream.enqueue({ type: 'text-start', id: 't' });
-    for (const delta of chunks) stream.enqueue({ type: 'text-delta', id: 't', delta });
-    stream.enqueue({ type: 'text-end', id: 't' }); stream.enqueue({ type: 'finish', usage, finishReason }); stream.close();
-  } }) }) }));
-  try {
-    const result = streamText({ model, prompt: 'synthetic redaction fixture' }); await result.consumeStream();
-    expect(await result.text).toBe(text);
-    await vi.waitFor(() => expect(captured()).toHaveLength(1));
-    const [event] = captured(); expect(event.payload.status).toBe('completed');
-    const readable = event.payload.content;
-    const resolved = readable.contentRef ? new ContentBlobStore(root).resolve(readable.contentRef) : { status: 'resolved', text: readable.text };
-    expect(resolved.status).toBe('resolved'); if (resolved.status !== 'resolved') throw new Error('Missing readable content');
-    expect(resolved.text).toBe(expected); expect(expected.startsWith(readable.text)).toBe(true);
-    expect(readable.chars).toBe(expected.length); expect(readable.bytes).toBe(Buffer.byteLength(expected));
-    expect(readable.hash).toBe(`sha256:${createHash('sha256').update(expected).digest('hex')}`);
-    const blob = new ContentBlobStore(root).resolve(event.payload.raw.contentRef);
-    expect(blob.status).toBe('resolved'); if (blob.status !== 'resolved') throw new Error('Missing raw content');
-    expect(event.payload.raw.bytes).toBe(Buffer.byteLength(blob.text));
-    expect(event.payload.raw.hash).toBe(`sha256:${createHash('sha256').update(blob.text).digest('hex')}`);
-    expect(blob.text).not.toContain('REVIEWFAKESECRETCONTENT'); expect(blob.text).not.toContain('SECONDFAKECONTENT');
-    expect(JSON.parse(blob.text).records.filter((r: any) => r.kind === 'model-content' && r.content.type === 'text').map((r: any) => r.content.text).join('')).toBe(expected);
-    expect(handler).not.toHaveBeenCalled();
-  } finally { spy.mockRestore(); vi.unstubAllGlobals(); }
-});
-
-test('malformed supplied usage reports capture error despite swallowed telemetry and publishes nothing', async () => {
-  const { model } = await fixtureModel();
-  const handler = vi.fn(); vi.stubGlobal('reportError', handler);
-  const spy = replaceModel(m => ({ ...m, doGenerate: async () => ({ content: [{ type: 'text', text: 'answer' }], usage: { inputTokens: { total: 'bad' }, outputTokens: {} }, finishReason, warnings: [] }) }));
-  try {
-    await generateText({ model, prompt: 'malformed', maxRetries: 0 }).catch(() => {});
-    await vi.waitFor(() => expect(handler).toHaveBeenCalled());
-    expect(captured()).toHaveLength(0); expect(handler.mock.calls[0][0].message).toContain('AI content capture failed');
-  } finally { spy.mockRestore(); vi.unstubAllGlobals(); }
-});
-
-test('cancelled partial stream retains interrupted prefix and split secrets are redacted', async () => {
+test('user cancellation delivers the observed prefix and releases the stream', async () => {
   const { model } = await fixtureModel();
   const controller = new AbortController();
   const spy = replaceModel((m, context) => ({ ...m, doStream: async () => ({ stream: new ReadableStream({ start(stream) {
     stream.enqueue({ type: 'stream-start', warnings: [] }); stream.enqueue({ type: 'text-start', id: 't' });
-    stream.enqueue({ type: 'text-delta', id: 't', delta: 'prefix sk-xxxxxxxxxx' });
-    stream.enqueue({ type: 'text-delta', id: 't', delta: 'xxxxxxxxxxxxxxxxxxxx ' });
+    stream.enqueue({ type: 'text-delta', id: 't', delta: 'partial ' });
+    stream.enqueue({ type: 'text-delta', id: 't', delta: 'answer ' });
     context.signal.addEventListener('abort', () => { try { stream.close(); } catch {} }, { once: true });
   } }) }) }));
   try {
     const stream = streamText({ model, prompt: 'cancel', abortSignal: controller.signal });
-    try { for await (const text of stream.textStream) { if (text.includes('xxxxxxxxxxxxxxxxxxxx ')) controller.abort(); } } catch (error) { expect(controller.signal.aborted).toBe(true); }
-    await vi.waitFor(() => expect(captured()).toHaveLength(1));
-    const [event] = captured(); expect(event.payload.status).toBe('interrupted');
-    expect(event.payload.content.text).toBe('prefix [REDACTED_SECRET] ');
-    expect(JSON.stringify(raw(event))).not.toContain('sk-xxxx');
+    let observed = '';
+    try { for await (const text of stream.textStream) { observed += text; if (text.includes('answer ')) controller.abort(); } } catch { expect(controller.signal.aborted).toBe(true); }
+    expect(observed).toBe('partial answer '); expect(controller.signal.aborted).toBe(true);
   } finally { spy.mockRestore(); }
 });
 
-test('terminal stream failure retains prefix and cannot be promoted by stream flush', async () => {
+test('terminal stream error part delivers prefix and error to the App', async () => {
   const { model } = await fixtureModel();
   const spy = replaceModel(m => ({ ...m, doStream: async () => ({ stream: new ReadableStream({ start(stream) {
     stream.enqueue({ type: 'stream-start', warnings: [] }); stream.enqueue({ type: 'text-start', id: 't' });
@@ -435,33 +344,20 @@ test('terminal stream failure retains prefix and cannot be promoted by stream fl
     stream.enqueue({ type: 'error', error: new Error('terminal fixture failure') }); stream.close();
   } }) }) }));
   try {
-    await streamText({ model, prompt: 'failure', maxRetries: 0, onError() {} }).consumeStream();
-    await vi.waitFor(() => expect(captured()).toHaveLength(1));
-    const [event] = captured(); expect(event.payload.status).toBe('failed'); expect(event.payload.content.text).toBe('before failure ');
-    expect(raw(event).records.at(-1).status).toBe('failed');
+    const onError = vi.fn();
+    const result = streamText({ model, prompt: 'failure', maxRetries: 0, onError }); await result.consumeStream();
+    expect(await result.text).toBe('before failure '); expect(onError).toHaveBeenCalledOnce();
   } finally { spy.mockRestore(); }
 });
 
-test('cancellation during an App tool records interrupted generation without replay', async () => {
+test('cancellation during an App tool does not replay the tool', async () => {
   const { model } = await fixtureModel('node'); const controller = new AbortController();
   const execute = vi.fn(async (_: unknown, options: any) => { controller.abort(); options.abortSignal.throwIfAborted(); return 'unreachable'; });
   await generateText({ model, prompt: 'cancel tool', abortSignal: controller.signal, tools: { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) }, stopWhen: stepCountIs(2), maxRetries: 0 }).catch(() => {});
-  await vi.waitFor(() => expect(captured()).toHaveLength(1));
-  expect(execute).toHaveBeenCalledTimes(1); expect(captured()[0].payload.status).toBe('interrupted');
-  expect(raw(captured()[0]).records.filter((r: any) => r.kind === 'tool-start')).toHaveLength(1);
+  expect(execute).toHaveBeenCalledTimes(1); expect(controller.signal.aborted).toBe(true);
 });
 
-test('failed persistence reaches App error handler while official generation still resolves', async () => {
-  const { model } = await fixtureModel(); const handler = vi.fn(); vi.stubGlobal('reportError', handler);
-  const persist = vi.spyOn(guard, 'publishAiTurn').mockRejectedValue(new Error('fixture storage unavailable'));
-  try {
-    expect((await generateText({ model, prompt: 'storage failure' })).text).toBe('hello');
-    expect(handler).toHaveBeenCalled(); expect(captured()).toHaveLength(0);
-    expect(handler.mock.calls[0][0].message).toContain('AI content capture failed');
-  } finally { persist.mockRestore(); vi.unstubAllGlobals(); }
-});
-
-test('thrown stream transport failure retains observed output', async () => {
+test('thrown stream read failure reaches the App', async () => {
   const { model } = await fixtureModel();
   let reads = 0;
   const spy = replaceModel(m => ({ ...m, doStream: async () => ({ stream: new ReadableStream({ pull(stream) {
@@ -469,14 +365,14 @@ test('thrown stream transport failure retains observed output', async () => {
     if (reads < parts.length) stream.enqueue(parts[reads++]); else throw new Error('reader failed');
   } }) }) }));
   try {
-    await streamText({ model, prompt: 'reader failure', maxRetries: 0, onError() {} }).consumeStream({ onError() {} });
-    await vi.waitFor(() => expect(captured()).toHaveLength(1));
-    expect(captured()[0].payload.status).toBe('failed'); expect(captured()[0].payload.content.text).toBe('observed ');
+    const onError = vi.fn();
+    await streamText({ model, prompt: 'reader failure', maxRetries: 0, onError }).consumeStream({ onError });
+    expect(onError).toHaveBeenCalled();
   } finally { spy.mockRestore(); }
 });
 
 test.each(['browser', 'node'] as const)('SDK retry cancels an outstanding %s pull without closing the generation', async path => {
-  const { model, source } = await fixtureModel(path); let attempts = 0;
+  const { model } = await fixtureModel(path); let attempts = 0;
   const handler = vi.fn(); vi.stubGlobal('reportError', handler);
   let firstInvocation: string | undefined;
   let sentError = false, pulling = false, cancelledWhilePulling = false;
@@ -512,34 +408,65 @@ test.each(['browser', 'node'] as const)('SDK retry cancels an outstanding %s pul
     const result = streamText({ model, prompt: 'retry stream', streamRetries: 1, onError: async () => { await outstandingPoll; } });
     await result.consumeStream(); expect(await result.text).toBe('hello');
     await settledPoll; expect(cancelledWhilePulling).toBe(true); expect(attempts).toBe(2);
-    await vi.waitFor(() => expect(captured()).toHaveLength(1));
-    const [event] = captured(); expect(event.payload.status).toBe('completed'); expect(event.payload.content.text).toBe('hello');
-    const records = raw(event).records;
-    const starts = records.filter((r: any) => r.kind === 'model-start');
-    expect(starts).toHaveLength(2); expect(new Set(starts.map((r: any) => r.invocationId)).size).toBe(2);
-    for (const start of starts) expect(start).toMatchObject({ model: 'openai:fixture', accessSource: source.id, stepNumber: 0 });
-    expect(records.filter((r: any) => r.kind === 'model-end')).toHaveLength(2);
-    expect(records[0].callId).toBe(event.payload.callId); expect(event.external_id).toBe(`ai.turn:${event.payload.callId}`);
-    expect(JSON.stringify(records)).toContain('retry prefix '); expect(records.filter((r: any) => r.kind === 'terminal')).toHaveLength(1);
     await vi.waitFor(() => expect(outstanding).toBe(0)); expect(service.invocations.size).toBe(0); expect(handler).not.toHaveBeenCalled();
   } finally { spy.mockRestore(); read.mockRestore(); cancellation.mockRestore(); vi.unstubAllGlobals(); }
 });
 
-test('unverifiable cross-channel model correlation reports an error and publishes nothing', async () => {
-  const { model, source } = await fixtureModel(); const other = await systemFor('browser', 'other');
-  const handler = vi.fn(); vi.stubGlobal('reportError', handler);
-  try {
-    await generateText({ model, prompt: 'wrong channel', prepareStep: () => ({ model: other.ai.languageModel({ model: 'openai:fixture', accessSource: source.id }) }), maxRetries: 0 }).catch(() => {});
-    expect(handler).toHaveBeenCalled(); expect(captured()).toHaveLength(0); expect(captured('other')).toHaveLength(0);
-  } finally { vi.unstubAllGlobals(); }
+test('ordinary App tool output is returned when the stop condition ends before another model call', async () => {
+  const { model } = await fixtureModel(); const execute = vi.fn(async () => ({ answer: 'last tool output' }));
+  const result = await generateText({ model, prompt: 'one step', tools: { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) } });
+  expect(execute).toHaveBeenCalledTimes(1);
+  expect(result.steps[0].toolResults[0].output).toEqual({ answer: 'last tool output' });
 });
 
-test('ordinary App tool output is retained when the stop condition ends before another model call', async () => {
-  const { model } = await fixtureModel(); const execute = vi.fn(async () => ({ answer: 'last tool output' }));
-  await generateText({ model, prompt: 'one step', tools: { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) } });
-  expect(execute).toHaveBeenCalledTimes(1);
-  const [event] = captured(); expect(event.payload.status).toBe('completed'); expect(event.payload.content).toBeUndefined();
-  const records = raw(event).records;
-  expect(records.filter((r: any) => r.kind === 'model-start')).toHaveLength(1);
-  expect(records.filter((r: any) => r.kind === 'tool-end')).toMatchObject([{ output: { answer: 'last tool output' } }]);
+for (const path of ['browser', 'node'] as const) test.each(['api-key', 'subscription'] as const)(`${path} %s tools preserve File/Table evidence and explicit App events`, async kind => {
+  const source = await service.sources.save({ provider: 'openai', kind, name: 'Fixture', ...(kind === 'api-key' ? { apiKey: 'synthetic' } : {}) });
+  const system = await systemFor(path);
+  const host = { source: 'system:server', producerRef: principal().producerRef, tableGrants: '*' as const, schemaGrant: true };
+  guard.schemaApply(host, guard.schemaPlan(host, 'CREATE TABLE answers (id TEXT NOT NULL PRIMARY KEY, answer TEXT)'), true);
+  new ProducerDescriptorStore(root).publish(descriptor()); expectedBlobs = await blobFiles();
+  const execute = vi.fn(async () => {
+    const written = await system.vfs.command('tee answer.txt', { stdin: 'saved answer' });
+    expect(written.exitCode, written.stderr).toBe(0);
+    await system.mutate('INSERT INTO answers (id, answer) VALUES (?, ?)', ['one', 'saved answer']);
+    await system.writeEvent({ type: 'fixture.answer.delivered', startedAt: 123, payload: { answer: 'saved answer' }, source: 'forged-source', producerRef: 'forged-producer' } as any);
+    return 'saved answer';
+  });
+  const tools = { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) };
+  await system.ai.withTools({ model: 'openai:fixture', accessSource: source.id, tools }, ({ model, tools }) => generateText({ model, tools, prompt: 'save answer', stopWhen: stepCountIs(2) }));
+  expect(execute).toHaveBeenCalledOnce();
+  expect(await readFile(join(root, 'files', 'answer.txt'), 'utf8')).toBe('saved answer');
+  expect(guard.query(principal(), 'SELECT * FROM answers')).toEqual([{ id: 'one', answer: 'saved answer' }]);
+  const events = guard.query(principal(), 'SELECT * FROM events WHERE source = ?', [principal().source]) as any[];
+  expect(events.map(event => event.type).sort()).toEqual(['fixture.answer.delivered', 'workspace.files.changed', 'workspace.table.rows.inserted']);
+  for (const event of events) expect(event.producer_ref).toBe(principal().producerRef);
+  expect(new ProducerDescriptorStore(root).resolve(principal().producerRef)).toEqual(descriptor());
+  expect(JSON.parse(events.find(event => event.type === 'fixture.answer.delivered').payload)).toEqual({ answer: 'saved answer' });
+  await expect(system.writeEvent({ type: 'ai.turn', startedAt: 123, payload: {} })).rejects.toThrow('reserved');
+});
+
+test.each(['browser', 'node'] as const)('%s resolves historical turn content without modifying retained data', async path => {
+  const { system, model } = await fixtureModel(path);
+  const text = JSON.stringify({ version: 1, records: [{ kind: 'model-content', content: { type: 'text', text: 'historical answer' } }] });
+  const blob = new ContentBlobStore(root).writeText({ text, mediaType: 'application/json' });
+  // Seed pre-existing D0 bytes directly in this isolated fixture, never through
+  // the reserved generic write API. No production backfill/compatibility path.
+  const old = new DatabaseSync(guard.databasePath);
+  try { old.prepare('INSERT INTO events (id, schema_version, source, producer_ref, type, external_id, started_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run('historical', D0_SCHEMA_VERSION, principal().source, principal().producerRef, 'ai.turn', 'ai.turn:historical', 1, JSON.stringify({ callId: 'historical', raw: { contentRef: blob.ref } })); }
+  finally { old.close(); }
+  expectedTurns = turnRows(); expectedBlobs = await blobFiles();
+  const before = await system.resolveContentRef(blob.ref);
+  expect(before).toMatchObject({ status: 'resolved', text });
+  expect((await generateText({ model, prompt: 'new request' })).text).toBe('hello');
+  expect(await streamText({ model, prompt: 'new stream' }).text).toBe('hello');
+  expect(await system.resolveContentRef(blob.ref)).toEqual(before); expect(turnRows()).toEqual(expectedTurns);
+});
+
+test('removed capture operation and route are unavailable', async () => {
+  bind('app-a');
+  expect(SYSTEM_OPERATIONS).not.toContain('ai.capture');
+  expect(isAppSystemRoute('/api/ai/capture', 'POST')).toBe(false);
+  await expect(broker.invoke('app-a', 'ai.capture' as any, {})).rejects.toThrow();
+  const request = new Request('http://localhost/api/ai/capture', { method: 'POST', body: '{}' });
+  await expect(handleAiRequest(service, request, { context: callers.get('app-a')!, signal: new AbortController().signal, release() {} })).rejects.toThrow();
 });

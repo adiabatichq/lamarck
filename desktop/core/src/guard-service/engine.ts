@@ -1,5 +1,3 @@
-import { prepareAiTurn } from './ai-turn';
-import type { AiTurnPublication } from './protocol';
 import {
   DatabaseSync,
   constants,
@@ -189,7 +187,6 @@ export class GuardServiceError extends Error {
 export class GuardEngine {
   readonly databasePath: string;
 
-  private readonly workspacePath: string;
   private readonly db: DatabaseSync;
   private readonly maxResultRows: number;
   private readonly maxResultBytes: number;
@@ -204,7 +201,6 @@ export class GuardEngine {
 
   constructor(opts: GuardEngineOptions) {
     const workspacePath = resolveRequiredWorkspacePath(opts.workspacePath);
-    this.workspacePath = workspacePath;
     const lamarckDir = join(workspacePath, ".lamarck");
     mkdirSync(lamarckDir, { recursive: true });
 
@@ -444,20 +440,6 @@ export class GuardEngine {
     }
   }
 
-  async publishAiTurn(principalInput: GuardPrincipal, input: AiTurnPublication): Promise<string> {
-    this.assertOpen();
-    const principal = normalizePrincipal(principalInput);
-    if (!principal.source.startsWith('app:')) throw new Error('AI capture requires an App workload principal');
-    const event = await prepareAiTurn(this.workspacePath, input);
-    this.assertOpen();
-    const existing = this.query(principalInput, 'SELECT id, producer_ref, started_at, ended_at, payload FROM events WHERE source = ? AND external_id = ?', [principal.source, event.externalId!])[0] as Record<string, unknown> | undefined;
-    if (existing) {
-      if (existing.producer_ref !== principal.producerRef || existing.started_at !== event.startedAt || existing.ended_at !== event.endedAt || existing.payload !== JSON.stringify(event.payload)) throw new Error('Conflicting ai.turn publication');
-      return existing.id as string;
-    }
-    return this.appendEvent(principal, event);
-  }
-
   writeEvent(principalInput: GuardPrincipal, event: GuardEventInput): string {
     this.assertOpen();
     const principal = normalizePrincipal(principalInput);
@@ -671,8 +653,6 @@ export class GuardEngine {
           params.principal as GuardPrincipal,
           params.statements as GuardStatement[],
         );
-      case "publishAiTurn":
-        return this.publishAiTurn(params.principal as GuardPrincipal, params.input as AiTurnPublication);
       case "writeEvent":
         return this.writeEvent(params.principal as GuardPrincipal, params.event as GuardEventInput);
       case "writeLifecycleEvent":

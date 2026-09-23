@@ -11,9 +11,11 @@ function fixture(mode = 'text') {
   const calls = new Map<string, any>();
   const cancelled: string[] = [];
   const invoke = vi.fn(async (op: string, input: any): Promise<any> => {
-    if (op === 'ai.capture') return { ok: true };
     if (op === 'ai.listOptions') return { models: [], accessSources: [{ id: 'source', support: [{ model: 'openai:embedding', maxEmbeddingsPerCall: 2, supportsParallelCalls: true }] }] };
-    if (op === 'ai.start') { const invocationId = String(++id); calls.set(invocationId, { input, sequence: 0, polls: 0 }); return { invocationId }; }
+    if (op === 'ai.start') {
+      expect(Object.keys(input).sort()).toEqual(['accessSource', 'callbacks', 'model', 'operation', 'options']);
+      const invocationId = String(++id); calls.set(invocationId, { input, sequence: 0, polls: 0 }); return { invocationId };
+    }
     if (op === 'ai.cancel') { cancelled.push(input.invocationId); return { ok: true }; }
     const call = calls.get(input.invocationId);
     if (op === 'ai.toolResult') { call.reply = decodeAi(input.value); return { ok: true }; }
@@ -52,6 +54,16 @@ describe('official Vercel operations through System model proxies', () => {
     expect(result.text).toBe('hello');
     expect(result.usage.inputTokens).toBe(2);
     expect(model.specificationVersion).toBe('v4');
+    expect(model.provider).toBe('lamarck');
+  });
+  test('App-configured official telemetry remains independent of System transport', async () => {
+    const { model } = fixture(); const onStart = vi.fn(), onEnd = vi.fn();
+    const telemetry = { integrations: [{ onStart, onEnd }] };
+    expect((await generateText({ model, prompt: 'hello', telemetry })).text).toBe('hello');
+    const streamed = streamText({ model, prompt: 'hello', telemetry }); await streamed.consumeStream();
+    expect(await streamed.text).toBe('hello');
+    expect(onStart).toHaveBeenCalledTimes(2); expect(onEnd).toHaveBeenCalledTimes(2);
+    expect((globalThis as any)[Symbol.for('@lamarck/system/ai-capture-v1')]).toBeUndefined();
   });
   test('streams incremental parts and structured output', async () => {
     const { model } = fixture();
@@ -116,9 +128,9 @@ describe('official Vercel operations through System model proxies', () => {
   test('pre-aborted calls do not start and URL inputs never download in App', async () => {
     const { model, invoke } = fixture();
     await expect(generateText({ model, prompt: 'stop', abortSignal: AbortSignal.abort() })).rejects.toThrow();
-    expect(invoke.mock.calls.filter(([operation]) => operation !== 'ai.capture')).toHaveLength(0);
+    expect(invoke).not.toHaveBeenCalled();
     await expect(generateText({ model, messages: [{ role: 'user', content: [{ type: 'image', image: new URL('https://example.invalid/image.png') }] }] })).rejects.toThrow('URL inputs');
-    expect(invoke.mock.calls.filter(([operation]) => operation !== 'ai.capture')).toHaveLength(0);
+    expect(invoke).not.toHaveBeenCalled();
   });
 });
 describe('AI codec', () => {

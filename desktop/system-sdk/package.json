@@ -58,7 +58,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
     "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
@@ -73,8 +73,5 @@
   "dependencies": {
     "@ai-sdk/provider": "4.0.17",
     "@ai-sdk/provider-utils": "5.0.43"
-  },
-  "peerDependencies": {
-    "ai": "7.0.105"
   }
 }

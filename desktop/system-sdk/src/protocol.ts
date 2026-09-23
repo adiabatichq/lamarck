@@ -74,7 +74,6 @@ export interface VfsCommandWireResult {
 }
 
 export interface SystemOperationMap {
-  "ai.capture": { input: import("./ai/types.js").AiCaptureRequest; output: { ok: true; id?: string } };
   "ai.listOptions": { input: Record<string, never>; output: AiOptions };
   "ai.start": { input: AiStart; output: { invocationId: string } };
   "ai.next": { input: { invocationId: string; sequence: number }; output: { events: AiEvent[] } };
@@ -127,7 +126,7 @@ export interface SystemOperationMap {
 }
 
 export const SYSTEM_OPERATIONS = Object.freeze([
-  "ai.capture", "ai.listOptions", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
+  "ai.listOptions", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
   "query",
   "resolveContentRef",
   "mutate",
@@ -172,6 +171,3 @@ export type SystemRpcResponse =
       ok: false;
       error: { message: string; code?: string };
     };
-
-export { captureData, captureBlock, captureMessage } from "./ai/capture-data.js";
-export type { AiCaptureRequest } from './ai/types.js';

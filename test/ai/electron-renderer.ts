@@ -18,8 +18,8 @@ Object.assign(window, {
       let validations = 0;
       const schema = z.object({ answer: z.number() }).superRefine(async (_, context) => {
         validations++;
-        const { rows } = await system.query('capture-count');
-        assert(rows[0].count === (rejected ? 5 : 4));
+        const { rows } = await system.query('timeline-count');
+        assert(rows[0].count === 0);
         if (rejected) context.addIssue({ code: 'custom', message: 'fixture validation' });
       });
       const outcome = await generateText({ model: system.ai.languageModel(selection), prompt: 'JSON', output: Output.object({ schema }) }).then(() => 'accepted', () => 'rejected');

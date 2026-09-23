@@ -33,7 +33,7 @@ export function runGuardExecutorWorker(workspacePath: string): void {
     engine.close();
   };
 
-  process.on("message", async (message: unknown) => {
+  process.on("message", (message: unknown) => {
     if (isShutdownMessage(message)) {
       if (busy) return;
       close();
@@ -54,7 +54,7 @@ export function runGuardExecutorWorker(workspacePath: string): void {
 
     busy = true;
     try {
-      const result = await engine.dispatch(message.method, message.params);
+      const result = engine.dispatch(message.method, message.params);
       process.send?.({ type: "executor.result", id: message.id, result });
     } catch (error) {
       process.send?.({

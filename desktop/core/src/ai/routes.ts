@@ -8,10 +8,6 @@ export async function handleAiRequest(service: AiService, request: Request, admi
   const path = new URL(request.url).pathname;
   const auth = admission.context;
   const body = request.method === 'POST' ? await readJsonBody<any>(request, 20 * 1024 * 1024) : {};
-  if (path === '/api/ai/capture' && request.method === 'POST') {
-    if (!service.turns) throw new AiError('capture_unavailable', 'AI content capture is unavailable');
-    return { body: await service.turns.request(admission, body), retained: body.action === 'start' };
-  }
   if (path === '/api/ai/options' && request.method === 'POST') return { body: await service.options(auth.kind === 'app' ? auth : undefined) };
   if (path.startsWith('/api/ai/invoke/') && request.method === 'POST') {
     if (auth.kind !== 'app') throw new AiError('unauthorized', 'App identity required');

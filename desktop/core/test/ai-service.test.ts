@@ -14,20 +14,15 @@ import { SYSTEM_SCHEMA_V1 } from '../src/db';
 import { CredentialStore } from '../src/credentials/credential-store';
 import { SqliteEncryptedSecretStore } from '../src/credentials/secret-store';
 import { AiService, type AiAdapter } from '../src/ai/service';
-import { AiTurns } from '../src/ai/turns';
-import { GuardEngine } from '../src/guard-service/engine';
 import { AI_CATALOG } from '../src/ai/catalog';
-let guard: GuardEngine;
-const principal = { source: 'app:fixture:ui', producerRef: `producer:v1:sha256:${'5'.repeat(64)}`, tableGrants: [] };
 let db: DatabaseSync, root: string, service: AiService;
 const caller = { kind: 'app', appId: 'fixture', channelId: 'fixture', workload: 'ui', authorization: {} } as any;
-beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'ai-service-')); db = new DatabaseSync(join(root, 'system.db')); db.exec(SYSTEM_SCHEMA_V1); guard = new GuardEngine({ workspacePath: root }); service = createService(); });
-afterEach(async () => { vi.unstubAllGlobals(); await service.close(); db.close(); guard.close(); await rm(root, { recursive: true, force: true }); });
-function createService(adapter?: AiAdapter) { return new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter, new AiTurns(root, () => ({ publishAiTurn: input => guard.publishAiTurn(principal, input) }))); }
+beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'ai-service-')); db = new DatabaseSync(join(root, 'system.db')); db.exec(SYSTEM_SCHEMA_V1); service = createService(); });
+afterEach(async () => { vi.unstubAllGlobals(); await service.close(); db.close(); await rm(root, { recursive: true, force: true }); });
+function createService(adapter?: AiAdapter) { return new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter); }
 async function restartService() { await service.close(); db.close(); db = new DatabaseSync(join(root, 'system.db')); service = createService(); }
 function system() {
   return createSystem(async (operation, input: any): Promise<any> => {
-    if (operation === 'ai.capture') return service.turns!.request({ context: caller, signal: new AbortController().signal, release() {} }, input);
     if (operation === 'ai.listOptions') return service.options(caller);
     if (operation === 'ai.start') return service.start({ context: caller, signal: new AbortController().signal, release() {} }, input);
     if (operation === 'ai.next') return service.invocations.next(caller, input.invocationId, input.sequence);
