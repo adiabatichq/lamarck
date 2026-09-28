@@ -90,7 +90,36 @@ const result = await system.ai.withTools({ ...selection, tools }, async ({ model
 
 Consume streams inside the helper callback before returning. Tool schemas are validated with the original App schema, and tool implementations run in that App, including any nested System calls. Subscription tool results are marked provider-executed so Vercel does not execute them again. Scope exit cancels outstanding work and rejects later use of its model. No bridge retry replays tool side effects.
 
-The callback seam supports ordinary function tools with `inputSchema` and `execute`. Subscription callbacks receive the tool-call ID and abort signal; the standard provider contract does not supply Vercel's original message/context objects, so these callback fields are empty/undefined. Use closures for App context. Approval-requiring tools, provider tools, streaming tool results, output schemas, and custom output conversion are rejected by this helper. Subscription forced-tool selection and runtime overrides are unsupported. Codex currently accepts text prompts/history and structured JSON output; unsupported file/history parts fail explicitly. API file data uses bounded bytes; remote URL inputs are rejected instead of being downloaded outside Capsule policy.
+App results retain the original `execute` output and available provider metadata. Exceptions from `execute` appear as Vercel `tool-error` parts and are sent back to the native subscription loop so the model can respond. Validation, serialization, conversion and transport failures fail the invocation; cancellation ends it. Failed execution skips `toModelOutput`.
+
+The callback seam supports ordinary function tools with `inputSchema`, `execute`, and Vercel's optional `toModelOutput`. Raw App results remain separate from model-facing output. Subscription results support text, JSON, and inline image content (bytes or base64 with an explicit image media type), including images in tool-result history. Unsupported content and conversion errors fail explicitly. Arbitrary JSON is never interpreted as an image. Subscription callbacks receive the tool-call ID and abort signal; the standard provider contract does not supply Vercel's original message/context objects, so these callback fields are empty/undefined. Use closures for App context. Approval-requiring tools, provider tools, streaming tool results, and output schemas are rejected by this helper. Subscription forced-tool selection and runtime overrides are unsupported. API file data uses bounded bytes; remote URL inputs are rejected instead of being downloaded outside Capsule policy.
+
+### Computer Use (macOS on Apple Silicon)
+
+`system.computer.withTools` provides ordinary Vercel tools backed by the bundled Cua Driver. It is independent of model and access source; the selected model must support tools and images.
+
+```ts
+import { generateText, stepCountIs } from 'ai';
+import { system } from '@lamarck/system';
+
+const result = await system.computer.withTools(
+  ({ tools, instructions }) => system.ai.withTools(
+    { ...selection, tools },
+    ({ model, tools }) => generateText({
+      model, tools, system: instructions,
+      prompt: 'Open Calculator and compute 123 × 45. Verify the displayed answer.',
+      stopWhen: stepCountIs(12),
+      abortSignal,
+      maxRetries: 0,
+    }),
+  ),
+  { abortSignal },
+);
+```
+
+Lamarck asks for permission for each scope. macOS also requires Accessibility and Screen Recording permission for Lamarck. The Host starts its pinned private MCP process; users do not install or configure an MCP server. There is one active scope per desktop, and actions must run sequentially. Scope exit, cancellation, App disconnect, and desktop shutdown stop its process. Consume streams inside both callbacks and pass the same abort signal to the model call. An action error is reported, never retried by Lamarck.
+
+The tools cover app/window inspection, screenshots, clicks, typing, keyboard actions, scrolling, dragging, menus, and window frames. File-output/configuration arguments, driver installs, updates, recording, clipboard tools, and arbitrary MCP servers are not exposed. Screenshot results stay inline and are bounded to 4 MiB per action. This initial direct MCP integration does not provide Cua's cursor overlay or browser DOM integration. Background action support depends on the target app; inspect the returned state and explicitly choose foreground delivery when necessary. Computer Use does not add automatic Timeline events.
 
 Calls keep Vercel usage, finish information, warnings, and sanitized errors. `providerMetadata.lamarck.invocationId` identifies the Host invocation. Tool writes retain the existing Guard evidence; AI call status is not added to the permanent D0 ledger. Custom HTTP headers and raw provider chunks are not exposed. Provider request/debug bodies, credentials, and CLI diagnostics do not cross the App channel. Calls are limited to eight per channel and 64 globally, with bounded event queues, a 60-second idle timeout, and a ten-minute deadline. Cancellation, disconnect, permission withdrawal, or source reconfiguration ends the corresponding work.
 

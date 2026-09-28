@@ -52,6 +52,8 @@ const expectedFiles = [
   "dist/ai/types.js",
   "dist/browser.d.ts",
   "dist/browser.js",
+  "dist/computer.d.ts",
+  "dist/computer.js",
   "dist/create-system.d.ts",
   "dist/create-system.js",
   "dist/node-system.d.ts",
@@ -159,6 +161,10 @@ async function verifyConsumer(tarballPath) {
       void (() => embed({ model: embedding, value: 'hello' }));
       void (() => embedMany({ model: embedding, values: ['hello'] }));
       const systems: readonly System[] = [system, browserSystem, nodeSystem];
+      void (() => browserSystem.computer.withTools(async ({ tools, instructions }) => {
+        return browserSystem.ai.withTools({ ...selection, tools }, ({ model, tools }) =>
+          generateText({ model, tools, system: instructions, prompt: 'Inspect the desktop' }));
+      }));
       const operation: SystemOperation = SYSTEM_OPERATIONS[0];
       const nodeOnlyRootExport: "LAMARCK_SDK_SOCKET" = LAMARCK_SDK_SOCKET_ENV;
       void systems;

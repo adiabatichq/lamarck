@@ -34,7 +34,8 @@ const adapter: AiAdapter = {
         if (JSON.stringify(options.prompt).includes('abort-me')) await new Promise((_, reject) => context.signal.addEventListener('abort', () => reject(new DOMException('Cancelled', 'AbortError')), { once: true }));
         const content: any[] = [];
         if (options.tools?.length) {
-          const value = await context.tool('lookup', { value: 'input' }, 'call');
+          const { value, modelOutput } = await context.tool('lookup', { value: 'input' }, 'call');
+          if (JSON.stringify(options.prompt).includes('computer-fixture') && (modelOutput.type !== 'content' || !modelOutput.value.some(part => part.type === 'file' && part.mediaType === 'image/png'))) throw new Error('Computer screenshot did not cross the renderer callback');
           content.push({ type: 'tool-call', toolCallId: 'call', toolName: 'lookup', input: '{"value":"input"}', providerExecuted: true }, { type: 'tool-result', toolCallId: 'call', toolName: 'lookup', result: value });
         }
         content.push({ type: 'text', text: options.responseFormat?.type === 'json' ? '{"answer":42}' : 'hello' }); return { content, usage, finishReason, warnings: [] };
@@ -105,9 +106,23 @@ const server = await serve({ hostname: '127.0.0.1', port: 0, async fetch(request
   } catch (error) { return Response.json({ error: String(error) }, { status: 400 }); }
   finally { if (!retained) admission.release(); }
 } });
-const broker = new SystemBroker({ coreBaseUrl: async () => `http://127.0.0.1:${server.port}`, revokeCapability: async () => { signal.abort(); } });
+let computerScope: string | undefined;
+const broker = new SystemBroker({ coreBaseUrl: async () => `http://127.0.0.1:${server.port}`, revokeCapability: async () => { signal.abort(); }, computer: {
+  async invoke(owner, appId, operation, input) {
+    if (owner !== 'browser' || appId !== 'browser-fixture') throw new Error('Incorrect Host computer identity');
+    const { sessionId } = input as { sessionId: string };
+    if (operation === 'computer.open') {
+      computerScope = sessionId;
+      return { sessionId, instructions: 'Fixture computer', tools: [{ name: 'lookup', inputSchema: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'] } }] };
+    }
+    if (computerScope !== sessionId) throw new Error('Computer scope was not retained');
+    if (operation === 'computer.close') { computerScope = undefined; return { ok: true }; }
+    return { content: [{ type: 'image', mimeType: 'image/png', data: 'AQID' }] };
+  },
+  async closeOwner() { computerScope = undefined; },
+} });
 const window = new BrowserWindow({ show: false, webPreferences: { preload: join(import.meta.dirname, 'preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false } });
-broker.bindSender(window.webContents.id, { capability: 'fixture', channelId: 'browser' });
+broker.bindSender(window.webContents.id, { capability: 'fixture', channelId: 'browser', appId: 'browser-fixture' });
 ipcMain.handle('app-system:invoke', (event, request) => broker.invokeSerialized(event.sender.id, request));
 let code = 0;
 try {

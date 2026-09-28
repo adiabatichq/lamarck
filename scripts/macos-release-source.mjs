@@ -54,6 +54,9 @@ export const MACOS_RELEASE_SOURCE_FILES = Object.freeze([
   "scripts/rename-excl.c",
   "scripts/stage-capsule-native.mjs",
   "scripts/stage-ai-runtimes.mjs",
+  "scripts/stage-computer-use.mjs",
+  "scripts/download-verified-file.mjs",
+  "scripts/ai-runtime-licenses/CUA-LICENSE",
   "scripts/ai-runtime-licenses/CODEX-LICENSE",
 ]);
 

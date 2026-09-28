@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { tmpdir } from "node:os";
+import { promisify, isDeepStrictEqual } from "node:util";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,14 +54,12 @@ export async function fetchPublishedRelease(version, fetchImpl = fetch) {
   ) {
     throw new Error(`npm registry returned invalid @lamarck/system ${version} metadata`);
   }
-  if (metadata.dependencies && Object.keys(metadata.dependencies).length > 0) {
-    throw new Error("App consumer lock updater requires @lamarck/system to have no runtime dependencies");
-  }
   return {
     version,
     resolved,
     integrity: metadata.dist.integrity,
     engines: normalizeEngines(metadata.engines),
+    ...(metadata.dependencies && Object.keys(metadata.dependencies).length ? { dependencies: metadata.dependencies } : {}),
   };
 }
 
@@ -77,7 +78,7 @@ export async function discoverConsumerDirectories({ appsDirectory, scaffoldDirec
   return [...appDirectories, scaffoldDirectory];
 }
 
-export async function updateConsumerLocks({ consumerDirectories, release }) {
+export async function updateConsumerLocks({ consumerDirectories, release, resolveDependencies = resolveConsumerDependencies }) {
   validateRelease(release);
   if (!Array.isArray(consumerDirectories) || consumerDirectories.length < 1) {
     throw new Error("No first-party App consumers found");
@@ -103,15 +104,43 @@ export async function updateConsumerLocks({ consumerDirectories, release }) {
       resolved: release.resolved,
       integrity: release.integrity,
       ...(release.engines ? { engines: release.engines } : {}),
+      ...(release.dependencies ? { dependencies: release.dependencies } : {}),
     };
     const currentEntry = lock.packages?.["node_modules/@lamarck/system"];
-    if (JSON.stringify(currentEntry) === JSON.stringify(nextEntry)) continue;
-    lock.packages["node_modules/@lamarck/system"] = nextEntry;
-    updates.push({ lockPath, bytes: `${JSON.stringify(lock, null, 2)}\n` });
+    if (Object.entries(nextEntry).every(([key, value]) => isDeepStrictEqual(currentEntry?.[key], value))) continue;
+    if (release.dependencies) {
+      // Let npm resolve the transitive graph; changing just the SDK entry would
+      // leave an invalid lock once the SDK has runtime dependencies.
+      const resolved = await resolveDependencies(packageDocument, lock, release.version);
+      const entry = resolved.packages?.["node_modules/@lamarck/system"];
+      if (!Object.entries(nextEntry).every(([key, value]) => isDeepStrictEqual(entry?.[key], value))) {
+        throw new Error("Resolved SDK lock does not match the verified registry release");
+      }
+      resolved.packages[""].dependencies["@lamarck/system"] = declaredRange;
+      updates.push({ lockPath, bytes: `${JSON.stringify(resolved, null, 2)}\n` });
+    } else {
+      lock.packages["node_modules/@lamarck/system"] = nextEntry;
+      updates.push({ lockPath, bytes: `${JSON.stringify(lock, null, 2)}\n` });
+    }
   }
 
   for (const update of updates) await writeFile(update.lockPath, update.bytes, "utf8");
   return updates.map((update) => update.lockPath);
+}
+
+async function resolveConsumerDependencies(packageDocument, lock, version) {
+  const directory = await mkdtemp(join(tmpdir(), "lamarck-sdk-lock-"));
+  try {
+    await writeFile(join(directory, "package.json"), JSON.stringify({ ...packageDocument,
+      dependencies: { ...packageDocument.dependencies, "@lamarck/system": version },
+    }));
+    await writeFile(join(directory, "package-lock.json"), JSON.stringify(lock));
+    await promisify(execFile)(process.platform === "win32" ? "npm.cmd" : "npm", [
+      "install", "--package-lock-only", "--ignore-scripts", "--audit=false", "--fund=false",
+      `--registry=${registryOrigin}`,
+    ], { cwd: directory, timeout: 120_000, maxBuffer: 1024 * 1024 });
+    return await readJson(join(directory, "package-lock.json"));
+  } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
 function validateRelease(release) {

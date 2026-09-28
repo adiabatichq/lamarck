@@ -18,7 +18,7 @@ function fixture(mode = 'text') {
     }
     if (op === 'ai.cancel') { cancelled.push(input.invocationId); return { ok: true }; }
     const call = calls.get(input.invocationId);
-    if (op === 'ai.toolResult') { call.reply = decodeAi(input.value); return { ok: true }; }
+    if (op === 'ai.toolResult') { call.reply = { value: decodeAi(input.value), failed: input.failed }; return { ok: true }; }
     if (op === 'ai.next') {
       call.polls++;
       const options = decodeAi(call.input.options) as any;
@@ -28,17 +28,22 @@ function fixture(mode = 'text') {
       if (mode === 'empty-poll-error') return { events: [{ type: 'error', sequence: call.sequence++, error: { code: 'provider', message: 'failed after polling', retryable: false } }] };
       if ((mode === 'callback' && call.polls === 1) || (mode === 'stream-callback' && call.polls === 2)) return { events: [{ type: 'tool', sequence: call.sequence++, toolCallId: 'tool-1', name: 'lookup', input: encodeAi({ value: 'valid' }) }] };
       if ((mode === 'callback' || mode === 'stream-callback') && call.reply === undefined) { await new Promise(resolve => setTimeout(resolve, 1)); return { events: [] }; }
-      const text = mode === 'json' ? '{"answer":42}' : mode === 'callback' ? String(call.reply) : 'hello';
+      const text = mode === 'json' ? '{"answer":42}' : mode === 'callback' ? String(call.reply.value) : 'hello';
+      const callbackParts = call.reply ? [
+        { type: 'tool-call', toolCallId: 'tool-1', toolName: 'lookup', input: '{"value":"valid"}', providerExecuted: true },
+        { type: 'tool-result', toolCallId: 'tool-1', toolName: 'lookup', result: call.reply.value, isError: call.reply.failed, providerMetadata: { fixture: { retained: true } } },
+      ] : [];
       if (call.input.operation === 'embed') return { events: [event('complete', { embeddings: options.values.map((v: string) => [v.length, 1]), usage: { tokens: options.values.length }, warnings: [] })] };
       if (call.input.operation === 'stream') return { events: [
         ...(call.sequence === 0 ? [{ type: 'ready', sequence: call.sequence++ }, event('part', { type: 'stream-start', warnings: [] })] : []),
+        ...callbackParts.map(part => event('part', part)),
         event('part', { type: 'text-start', id: 'text' }),
         event('part', { type: 'text-delta', id: 'text', delta: 'hel' }), event('part', { type: 'text-delta', id: 'text', delta: 'lo' }),
         event('part', { type: 'text-end', id: 'text' }), event('part', { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' }, usage }), event('complete', null),
       ] };
       const firstToolStep = mode === 'api-tool' && !options.prompt.some((message: any) => message.role === 'tool');
       return { events: [event('complete', {
-        content: firstToolStep ? [{ type: 'tool-call', toolCallId: 'api-tool', toolName: 'lookup', input: '{"value":"valid"}' }] : [{ type: 'text', text }],
+        content: firstToolStep ? [{ type: 'tool-call', toolCallId: 'api-tool', toolName: 'lookup', input: '{"value":"valid"}' }] : [...callbackParts, { type: 'text', text }],
         finishReason: { unified: firstToolStep ? 'tool-calls' : 'stop', raw: 'stop' }, usage, warnings: [],
       })] };
     }
@@ -124,6 +129,54 @@ describe('official Vercel operations through System model proxies', () => {
     const { system, cancelled } = fixture();
     await expect(system.ai.withTools({ model: 'openai:test', accessSource: 'source', tools: {} }, async ({ model }) => model.doStream({ prompt: [] }))).rejects.toThrow('Consume');
     expect(cancelled.length).toBe(1);
+  });
+  test('subscription callbacks keep raw App output separate from toModelOutput images', async () => {
+    const { system, invoke } = fixture('callback');
+    const value = { screenshot: new Uint8Array([1, 2, 3]), caption: 'Screen' };
+    const toModelOutput = vi.fn(({ output }: { output: typeof value }) => ({ type: 'content' as const, value: [{ type: 'file' as const, mediaType: 'image/png', data: { type: 'data' as const, data: output.screenshot } }] }));
+    const tools = { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute: async () => value, toModelOutput }) };
+    const result = await system.ai.withTools({ model: 'openai:test', accessSource: 'source', tools }, ({ model, tools }) => generateText({ model, tools, prompt: 'screenshot' }));
+    expect(result.toolResults[0].output).toEqual(value);
+    expect(result.toolResults[0].providerMetadata).toEqual({ fixture: { retained: true } });
+    expect(toModelOutput).toHaveBeenCalledWith({ toolCallId: 'tool-1', input: { value: 'valid' }, output: value });
+    const reply = invoke.mock.calls.find(([op]) => op === 'ai.toolResult')![1];
+    expect(decodeAi(reply.value)).toEqual(value);
+    expect(decodeAi(reply.modelOutput)).toEqual(toModelOutput.mock.results[0].value);
+    expect(reply.failed).toBe(false);
+  });
+  test.each([false, true])('execute errors stay tool errors, without custom conversion or abort (streaming=%s)', async streaming => {
+    const { system, invoke } = fixture(streaming ? 'stream-callback' : 'callback');
+    const toModelOutput = vi.fn(() => ({ type: 'text' as const, value: 'unexpected' }));
+    const execute = vi.fn(async () => { throw new Error('lookup failed'); });
+    const tools = { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute, toModelOutput }) };
+    await system.ai.withTools({ model: 'openai:test', accessSource: 'source', tools }, async ({ model, tools }) => {
+      const result = streaming ? streamText({ model, tools, prompt: 'lookup', maxRetries: 0 }) : await generateText({ model, tools, prompt: 'lookup', maxRetries: 0 });
+      const content = (await result.steps)[0].content;
+      expect(content.find(part => part.type === 'tool-error')).toMatchObject({ toolName: 'lookup', error: 'Error: lookup failed' });
+      expect(await result.text).toBeTruthy();
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(toModelOutput).not.toHaveBeenCalled();
+    const reply = invoke.mock.calls.find(([op]) => op === 'ai.toolResult')![1];
+    expect(reply.failed).toBe(true); expect(decodeAi(reply.value)).toBe('Error: lookup failed'); expect(reply.modelOutput).toBeUndefined();
+  });
+  test.each([false, true])('App-owned value/modelOutput keys are returned unchanged (streaming=%s)', async streaming => {
+    const { system, invoke } = fixture(streaming ? 'stream-callback' : 'callback');
+    const output = { value: 'App value', modelOutput: { type: 'text', value: 'App data' } };
+    const tools = { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute: async () => output }) };
+    await system.ai.withTools({ model: 'openai:test', accessSource: 'source', tools }, async ({ model, tools }) => {
+      const result = streaming ? streamText({ model, tools, prompt: 'lookup' }) : await generateText({ model, tools, prompt: 'lookup' });
+      expect((await result.toolResults)[0].output).toEqual(output);
+      expect((await result.toolResults)[0].providerMetadata).toEqual({ fixture: { retained: true } });
+    });
+    const reply = invoke.mock.calls.find(([op]) => op === 'ai.toolResult')![1];
+    expect(decodeAi(reply.value)).toEqual(output); expect(reply.modelOutput).toBeUndefined();
+  });
+  test('conversion failures fail the invocation instead of becoming execute errors', async () => {
+    const { system, invoke } = fixture('callback');
+    const tools = { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute: async () => 'ok', toModelOutput: () => { throw new Error('conversion failed'); } }) };
+    await expect(system.ai.withTools({ model: 'openai:test', accessSource: 'source', tools }, ({ model, tools }) => generateText({ model, tools, prompt: 'lookup', maxRetries: 0 }))).rejects.toThrow('conversion failed');
+    expect(invoke.mock.calls.some(([op]) => op === 'ai.toolResult')).toBe(false);
   });
   test('pre-aborted calls do not start and URL inputs never download in App', async () => {
     const { model, invoke } = fixture();

@@ -27,7 +27,7 @@ function system() {
     if (operation === 'ai.start') return service.start({ context: caller, signal: new AbortController().signal, release() {} }, input);
     if (operation === 'ai.next') return service.invocations.next(caller, input.invocationId, input.sequence);
     if (operation === 'ai.cancel') { service.invocations.cancel(caller, input.invocationId); return { ok: true }; }
-    if (operation === 'ai.toolResult') { service.invocations.reply(caller, input.invocationId, input.toolCallId, decodeAi(input.value), input.failed); return { ok: true }; }
+    if (operation === 'ai.toolResult') { service.invocations.reply(caller, input.invocationId, input.toolCallId, decodeAi(input.value), input.failed, input.modelOutput === undefined ? undefined : decodeAi(input.modelOutput) as any); return { ok: true }; }
     throw new Error('Unexpected operation');
   });
 }

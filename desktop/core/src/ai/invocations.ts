@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { encodeAi, type AiEvent, type AiStart, type JsonValue } from '@lamarck/system/protocol';
+import { encodeAi, type AiEvent, type AiStart, type AiToolResult, type JsonValue } from '@lamarck/system/protocol';
 import type { AppAuthContext, AuthAdmission } from '../auth';
 import { AiError, aiFailure } from './errors';
 
@@ -8,7 +8,7 @@ export interface InvocationContext {
   caller: AppAuthContext;
   signal: AbortSignal;
   streamReady(): Promise<void>;
-  tool(name: string, input: unknown, toolCallId: string): Promise<unknown>;
+  tool(name: string, input: unknown, toolCallId: string): Promise<AiToolResult>;
   part(value: unknown): Promise<void>;
 }
 type Unsequenced<T> = T extends { sequence: number } ? Omit<T, 'sequence'> : never;
@@ -17,7 +17,7 @@ interface Invocation {
   events: AiEvent[]; sequence: number; readSequence: number; bytes: number; terminal: boolean;
   reading: boolean; wake?: () => void; drains: Set<() => void>; timer: ReturnType<typeof setTimeout>;
   idleTimer: ReturnType<typeof setTimeout>; release(): void;
-  tools: Map<string, { resolve(value: unknown): void; reject(error: Error): void }>;
+  tools: Map<string, { resolve(value: AiToolResult): void; reject(error: Error): void }>;
   seenTools: Set<string>;
 }
 /** Pull-driven event frames multiplexed with control replies on the existing v1 channel. */
@@ -64,7 +64,7 @@ export class AiInvocations {
         if (!input.callbacks) throw new AiError('tools_require_scope', 'Subscription tools require system.ai.withTools');
         if (call.seenTools.has(toolCallId) || call.seenTools.size >= 1024 || call.tools.size >= 32) throw new AiError('invalid_tool', 'Duplicate or excessive AI tool callbacks');
         call.seenTools.add(toolCallId);
-        const promise = new Promise<unknown>((resolve, reject) => call.tools.set(toolCallId, { resolve, reject }));
+        const promise = new Promise<AiToolResult>((resolve, reject) => call.tools.set(toolCallId, { resolve, reject }));
         // Observe a simultaneous cancellation even while enqueue is waiting.
         void promise.catch(() => {});
         await this.enqueue(call, { type: 'tool', name, input: encodeAi(value), toolCallId });
@@ -111,13 +111,23 @@ export class AiInvocations {
       if (this.calls.has(id)) { call.idleTimer = setTimeout(cancel, this.limits.idleMs); call.idleTimer.unref(); }
     }
   }
-  reply(caller: AppAuthContext, id: string, toolCallId: string, value: unknown, failed: boolean): void {
+  reply(caller: AppAuthContext, id: string, toolCallId: string, value: unknown, failed: boolean, modelOutput?: AiToolResult['modelOutput']): void {
     const call = this.require(caller, id);
     const pending = call.tools.get(toolCallId);
     if (!pending || call.terminal) throw new AiError('invalid_tool', 'Unknown or completed AI tool callback');
     call.tools.delete(toolCallId);
-    if (failed) pending.reject(new AiError('tool_failed', typeof value === 'string' ? value.slice(0, 1000) : 'App tool failed'));
-    else pending.resolve(value);
+    try {
+      if (failed) {
+        const message = typeof value === 'string' ? value : 'App tool failed';
+        pending.resolve({ value: message, modelOutput: { type: 'error-text', value: message }, isError: true });
+      } else {
+        // The v1 value remains the raw App result, including objects whose keys
+        // happen to be value/modelOutput. Only the separate field is model content.
+        pending.resolve({ value, modelOutput: modelOutput !== undefined ? modelOutput : (typeof value === 'string'
+          ? { type: 'text', value }
+          : { type: 'json', value: value === undefined ? null : JSON.parse(JSON.stringify(value)) }) });
+      }
+    } catch (error) { pending.reject(error instanceof Error ? error : new Error('Invalid AI tool result')); }
   }
   cancel(caller: AppAuthContext, id: string): void {
     const call = this.calls.get(id);

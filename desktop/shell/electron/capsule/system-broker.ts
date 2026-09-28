@@ -5,10 +5,11 @@ import {
   type SystemOperationMap,
 } from "@lamarck/system/protocol";
 export { SYSTEM_OPERATIONS };
+import type { ComputerHost } from '../computer-use';
 
 export const AI_CONTROL_REQUEST_RESERVE_PER_SENDER = 4;
 export function isAiControlOperation(operation: SystemOperation): boolean {
-  return operation === 'ai.cancel' || operation === 'ai.toolResult';
+  return operation === 'ai.cancel' || operation === 'ai.toolResult' || operation === 'computer.close';
 }
 
 const SYSTEM_OPERATION_SET: ReadonlySet<string> = new Set(SYSTEM_OPERATIONS);
@@ -25,6 +26,7 @@ const MAX_JSON_DEPTH = 128;
 export type SenderId = string | number;
 
 export interface SystemSenderBinding {
+  appId?: string;
   channelId: string;
   capability: string;
 }
@@ -34,6 +36,7 @@ export interface SystemViewerResourceBinding {
 }
 
 export interface SystemBrokerOptions {
+  computer?: ComputerHost;
   coreBaseUrl: string | (() => string | Promise<string>);
   fetch?: typeof fetch;
   timeoutMs?: number;
@@ -72,6 +75,7 @@ export class SystemBrokerError extends Error {
 }
 
 interface PrivateBinding {
+  readonly appId?: string;
   readonly channelId: string;
   readonly capability: string;
   readonly viewerResources?: SystemViewerResourceBinding;
@@ -101,6 +105,7 @@ interface CoreResponse {
  * it cannot supply a route, capability, App id, workload, or channel id.
  */
 export class SystemBroker {
+  #computer?: ComputerHost;
   #coreBaseUrl: SystemBrokerOptions["coreBaseUrl"];
   #fetch: typeof fetch;
   #timeoutMs: number;
@@ -122,6 +127,7 @@ export class SystemBroker {
   #aggregateBytesGlobal = 0;
 
   constructor(options: SystemBrokerOptions) {
+    this.#computer = options.computer;
     this.#coreBaseUrl = options.coreBaseUrl;
     this.#fetch = options.fetch ?? globalThis.fetch;
     if (typeof this.#fetch !== "function") throw new Error("SystemBroker requires fetch");
@@ -174,6 +180,7 @@ export class SystemBroker {
     // the raw capability, and no public inspection API returns the binding.
     const stored: PrivateBinding = Object.freeze({
       channelId: binding.channelId,
+      appId: binding.appId,
       capability: binding.capability,
       ...(viewerResources ? { viewerResources } : {}),
     });
@@ -304,7 +311,10 @@ export class SystemBroker {
     }
 
     const epoch = this.#connectionEpoch.get(senderId) ?? 0;
-    const coreRequest = mapCoreRequest(operation, input);
+    const computer = operation.startsWith('computer.');
+    const coreRequest = computer
+      ? { method: 'POST' as const, path: '', body: undefined, sizeValue: expectJson(input, operation) }
+      : mapCoreRequest(operation, input);
     const serializedForSize = serializeJson(coreRequest.sizeValue);
     const coreRequestBytes = byteLength(serializedForSize);
     if (coreRequestBytes > this.#maxRequestBytes) {
@@ -318,6 +328,18 @@ export class SystemBroker {
     }, this.#timeoutMs);
 
     try {
+      if (computer) {
+        if (!binding.appId || !this.#computer) throw new SystemBrokerError('operation_denied', 'Computer Use requires a bound desktop App');
+        const data = await raceWithAbort(this.#computer.invoke(binding.channelId, binding.appId, operation, input, controller.signal), controller.signal);
+        if (this.#bindingsBySender.get(senderId) !== binding || epoch !== this.#connectionEpoch.get(senderId)) {
+          await this.#computer.closeOwner(binding.channelId);
+          throw new SystemBrokerError('request_aborted', 'Computer Use channel disconnected');
+        }
+        const bytes = byteLength(serializeJson(expectJson(data, operation)));
+        if (bytes > this.#maxResponseBytes) throw new SystemBrokerError('response_too_large', 'Computer Use response exceeds the size limit');
+        this.#chargeLease(lease, bytes);
+        return finish({ data }, lease);
+      }
       const baseUrl = typeof this.#coreBaseUrl === "function"
         ? await raceWithAbort(Promise.resolve(this.#coreBaseUrl()), controller.signal)
         : this.#coreBaseUrl;
@@ -405,6 +427,7 @@ export class SystemBroker {
     const calls = this.#aiCalls.get(senderId);
     this.#aiCalls.delete(senderId);
     const binding = this.#bindingsBySender.get(senderId);
+    if (binding) void this.#computer?.closeOwner(binding.channelId).catch(() => {});
     if (binding) for (const invocationId of calls ?? []) this.#cancelAiCall(binding, invocationId);
   }
 
@@ -552,6 +575,8 @@ function mapCoreRequest(operation: string, input: unknown): CoreRequest {
   const value = expectRecord(input);
 
   switch (operation as SystemOperation) {
+    case 'computer.open': case 'computer.call': case 'computer.close':
+      throw new SystemBrokerError('operation_denied', 'Computer Use is a Host operation');
     case 'ai.listOptions':
     case 'ai.start':
     case 'ai.next':

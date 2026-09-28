@@ -44,8 +44,30 @@ function createBroker(
 }
 
 describe("SystemBroker", () => {
+  test('Computer Use derives App identity from Host binding and closes on disconnect', async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const computer = { invoke: vi.fn(async () => ({ sessionId: 's', tools: [], instructions: '' })), closeOwner: vi.fn(async () => {}) };
+    const { broker } = createBroker(fetchImpl, { computer });
+    broker.bindSender(1, { channelId: 'channel', capability: 'secret', appId: 'real-app' });
+    await broker.invoke(1, 'computer.open', { sessionId: 'test-scope' });
+    expect(computer.invoke).toHaveBeenCalledWith('channel', 'real-app', 'computer.open', { sessionId: 'test-scope' }, expect.any(AbortSignal));
+    expect(fetchImpl).not.toHaveBeenCalled();
+    broker.cancelAi(1);
+    expect(computer.closeOwner).toHaveBeenCalledWith('channel');
+    broker.bindSender(2, { channelId: 'missing-app', capability: 'secret' });
+    await expect(broker.invoke(2, 'computer.open', { sessionId: 'test-scope' })).rejects.toMatchObject({ code: 'operation_denied' });
+    expect(computer.invoke).toHaveBeenCalledTimes(1);
+  });
+  test('Computer Use shares Host bounds and revokes late opening scopes', async () => {
+    const computer = { invoke: vi.fn(async () => { broker.cancelAi(1); return { sessionId: 'late', tools: [], instructions: '' }; }), closeOwner: vi.fn(async () => {}) };
+    const { broker } = createBroker(vi.fn<typeof fetch>(), { computer });
+    broker.bindSender(1, { channelId: 'channel', capability: 'secret', appId: 'app' });
+    await expect(broker.invoke(1, 'computer.open', { sessionId: 'test-scope' })).rejects.toMatchObject({ code: 'request_aborted' });
+    expect(computer.closeOwner).toHaveBeenCalledWith('channel');
+  });
   test("exposes the closed System operation allowlist and rejects unknown operations", async () => {
     expect(SYSTEM_OPERATIONS).toEqual([
+      'computer.open', 'computer.call', 'computer.close',
       "ai.listOptions", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
       "query",
       "resolveContentRef",

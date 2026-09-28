@@ -15,6 +15,18 @@ import { CredentialStore } from '../../desktop/core/src/credentials/credential-s
 import { SqliteEncryptedSecretStore } from '../../desktop/core/src/credentials/secret-store';
 import { AiService, type AiAdapter } from '../../desktop/core/src/ai/service';
 const native = process.env.LAMARCK_AI_NATIVE_SMOKE === '1';
+const screenshot = 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFElEQVR4nGNoIBEwjGoY1TB8NQAAJYSAEGy7FvQAAAAASUVORK5CYII=';
+const appToolOutput = { caption: 'tool-answer', screenshot };
+function imageToolOutput({ output }: { output: typeof appToolOutput }) {
+  expect(output).toEqual(appToolOutput);
+  return { type: 'content' as const, value: [{ type: 'text' as const, text: output.caption }, { type: 'file' as const, mediaType: 'image/png', data: { type: 'data' as const, data: output.screenshot } }] };
+}
+const imageHistory = [
+  { role: 'user' as const, content: 'Previous screenshot' },
+  { role: 'assistant' as const, content: [{ type: 'tool-call' as const, toolCallId: 'history-call', toolName: 'lookup', input: { value: 'history' } }] },
+  { role: 'tool' as const, content: [{ type: 'tool-result' as const, toolCallId: 'history-call', toolName: 'lookup', output: imageToolOutput({ output: appToolOutput }) }] },
+  { role: 'user' as const, content: 'Use lookup then reply.' },
+];
 test.runIf(native)('pinned subscription runtimes start with isolated, logged-out sources', async () => {
   const roots = await Promise.all([1, 2].map(() => mkdtemp(join(tmpdir(), 'ai-native-'))));
   try {
@@ -45,7 +57,8 @@ test.runIf(native).each([
   ...['gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex'].flatMap(id => [false, true].map(streaming => ({ id, codeMode: false, streaming, cancelled: false }))),
   ...['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'].flatMap(id => [false, true].map(streaming => ({ id, codeMode: true, streaming, cancelled: false }))),
   ...[{ id: 'gpt-6-astra', codeMode: true }, { id: 'gpt-5.5', codeMode: false }].map(row => ({ ...row, streaming: true, cancelled: true })),
-])('native Codex $id codeMode=$codeMode streaming=$streaming cancelled=$cancelled through Host', async ({ id, codeMode, streaming, cancelled }) => {
+  ...[false, true].map(streaming => ({ id: 'gpt-5.5', codeMode: false, streaming, cancelled: false, toolFailed: true })),
+])('native Codex $id codeMode=$codeMode streaming=$streaming cancelled=$cancelled toolFailed=$toolFailed through Host', async ({ id, codeMode, streaming, cancelled, toolFailed }: { id: string; codeMode: boolean; streaming: boolean; cancelled: boolean; toolFailed?: boolean }) => {
   const root = await mkdtemp(join(tmpdir(), 'ai-native-model-'));
   const requests: any[] = [], children: number[] = [];
   const controller = new AbortController();
@@ -105,15 +118,16 @@ test.runIf(native).each([
       const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,comm='], { encoding: 'utf8' });
       for (const line of result.stdout.split('\n')) { const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/); if (match && Number(match[2]) === process.pid && match[3].includes('codex-code-mode-host')) children.push(Number(match[1])); }
       if (cancelled) { controller.abort(); throw new DOMException('Cancelled', 'AbortError'); }
-      return 'app-result';
+      if (toolFailed) throw new Error('lookup failed');
+      return appToolOutput;
     });
-    const generated = host.system.ai.withTools({ model: `openai:${id}`, accessSource: access.id, tools: { lookup: tool({ inputSchema: jsonSchema({ type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false }), execute }) } }, async ({ model, tools }) => {
-      const options = { model, tools, reasoning: 'minimal' as const, prompt: 'Use lookup then reply.', abortSignal: controller.signal, maxRetries: 0, ...(streaming ? { output: Output.object({ schema: jsonSchema<{ answer: string }>({ type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false }) }) } : {}) };
+    const generated = host.system.ai.withTools({ model: `openai:${id}`, accessSource: access.id, tools: { lookup: tool({ inputSchema: jsonSchema({ type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false }), execute, toModelOutput: imageToolOutput }) } }, async ({ model, tools }) => {
+      const options = { model, tools, reasoning: 'minimal' as const, messages: imageHistory, abortSignal: controller.signal, maxRetries: 0, ...(streaming ? { output: Output.object({ schema: jsonSchema<{ answer: string }>({ type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false }) }) } : {}) };
       if (!streaming) return generateText(options);
       const result = streamText(options);
       const deltas: string[] = []; for await (const text of result.textStream) deltas.push(text);
       if (!cancelled) expect(deltas.length).toBeGreaterThan(1);
-      return { text: await result.text, toolCalls: await result.toolCalls, reasoningText: await result.reasoningText, output: await result.output };
+      return { text: await result.text, toolCalls: await result.toolCalls, reasoningText: await result.reasoningText, output: await result.output, steps: await result.steps };
     });
     if (cancelled) await expect(generated).rejects.toThrow();
     else {
@@ -121,11 +135,16 @@ test.runIf(native).each([
       expect(result.text).toContain('contained');
       expect(result.reasoningText).toBe('fixture reasoning');
       expect(result.toolCalls).toHaveLength(1); expect(result.toolCalls[0]).toMatchObject({ toolName: 'lookup', providerExecuted: true });
+      const content = result.steps.flatMap(step => step.content);
+      if (toolFailed) expect(content.find(part => part.type === 'tool-error')).toMatchObject({ toolName: 'lookup', error: 'Error: lookup failed' });
+      else expect(content.find(part => part.type === 'tool-result')).toMatchObject({ toolName: 'lookup', output: appToolOutput });
       if (streaming) expect(result.output).toEqual({ answer: 'contained' });
     }
     expect(execute).toHaveBeenCalledTimes(1);
     expect(execute.mock.calls[0][0]).toEqual({ value: 'native' });
     expect(requests).toHaveLength(cancelled ? 1 : denialProbe ? 3 : 2);
+    expect(JSON.stringify(requests[0].input.find((item: any) => item.type === 'function_call_output' && item.call_id === 'history-call'))).toContain(`data:image/png;base64,${screenshot}`);
+    if (!cancelled) expect(JSON.stringify(requests.at(-1).input.filter((item: any) => item.call_id === 'native-call'))).toContain(toolFailed ? 'lookup failed' : `data:image/png;base64,${screenshot}`);
     if (denialProbe) {
       const denied = requests[1].input.filter((item: any) => item.type === 'function_call_output' && item.call_id.startsWith('denied-'));
       expect(denied).toHaveLength(8);
@@ -179,7 +198,7 @@ async function fixtureHost(root: string, adapter: AiAdapter) {
     if (operation === 'ai.cancel') { service.invocations.cancel(caller, input.invocationId); return { ok: true }; }
     if (operation === 'ai.toolResult') {
       expect(() => service.invocations.reply({ ...caller, channelId: 'foreign-channel' }, input.invocationId, input.toolCallId, 'wrong-owner', false)).toThrow('unavailable');
-      service.invocations.reply(caller, input.invocationId, input.toolCallId, decodeAi(input.value), input.failed); return { ok: true };
+      service.invocations.reply(caller, input.invocationId, input.toolCallId, decodeAi(input.value), input.failed, input.modelOutput === undefined ? undefined : decodeAi(input.modelOutput) as any); return { ok: true };
     }
     throw new Error('Unexpected operation');
   });
@@ -195,7 +214,8 @@ test.runIf(native).each([
   { id: 'claude-sonnet-5', streaming: true, cancelled: false, structured: false },
   { id: 'claude-haiku-4-5-20251001', streaming: false, cancelled: false, structured: false },
   { id: 'sonnet', streaming: false, cancelled: true, structured: false },
-])('native Claude $id streaming=$streaming cancellation=$cancelled structured=$structured refusal=$refused contains MCP tools', async ({ id, streaming, cancelled, structured, refused }: { id: string; streaming: boolean; cancelled: boolean; structured: boolean; refused?: boolean }) => {
+  ...[false, true].map(streaming => ({ id: 'sonnet', streaming, cancelled: false, structured: false, toolFailed: true })),
+])('native Claude $id streaming=$streaming cancellation=$cancelled structured=$structured refusal=$refused toolFailed=$toolFailed contains MCP tools', async ({ id, streaming, cancelled, structured, refused, toolFailed }: { id: string; streaming: boolean; cancelled: boolean; structured: boolean; refused?: boolean; toolFailed?: boolean }) => {
   const { AiSubscriptions } = await import('../../desktop/core/src/ai/subscriptions');
   const root = await mkdtemp(join(tmpdir(), 'ai-native-claude-'));
   const requests: any[] = [], calls: any[] = [];
@@ -242,14 +262,26 @@ test.runIf(native).each([
     expect(description.accessSources[0].support.map(support => support.model)).toEqual(expect.arrayContaining(['anthropic:default', 'anthropic:claude-opus-5[1m]', 'anthropic:sonnet', 'anthropic:claude-sonnet-5', 'anthropic:haiku', 'anthropic:claude-haiku-4-5-20251001', 'anthropic:claude-fable-5-1']));
     expect(requests).toEqual([]);
     const options: any = { ...(structured ? { responseFormat: { type: 'json', schema: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false } } } : {}), prompt: [{ role: 'user', content: [{ type: 'text', text: 'Use lookup then reply.' }] }], tools: [{ type: 'function', name: 'lookup', inputSchema: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false } }] };
-    const generated = host.system.ai.withTools({ model: `anthropic:${id}`, accessSource: access.id, tools: { lookup: tool({ inputSchema: jsonSchema(options.tools[0].inputSchema), execute: async input => { calls.push(input); if (cancelled) { controller.abort(); throw new DOMException('Cancelled', 'AbortError'); } return 'tool-answer'; } }) } }, async ({ model, tools }) => {
-      const callOptions = { ...(structured ? { output: Output.object({ schema: jsonSchema<{ answer: string }>(options.responseFormat.schema) }) } : {}), reasoning: 'high' as const, model, tools, prompt: 'Use lookup then reply.', abortSignal: controller.signal, maxRetries: 0 };
+    const generated = host.system.ai.withTools({ model: `anthropic:${id}`, accessSource: access.id, tools: { lookup: tool({ inputSchema: jsonSchema(options.tools[0].inputSchema), toModelOutput: imageToolOutput, execute: async input => { calls.push(input); if (cancelled) { controller.abort(); throw new DOMException('Cancelled', 'AbortError'); } if (toolFailed) throw new Error('lookup failed'); return appToolOutput; } }) } }, async ({ model, tools }) => {
+      const callOptions = { ...(structured ? { output: Output.object({ schema: jsonSchema<{ answer: string }>(options.responseFormat.schema) }) } : {}), reasoning: 'high' as const, model, tools, messages: imageHistory, abortSignal: controller.signal, maxRetries: 0 };
       if (!streaming) return generateText(callOptions);
-      const result = streamText(callOptions); return { text: await result.text, toolCalls: await result.toolCalls, output: structured ? await result.output : undefined };
+      const result = streamText(callOptions); return { text: await result.text, toolCalls: await result.toolCalls, output: structured ? await result.output : undefined, steps: await result.steps };
     });
     if (cancelled || refused) await expect(generated).rejects.toThrow();
-    else { const result = await generated; expect(result.text).toContain('contained'); if (structured) expect(result.output).toEqual({ answer: 'contained' }); else expect(result.toolCalls[0].toolName).toBe('lookup'); }
+    else {
+      const result = await generated; expect(result.text).toContain('contained'); if (structured) expect(result.output).toEqual({ answer: 'contained' }); else expect(result.toolCalls[0].toolName).toBe('lookup');
+      const output = result.steps.flatMap(step => step.content).find(part => part.type === (toolFailed ? 'tool-error' : 'tool-result'));
+      expect(output).toMatchObject(toolFailed ? { toolName: 'lookup', error: 'Error: lookup failed' } : { toolName: 'lookup', output: appToolOutput });
+      expect(output?.providerMetadata?.['claude-code']).toMatchObject({ rawResultTruncated: false, parentToolCallId: null });
+      expect(typeof output?.providerMetadata?.['claude-code']?.rawResult).toBe('string');
+    }
     expect(calls).toHaveLength(refused ? 0 : 1); if (!refused) expect(calls[0]).toEqual({ value: 'fixture' });
+    expect(requests[0].messages.flatMap((message: any) => message.content ?? []).some((part: any) => part.type === 'image' && part.source?.data === screenshot)).toBe(true);
+    if (!cancelled && !refused) {
+      const outputs = requests.flatMap(request => request.messages ?? []).flatMap(message => message.content ?? []).filter(part => part.type === 'tool_result');
+      if (toolFailed) expect(outputs.some(part => part.is_error && JSON.stringify(part.content).includes('lookup failed'))).toBe(true);
+      else expect(outputs.some(part => part.content?.some((item: any) => item.type === 'image' && item.source?.data === screenshot && item.source?.media_type === 'image/png'))).toBe(true);
+    }
     const modelCalls = requests.filter(request => request.tools?.length);
     expect(modelCalls.length).toBeGreaterThan(0);
     for (const request of modelCalls) { expect(request.model).toBe(({ default: 'claude-opus-5', fable: 'claude-fable-5-1', sonnet: 'claude-sonnet-5', 'sonnet[1m]': 'claude-sonnet-5', 'claude-opus-5[1m]': 'claude-opus-5' } as Record<string, string>)[id] ?? id); expect(request.thinking?.type).toBe(id.includes('haiku') ? 'enabled' : 'adaptive'); expect(request.output_config?.effort).toBe(id.includes('haiku') ? undefined : 'high'); expect(request.tools.map((tool: any) => tool.name).sort()).toEqual(structured ? ['StructuredOutput', 'mcp__lamarck__lookup'] : ['mcp__lamarck__lookup']); }

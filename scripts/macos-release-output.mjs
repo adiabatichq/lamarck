@@ -15,7 +15,7 @@ export async function copyRealFile(source, destination) {
 }
 
 export function maxOutputFileBytes(path) {
-  return /^dist-electron\/ai-runtimes\/(?:codex|claude|codex-code-mode-host)$/.test(path)
+  return /^dist-electron\/(?:ai-runtimes\/(?:codex|claude|codex-code-mode-host)|computer-use\/cua-driver)$/.test(path)
     ? 512 * 1024 * 1024 : 64 * 1024 * 1024;
 }
 

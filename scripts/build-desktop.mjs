@@ -33,6 +33,8 @@ const GENERATED_HOST_PATHS = [
   "pty-helper.cjs",
   "marketplace-trust-roots.json",
   "ai-runtimes/manifest.json",
+  "computer-use/manifest.json",
+  "computer-use/LICENSE",
   "ai-runtimes/CODEX-LICENSE",
   "ai-runtimes/CLAUDE-LICENSE.md",
 ];

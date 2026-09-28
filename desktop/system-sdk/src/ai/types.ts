@@ -1,4 +1,5 @@
 import type { JsonValue } from '../protocol.js';
+import type { ToolResultOutput } from '@ai-sdk/provider-utils';
 
 export type AccessKind = 'api-key' | 'subscription' | 'local' | 'lamarck';
 export type AccessSourceAllow = { mode: 'all' } | { mode: 'apps'; appIds: string[] };
@@ -57,3 +58,5 @@ export interface AiStart extends ModelSelection {
   options: JsonValue;
   callbacks: boolean;
 }
+/** Host callback result: keep the App result separate from model content. */
+export interface AiToolResult { value: unknown; modelOutput: ToolResultOutput; isError?: boolean }

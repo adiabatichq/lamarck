@@ -74,7 +74,7 @@ const adapter: AiAdapter = {
         if (JSON.stringify(options.prompt).includes('wait-for-abort')) await new Promise((_, reject) => context.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true }));
         if (options.tools?.length) {
           if (source.kind === 'subscription') {
-            const output = await context.tool('lookup', { value: 'input' }, 'scoped-tool');
+            const { value: output } = await context.tool('lookup', { value: 'input' }, 'scoped-tool');
             return { content: [{ type: 'tool-call', toolName: 'lookup', toolCallId: 'scoped-tool', input: '{"value":"input"}', providerExecuted: true }, { type: 'tool-result', toolName: 'lookup', toolCallId: 'scoped-tool', result: output }, { type: 'text', text: String(output) }], usage, finishReason, warnings: [] } as any;
           }
           if (!options.prompt.some((m: any) => m.role === 'tool')) return { content: [{ type: 'tool-call', toolName: 'lookup', toolCallId: 'api-tool', input: '{"value":"input"}' }], usage, finishReason: { unified: 'tool-calls', raw: 'tool' }, warnings: [] } as any;
@@ -85,7 +85,7 @@ const adapter: AiAdapter = {
         return { stream: new ReadableStream({ async start(controller) {
           controller.enqueue({ type: 'stream-start', warnings: [] });
           await new Promise(resolve => setTimeout(resolve, 15));
-          const text = options.tools?.length ? String(await context.tool('lookup', { value: 'input' }, 'stream-tool')) : 'hello';
+          const text = options.tools?.length ? String((await context.tool('lookup', { value: 'input' }, 'stream-tool')).value) : 'hello';
           controller.enqueue({ type: 'text-start', id: 'text' });
           controller.enqueue({ type: 'text-delta', id: 'text', delta: text.slice(0, 3) });
           await new Promise(resolve => setTimeout(resolve, 15));

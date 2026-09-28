@@ -1,4 +1,4 @@
-import { decodeAi, type AiSourceInput, type AiStart } from '@lamarck/system/protocol';
+import { decodeAi, type AiSourceInput, type AiStart, type AiToolResult } from '@lamarck/system/protocol';
 import type { AuthAdmission } from '../auth';
 import { readJsonBody } from '../http-body';
 import type { AiService } from './service';
@@ -20,7 +20,8 @@ export async function handleAiRequest(service: AiService, request: Request, admi
     if (path === '/api/ai/invoke/cancel') { service.invocations.cancel(auth, body.invocationId); return { body: { ok: true } }; }
     if (path === '/api/ai/invoke/tool-result') {
       if (typeof body.toolCallId !== 'string' || typeof body.failed !== 'boolean') throw new AiError('invalid_request', 'Invalid tool result');
-      service.invocations.reply(auth, body.invocationId, body.toolCallId, decodeAi(body.value), body.failed);
+      service.invocations.reply(auth, body.invocationId, body.toolCallId, decodeAi(body.value), body.failed,
+        body.modelOutput === undefined ? undefined : decodeAi(body.modelOutput) as AiToolResult['modelOutput']);
       return { body: { ok: true } };
     }
   }

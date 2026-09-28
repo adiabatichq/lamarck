@@ -93,7 +93,7 @@ createInterface({input:process.stdin}).on('line', line=>{
     try {
       await rpc.initialize();
       const calls: unknown[] = [];
-      const model = codexModel(id, rpc, { id: 'invocation', caller: {} as any, signal: new AbortController().signal, streamReady: async () => {}, part: async () => {}, tool: async (...args) => { calls.push(args); return 'result'; } });
+      const model = codexModel(id, rpc, { id: 'invocation', caller: {} as any, signal: new AbortController().signal, streamReady: async () => {}, part: async () => {}, tool: async (...args) => { calls.push(args); return { value: 'result', modelOutput: { type: 'text', value: 'result' } };  } });
       const result = await model.doGenerate({ reasoning, responseFormat: { type: 'json', schema: { type: 'object' } }, prompt: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }], tools: [{ type: 'function', name: 'lookup', inputSchema: { type: 'object' } }] });
       const thread = requests.mock.calls.find(([method]) => method === 'thread/start')![1] as any;
       const turn = requests.mock.calls.find(([method]) => method === 'turn/start')![1] as any;

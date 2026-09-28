@@ -185,7 +185,7 @@ export interface CapsuleManagerOptions {
   coreBaseUrl: () => string;
   coreToken: string;
   fetch?: typeof globalThis.fetch;
-  bindSystemSender(senderId: string, binding: IssuedCapability): void;
+  bindSystemSender(senderId: string, binding: IssuedCapability & { appId: string }): void;
   unbindSystemSender(senderId: string): void;
   onBackendBoundaryLost?(error: unknown): void;
   onUiLost?(event: CapsuleUiLostEvent & { viewerId: string }): void | Promise<void>;
@@ -361,7 +361,7 @@ export class CapsuleManager {
     }
     const runtimeSenderId = `capsule_${randomBytes(24).toString("base64url")}`;
     try {
-      this.#bindSystemSender(runtimeSenderId, runtimeIssued);
+      this.#bindSystemSender(runtimeSenderId, { ...runtimeIssued, appId });
     } catch (error) {
       await this.#revokeCapability(runtimeIssued.channelId).catch(() => {});
       throw error;
@@ -613,7 +613,7 @@ export class CapsuleManager {
     }
     const runtimeSenderId = `capsule_${randomBytes(24).toString("base64url")}`;
     try {
-      this.#bindSystemSender(runtimeSenderId, runtimeIssued);
+      this.#bindSystemSender(runtimeSenderId, { ...runtimeIssued, appId: viewer.appId });
     } catch (error) {
       await Promise.allSettled([
         this.#revokeCapability(runtimeIssued.channelId),

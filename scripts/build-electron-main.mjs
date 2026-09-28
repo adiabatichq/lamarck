@@ -1,4 +1,5 @@
 import { stageAiRuntimes } from './stage-ai-runtimes.mjs';
+import { stageComputerUse } from './stage-computer-use.mjs';
 import { createHash } from "node:crypto";
 import { cp, mkdir, rm, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -105,3 +106,4 @@ await writeFile(resolve(outDir, "managed-cli.json"), `${JSON.stringify({
 })}\n`);
 
 await stageAiRuntimes(outDir);
+await stageComputerUse(outDir);

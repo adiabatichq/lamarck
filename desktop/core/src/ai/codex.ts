@@ -2,6 +2,7 @@ import type { LanguageModelV4, LanguageModelV4StreamPart, LanguageModelV4Usage, 
 import type { InvocationContext } from './invocations';
 import { CodexRpc } from './runtime';
 import { AiError } from './errors';
+import { toCodexToolResult } from './tool-output';
 
 export const CODEX_CONTAINMENT = Object.freeze({
   'features.shell_tool': false, 'features.unified_exec': false,
@@ -74,7 +75,12 @@ export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationCo
       for (const part of message.content) {
         if (part.type === 'text') result.push({ type: 'message', role: message.role, content: [{ type: message.role === 'assistant' ? 'output_text' : 'input_text', text: part.text }] });
         else if (part.type === 'tool-call') result.push({ type: 'function_call', name: part.toolName, call_id: part.toolCallId, arguments: JSON.stringify(part.input) });
-        else if (part.type === 'tool-result') result.push({ type: 'function_call_output', call_id: part.toolCallId, output: JSON.stringify(part.output) });
+        else if (part.type === 'tool-result') {
+          const output = toCodexToolResult(part.output);
+          result.push({ type: 'function_call_output', call_id: part.toolCallId, output: output.contentItems.map(item => item.type === 'inputText'
+            ? { type: 'input_text', text: item.text }
+            : { type: 'input_image', image_url: item.imageUrl }) });
+        }
         else throw new AiError('unsupported', 'This Codex history content is unsupported');
       }
       return result;
@@ -110,10 +116,13 @@ export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationCo
     rpc.onClose = () => rejectDone(new AiError('runtime_closed', 'Codex runtime closed'));
     rpc.onRequest = async (method, params) => {
       if (method !== 'item/tool/call' || params.threadId !== thread.id || params.namespace != null || !declared.has(params.tool)) return { decision: 'decline' };
-      const result = await context.tool(params.tool, params.arguments, params.callId);
-      emit({ type: 'tool-call', toolCallId: params.callId, toolName: params.tool, input: JSON.stringify(params.arguments), providerExecuted: true });
-      emit({ type: 'tool-result', toolCallId: params.callId, toolName: params.tool, result: result as any });
-      return { contentItems: [{ type: 'inputText', text: typeof result === 'string' ? result : JSON.stringify(result) }], success: true };
+      try {
+        const result = await context.tool(params.tool, params.arguments, params.callId);
+        const response = toCodexToolResult(result.modelOutput);
+        emit({ type: 'tool-call', toolCallId: params.callId, toolName: params.tool, input: JSON.stringify(params.arguments), providerExecuted: true });
+        emit({ type: 'tool-result', toolCallId: params.callId, toolName: params.tool, result: result.value as any, isError: result.isError ?? false });
+        return response;
+      } catch (error) { rejectDone(error); void rpc.close(); throw error; }
     };
     rpc.onEvent = (method, params) => {
       if (params.threadId !== thread.id) return;

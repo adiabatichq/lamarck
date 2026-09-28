@@ -13,6 +13,8 @@ import {
   autoUpdater,
   BrowserWindow,
   dialog,
+  desktopCapturer,
+  systemPreferences,
   ipcMain,
   powerMonitor,
   safeStorage,
@@ -52,6 +54,7 @@ import { CapacityExhaustedError } from "./capsule/capacity-coordinator";
 import { CapsuleVmHostError } from "./capsule-vm/launcher";
 import { isCapsuleRestartRequiredError } from "./capsule/backend";
 import { SystemBroker } from "./capsule/system-broker";
+import { ComputerUseService } from './computer-use';
 import { SystemStreamServer } from "./capsule/system-stream";
 import { AppCliStreamServer } from "./capsule/app-cli-broker";
 import { createViewerGateway, type ViewerGatewayBinding } from "./capsule/viewer-gateway";
@@ -298,7 +301,28 @@ const appViewerSessions = new Map<string, AppViewerSessionState>();
 const appViewerLifecycle = new ViewerLifecycleCoordinator();
 const configuredAppWebContents = new WeakSet<WebContents>();
 const expectedAppViewerCloses = new WeakSet<WebContents>();
+const computerUse = new ComputerUseService({
+  executable: join(__dirname, 'computer-use', 'cua-driver'),
+  bundleId: app.getVersion().includes('-alpha') ? 'ai.lamarck.desktop.alpha' : 'ai.lamarck.desktop',
+  async authorize(appId, signal) {
+    const { response } = await dialog.showMessageBox({
+      type: 'question', title: 'Allow Computer Use?',
+      message: `Allow “${appId}” to view and control your computer?`,
+      detail: 'This App can read the screen and use the keyboard and mouse until this task finishes or is cancelled.',
+      buttons: ['Cancel', 'Allow for this task'], defaultId: 0, cancelId: 0, signal,
+    });
+    signal.throwIfAborted();
+    if (response !== 1) throw new Error('Computer Use permission was declined');
+    if (!systemPreferences.isTrustedAccessibilityClient(true)) throw new Error('Allow Lamarck in System Settings → Privacy & Security → Accessibility, then retry.');
+    if (systemPreferences.getMediaAccessStatus('screen') !== 'granted') {
+      await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } });
+      signal.throwIfAborted();
+      if (systemPreferences.getMediaAccessStatus('screen') !== 'granted') throw new Error('Allow Lamarck in System Settings → Privacy & Security → Screen Recording, then retry.');
+    }
+  },
+});
 const systemBroker = new SystemBroker({
+  computer: computerUse,
   coreBaseUrl: () => coreBaseUrl(),
   async revokeCapability(channelId) {
     const response = await fetch(
@@ -3100,6 +3124,7 @@ function prepareDesktopShutdown(): Promise<void> {
   disposeAllTerminals();
   // Wait for any in-flight startup/workspace operation before teardown.
   shutdownTask = runtimeSupervisor.enqueue(() => runtimeSupervisor.stop("failure"))
+    .finally(() => computerUse.close())
     .catch((error) => {
       console.error(`[electron] Runtime shutdown required process exit: ${errorMessage(error)}`);
     })

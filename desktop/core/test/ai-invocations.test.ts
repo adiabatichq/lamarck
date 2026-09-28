@@ -9,14 +9,39 @@ const limits = { perChannel: 2, global: 4, queueBytes: 1200, globalBytes: 3600, 
 describe('AI invocation lifetime', () => {
   test('holds admission to terminal and rejects cross-caller or duplicate tool replies', async () => {
     const calls = new AiInvocations(limits); const a = admission();
-    const { invocationId } = calls.start(a, input, async context => context.tool('lookup', { query: 1 }, 'tool'));
+    const { invocationId } = calls.start(a, input, async context => (await context.tool('lookup', { query: 1 }, 'tool')).value);
     const first = await calls.next(a.context, invocationId, 0);
     expect(first.events[0]).toMatchObject({ type: 'tool', toolCallId: 'tool', sequence: 0 }); expect(a.release).not.toHaveBeenCalled();
     expect(() => calls.reply(caller('b'), invocationId, 'tool', 'bad', false)).toThrow('unavailable');
     calls.reply(a.context, invocationId, 'tool', 'ok', false);
     expect(() => calls.reply(a.context, invocationId, 'tool', 'duplicate', false)).toThrow();
-    expect((await calls.next(a.context, invocationId, 1)).events[0]).toMatchObject({ type: 'complete', value: 'ok' });
+    expect((await calls.next(a.context, invocationId, 1)).events[0]).toMatchObject({ type: 'complete', value: encodeAi('ok') });
     await vi.waitFor(() => expect(a.release).toHaveBeenCalledTimes(1)); expect(calls.size).toBe(0);
+  });
+  test.each(['ok', { answer: 42 }, { value: 'App value', modelOutput: 'App data' }, undefined])('accepts existing v1 raw tool values without interpreting App keys: %j', async value => {
+    const calls = new AiInvocations(limits); const a = admission();
+    const { invocationId } = calls.start(a, input, async context => context.tool('lookup', {}, 'tool'));
+    await calls.next(a.context, invocationId, 0);
+    calls.reply(a.context, invocationId, 'tool', value, false);
+    expect((await calls.next(a.context, invocationId, 1)).events[0]).toMatchObject({ type: 'complete', value: encodeAi({ value, modelOutput: typeof value === 'string' ? { type: 'text', value } : { type: 'json', value: value ?? null } }) });
+    await calls.close();
+  });
+  test('keeps explicit model output separate and resolves execute failures as tool errors', async () => {
+    const calls = new AiInvocations(limits); const a = admission();
+    const { invocationId } = calls.start(a, input, async context => {
+      const result = await context.tool('lookup', {}, 'one');
+      expect(result).toEqual({ value: { answer: 42 }, modelOutput: { type: 'text', value: 'For the model' } });
+      const failure = await context.tool('lookup', {}, 'two');
+      expect(context.signal.aborted).toBe(false);
+      expect(failure).toEqual({ value: 'lookup failed', modelOutput: { type: 'error-text', value: 'lookup failed' }, isError: true });
+      return 'continued';
+    });
+    await calls.next(a.context, invocationId, 0);
+    calls.reply(a.context, invocationId, 'one', { answer: 42 }, false, { type: 'text', value: 'For the model' });
+    expect((await calls.next(a.context, invocationId, 1)).events[0]).toMatchObject({ type: 'tool', toolCallId: 'two' });
+    calls.reply(a.context, invocationId, 'two', 'lookup failed', true);
+    expect((await calls.next(a.context, invocationId, 2)).events[0]).toMatchObject({ type: 'complete', value: 'continued' });
+    await calls.close();
   });
   test('cancels outstanding callbacks on capability revocation and ignores terminal races', async () => {
     const calls = new AiInvocations(limits); const a = admission();

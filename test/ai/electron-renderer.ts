@@ -14,6 +14,12 @@ Object.assign(window, {
     let calls = 0;
     const tools = { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute: async () => { calls++; const result = await system.query('fixture'); assert(result.rows[0].appId === 'browser-fixture'); return 'answer'; } }) };
     await system.ai.withTools({ ...selection, tools }, async ({ model, tools }) => generateText({ model, tools, prompt: 'lookup' })); assert(calls === 1);
+    await system.computer.withTools(async ({ tools, instructions }) => {
+      assert(instructions === 'Fixture computer');
+      const result = await system.ai.withTools({ ...selection, tools }, ({ model, tools }) => generateText({ model, tools, prompt: 'computer-fixture' }));
+      assert(result.text === 'hello');
+      assert((result.toolResults[0].output as any).content[0].type === 'image');
+    });
     for (const rejected of [false, true]) {
       let validations = 0;
       const schema = z.object({ answer: z.number() }).superRefine(async (_, context) => {

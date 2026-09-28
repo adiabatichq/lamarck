@@ -93,8 +93,8 @@ test("accepts exact dependency-free npm registry metadata", async () => {
   assert.deepEqual(actual, release);
 });
 
-test("rejects registry metadata that introduces SDK runtime dependencies", async () => {
-  await assert.rejects(
+test("retains SDK runtime dependencies from verified registry metadata", async () => {
+  const actual = await
     fetchPublishedRelease("0.1.1", async () => ({
       ok: true,
       status: 200,
@@ -103,13 +103,35 @@ test("rejects registry metadata that introduces SDK runtime dependencies", async
           name: "@lamarck/system",
           version: release.version,
           engines: release.engines,
-          dependencies: { unexpected: "1.0.0" },
+          dependencies: { "@ai-sdk/provider": "4.0.17" },
           dist: { tarball: release.resolved, integrity: release.integrity },
         };
       },
-    })),
-    /no runtime dependencies/,
-  );
+    }));
+  assert.deepEqual(actual.dependencies, { "@ai-sdk/provider": "4.0.17" });
+});
+
+test("resolves the dependency graph and preserves App ranges without rewriting package.json", async (t) => {
+  const directory = await createApps(t, ["app-v1"]);
+  const appDirectory = join(directory, "app-v1");
+  const packagePath = join(appDirectory, "package.json");
+  const before = await readFile(packagePath, "utf8");
+  const withDependencies = { ...release, dependencies: { "@ai-sdk/provider": "4.0.17" } };
+  const resolveDependencies = async (pkg, lock, version) => {
+    assert.equal(pkg.dependencies["@lamarck/system"], "^0.1.0");
+    assert.equal(version, release.version);
+    lock.packages[""].dependencies["@lamarck/system"] = version;
+    const { version: sdkVersion, resolved, integrity, engines, dependencies } = withDependencies;
+    lock.packages["node_modules/@lamarck/system"] = { version: sdkVersion, resolved, integrity, engines, dependencies };
+    lock.packages["node_modules/@ai-sdk/provider"] = { version: "4.0.17" };
+    return lock;
+  };
+  assert.deepEqual(await updateConsumerLocks({ consumerDirectories: [appDirectory], release: withDependencies, resolveDependencies }), [join(appDirectory, "package-lock.json")]);
+  const lock = await readJson(join(appDirectory, "package-lock.json"));
+  assert.equal(lock.packages[""].dependencies["@lamarck/system"], "^0.1.0");
+  assert.equal(lock.packages["node_modules/@ai-sdk/provider"].version, "4.0.17");
+  assert.equal(await readFile(packagePath, "utf8"), before);
+  await assert.rejects(updateConsumerLocks({ consumerDirectories: [appDirectory], release: { ...withDependencies, integrity: `sha512-${Buffer.alloc(64, 3).toString("base64")}` }, resolveDependencies }), /does not match/);
 });
 
 async function createApps(t, appIds) {

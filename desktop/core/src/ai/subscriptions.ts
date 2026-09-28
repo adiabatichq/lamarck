@@ -7,12 +7,13 @@ import { query, type SDKUserMessage, type ModelInfo } from '@anthropic-ai/claude
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { LanguageModelV4, LanguageModelV4CallOptions, ProviderV4 } from '@ai-sdk/provider';
-import type { AiAccessSource, AiModel, AiSupport, ManagedAiSource } from '@lamarck/system/protocol';
+import type { AiAccessSource, AiModel, AiSupport, AiToolResult, ManagedAiSource } from '@lamarck/system/protocol';
 import type { AiSourceStore } from './source-store';
 import type { InvocationContext } from './invocations';
 import { AiError } from './errors';
 import { aiExecutable, CodexRpc, subscriptionEnv } from './runtime';
 import { codexModel, codexModels } from './codex';
+import { toMcpToolResult } from './tool-output';
 
 export interface LoginStatus { status: 'pending' | 'ready' | 'cancelled' | 'failed'; url?: string; message?: string }
 interface LoginAttempt { status: LoginStatus; cancel(): void; generation: number }
@@ -128,17 +129,34 @@ export class AiSubscriptions {
       const server = new McpServer({ name: 'lamarck', version: '1.0.0' }, { capabilities: { tools: {} } });
       if (options.toolChoice && !['auto', 'none'].includes(options.toolChoice.type)) throw new AiError('unsupported', 'Claude subscription does not support forced tool selection');
       const tools = options.toolChoice?.type === 'none' ? [] : options.tools ?? [];
+      const callbackResults = new Map<string, AiToolResult>();
+      const nativeResults = new Map<string, AiToolResult>();
+      const failed = new AbortController();
+      const signal = AbortSignal.any([context.signal, failed.signal]);
       if (tools.some(tool => tool.type !== 'function')) throw new AiError('unsupported', 'Subscription only supports App function tools');
       server.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.map(tool => ({ name: tool.name, description: tool.type === 'function' ? tool.description : '', inputSchema: tool.type === 'function' ? tool.inputSchema : {} })) as any }));
       server.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         if (!tools.some(tool => tool.name === request.params.name)) throw new Error('Unknown App tool');
         try {
           const value = await context.tool(request.params.name, request.params.arguments ?? {}, String(extra.requestId));
-          return { content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value) }] };
-        } catch { return { isError: true, content: [{ type: 'text' as const, text: 'App tool failed' }] }; }
+          callbackResults.set(String(extra.requestId), value);
+          return { ...toMcpToolResult(value.modelOutput), _meta: { 'lamarck/toolCallId': String(extra.requestId) } };
+        } catch (error) { failed.abort(error); throw error; }
       });
       const provider = createClaudeCode({ defaultSettings: {
         ...this.claudeOptions(session.directory, session.processes), streamingInput: 'always', logger: false,
+        onSdkMessage: message => {
+          if (message.type !== 'user') return;
+          const id = (message.tool_use_result as any)?._meta?.['lamarck/toolCallId'];
+          if (id === undefined) return;
+          const parts = Array.isArray(message.message.content) ? message.message.content.filter(part => part.type === 'tool_result') : [];
+          const result = callbackResults.get(id);
+          if (!result || parts.length !== 1 || nativeResults.has(parts[0].tool_use_id)) {
+            failed.abort(new AiError('invalid_tool', 'Invalid Claude tool result correlation')); return;
+          }
+          callbackResults.delete(id);
+          nativeResults.set(parts[0].tool_use_id, result);
+        },
         mcpServers: { lamarck: { type: 'sdk', name: 'lamarck', instance: server } },
         canUseTool: async (name, input) => tools.some(tool => `mcp__lamarck__${tool.name}` === name)
           ? { behavior: 'allow', updatedInput: input }
@@ -149,7 +167,7 @@ export class AiSubscriptions {
         if (!match) throw new AiError('unsupported', 'The selected model is unavailable through this Claude subscription');
         // Preserve native identifiers and use only upstream resolution to bound
         // the invocation. The allowlist also prevents native refusal fallback.
-        return normalizeClaudeModel(provider.languageModel(id, { settings: { model: id, availableModels: [match.resolvedModel ?? match.value], enforceAvailableModels: true, fallbackModel: [] } }), new Set(tools.map(tool => tool.name)), context.signal);
+        return normalizeClaudeModel(provider.languageModel(id, { settings: { model: id, availableModels: [match.resolvedModel ?? match.value], enforceAvailableModels: true, fallbackModel: [] } }), new Set(tools.map(tool => tool.name)), signal, nativeResults);
       } };
       return { provider: scopedProvider, dispose: async () => { try { context.signal.removeEventListener('abort', abort); await server.close(); } finally { await session.dispose(); } } };
     } catch (error) { context.signal.removeEventListener('abort', abort); await session.dispose(); throw error; }
@@ -253,19 +271,42 @@ export class AiSubscriptions {
 function languageSupport(model: string): AiSupport { return { model, streaming: true, structuredOutput: true, tools: true }; }
 
 /** Native MCP names are internal; Apps observe their original Vercel tool names. */
-function normalizeClaudeModel(model: LanguageModelV4, names: Set<string>, signal: AbortSignal): LanguageModelV4 {
+function normalizeClaudeModel(model: LanguageModelV4, names: Set<string>, signal: AbortSignal, results: Map<string, AiToolResult>): LanguageModelV4 {
   const normalize = <T>(part: T): T => {
     const value = part as any;
     if (typeof value.toolName !== 'string' || !value.toolName.startsWith('mcp__lamarck__')) return part;
     const toolName = value.toolName.slice('mcp__lamarck__'.length);
     if (!names.has(toolName)) throw new AiError('invalid_tool', 'Unexpected subscription tool');
+    if (value.type === 'tool-result') {
+      const result = results.get(value.toolCallId);
+      if (!result) throw new AiError('invalid_tool', 'Missing Claude App tool result');
+      results.delete(value.toolCallId);
+      return { ...value, toolName, dynamic: false, result: result.value, isError: result.isError ?? false };
+    }
     return { ...value, toolName, dynamic: false };
   };
   return {
     specificationVersion: 'v4', provider: model.provider, modelId: model.modelId, supportedUrls: model.supportedUrls,
-    async doGenerate(options) { signal.throwIfAborted(); const result = await model.doGenerate(options); signal.throwIfAborted(); return { ...result, warnings: result.warnings.filter(warning => warning.type !== 'unsupported' || warning.feature !== 'tools'), content: result.content.map(normalize) }; },
-    async doStream(options) { signal.throwIfAborted(); const result = await model.doStream(options); signal.throwIfAborted(); return { ...result, stream: result.stream.pipeThrough(new TransformStream({ transform(part, controller) { signal.throwIfAborted(); controller.enqueue(part.type === 'stream-start' ? { ...part, warnings: part.warnings.filter(warning => warning.type !== 'unsupported' || warning.feature !== 'tools') } : normalize(part)); } })) }; },
+    async doGenerate(options) { signal.throwIfAborted(); const result = await model.doGenerate({ ...options, abortSignal: signal, prompt: claudeImageHistory(options.prompt) }); signal.throwIfAborted(); return { ...result, warnings: result.warnings.filter(warning => warning.type !== 'unsupported' || warning.feature !== 'tools'), content: result.content.map(normalize) }; },
+    async doStream(options) { signal.throwIfAborted(); const result = await model.doStream({ ...options, abortSignal: signal, prompt: claudeImageHistory(options.prompt) }); signal.throwIfAborted(); return { ...result, stream: result.stream.pipeThrough(new TransformStream({ transform(part, controller) { signal.throwIfAborted(); controller.enqueue(part.type === 'stream-start' ? { ...part, warnings: part.warnings.filter(warning => warning.type !== 'unsupported' || warning.feature !== 'tools') } : normalize(part)); } })) }; },
   };
+}
+
+/** The upstream Claude adapter flattens tool history to text. Preserve its image
+ * parts as adjacent file inputs, labelled with the exact original tool call. */
+function claudeImageHistory(prompt: LanguageModelV4CallOptions['prompt']): LanguageModelV4CallOptions['prompt'] {
+  return prompt.flatMap(message => {
+    if (message.role !== 'tool' && message.role !== 'assistant') return [message];
+    if (!message.content.some(part => part.type === 'tool-result' && part.output.type === 'content' && part.output.value.some(item => item.type !== 'text'))) return [message];
+    return message.content.flatMap((part): LanguageModelV4CallOptions['prompt'] => {
+      if (part.type !== 'tool-result' || part.output.type !== 'content' || !part.output.value.some(item => item.type !== 'text')) return [{ ...message, content: [part] } as typeof message];
+      const output = toMcpToolResult(part.output);
+      return [{ role: message.role === 'tool' ? 'user' : 'assistant', content: [
+        { type: 'text', text: `Tool Result (${part.toolName}, call ${part.toolCallId}):` },
+        ...output.content.map(item => item.type === 'text' ? item : { type: 'file' as const, mediaType: item.mimeType, data: { type: 'data' as const, data: item.data } }),
+      ] }];
+    });
+  });
 }
 
 function stopProcess(child: ChildProcess): Promise<void> {

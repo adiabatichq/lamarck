@@ -5,6 +5,7 @@ import { DESKTOP_UPDATER_CONFIG } from "./desktop-release.mjs";
 import { copyRealFile } from "./macos-release-output.mjs";
 
 import { validateAiRuntimes, smokeAiRuntimes } from './stage-ai-runtimes.mjs';
+import { validateComputerUse, smokeComputerUse } from './stage-computer-use.mjs';
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
@@ -202,6 +203,7 @@ async function packageRelease(releaseConfig, signingIdentity) {
     );
 
     await smokeAiRuntimes(join(appPath, 'Contents', 'Resources', 'app', 'dist-electron', 'ai-runtimes'));
+    smokeComputerUse(join(appPath, 'Contents', 'Resources', 'app', 'dist-electron', 'computer-use'));
     await verifyPackagedElectronIdentity(appPath);
 
     run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, submissionArchive]);
@@ -511,6 +513,8 @@ async function assembleApplication(
   );
   await validateAiRuntimes(join(shellBuildExport, 'dist-electron', 'ai-runtimes'), 'darwin', 'arm64');
   await copyRealTree(join(shellBuildExport, 'dist-electron', 'ai-runtimes'), join(electronResources, 'ai-runtimes'));
+  await validateComputerUse(join(shellBuildExport, 'dist-electron', 'computer-use'));
+  await copyRealTree(join(shellBuildExport, 'dist-electron', 'computer-use'), join(electronResources, 'computer-use'));
   await copyRealTree(nativeRoot, join(electronResources, "native"));
   assertDeviceIdentityNativeResourceLayout(
     electronResources,
@@ -537,6 +541,7 @@ async function validatePackagedApplication(appPath, releaseConfig) {
   const electronResources = join(appResources, "dist-electron");
   assertExactList(await sortedEntries(electronResources), [
     "ai-runtimes",
+    "computer-use",
     "app-preload.cjs",
     "connector-runner.cjs",
     "core.mjs",
@@ -840,6 +845,7 @@ async function signElectronApplication(appPath, capsuleHelper, identity, sign) {
   for (const name of ['codex', 'codex-code-mode-host', 'claude']) {
     if (!signableCode.has(resolve(appPath, 'Contents', 'Resources', 'app', 'dist-electron', 'ai-runtimes', name))) throw new Error('AI runtime is missing from the release signing set');
   }
+  if (!signableCode.has(resolve(appPath, 'Contents', 'Resources', 'app', 'dist-electron', 'computer-use', 'cua-driver'))) throw new Error('Computer Use runtime is missing from the release signing set');
   const bundleSuffixes = [".app", ".framework"];
   await sign({
     app: appPath,

@@ -1,4 +1,6 @@
 import type { AiOptions, AiStart, AiEvent } from './ai/types.js';
+import type { ComputerTool, ComputerResult } from './computer.js';
+export type { ComputerTool, ComputerResult } from './computer.js';
 export * from './ai/types.js';
 export { encodeAi, decodeAi, AI_MAX_VALUE_BYTES } from './ai/codec.js';
 export type JsonValue =
@@ -74,11 +76,14 @@ export interface VfsCommandWireResult {
 }
 
 export interface SystemOperationMap {
+  'computer.open': { input: { sessionId: string }; output: { sessionId: string; tools: ComputerTool[]; instructions: string } };
+  'computer.call': { input: { sessionId: string; name: string; arguments: Record<string, unknown> }; output: ComputerResult };
+  'computer.close': { input: { sessionId: string }; output: { ok: true } };
   "ai.listOptions": { input: Record<string, never>; output: AiOptions };
   "ai.start": { input: AiStart; output: { invocationId: string } };
   "ai.next": { input: { invocationId: string; sequence: number }; output: { events: AiEvent[] } };
   "ai.cancel": { input: { invocationId: string }; output: { ok: true } };
-  "ai.toolResult": { input: { invocationId: string; toolCallId: string; value: JsonValue; failed: boolean }; output: { ok: true } };
+  "ai.toolResult": { input: { invocationId: string; toolCallId: string; value: JsonValue; failed: boolean; modelOutput?: JsonValue }; output: { ok: true } };
   query: {
     input: { sql: string; params?: SqlParams };
     output: { rows: unknown[] };
@@ -126,6 +131,7 @@ export interface SystemOperationMap {
 }
 
 export const SYSTEM_OPERATIONS = Object.freeze([
+  'computer.open', 'computer.call', 'computer.close',
   "ai.listOptions", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
   "query",
   "resolveContentRef",

@@ -1,4 +1,4 @@
-import { APICallError, type EmbeddingModelV4, type LanguageModelV4, type LanguageModelV4CallOptions, type LanguageModelV4StreamPart } from '@ai-sdk/provider';
+import { APICallError, getErrorMessage, type EmbeddingModelV4, type LanguageModelV4, type LanguageModelV4CallOptions, type LanguageModelV4StreamPart } from '@ai-sdk/provider';
 import { validateTypes, type Tool } from '@ai-sdk/provider-utils';
 import type { SystemInvoke } from '../protocol.js';
 import { decodeAi, encodeAi } from './codec.js';
@@ -54,21 +54,29 @@ export function createAi(invoke: SystemInvoke): SystemAi {
     } catch (error) { finish(); throw error; }
     const id = invocationId;
     async function reply(event: Extract<import('./types.js').AiEvent, { type: 'tool' }>) {
+      if (!scope?.open || completedTools.has(event.toolCallId)) throw new Error('Invalid AI tool callback');
+      completedTools.add(event.toolCallId);
+      const tool = Object.hasOwn(scope.tools, event.name) ? scope.tools[event.name] : undefined;
+      if (!tool?.execute) throw new Error('Unknown AI tool callback');
+      // Only execute failures are tool errors. Validation, conversion and
+      // transport failures must still fail the invocation.
+      const input = await validateTypes({ value: decodeAi(event.input), schema: tool.inputSchema });
+      signal.throwIfAborted();
       let value: unknown;
       let failed = false;
       try {
-        if (!scope?.open || completedTools.has(event.toolCallId)) throw new Error('Invalid AI tool callback');
-        completedTools.add(event.toolCallId);
-        const tool = Object.hasOwn(scope.tools, event.name) ? scope.tools[event.name] : undefined;
-        if (!tool?.execute) throw new Error('Unknown AI tool callback');
-        // Use Vercel's own schema adapter and validator inside the Capsule.
-        const input = await validateTypes({ value: decodeAi(event.input), schema: tool.inputSchema });
-        signal.throwIfAborted();
         value = await tool.execute(input, { toolCallId: event.toolCallId, messages: [], context: undefined, abortSignal: signal });
-        if (value && typeof value === 'object' && Symbol.asyncIterator in value) throw new Error('Streaming tool outputs are unsupported for subscription callbacks');
-        encodeAi(value);
-      } catch (error) { failed = true; value = error instanceof Error ? error.message : 'App tool failed'; }
-      if (!closed && !signal.aborted) await invoke('ai.toolResult', { invocationId: id, toolCallId: event.toolCallId, value: encodeAi(value), failed });
+      } catch (error) { failed = true; value = getErrorMessage(error); }
+      signal.throwIfAborted();
+      if (value && typeof value === 'object' && Symbol.asyncIterator in value) throw new Error('Streaming tool outputs are unsupported for subscription callbacks');
+      const encodedValue = encodeAi(value);
+      const modelOutput = !failed && tool.toModelOutput
+        ? encodeAi(await tool.toModelOutput({ toolCallId: event.toolCallId, input, output: value }))
+        : undefined;
+      if (!closed && !signal.aborted) await invoke('ai.toolResult', {
+        invocationId: id, toolCallId: event.toolCallId, value: encodedValue, failed,
+        ...(modelOutput !== undefined ? { modelOutput } : {}),
+      });
     }
     return {
       finish,
@@ -83,7 +91,7 @@ export function createAi(invoke: SystemInvoke): SystemAi {
           if (event.type === 'tool') {
             // Do not block the receive loop on tools: their nested System calls
             // use the same channel, and cancellation must remain responsive.
-            void reply(event).catch(() => { cancel(); finish(); });
+            void reply(event).catch(error => { cancel(); controller.abort(error); finish(); });
           } else output.push(event);
         }
         return output;
@@ -165,8 +173,8 @@ export function createAi(invoke: SystemInvoke): SystemAi {
     async withTools<T extends Tools, R>(selection: ModelSelection & { tools: T }, run: (value: { model: LanguageModelV4; tools: T }) => Promise<R>): Promise<R> {
       const scope: Scope = { tools: selection.tools, open: true, active: new Set() };
       for (const tool of Object.values(scope.tools)) {
-        if (!tool.execute || tool.needsApproval || tool.toModelOutput || tool.type === 'provider' || tool.outputSchema) {
-          throw new Error('AI callback tools require execute and inputSchema; approval, provider, output schema and custom output conversion are unsupported');
+        if (!tool.execute || tool.needsApproval || tool.type === 'provider' || tool.outputSchema) {
+          throw new Error('AI callback tools require execute and inputSchema; approval, provider tools and output schemas are unsupported');
         }
       }
       try {
