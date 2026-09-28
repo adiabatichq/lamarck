@@ -159,7 +159,8 @@ run(process.execPath, [
 });
 
 await stageMacOsAiRuntimesFromLock(source, join(source, 'desktop/shell/dist-electron'));
-await stageComputerUse(join(source, 'desktop/shell/dist-electron'), 'darwin');
+// This module is loaded from /snapshot (read-only); downloads belong in /work.
+await stageComputerUse(join(source, 'desktop/shell/dist-electron'), 'darwin', undefined, join(source, '.lamarck/build/computer-use'));
 
 await copyOutputTree(join(source, "desktop/shell/dist"), join(exportRoot, "dist"));
 await copyOutputTree(

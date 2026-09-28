@@ -14,7 +14,8 @@ export const CUA_DRIVER = Object.freeze({
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 
 /** Build-time only. The installed desktop never downloads or updates this driver. */
-export async function stageComputerUse(output, platform = process.platform, archivePath) {
+export async function stageComputerUse(output, platform = process.platform, archivePath,
+  cacheDirectory = fileURLToPath(new URL('../.lamarck/build/computer-use/', import.meta.url))) {
   const target = join(output, 'computer-use');
   await mkdir(target, { recursive: true });
   await cp(new URL('./ai-runtime-licenses/CUA-LICENSE', import.meta.url), join(target, 'LICENSE'));
@@ -22,9 +23,8 @@ export async function stageComputerUse(output, platform = process.platform, arch
     await writeFile(join(target, 'manifest.json'), JSON.stringify({ schemaVersion: 1, supported: false, platform }));
     return;
   }
-  const cache = fileURLToPath(new URL('../.lamarck/build/computer-use/', import.meta.url));
-  await mkdir(cache, { recursive: true });
-  const archive = archivePath ?? join(cache, `${CUA_DRIVER.sha256}.tar.gz`);
+  if (!archivePath) await mkdir(cacheDirectory, { recursive: true });
+  const archive = archivePath ?? join(cacheDirectory, `${CUA_DRIVER.sha256}.tar.gz`);
   let bytes = await readFile(archive).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
   if (!bytes) {
     await downloadVerifiedFile({
