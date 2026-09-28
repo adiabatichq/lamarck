@@ -95,7 +95,8 @@ async function verifyConsumer(tarballPath) {
     })}\n`);
     await run("npm", [
       "install",
-      "--offline",
+      "--prefer-offline",
+      "--registry=https://registry.npmjs.org",
       "--ignore-scripts",
       "--no-audit",
       "--no-fund",
@@ -109,7 +110,7 @@ async function verifyConsumer(tarballPath) {
       try { import.meta.resolve("ai"); throw new Error("Unexpected ai runtime dependency"); }
       catch (error) { if (error.code !== "ERR_MODULE_NOT_FOUND") throw error; }
     `], consumer);
-    await run("npm", ["install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--no-save", tarballPath, "ai@7.0.105"], consumer);
+    await run("npm", ["install", "--prefer-offline", "--registry=https://registry.npmjs.org", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--no-save", tarballPath, "ai@7.0.105"], consumer);
     await run(process.execPath, [
       "--input-type=module",
       "--eval",
