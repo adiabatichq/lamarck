@@ -94,3 +94,9 @@ describe("typed CLI protocol V1", () => {
     expect(() => parseCliResponse(value, "two")).toThrow("attribution mismatch");
   });
 });
+
+test("Trigger wire requests reject operational state and invalid preview/revision bounds", () => {
+  expect(HOST_CLI_OPERATIONS).toContain("trigger.create"); expect(MANAGED_CLI_OPERATIONS.some(op => op.startsWith("trigger."))).toBe(false);
+  for (const [operation, input] of [["trigger.list", { source: "forged" }], ["trigger.update", { triggerId: "t", config: {}, revision: 0 }], ["trigger.preview", { triggerId: "t", config: {} }], ["trigger.preview", { config: {}, limit: 21 }], ["trigger.runs", { triggerId: "t", limit: 501 }], ["trigger.cancel", { runId: "r", appId: "forged" }]]) expect(() => parseCliRequest({ requestId: "test", operation, input })).toThrow();
+  expect(parseCliRequest({ requestId: "test", operation: "trigger.create", input: { config: { condition: { kind: "schedule", cron: "* * * * *", timezone: "UTC" } } } }).operation).toBe("trigger.create");
+});

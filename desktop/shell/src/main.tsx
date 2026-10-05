@@ -56,6 +56,9 @@ if (import.meta.env.DEV && !window.lamarckHost) {
     closeAppViewer: async () => ({ ok: true as const }),
     reloadAppRuntime: async () => ({ active: false }),
     getAppRuntimeStates: async () => [],
+    stopAppJob: async () => { throw new Error("App execution management requires the Desktop Host"); },
+    closeAppUi: async () => { throw new Error("App execution management requires the Desktop Host"); },
+    stopApp: async () => { throw new Error("App execution management requires the Desktop Host"); },
     archiveApp: async (appId: string) => {
       const response = await fetch(`${base}/api/apps/${encodeURIComponent(appId)}/archive`, {
         method: "POST",

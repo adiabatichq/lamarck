@@ -91,6 +91,40 @@ after(async () => {
 });
 
 describe("Node Guard utility", { concurrency: 1 }, () => {
+  test("matches subscription queries through the Guard RPC snapshot boundary", async () => {
+    const after = await rpc("events.boundary", { principal: host });
+    const id = await rpc("writeEvent", { principal: host, event: { type: "subscription.rpc.test", startedAt: 1, payload: { value: 7 } } });
+    const input = { principal: host, sql: "SELECT e.id FROM events e JOIN json_each('[1,2]') j WHERE e.type = ?", params: ["subscription.rpc.test"], after };
+    const match = await rpc("events.match", input);
+    assert.deepEqual(match.events.map(event => event.id), [id]);
+    assert.deepEqual(match.events[0].payload, { value: 7 });
+    assert.equal(match.events[0].source, host.source);
+    assert.ok(match.cursor > after);
+    assert.deepEqual((await rpc("events.match", { ...input, after: match.cursor })).events, []);
+    assert.equal((await rpc("events.match", { ...input, preview: true })).events[0].id, id);
+    await assert.rejects(() => rpc("events.match", { ...input, sql: "SELECT * FROM triggers", params: [] }));
+    await assert.rejects(() => rpc("events.match", { ...input, sql: "DELETE FROM events", params: [] }));
+  });
+  test("splits subscription bursts through RPC and preserves the oversized-event error code", async () => {
+    const after = await rpc("events.boundary", { principal: host });
+    const ids = [];
+    for (let i = 0; i < 100; i++) {
+      ids.push(await rpc("writeEvent", { principal: host, event: { type: "subscription.rpc.burst", startedAt: i, payload: { value: "x".repeat(90 * 1024) } } }));
+    }
+    const input = { principal: host, sql: "SELECT id FROM events WHERE type = ?", params: ["subscription.rpc.burst"], after };
+    const first = await rpc("events.match", input);
+    assert.ok(first.events.length > 0 && first.events.length < 100);
+    assert.ok(Buffer.byteLength(JSON.stringify(first)) <= 8 * 1024 * 1024);
+    const second = await rpc("events.match", { ...input, after: first.cursor });
+    assert.deepEqual([...first.events, ...second.events].map(event => event.id), ids);
+    assert.ok(Buffer.byteLength(JSON.stringify(second)) <= 8 * 1024 * 1024);
+    const boundary = second.cursor;
+    await rpc("writeEvent", { principal: host, event: { type: "subscription.rpc.oversized", startedAt: 1, payload: { value: "x".repeat(8 * 1024 * 1024) } } });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await assert.rejects(() => rpc("events.match", { ...input, params: ["subscription.rpc.oversized"], after: boundary }), { code: "GUARD_SUBSCRIPTION_EVENT_TOO_LARGE" });
+    }
+    assert.deepEqual((await rpc("events.match", { ...input, after: boundary })).events, []);
+  });
   test("serves loopback health and requires bearer auth for RPC", { skip: DIRECT }, async () => {
     const health = await fetch(`${origin}/health`);
     assert.equal(health.status, 200);

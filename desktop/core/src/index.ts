@@ -1,3 +1,9 @@
+import { TriggerStore } from "./triggers/store";
+import { TriggerCoordinator } from "./triggers/coordinator";
+import { HostTriggerTargets } from "./triggers/targets";
+import { AppJobDispatch } from "./triggers/app-jobs";
+import { manageTriggers } from "./triggers/management";
+import { RuntimeListeners } from "./triggers/listeners";
 import { AiService } from './ai/service';
 import { handleAiRequest } from './ai/routes';
 import { AiError } from './ai/errors';
@@ -148,6 +154,7 @@ const guard = RemoteGuard.fromEnvironment(
   systemProducer.prepareProducer,
 );
 await guard.health();
+const runtimeListeners = new RuntimeListeners();
 const appVersionGuard = guard.withSource("system:apps", {
   producerRef: systemProducer.producerRef,
   prepareProducer: systemProducer.prepareProducer,
@@ -205,6 +212,9 @@ const authManager = new ConnectorAuthManager(
   },
 );
 const connectorSupervisor = new ConnectorSupervisor({
+  subscriptionMatcher: (source, producer, signal) => guard.withSource(source, {
+    producerRef: producer.producerRef, writeTables: [], schemaGrant: false, signal,
+  }),
   systemDb,
   guard,
   workspacePath,
@@ -236,6 +246,12 @@ const connectorScheduler = new ConnectorScheduler({
   },
 });
 await appLifecycle.refreshRegistry();
+const triggerLifetime = new AbortController();
+const appJobDispatch = new AppJobDispatch(Date.now, channelId => { void appCapabilities.revoke(channelId).catch(error => console.error("[triggers] job channel cleanup", error)); });
+const triggerCoordinator = new TriggerCoordinator(new TriggerStore(systemDb), guard.withSource("system:triggers", {
+  producerRef: systemProducer.producerRef, prepareProducer: systemProducer.prepareProducer,
+  writeTables: [], schemaGrant: false, signal: triggerLifetime.signal, deadlineMs: HOST_GUARD_DEADLINE_MS,
+}), new HostTriggerTargets(appLifecycle, connectorSupervisor, appJobDispatch));
 const marketplaceService = await MarketplaceService.initialize({
   workspacePath,
   apiOrigin: lamarckApiOrigin,
@@ -333,6 +349,8 @@ const d1Sequencer = new D1Sequencer();
 const vfs = new VfsService(workspacePath, d1ObserverState, contentBlobStore, d1Sequencer);
 appCapabilities.onChannelDeleted((channelId) => {
   vfs.closeWorkload(channelId);
+  runtimeListeners.closeOwner(channelId);
+  appJobDispatch.unbind(channelId);
 });
 await vfs.initialize();
 const observerGuard = guard.withSource("system:vfs:observer", {
@@ -894,6 +912,11 @@ async function executeCoreCliOperation(
   signal: AbortSignal,
 ): Promise<unknown> {
   const input = request.input as Record<string, unknown>;
+  if (request.operation.startsWith("trigger.")) {
+    if (principal.kind !== "system") throw cliCoded("CLI_UNSUPPORTED_COMMAND", "Trigger management requires Host authority");
+    try { return await manageTriggers(triggerCoordinator, request.operation, input, true); }
+    catch (error) { throw cliCoded("CLI_USAGE", coreErrorMessage(error)); }
+  }
   const requestGuard = cliGuardForPrincipal(principal, signal);
   switch (request.operation) {
     case "query":
@@ -1315,6 +1338,41 @@ const server = await serve<{ cwd: string }>({
         }
       }
 
+      if (path === "/api/triggers/manage" && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readJsonBody<Record<string, unknown>>(req, 20 * 1024);
+        try {
+          assertAllowedRequestFields(body, ["operation", "input"]);
+          const request = parseCliRequest({ requestId: "console", operation: body.operation, input: body.input });
+          if (!request.operation.startsWith("trigger.")) return json({ error: "Trigger operation required" }, 400);
+          return json(await manageTriggers(triggerCoordinator, request.operation, request.input as Record<string, unknown>, true));
+        } catch (error) { return json({ error: coreErrorMessage(error) }, 400); }
+      }
+      if (path === "/api/triggers/jobs/heartbeat" && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readJsonBody<Record<string, unknown>>(req, 4096);
+        assertAllowedRequestFields(body, ["available", "active"]);
+        if (typeof body.available !== "boolean" || !Array.isArray(body.active) || body.active.length > 4 || body.active.some(id => typeof id !== "string" || id.length > 64)) return json({ error: "Invalid job heartbeat" }, 400);
+        return json({ cancel: appJobDispatch.heartbeat(body.available, body.active as string[]) });
+      }
+      if (path === "/api/triggers/jobs/claim" && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readJsonBody(req, 1024); assertAllowedRequestFields(body, []);
+        return json({ job: appJobDispatch.claim() });
+      }
+      if (path === "/api/triggers/jobs/complete" && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const body = await readJsonBody<Record<string, unknown>>(req, 4096);
+        assertAllowedRequestFields(body, ["runId", "error"]);
+        if (typeof body.runId !== "string" || body.runId.length > 64 || (body.error !== null && typeof body.error !== "string")) return json({ error: "Invalid job result" }, 400);
+        appJobDispatch.complete(body.runId, body.error as string | null); return json({ ok: true });
+      }
+      if (path === "/api/app-runtime/job-input" && method === "POST") {
+        if (auth!.kind !== "app" || !auth!.workload.startsWith("job:")) return json({ error: "bound job workload required" }, 403);
+        const body = await readJsonBody(req, 1024); assertAllowedRequestFields(body, []);
+        return json(appJobDispatch.input(auth!.channelId));
+      }
+
       // -- Workspace --
       if (path === "/api/workspace" && method === "GET") {
         return json({ path: workspacePath });
@@ -1419,6 +1477,22 @@ const server = await serve<{ cwd: string }>({
         const removed = d1ObserverState.removeExclusion(body.path);
         d1Observer.schedule();
         return json({ ok: true, removed });
+      }
+
+      if (path.startsWith("/api/subscription/") && method === "POST") {
+        if (auth!.kind !== "app") return json({ error: "app runtime required" }, 403);
+        const owner = auth!.channelId;
+        const body = await readBody<Record<string, unknown>>(req);
+        if (path === "/api/subscription/start") return json(await runtimeListeners.start(
+          owner, guardForRequest(auth!, { signal: admission!.signal }), body, admission!.signal,
+          { requestSignal: requestGuardSignal, matcher: (signal) => guardForRequest(auth!, { signal }) },
+        ));
+        if (!body || typeof body.subscriptionId !== "string") throw new HttpStatusError(400, "Subscription handle is required");
+        if (path === "/api/subscription/next") {
+          if (typeof body.acknowledged !== "number") throw new HttpStatusError(400, "Subscription acknowledgement is required");
+          return json(await runtimeListeners.next(owner, body.subscriptionId, body.acknowledged));
+        }
+        if (path === "/api/subscription/cancel") return json(runtimeListeners.cancel(owner, body.subscriptionId));
       }
 
       // -- Events --
@@ -1928,6 +2002,7 @@ const server = await serve<{ cwd: string }>({
           appId?: unknown;
           workload?: unknown;
           activationId?: unknown;
+          jobRunId?: unknown;
         }>(req);
         const workload = parseRequestedWorkload(body.workload);
         if (
@@ -1950,7 +2025,7 @@ const server = await serve<{ cwd: string }>({
             systemIdentity,
           ));
           producerDescriptorStore.resolve(descriptor.ref);
-          return json(appCapabilities.issue(body.appId, workload, {
+          const issued = appCapabilities.issue(body.appId, workload, {
             activationId: activation.activationId,
             manifestDigest: activation.manifestDigest,
             packageDigest: activation.packageDigest,
@@ -1960,7 +2035,14 @@ const server = await serve<{ cwd: string }>({
               `apps/${body.appId}/`,
               ...activation.manifest.permissions.writes.files,
             ],
-          }));
+          });
+          if (body.jobRunId !== undefined) {
+            try {
+              if (typeof body.jobRunId !== "string") throw new Error("Invalid job run id");
+              appJobDispatch.bind(issued.channelId, body.jobRunId, body.appId, workload);
+            } catch (error) { await appCapabilities.revoke(issued.channelId); throw error; }
+          }
+          return json(issued);
         } catch (error) {
           return json({ error: error instanceof Error ? error.message : String(error) }, 409);
         }
@@ -1978,7 +2060,9 @@ const server = await serve<{ cwd: string }>({
       if (runtimeAppChannelsMatch && method === "DELETE") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const appId = decodeURIComponent(runtimeAppChannelsMatch[1]);
-        return json({ ok: true, revoked: await appCapabilities.revokeApp(appId) });
+        const workload = url.searchParams.get("workload");
+        if (workload !== null && workload !== "ui") return json({ error: "Unsupported revocation scope" }, 400);
+        return json({ ok: true, revoked: await appCapabilities.revokeApp(appId, workload ?? undefined) });
       }
 
       if (path === "/api/apps" && method === "GET") {
@@ -2239,6 +2323,7 @@ const server = await serve<{ cwd: string }>({
   },
 });
 
+triggerCoordinator.start();
 connectorScheduler.start().catch((err) => {
   console.error("[lamarck] Connector scheduler failed:", err);
 });
@@ -2282,13 +2367,17 @@ function assertDisplayNameField(
 
 // Graceful shutdown
 async function shutdown(): Promise<void> {
+  runtimeListeners.close();
   if (shuttingDown) return;
   shuttingDown = true;
+  triggerLifetime.abort();
+  appJobDispatch.close();
   console.log("\n[lamarck] Shutting down...");
   clearInterval(connectorUpdateTimer);
   // Stop every producer before awaiting any one service. A stalled AI close
   // must not leave polling, HTTP admission, or filesystem scans running.
   const cleanup = [
+    triggerCoordinator.close(),
     aiService.close(),
     vfs.close(),
     server.stop(),

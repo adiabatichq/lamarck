@@ -33,9 +33,9 @@ describe("Host runtime discovery", () => {
 
     const changed = new HostCliTransport({
       descriptorPath: path,
-      fetch: vi.fn<typeof fetch>(async () => Response.json({ protocolVersion: 1, environment: "host", supportedOperations: HOST_CLI_OPERATIONS.slice(1) })),
+      fetch: vi.fn<typeof fetch>(async () => Response.json({ protocolVersion: 1, environment: "host", supportedOperations: HOST_CLI_OPERATIONS.filter(operation => operation !== "query") })),
     });
-    await expect(changed.hello()).resolves.toMatchObject({ supportedOperations: HOST_CLI_OPERATIONS.slice(1) });
+    await expect(changed.hello()).resolves.toMatchObject({ supportedOperations: HOST_CLI_OPERATIONS.filter(operation => operation !== "query") });
     await expect(changed.execute({ requestId: "missing", operation: "query", input: { sql: "SELECT 1" } })).rejects.toMatchObject({ code: "CLI_UNSUPPORTED_COMMAND" });
   });
 

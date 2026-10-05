@@ -1,3 +1,5 @@
+import { createSubscribe } from "@lamarck/system/internal/subscription";
+import type { SubscriptionBatch, SqlStatement } from "@lamarck/system/protocol";
 // process-runner — host side of the connector runner process.
 //
 // RunnerSession is the supervisor's uniform surface for executing trusted
@@ -32,6 +34,9 @@ import type {
 import type { HostToRunnerMessage, RunnerRpcMethod, RunnerToHostMessage } from "./runner-protocol";
 
 export interface RunnerCapabilities {
+  subscriptionStart?(input: SqlStatement): Promise<{ subscriptionId: string }>;
+  subscriptionNext?(input: { subscriptionId: string; acknowledged: number }): Promise<SubscriptionBatch>;
+  subscriptionCancel?(input: { subscriptionId: string }): Promise<{ ok: true }>;
   authType: ConnectorRuntimeAuthType;
   providerOrigin?: string;
   writeEvent(event: unknown): Promise<unknown>;
@@ -150,6 +155,11 @@ export class InProcessRunnerSession implements RunnerSession {
   async run(opts: RunnerRunOptions): Promise<void> {
     const caps = opts.capabilities;
     await this.definition.run({
+      subscribe: createSubscribe({
+        start: (input) => caps.subscriptionStart ? caps.subscriptionStart(input) : Promise.reject(new Error('Subscriptions unavailable')),
+        next: (input) => caps.subscriptionNext!(input),
+        cancel: (input) => caps.subscriptionCancel!(input),
+      }, opts.signal),
       guard: {
         writeEvent: (event) => caps.writeEvent(event) as Promise<{ id: string }>,
         writeEvents: (events) => caps.writeEvents(events) as Promise<{ ids: string[] }>,
@@ -652,6 +662,13 @@ export class ProcessRunnerSession implements RunnerSession {
       }
       let value: unknown;
       switch (method) {
+        case "subscriptionStart": case "subscriptionNext": case "subscriptionCancel": {
+          if (!("writeEvent" in caps)) throw new Error("Subscription requires an active Source run");
+          const invoke = caps[method];
+          if (!invoke) throw new Error("Subscriptions unavailable");
+          value = await invoke(params as any);
+          break;
+        }
         case "writeEvent":
           if (!("writeEvent" in caps)) throw new Error("Connector capability unavailable: writeEvent");
           value = await caps.writeEvent(params);

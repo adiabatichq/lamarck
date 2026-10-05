@@ -88,6 +88,17 @@ describe("CLI rendering and exit behavior", () => {
     }
   });
 
+  test("Trigger config files are read locally and domain JSON is rendered without a transport envelope", async () => {
+    const root = await mkdtemp(join(tmpdir(), "trigger-cli-"));
+    try {
+      const path = join(root, "trigger.json"), config = { name: "Daily", target: "source:s1:run", condition: { kind: "schedule", cron: "0 9 * * *", timezone: "UTC" } };
+      await writeFile(path, JSON.stringify(config)); const calls: CliRequest[] = [], output = io();
+      expect(await runCli({ environment: "host", argv: ["trigger", "create", "--file", path, "--json"], transport: transport([{ id: "t1", revision: 1 }], calls), io: output.value })).toBe(0);
+      expect(calls[0]).toMatchObject({ operation: "trigger.create", input: { config } }); expect(JSON.parse(output.stdout())).toEqual({ id: "t1", revision: 1 });
+      await writeFile(path, "bad JSON"); const invalid = io(); expect(await runCli({ environment: "host", argv: ["trigger", "create", "--file", path, "--json"], transport: transport([]), io: invalid.value })).toBe(1); expect(JSON.parse(invalid.stderr()).error.code).toBe("CLI_USAGE");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   test("waits only on the accepted persisted run id and preserves terminal errors", async () => {
     const output = io();
     const calls: CliRequest[] = [];
@@ -131,6 +142,13 @@ describe("CLI rendering and exit behavior", () => {
     expect(await runCli({ environment: "host", argv: ["connector", "remove", "oura", "--json"], transport: transport([], calls), io: output.value })).toBe(1);
     expect(JSON.parse(output.stderr()).error.code).toBe("CONFIRMATION_REQUIRED");
     expect(calls).toEqual([]);
+
+    const triggerOutput = io();
+    expect(await runCli({ environment: "host", argv: ["trigger", "delete", "trigger-a", "--json"], transport: transport([], calls), io: triggerOutput.value })).toBe(1);
+    expect(JSON.parse(triggerOutput.stderr()).error.code).toBe("CONFIRMATION_REQUIRED"); expect(calls).toEqual([]);
+    const confirmed = io();
+    expect(await runCli({ environment: "host", argv: ["trigger", "delete", "trigger-a", "--yes", "--json"], transport: transport([{ ok: true }], calls), io: confirmed.value })).toBe(0);
+    expect(calls.map(call => call.operation)).toEqual(["trigger.delete"]); calls.length = 0;
 
     const appOutput = io();
     expect(await runCli({ environment: "host", argv: ["app", "archive", "example", "--json"], transport: transport([], calls), io: appOutput.value })).toBe(1);

@@ -75,7 +75,32 @@ export interface VfsCommandWireResult {
   stderrBase64: string;
 }
 
+/** Original D0 envelope; payload is decoded JSON, never a query projection. */
+export interface D0Event {
+  id: string;
+  schema_version: string;
+  source: string;
+  producer_ref: string;
+  type: string;
+  external_id: string | null;
+  started_at: number;
+  ended_at: number | null;
+  payload: JsonValue;
+  created_at: number;
+}
+export interface SubscriptionBatch { sequence: number; events: D0Event[]; }
+
+/** Proposed job-input contract for review; no manifest or protocol version bump. */
+export interface JobInvocation {
+  version: 1; triggerId: string; runId: string; revision: number;
+  input: { kind: 'event'; event: D0Event } | { kind: 'schedule'; scheduledAt: number };
+}
+
 export interface SystemOperationMap {
+  "job.input": { input: Record<string, never>; output: JobInvocation };
+  "subscription.start": { input: SqlStatement; output: { subscriptionId: string } };
+  "subscription.next": { input: { subscriptionId: string; acknowledged: number }; output: SubscriptionBatch };
+  "subscription.cancel": { input: { subscriptionId: string }; output: { ok: true } };
   'computer.open': { input: { sessionId: string }; output: { sessionId: string; tools: ComputerTool[]; instructions: string } };
   'computer.call': { input: { sessionId: string; name: string; arguments: Record<string, unknown> }; output: ComputerResult };
   'computer.close': { input: { sessionId: string }; output: { ok: true } };
@@ -131,8 +156,10 @@ export interface SystemOperationMap {
 }
 
 export const SYSTEM_OPERATIONS = Object.freeze([
+  "job.input",
   'computer.open', 'computer.call', 'computer.close',
   "ai.listOptions", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
+  "subscription.start", "subscription.next", "subscription.cancel",
   "query",
   "resolveContentRef",
   "mutate",

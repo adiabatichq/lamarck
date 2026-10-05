@@ -1,3 +1,5 @@
+import { createSubscribe, type Subscription } from "./subscription.js";
+export type { Subscription } from "./subscription.js";
 import { createAi, type SystemAi } from './ai/client.js';
 import { createComputer, type SystemComputer } from './computer.js';
 export type { SystemComputer } from './computer.js';
@@ -30,6 +32,9 @@ export interface VfsCommandResult {
 }
 
 export interface System {
+  /** Proposed public contract: read only this declared job's immutable invocation. */
+  jobInput(): Promise<import('./protocol.js').JobInvocation>;
+  subscribe(query: SqlStatement, handler: (event: import("./protocol.js").D0Event) => void | Promise<void>): Promise<Subscription>;
   ai: SystemAi;
   computer: SystemComputer;
   query(sql: string, params?: SqlParams): Promise<{ rows: unknown[] }>;
@@ -49,6 +54,12 @@ const VFS_UPLOAD_MAX_BYTES = 1024 * 1024 * 1024;
 
 export function createSystem(invoke: SystemInvoke): System {
   return Object.freeze({
+    jobInput: () => invoke('job.input', {}),
+    subscribe: createSubscribe({
+      start: (input) => invoke("subscription.start", input),
+      next: (input) => invoke("subscription.next", input),
+      cancel: (input) => invoke("subscription.cancel", input),
+    }),
     ai: createAi(invoke),
     computer: createComputer(invoke),
     query: (sql: string, params?: SqlParams) => invoke(

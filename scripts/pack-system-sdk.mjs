@@ -64,6 +64,8 @@ const expectedFiles = [
   "dist/node.js",
   "dist/protocol.d.ts",
   "dist/protocol.js",
+  "dist/subscription.d.ts",
+  "dist/subscription.js",
   "dist/vfs-internal.d.ts",
   "dist/vfs-internal.js",
   "package.json",

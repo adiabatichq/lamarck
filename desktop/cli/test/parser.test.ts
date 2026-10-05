@@ -3,6 +3,17 @@ import { CLI_OPERATIONS, helpText, parseCliArgs } from "../src/index";
 
 describe("shared CLI parser", () => {
   const vectors: ReadonlyArray<[readonly string[], string, unknown]> = [
+    [["trigger", "targets"], "trigger.targets", {}],
+    [["trigger", "list"], "trigger.list", {}],
+    [["trigger", "inspect", "t1"], "trigger.inspect", { triggerId: "t1" }],
+    [["trigger", "create", "--name", "Inbox", "--target", "app:notes:job:inbox", "--sql", "SELECT id FROM events", "--params", "[]", "--enabled"], "trigger.create", { config: { name: "Inbox", target: "app:notes:job:inbox", enabled: true, condition: { kind: "event", sql: "SELECT id FROM events", params: [] } } }],
+    [["trigger", "update", "t1", "--name", "Renamed", "--revision", "2"], "trigger.update", { triggerId: "t1", revision: 2, config: { name: "Renamed" } }],
+    [["trigger", "enable", "t1"], "trigger.enable", { triggerId: "t1" }],
+    [["trigger", "disable", "t1"], "trigger.disable", { triggerId: "t1" }],
+    [["trigger", "delete", "t1", "--revision", "2"], "trigger.delete", { triggerId: "t1", revision: 2 }],
+    [["trigger", "preview", "--cron", "0 9 * * *", "--timezone", "Asia/Taipei", "--limit", "3"], "trigger.preview", { config: { condition: { kind: "schedule", cron: "0 9 * * *", timezone: "Asia/Taipei" } }, limit: 3 }],
+    [["trigger", "runs", "t1", "--limit", "10"], "trigger.runs", { triggerId: "t1", limit: 10 }],
+    [["trigger", "cancel", "r1"], "trigger.cancel", { runId: "r1" }],
     [["query", "SELECT", "1", "--json"], "query", { sql: "SELECT 1" }],
     [["schema", "change", "--author", "Ada", "CREATE TABLE x(id TEXT PRIMARY KEY)"], "schema.change", { ddl: "CREATE TABLE x(id TEXT PRIMARY KEY)", author: "Ada" }],
     [["file", "ls", "-R", "notes"], "file.command", { argv: ["ls", "-R", "notes"] }],
@@ -90,4 +101,12 @@ describe("shared CLI parser", () => {
     expect(() => parseCliArgs(["marketplace", "list", "--kind", "service"], "host"))
       .toThrowError(expect.objectContaining({ code: "CLI_USAGE" }));
   });
+});
+
+test("Trigger configuration modes stay exclusive and Host-only", () => {
+  expect(parseCliArgs(["trigger", "create", "--config", '{"name":"Test"}'], "host")).toMatchObject({ input: { config: { name: "Test" } } });
+  expect(parseCliArgs(["trigger", "create", "--file", "trigger.json"], "host")).toMatchObject({ configFile: "trigger.json" });
+  for (const args of [["preview", "t1", "--sql", "SELECT id FROM events"], ["create", "--file", "a.json", "--name", "A"], ["create", "--sql", "SELECT id FROM events", "--cron", "* * * * *"], ["preview", "--cron", "* * * * *"], ["preview", "t1", "--limit", "21"], ["update", "t1", "--name", "a", "--revision", "0"]]) expect(() => parseCliArgs(["trigger", ...args], "host")).toThrow();
+  expect(() => parseCliArgs(["trigger", "list"], "managed")).toThrowError(expect.objectContaining({ code: "CLI_UNSUPPORTED_COMMAND" }));
+  expect(helpText("managed")).not.toContain("lamarck trigger");
 });

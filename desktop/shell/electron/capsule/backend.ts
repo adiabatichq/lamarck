@@ -24,6 +24,9 @@ export interface CapsuleUiSpec {
   sdkSenderId: string;
 }
 
+/** Host-private declared job launch; completion is authenticated process exit. */
+export type CapsuleJobSpec = Omit<CapsuleUiSpec, "port"> & { jobId: string };
+
 export interface CapsuleUiInstance {
   instanceId: string;
 }
@@ -97,6 +100,7 @@ export interface CapsuleBackend {
   /** Reports an authenticated, unexpected terminal event for one active or prepared UI. */
   setUiLostHandler?(handler: (event: CapsuleUiLostEvent) => void): void;
   status(): Promise<CapsuleBackendStatus>;
+  runJob?(spec: CapsuleJobSpec, signal: AbortSignal, onState?: (state: "running" | "stopping") => void): Promise<void>;
   /**
    * Builds and starts a streamable candidate without changing activation.
    * When previousInstanceId is present, commit atomically replaces that exact
@@ -117,6 +121,8 @@ export interface CapsuleBackend {
   /** Opens one active or prepared instance-bound stream to the declared Guest UI port. */
   openUiStream(instanceId: string): Promise<Duplex>;
   stopUi(instanceId: string): Promise<void>;
+  /** Stops only UI launches and instances, including a launch with no returned handle yet. */
+  stopAppUi(appId: string): Promise<void>;
   stopApp(appId: string): Promise<void>;
   /**
    * Authoritatively stops an App and removes only its reconstructable Capsule
@@ -165,6 +171,8 @@ export class UnavailableCapsuleBackend implements CapsuleBackend {
   }
 
   async stopUi(_instanceId: string): Promise<void> {}
+
+  async stopAppUi(_appId: string): Promise<void> {}
 
   async stopApp(_appId: string): Promise<void> {}
 

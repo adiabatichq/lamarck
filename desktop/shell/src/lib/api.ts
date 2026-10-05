@@ -23,6 +23,27 @@ export type {
 } from "@lamarck/system/protocol";
 
 let cachedCoreBaseUrl: string | null = null;
+
+export type TriggerCondition = { kind: "event"; sql: string; params?: SqlParams } | { kind: "schedule"; cron: string; timezone: string };
+export interface TriggerSettings { name: string; target: string; enabled: boolean; condition: TriggerCondition }
+export interface TriggerRunSummary {
+  id: string; triggerId: string; revision: number; name: string; target: string;
+  status: "pending" | "running" | "success" | "error" | "interrupted" | "canceled";
+  createdAt: number; startedAt: number | null; endedAt: number | null; error: string | null;
+  input: { kind: "event"; eventId: string; type: string } | { kind: "schedule"; scheduledAt: number };
+}
+export interface TriggerSummary {
+  id: string; revision: number; name: string; target: string; kind: "event" | "schedule"; enabled: boolean;
+  available: boolean; unavailableReason: string | null; error: string | null; nextRunAt: number | null; lastRun: TriggerRunSummary | null;
+}
+export interface TriggerDetail extends TriggerSummary { settings: TriggerSettings; runs: TriggerRunSummary[] }
+export interface TriggerTarget { id: string; name: string; kind: "app-job" | "source-run"; appId?: string; sourceId?: string; inputs: ("event" | "schedule")[]; available: boolean; reason: string | null }
+export type TriggerPreview = { kind: "event"; truncated: boolean; events: { id: string; type: string; source: string; startedAt: number }[] } | { kind: "schedule"; times: number[] };
+
+/** Host Console uses the same typed operations as the Host CLI. */
+export function manageTrigger<T>(operation: `trigger.${"targets" | "list" | "inspect" | "create" | "update" | "enable" | "disable" | "delete" | "preview" | "runs" | "cancel"}`, input: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
+  return request<T>("/api/triggers/manage", { method: "POST", body: JSON.stringify({ operation, input }), signal }, ["trigger.targets", "trigger.list", "trigger.inspect", "trigger.preview", "trigger.runs"].includes(operation));
+}
 let coreUrlEpoch = 0;
 export const CORE_READ_TIMEOUT_MS = 15_000;
 type Host = NonNullable<Window["lamarckHost"]>;
@@ -96,6 +117,21 @@ async function getCoreRuntimeState(fresh = false): Promise<HostCoreRuntimeState 
 
 export async function getAppRuntimeStates(): ReturnType<Host["getAppRuntimeStates"]> {
   return window.lamarckHost ? (await readHost("getAppRuntimeStates")).value : [];
+}
+
+export function stopAppJob(appId: string, runId: string): Promise<{ active: boolean }> {
+  if (!window.lamarckHost) return Promise.reject(new Error("App execution management requires the Desktop Host"));
+  return window.lamarckHost.stopAppJob(appId, runId);
+}
+
+export function closeAppUi(appId: string): Promise<{ ok: true }> {
+  if (!window.lamarckHost) return Promise.reject(new Error("App execution management requires the Desktop Host"));
+  return window.lamarckHost.closeAppUi(appId);
+}
+
+export function stopApp(appId: string): Promise<{ ok: true }> {
+  if (!window.lamarckHost) return Promise.reject(new Error("App execution management requires the Desktop Host"));
+  return window.lamarckHost.stopApp(appId);
 }
 
 export async function getCoreBaseUrl(): Promise<string> {

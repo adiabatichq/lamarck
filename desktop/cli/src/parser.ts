@@ -12,6 +12,7 @@ export type ParsedCliCommand =
       readonly wait: boolean;
       readonly confirmed: boolean;
       readonly schemaFile?: string;
+      readonly configFile?: string;
       readonly readsStdin: boolean;
     };
 
@@ -28,9 +29,12 @@ export function parseCliArgs(argv: readonly string[], environment: CliEnvironmen
   let wait = false;
   let confirmed = false;
   let schemaFile: string | undefined;
+  let configFile: string | undefined;
   let readsStdin = false;
 
-  if (top === "query") {
+  if (top === "trigger") {
+    const parsed = parseTrigger(args); operation = parsed.operation; input = parsed.input; configFile = parsed.file; confirmed = parsed.confirmed;
+  } else if (top === "query") {
     requireNoOptions(args, "query");
     const sql = args.join(" ").trim();
     if (!sql) usage("query requires read-only SQL");
@@ -116,7 +120,7 @@ export function parseCliArgs(argv: readonly string[], environment: CliEnvironmen
     throw new CliError("CLI_UNSUPPORTED_COMMAND", `lamarck ${operation.replaceAll(".", " ")} is not available in the ${environment} CLI.`);
   }
   return { kind: "execute", operation, input: input as CliOperationInput<CliOperation>, json, wait, confirmed,
-    ...(schemaFile === undefined ? {} : { schemaFile }), readsStdin };
+    ...(schemaFile === undefined ? {} : { schemaFile }), ...(configFile === undefined ? {} : { configFile }), readsStdin };
 }
 
 function scopedHelp(args: readonly string[], environment: CliEnvironment): string {
@@ -163,3 +167,45 @@ function requireNoOptions(args: readonly string[], label: string): void {
 function oneArg(args: string[], label: string): string { if (args.length !== 1 || !args[0]) usage(`${label} requires exactly one id`); return args[0]; }
 function noArgs(args: string[], label: string): void { if (args.length) usage(`${label} accepts no arguments`); }
 function usage(message: string): never { throw new CliError("CLI_USAGE", message); }
+
+function parseTrigger(args: string[]): { operation: CliOperation; input: Record<string, unknown>; file?: string; confirmed: boolean } {
+  const verb = args.shift();
+  if (!verb || !["targets", "list", "inspect", "create", "update", "enable", "disable", "delete", "preview", "runs", "cancel"].includes(verb)) usage("trigger requires targets, list, inspect, create, update, enable, disable, delete, preview, runs, or cancel");
+  const confirmed = verb === "delete" && removeBooleanFlag(args, "--yes");
+  const enabled = removeBooleanFlag(args, "--enabled"), disabled = removeBooleanFlag(args, "--disabled");
+  if (enabled && disabled) usage("choose --enabled or --disabled");
+  const { values: v, positionals } = parseNamedValues(args, new Map(["name", "target", "sql", "params", "cron", "timezone", "config", "file", "limit", "revision"].map(k => [`--${k}`, k])));
+  const configuration = v.config !== undefined || v.file !== undefined || ["name", "target", "sql", "params", "cron", "timezone"].some(k => v[k] !== undefined) || enabled || disabled;
+  const input: Record<string, unknown> = {};
+  if (verb === "targets" || verb === "list") { if (configuration || Object.keys(v).length || positionals.length) usage(`trigger ${verb} accepts no arguments`); }
+  else if (verb === "create") { if (positionals.length) usage("trigger create uses --name and --target"); }
+  else if (verb === "preview") { if (positionals.length > 1 || (positionals.length && configuration)) usage("preview accepts one Trigger id or a draft condition"); if (positionals.length) input.triggerId = positionals[0]; }
+  else input[verb === "cancel" ? "runId" : "triggerId"] = oneArg(positionals, `trigger ${verb}`);
+  if (v.revision !== undefined) { if (!["update", "enable", "disable", "delete"].includes(verb)) usage("--revision is only for settings changes"); input.revision = positiveInteger(v.revision, "revision"); }
+  if (v.limit !== undefined) { if (!["preview", "runs"].includes(verb)) usage("--limit is only for previews or history"); input.limit = positiveInteger(v.limit, "limit"); if (Number(input.limit) > (verb === "preview" ? 20 : 500)) usage("limit is too large"); }
+  if (!["create", "update", "preview"].includes(verb) && configuration) usage(`trigger ${verb} does not accept configuration`);
+  let file: string | undefined;
+  if (["create", "update", "preview"].includes(verb) && !(verb === "preview" && input.triggerId)) {
+    if (v.config !== undefined || v.file !== undefined) {
+      if (v.config !== undefined && v.file !== undefined || ["name", "target", "sql", "params", "cron", "timezone"].some(k => v[k] !== undefined) || enabled || disabled) usage("--config/--file cannot be combined with direct configuration flags");
+      if (v.file !== undefined) { file = v.file; input.config = {}; } else input.config = jsonObject(v.config!, "configuration");
+    } else {
+      const config: Record<string, unknown> = {};
+      for (const k of ["name", "target"]) if (v[k] !== undefined) config[k] = v[k];
+      if (enabled || disabled) config.enabled = enabled;
+      if (v.sql !== undefined) {
+        if (v.cron !== undefined || v.timezone !== undefined) usage("choose SQL or cron");
+        config.condition = { kind: "event", sql: v.sql, ...(v.params === undefined ? {} : { params: jsonValue(v.params, "params") }) };
+      } else if (v.cron !== undefined) {
+        if (!v.timezone || v.params !== undefined) usage("cron requires --timezone and does not accept --params");
+        config.condition = { kind: "schedule", cron: v.cron, timezone: v.timezone };
+      } else if (v.params !== undefined || v.timezone !== undefined) usage("params/timezone require SQL/cron");
+      if (!Object.keys(config).length) usage("configuration is required");
+      input.config = config;
+    }
+  }
+  return { operation: `trigger.${verb}` as CliOperation, input, confirmed, ...(file === undefined ? {} : { file }) };
+}
+function positiveInteger(value: string, label: string): number { const n = Number(value); if (!/^\d+$/.test(value) || !Number.isSafeInteger(n) || n < 1) usage(`${label} requires a positive integer`); return n; }
+function jsonValue(value: string, label: string): unknown { try { return JSON.parse(value); } catch { return usage(`${label} must be JSON`); } }
+function jsonObject(value: string, label: string): Record<string, unknown> { const parsed = jsonValue(value, label); if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) usage(`${label} must be an object`); return parsed as Record<string, unknown>; }

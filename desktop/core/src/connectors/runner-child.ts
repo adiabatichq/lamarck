@@ -1,3 +1,4 @@
+import { createSubscribe } from "@lamarck/system/internal/subscription";
 // runner-child — the connector runner process entrypoint.
 //
 // Spawned by ProcessRunnerSession with IPC. Imports exactly one trusted
@@ -127,6 +128,11 @@ async function handleMessage(msg: HostToRunnerMessage): Promise<void> {
       }
       try {
         await definition.run({
+          subscribe: createSubscribe({
+            start: (input) => rpc("subscriptionStart", input),
+            next: (input) => rpc("subscriptionNext", input),
+            cancel: (input) => rpc("subscriptionCancel", input),
+          }, abortController.signal),
           guard: {
             writeEvent: (event) => rpc("writeEvent", event),
             writeEvents: (events) => rpc("writeEvents", events),

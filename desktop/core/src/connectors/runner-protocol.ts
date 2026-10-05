@@ -62,6 +62,7 @@ export type RunnerToHostMessage =
   | { type: "rpc"; id: number; method: RunnerRpcMethod; params?: unknown };
 
 export type RunnerRpcMethod =
+  | "subscriptionStart" | "subscriptionNext" | "subscriptionCancel"
   | "writeEvent"
   | "writeEvents"
   | "writeTextBlob"

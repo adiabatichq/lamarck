@@ -26,6 +26,9 @@ export function renderHuman(operation: CliOperation, value: unknown): string {
 
 function summaryLine(operation: CliOperation, value: unknown): string {
   const item = value as Record<string, unknown>;
+  if (operation === "trigger.list") return `${item.id}\t${item.name}\t${item.enabled ? "enabled" : "disabled"}\t${item.target}\t${item.available ? "available" : item.unavailableReason}${item.error ? `\t${item.error}` : ""}`;
+  if (operation === "trigger.targets") return `${item.id}\t${item.name}\t${item.available ? "available" : item.reason}`;
+  if (operation === "trigger.runs") return `${item.id}\t${item.status}\t${new Date(Number(item.createdAt)).toISOString()}\t${item.target}${item.error ? `\t${item.error}` : ""}`;
   if (operation === "source.list") return `${item.id}\t${item.name}\t${(item.lifecycle as Record<string, unknown>)?.state ?? ""}`;
   if (operation === "marketplace.list") return `${item.kind}\t${item.packageId}\t${item.displayName}\t${item.description}`;
   if (operation === "connector.list") return `${item.id}\t${item.name}\t${item.trust}\t${item.sourceCount} source(s)`;

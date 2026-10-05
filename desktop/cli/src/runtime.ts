@@ -43,6 +43,11 @@ export async function runCli(options: {
     if (parsed.schemaFile !== undefined) {
       input = { ...input, ddl: await readBoundedFile(parsed.schemaFile, 300 * 1024) };
     }
+    if (parsed.configFile !== undefined) {
+      const text = await readBoundedFile(parsed.configFile, 16 * 1024);
+      try { input = { ...input, config: JSON.parse(text) }; }
+      catch { throw new CliError("CLI_USAGE", "Trigger configuration file must contain JSON."); }
+    }
     if (parsed.readsStdin) {
       uploadBytes = await readBoundedStdin(io.stdin, CLI_MAX_INLINE_BYTES);
       upload = { kind: "file-stdin", bytes: uploadBytes.byteLength };
@@ -117,6 +122,9 @@ async function confirm(operation: CliOperation, input: Record<string, unknown>, 
   if (operation === "connector.remove") {
     const connector = await execute(transport, "connector.inspect", { connectorId: input.connectorId }) as { id: string; sourceCount: number };
     promptText = `Remove ${connector.id} and retire ${connector.sourceCount} Source(s)? [y/N] `;
+  } else if (operation === "trigger.delete") {
+    const trigger = await execute(transport, "trigger.inspect", { triggerId: input.triggerId }) as { name: string };
+    promptText = `Delete ${trigger.name} and cancel queued runs? Running work can finish; history is retained. [y/N] `;
   } else if (operation === "app.archive") {
     const app = await execute(transport, "app.inspect", { appId: input.appId }) as { id: string; name?: string };
     promptText = `Archive ${app.name ?? app.id}? Its running Capsules will terminate immediately. [y/N] `;
@@ -139,7 +147,7 @@ function renderFileResult(result: FileCommandResult, io: CliIo): number {
   if (stdout.length) io.stdout.write(stdout); if (stderr.length) io.stderr.write(stderr); return result.exitCode;
 }
 function isFileOperation(operation: CliOperation): boolean { return operation === "file.command" || operation === "file.import" || operation === "file.export"; }
-function needsConfirmation(operation: CliOperation): boolean { return operation === "connector.remove" || operation === "app.archive" || operation === "app.refresh"; }
+function needsConfirmation(operation: CliOperation): boolean { return operation === "connector.remove" || operation === "app.archive" || operation === "app.refresh" || operation === "trigger.delete"; }
 async function readBoundedFile(path: string, max: number): Promise<string> {
   try {
     const handle = await open(path, "r");
@@ -152,7 +160,7 @@ async function readBoundedFile(path: string, max: number): Promise<string> {
     } finally { await handle.close(); }
   } catch (error) {
     if (error instanceof CliError) throw error;
-    throw new CliError("CLI_USAGE", "The schema file could not be read as UTF-8.", {
+    throw new CliError("CLI_USAGE", "The input file could not be read as UTF-8.", {
       cause: error instanceof Error ? error : undefined,
     });
   }

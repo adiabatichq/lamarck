@@ -18,6 +18,82 @@ D1 filenames follow the local filesystem. On macOS and Linux, names containing `
 
 `ls` and `stat` display paths containing control characters or backslashes as JSON string literals. Use `ls -0` (or `ls -0R`) for exact, unescaped paths separated and terminated by NUL, including names containing newlines or tabs. Filenames are not silently omitted for lacking cross-platform portability.
 
+## Runtime event subscriptions
+
+```ts
+const listener = await system.subscribe(
+  { sql: "SELECT id FROM events WHERE type = ?", params: ["telegram.message.received"] },
+  async (event) => {
+    // Original D0 envelope, with payload decoded as JSON.
+    await processMessage(event);
+  },
+);
+
+await listener.cancel(); // Stops further callbacks; an active callback may finish.
+await listener.done;
+```
+
+Every call creates an independent temporary listener from the current append
+boundary. A restarted runtime must call `subscribe` again; it does not receive
+appends made while absent. The Host cancels listeners when their runtime or
+SDK connection ends. `done` rejects if query evaluation, transport, or a handler
+fails; that listener then closes. There is no automatic handler retry.
+
+Queries use native read-only SQLite and ordinary bound parameters through Guard.
+They must return one column named `id`. JOINs, subqueries, grouping, ordering,
+and LIMIT retain their SQL meaning. Repeated IDs select one logical delivery;
+projected columns do not replace the original event. Only newly considered
+appends are eligible, including imported observations with old timestamps.
+Changing joined data or waiting does not reconsider already-consumed appends.
+Ordinary `system.query` and internal historical previews do not deliver events.
+
+Deliveries split at the existing 8 MiB response limit. The next matching event
+stays pending when it cannot fit in the current batch. A single event that
+cannot fit in a response fails with an oversized-event error; its contents are
+not shortened or skipped. Unacknowledged batches remain available within the
+active listener. This temporary delivery state is not persistent consumption.
+
+Connectors receive the same API as `context.subscribe(query, handler)` during
+`run(context)`. Callbacks execute in that Source's runner. This grants no general
+Connector SQL interface or new write authority, and does not add a per-run
+Connector event-input contract. Keep `run(context)` active while listening.
+
+Persistent event/cron execution and management are separate Host services. Their
+settings, saved progress, and immutable execution records live in the complete
+greenfield v1 `system.db` baseline. Console and Host `lamarck trigger` manage them.
+There is no SDK Trigger-management API, persistent listener name, or
+predicate-function variant.
+
+## Preview App job input
+
+`system.jobInput()` is a preview API in this pre-1.0 release. It uses the existing manifest v1
+`runtime.jobs.<job-id>.command` declaration and System protocol v1:
+
+```ts
+const invocation = await system.jobInput();
+// { version: 1, triggerId, runId, revision, input }
+if (invocation.input.kind === 'event') {
+  await processMessage(invocation.input.event); // Original D0 envelope.
+} else {
+  await runScheduledWork(invocation.input.scheduledAt); // UTC milliseconds.
+}
+// Exiting successfully completes this invocation; a nonzero exit fails it.
+```
+
+The Host cold-starts the declared job under its exact Capsule activation and
+binds that job's capability to one immutable run input. The call accepts no run,
+App, or Trigger selector. UI channels and other jobs cannot read that input.
+Cancellation/completion/teardown revokes it. Existing Guard permissions govern
+job writes; input delivery does not grant new write authority.
+
+The local policy serializes each target, allows four invocations globally,
+requests cancellation after 30 minutes, and does not automatically retry failed
+or interrupted executions. Queued runs retain their input/settings snapshot;
+disable pauses them and delete cancels them while retaining history. External
+effects may occur before interruption or cancellation; exactly-once effects are
+not promised. These preview policies and this method may evolve before 1.0.
+No SDK claim, completion, invocation-selector, or Trigger CRUD/list API is added.
+
 ## Release
 
 Publishing a GitHub Release whose tag is `system-sdk-v<version>` publishes the exact tarball produced by `scripts/pack-system-sdk.mjs`. The release gate verifies the SDK, reproducible tarball contents, clean consumer installation, and registry bytes without depending on Core, Shell, or first-party App lockfiles. It accepts an existing immutable version only when the registry integrity and tarball URL match the locally verified artifact.

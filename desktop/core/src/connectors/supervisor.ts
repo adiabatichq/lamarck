@@ -1,3 +1,4 @@
+import { RuntimeListeners, type EventMatcher } from "../triggers/listeners";
 import type { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import { hostname } from "node:os";
@@ -168,6 +169,7 @@ interface ActiveConfigUiSession {
 }
 
 export interface ConnectorSupervisorOptions {
+  subscriptionMatcher?: (source: string, producer: ProducerBinding, signal: AbortSignal) => EventMatcher;
   systemDb: DatabaseSync;
   guard: ConnectorHostGuard;
   workspacePath: string;
@@ -263,7 +265,10 @@ export class ConnectorSupervisor {
   private inProcessProducer: ProducerBinding | undefined;
   private installationStore: ConnectorInstallationStore;
 
+  private runtimeListeners = new RuntimeListeners();
+  private subscriptionMatcher: ConnectorSupervisorOptions['subscriptionMatcher'];
   constructor(opts: ConnectorSupervisorOptions) {
+    this.subscriptionMatcher = opts.subscriptionMatcher;
     this.guard = opts.guard;
     this.workspacePath = opts.workspacePath;
     this.systemIdentity = opts.systemIdentity;
@@ -2162,12 +2167,13 @@ export class ConnectorSupervisor {
           await session.run({
             config: mergeConfig(schemaDefaults(registration.manifest), sourceRecord.config),
             signal: attemptController.signal,
-            capabilities: this.buildRunCapabilities(registration, sourceRecord, producer),
+            capabilities: this.buildRunCapabilities(registration, sourceRecord, producer, attemptController.signal),
           });
           attemptResult = { ok: true };
         } catch (err) {
           attemptResult = { ok: false, error: err };
         } finally {
+          attemptController.abort();
           await session?.close().catch(() => {});
           settleAttempt();
           if (active.attemptSettled === attemptSettled) {
@@ -2289,6 +2295,7 @@ export class ConnectorSupervisor {
     registration: Registration,
     sourceRecord: ConnectorSource,
     producer: ProducerBinding | undefined,
+    signal: AbortSignal,
   ): RunnerCapabilities {
     if (!identityPairResolved(sourceRecord, registration.manifest.source.identity)) {
       throw new Error(`Connector Source identity is not resolved: ${sourceRecord.id}`);
@@ -2308,7 +2315,15 @@ export class ConnectorSupervisor {
     const authSpec = registration.manifest.auth ?? { type: "none" };
     const authHandle = this.authManager.createHandle(authSpec, sourceRecord);
     const blobStore = new ContentBlobStore(this.workspacePath);
+    const owner = crypto.randomUUID();
+    const matcher = this.subscriptionMatcher?.(sourceForConnector(sourceRecord.connectorId, sourceRecord.sourceKey ?? undefined), producer, signal);
     return {
+      subscriptionStart: async (input) => {
+        if (!matcher) throw new Error("Subscriptions unavailable");
+        return this.runtimeListeners.start(owner, matcher, input, signal);
+      },
+      subscriptionNext: (input) => this.runtimeListeners.next(owner, input.subscriptionId, input.acknowledged),
+      subscriptionCancel: async (input) => this.runtimeListeners.cancel(owner, input.subscriptionId),
       authType: runtimeAuthType(authSpec),
       ...(authHandle.type === "managedProvider"
         ? { providerOrigin: authHandle.providerOrigin }

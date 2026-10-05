@@ -41,6 +41,23 @@ function validateInput(
     text(input[field], field);
   };
   switch (operation) {
+    case "trigger.targets": case "trigger.list": empty(); break;
+    case "trigger.inspect": id("triggerId"); break;
+    case "trigger.cancel": id("runId"); break;
+    case "trigger.create":
+      exactKeys(input, ["config"], `CLI ${operation} input`); triggerConfig(input.config); break;
+    case "trigger.update":
+      exactOptionalKeys(input, ["triggerId", "config"], ["revision"], `CLI ${operation} input`);
+      text(input.triggerId, "triggerId"); triggerConfig(input.config); integer(input.revision, "revision"); break;
+    case "trigger.enable": case "trigger.disable": case "trigger.delete":
+      exactOptionalKeys(input, ["triggerId"], ["revision"], `CLI ${operation} input`); text(input.triggerId, "triggerId"); integer(input.revision, "revision"); break;
+    case "trigger.preview":
+      exactOptionalKeys(input, [], ["triggerId", "config", "limit"], `CLI ${operation} input`);
+      if ((input.triggerId === undefined) === (input.config === undefined)) throw new Error("Preview requires a Trigger id or draft config");
+      if (input.triggerId !== undefined) text(input.triggerId, "triggerId"); else triggerConfig(input.config);
+      integer(input.limit, "limit", 20); break;
+    case "trigger.runs":
+      exactOptionalKeys(input, ["triggerId"], ["limit"], `CLI ${operation} input`); text(input.triggerId, "triggerId"); integer(input.limit, "limit", 500); break;
     case "source.list": case "connector.list": case "app.list": empty(); break;
     case "marketplace.list":
       exactOptionalKeys(input, [], ["kind"], `CLI ${operation} input`);
@@ -109,3 +126,6 @@ function exactOptionalKeys(value: Record<string, unknown>, required: readonly st
   for (const key of required) if (!(key in value)) throw new Error(`${label} is missing ${key}`);
   if (Object.keys(value).some((key) => !required.includes(key) && !optional.includes(key))) throw new Error(`${label} has an unexpected field`);
 }
+
+function triggerConfig(value: unknown): void { record(value, "Trigger configuration"); if (Buffer.byteLength(JSON.stringify(value)) > 16 * 1024) throw new Error("Trigger configuration exceeds 16 KiB"); }
+function integer(value: unknown, field: string, max = Number.MAX_SAFE_INTEGER): void { if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > max)) throw new Error(`CLI ${field} is invalid`); }

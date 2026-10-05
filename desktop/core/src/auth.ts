@@ -181,9 +181,9 @@ export class AppCapabilityRegistry {
     return newlyClosed;
   }
 
-  async revokeApp(appId: string): Promise<number> {
+  async revokeApp(appId: string, workload?: "ui"): Promise<number> {
     const channels = [...this.#channelsById.values()].filter(
-      ({ context }) => context.appId === appId,
+      ({ context }) => context.appId === appId && (workload === undefined || context.workload === workload),
     );
     let newlyClosed = 0;
     for (const channel of channels) {

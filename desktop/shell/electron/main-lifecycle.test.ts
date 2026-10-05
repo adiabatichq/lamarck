@@ -59,6 +59,13 @@ describe("Shell window lifecycle", () => {
 });
 
 describe("App viewer IPC contract", () => {
+  test.each(["stop-job", "close-ui", "stop"])("App execution %s is fenced behind trusted Shell IPC", operation => {
+    const handler = mainSource.slice(mainSource.indexOf(`  ipcMain.handle("app-runtime:${operation}"`)).split("\n  });")[0];
+    expect(handler).toContain("requireShellIpc(event)");
+    const action = operation === "stop-job" ? "capsuleManager.stopJob" : operation === "close-ui" ? "capsuleManager.closeAppUi" : "capsuleManager.stopApp";
+    expect(handler.indexOf("requireShellIpc(event)")).toBeLessThan(handler.indexOf(action));
+    expect(handler).toContain(action);
+  });
   test("isolates an unexpected App UI loss to its viewer", () => {
     const start = mainSource.indexOf("  onUiLost(event) {");
     const end = mainSource.indexOf("\n  },\n});", start);

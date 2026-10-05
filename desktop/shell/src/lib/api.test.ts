@@ -17,9 +17,25 @@ import {
   retryConnectorSourceIdentity,
   startConnectorAuth,
   updateConnectorSource,
+  getAppRuntimeStates,
+  stopAppJob,
+  closeAppUi,
+  stopApp,
 } from "./api";
 
 describe("Core endpoint resolution", () => {
+  test("App execution controls await trusted Host cleanup and propagate errors and finished jobs", async () => {
+    const gate = Promise.withResolvers<{ active: boolean }>();
+    const state = [{ appId: "notes", ui: "running", stopping: false, jobs: [{ jobId: "inbox", runId: "run-a", triggerId: "trigger-a", state: "starting", cleanupError: null }], runningWorkloads: 2, latestFailure: null }];
+    const host = { getAppRuntimeStates: vi.fn(async () => state), stopAppJob: vi.fn(() => gate.promise), closeAppUi: vi.fn(async () => ({ ok: true })), stopApp: vi.fn(async () => { throw new Error("VM stop unconfirmed"); }) };
+    vi.stubGlobal("window", { lamarckHost: host });
+    expect(await getAppRuntimeStates()).toEqual(state);
+    let settled = false; const stop = stopAppJob("notes", "run-a").then(result => { settled = true; return result; });
+    await Promise.resolve(); expect(settled).toBe(false);
+    gate.resolve({ active: false }); expect(await stop).toEqual({ active: false });
+    await closeAppUi("notes"); await expect(stopApp("notes")).rejects.toThrow("unconfirmed");
+    expect(host.stopAppJob.mock.calls).toEqual([["notes", "run-a"]]); expect(host.closeAppUi.mock.calls).toEqual([["notes"]]);
+  });
   test("resolves token once and retains one authoritative Host check per subsequent inventory read", async () => {
     const host = inventoryHost();
     vi.stubGlobal("window", { lamarckHost: host });

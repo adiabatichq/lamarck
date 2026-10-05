@@ -1,3 +1,4 @@
+import { Triggers, type TriggerFilter } from "./Triggers";
 import { DesktopUpdate } from "../components/DesktopUpdate";
 import { AiSources } from './AiSources';
 import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
@@ -24,7 +25,7 @@ import styles from "./SystemRoom.module.css";
 import { AppsManager } from "./AppsManager";
 import { useCorePolling } from "../hooks/useCorePolling";
 
-type SystemSection = "ai" | "shape" | "sources" | "apps" | "data" | "timeline" | "workspace";
+type SystemSection = "ai" | "shape" | "sources" | "apps" | "triggers" | "data" | "timeline" | "workspace";
 
 interface RecentEvent {
   id: string;
@@ -58,6 +59,7 @@ interface SystemRoomProps {
   identityBusy: boolean;
   onReturnToUse: () => void;
   onOpenApp: (appId: string) => void;
+  onUiClosed?: (appId: string) => void;
   onCoreChanged: () => void | Promise<void>;
   onIdentitySignIn: () => void;
   onIdentitySignOut: () => void;
@@ -72,11 +74,14 @@ export function SystemRoom({
   identityBusy,
   onReturnToUse,
   onOpenApp,
+  onUiClosed,
   onCoreChanged,
   onIdentitySignIn,
   onIdentitySignOut,
 }: SystemRoomProps) {
   const [section, setSection] = useState<SystemSection>("shape");
+  const [triggerFilter, setTriggerFilter] = useState<TriggerFilter>();
+  const openTriggers = (filter: TriggerFilter) => { setTriggerFilter(filter); setSection("triggers"); };
   const [snapshot, setSnapshot] = useState<SystemSnapshot>(EMPTY_SNAPSHOT);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -176,7 +181,7 @@ export function SystemRoom({
               type="button"
               key={item.id}
               className={`${styles.navItem} ${section === item.id ? styles.navItemActive : ""}`}
-              onClick={() => setSection(item.id)}
+              onClick={() => { if (item.id === "triggers") setTriggerFilter(undefined); setSection(item.id); }}
               aria-current={section === item.id ? "page" : undefined}
             >
               <span className={styles.navIndex}>0{index + 1}</span>
@@ -196,7 +201,7 @@ export function SystemRoom({
             onClick={() => setSection("workspace")}
             aria-current={section === "workspace" ? "page" : undefined}
           >
-            <span className={styles.navIndex}>07</span>
+            <span className={styles.navIndex}>08</span>
             <WorkspaceIcon />
             <span>Workspace</span>
           </button>
@@ -225,7 +230,7 @@ export function SystemRoom({
         {section === "ai" && <AiSources apps={apps} />}
         {section === "sources" && (
           <div className={styles.fullSurface}>
-            <ConnectorsView />
+            <ConnectorsView onManageTriggers={sourceId => openTriggers({ sourceId })} />
           </div>
         )}
         {section === "apps" && (
@@ -234,9 +239,12 @@ export function SystemRoom({
             inventoryLoading={coreStatus === "checking"}
             inventoryError={coreStatus === "offline" ? coreError : null}
             onOpenApp={onOpenApp}
+            onManageTriggers={(appId, triggerId) => openTriggers({ appId, triggerId })}
+            onUiClosed={onUiClosed}
             onInventoryChanged={onCoreChanged}
           />
         )}
+        {section === "triggers" && <Triggers filter={triggerFilter} connected={coreStatus === "connected"} />}
         {section === "data" && (
           <SystemData
             tables={snapshot.tables}
@@ -270,6 +278,7 @@ const SECTION_LABELS: Record<SystemSection, string> = {
   shape: "Shape",
   sources: "Sources",
   apps: "Apps",
+  triggers: "Triggers",
   data: "Data",
   timeline: "Timeline",
   workspace: "Workspace",
@@ -283,6 +292,7 @@ const PRIMARY_SECTIONS: Array<{
   { id: "shape", label: "Overview", icon: ShapeIcon },
   { id: "sources", label: "Sources", icon: SourcesIcon },
   { id: "apps", label: "Apps", icon: AppsIcon },
+  { id: "triggers", label: "Triggers", icon: TimelineIcon },
   { id: "data", label: "Data", icon: DataIcon },
   { id: "timeline", label: "Timeline", icon: TimelineIcon },
   { id: "ai", label: "AI", icon: SystemIcon },

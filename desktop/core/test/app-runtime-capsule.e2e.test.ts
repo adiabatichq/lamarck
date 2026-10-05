@@ -9,8 +9,12 @@ import { createInterface } from "node:readline";
 import { Duplex, PassThrough } from "node:stream";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import { HostCliTransport, runCli as runSharedCli, type CliIo } from "@lamarck/cli";
+import { CapsuleJobWorker } from "../../shell/electron/capsule/job-worker";
+import { CapsuleManager } from "../../shell/electron/capsule/manager";
+import type { CapsuleBackend } from "../../shell/electron/capsule/backend";
+import type { JobInvocation } from "@lamarck/system/protocol";
 import { SystemBroker } from "../../shell/electron/capsule/system-broker";
 import { SystemStreamServer } from "../../shell/electron/capsule/system-stream";
 import { CliOperationDispatcher } from "../../shell/electron/cli-dispatcher";
@@ -52,6 +56,7 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
       writeAppManifest("app-b", ["app_b_items"]),
       writeAppManifest("history-app", []),
       writeAppManifest("archive-app", []),
+      writeAppManifest("trigger-app", []),
       writeConnectorPackage("lamarck.cli-fixture"),
     ]);
     seedDataDatabase();
@@ -453,6 +458,104 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     expect(current.manifestDigest).not.toBe(stale.manifestDigest);
     await releaseActivation(current.activationId);
   });
+  test("Host CLI and Console share Trigger management, dispatch a bound App job and persist its original event and completion", async () => {
+    const broker = new SystemBroker({ coreBaseUrl: coreOrigin, revokeCapability: async channelId => { await hostRequest(`/api/app-runtime/channels/${channelId}`, { method: "DELETE" }); } });
+    const received: JobInvocation[] = [];
+    let holdNext = false, activeJobCapability = ""; const cleanupGate = Promise.withResolvers<void>();
+    const backend: CapsuleBackend = {
+      status: async () => ({ available: true, backend: "isolated-Guest-fixture" }), stopAll: async () => {}, stopAppUi: async () => {},
+      prepareUi: async () => { throw new Error("Fixture supports jobs only"); },
+      commitPreparedUi: async () => { throw new Error("Fixture supports jobs only"); },
+      abortPreparedUi: async () => {}, stopUi: async () => {}, stopApp: async () => {}, retireApp: async () => {},
+      startUi: async () => { throw new Error("Fixture supports jobs only"); },
+      replaceUi: async () => { throw new Error("Fixture supports jobs only"); },
+      openUiStream: async () => { throw new Error("Fixture supports jobs only"); },
+      runJob: async (spec, signal, onState) => {
+        signal.throwIfAborted(); const pair = duplexPair(); const streams = new SystemStreamServer(broker, { unbindOnClose: false });
+        const detach = streams.attach(spec.sdkSenderId, pair.server); const rpc = new FramedRpcClient(pair.client, { requestTimeoutMs: 10_000 }); const system = createSystem(rpc.invoke);
+        try {
+          const invocation = await system.jobInput(); received.push(invocation);
+          onState?.("running");
+          if (holdNext) {
+            holdNext = false;
+            try { await new Promise<void>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })); }
+            finally { await cleanupGate.promise; }
+          }
+          await expect(rpc.invoke("job.input", { runId: "foreign" } as never)).rejects.toThrow();
+          await system.writeEvent({ type: "trigger.result", startedAt: Date.now(), payload: { runId: invocation.runId, input: JSON.parse(JSON.stringify(invocation.input)) } });
+        } finally { rpc.close(); detach(); pair.client.destroy(); pair.server.destroy(); }
+      },
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => workspace, coreBaseUrl: () => coreOrigin, coreToken: CORE_TOKEN, bindSystemSender: (id, binding) => { activeJobCapability = binding.capability; broker.bindSender(id, binding); }, unbindSystemSender: id => broker.unbindSender(id) });
+    const worker = new CapsuleJobWorker(manager, CORE_TOKEN); worker.start(coreOrigin);
+    let triggerId = "";
+    try {
+      const source = await issueCapability("app-b");
+      const prior = await hostRequest("/api/events", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "trigger.fixture", startedAt: 1, payload: { historical: true } }) });
+      triggerId = (JSON.parse(await runCli("trigger", "create", "--name", "Inbox", "--target", "app:trigger-app:job:inbox", "--sql", "SELECT e.id, 999 AS payload FROM events e JOIN json_each('[1,2]') j WHERE e.type='trigger.fixture'", "--enabled", "--json")) as { id: string }).id;
+      const consoleList = await hostRequest("/api/triggers/manage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation: "trigger.list", input: {} }) }) as { id: string }[];
+      expect(consoleList.map(r => r.id)).toContain(triggerId);
+      const appResponse = await fetch(`${coreOrigin}/api/events`, { method: "POST", headers: { "Content-Type": "application/json", "x-lamarck-app-capability": source.capability }, body: JSON.stringify({ type: "trigger.fixture", startedAt: 2, payload: { original: "unaltered" } }) }); expect(appResponse.ok).toBe(true); const written = await appResponse.json() as { id: string };
+      await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 10_000 });
+      expect(received[0]).toMatchObject({ version: 1, triggerId, revision: 1, input: { kind: "event", event: { id: written.id, source: "app:app-b:ui", payload: { original: "unaltered" } } } });
+      expect(received[0].input).not.toEqual(prior);
+      await vi.waitFor(async () => { const runs = JSON.parse(await runCli("trigger", "runs", triggerId, "--json")); expect(runs).toMatchObject([{ status: "success", input: { eventId: written.id } }]); }, { timeout: 10_000 });
+      const detail = JSON.parse(await runCli("trigger", "inspect", triggerId, "--json"));
+      const preview = await hostRequest("/api/triggers/manage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation: "trigger.preview", input: { triggerId, limit: 2 } }) }); expect(preview).toMatchObject({ kind: "event", events: expect.any(Array) });
+      expect(JSON.parse(await runCli("trigger", "inspect", triggerId, "--json")).cursor).toBe(detail.cursor);
+      for (const path of ["/api/triggers/manage", "/api/triggers/jobs/claim", "/api/app-runtime/job-input"]) {
+        const response = await fetch(`${coreOrigin}${path}`, { method: "POST", headers: { "Content-Type": "application/json", "x-lamarck-app-capability": source.capability }, body: "{}" }); expect(response.status).toBe(403);
+      }
+      const managed = await hostRequest("/api/cli/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ principal: { kind: "app", appId: "app-b", workload: "ui", appCommit: source.appCommit, writeTables: [], fileGrants: [], workloadHandle: "guest-workload" }, request: { requestId: "denied", operation: "trigger.list", input: {} } }) });
+      expect(managed).toMatchObject({ ok: false, error: { code: "CLI_UNSUPPORTED_COMMAND" } });
+      const update = JSON.parse(await runCli("trigger", "update", triggerId, "--name", "Renamed", "--revision", "1", "--json")); expect(update.revision).toBe(2);
+      expect(await runCliFailure("trigger", "update", triggerId, "--name", "Stale", "--revision", "1", "--json")).toMatchObject({ error: { code: "CLI_USAGE", message: expect.stringContaining("reload") } });
+      await runCli("trigger", "disable", triggerId, "--json"); expect(JSON.parse(await runCli("trigger", "inspect", triggerId, "--json")).enabled).toBe(false);
+      await runCli("trigger", "enable", triggerId, "--json");
+      holdNext = true;
+      const append = () => hostRequest("/api/events", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "trigger.fixture", startedAt: 3, payload: { cancellation: true } }) });
+      await append(); await vi.waitFor(() => expect(received).toHaveLength(2), { timeout: 10_000 });
+      const ui = await issueCapability("trigger-app");
+      const unauthorized = await fetch(`${coreOrigin}/api/app-runtime/apps/trigger-app/channels?workload=ui`, { method: "DELETE", headers: { "x-lamarck-app-capability": activeJobCapability } }); expect(unauthorized.status).toBe(403);
+      const invalidScope = await fetch(`${coreOrigin}/api/app-runtime/apps/trigger-app/channels?workload=job:inbox`, { method: "DELETE", headers: { Authorization: `Bearer ${CORE_TOKEN}` } }); expect(invalidScope.status).toBe(400);
+      expect(await hostRequest("/api/app-runtime/apps/trigger-app/channels?workload=ui", { method: "DELETE" })).toMatchObject({ revoked: 1 });
+      const uiRequest = await fetch(`${coreOrigin}/api/app-runtime/job-input`, { method: "POST", headers: { "Content-Type": "application/json", "x-lamarck-app-capability": ui.capability }, body: "{}" }); expect(uiRequest.status).toBe(401);
+      const jobInput = await fetch(`${coreOrigin}/api/app-runtime/job-input`, { method: "POST", headers: { "Content-Type": "application/json", "x-lamarck-app-capability": activeJobCapability }, body: "{}" }); expect(jobInput.status).toBe(200); expect(await jobInput.json()).toMatchObject({ runId: received[1].runId });
+      expect(manager.appRuntimeStates().find(state => state.appId === "trigger-app")!.jobs).toEqual([
+        { jobId: "inbox", runId: received[1].runId, triggerId, state: "running", cleanupError: null },
+      ]);
+      let stopped = false;
+      const stopping = manager.stopJob("trigger-app", received[1].runId).then(result => { stopped = true; return result; });
+      await vi.waitFor(() => expect(manager.appRuntimeStates().find(state => state.appId === "trigger-app")!.jobs[0].state).toBe("stopping"));
+      await runCli("trigger", "cancel", received[1].runId, "--json"); await append();
+      await new Promise(resolve => setTimeout(resolve, 1500)); expect(received).toHaveLength(2);
+      const duringCleanup = JSON.parse(await runCli("trigger", "runs", triggerId, "--json")); expect(duringCleanup.some((run: { status: string }) => run.status === "pending")).toBe(true);
+      expect(stopped).toBe(false);
+      cleanupGate.resolve(); expect(await stopping).toEqual({ active: true });
+      expect(await manager.stopJob("trigger-app", received[1].runId)).toEqual({ active: false });
+      await vi.waitFor(() => expect(received).toHaveLength(3), { timeout: 10_000 });
+      await vi.waitFor(async () => expect(JSON.parse(await runCli("trigger", "runs", triggerId, "--json")).map((run: { status: string }) => run.status)).toEqual(["success", "canceled", "success"]), { timeout: 10_000 });
+      await hostRequest(`/api/app-runtime/channels/${source.channelId}`, { method: "DELETE" });
+    } finally {
+      cleanupGate.resolve();
+      if (triggerId) await runCli("trigger", "delete", triggerId, "--yes", "--json");
+      await Promise.all([worker.stop(), manager.stopAll()]);
+    }
+    expect(JSON.parse(await runCli("trigger", "runs", triggerId, "--json")).map((run: { status: string }) => run.status)).toEqual(["success", "canceled", "success"]);
+  }, 30_000);
+
+  test.each(["Asia/Taipei", "Japan", "CET"])("schedule previews for %s share Console and CLI validation without creating clock events or execution", async timezone => {
+    const config = { name: "Daily", target: "app:trigger-app:job:inbox", enabled: false, condition: { kind: "schedule", cron: "0 9 * * *", timezone } };
+    const created = JSON.parse(await runCli("trigger", "create", "--config", JSON.stringify(config), "--json"));
+    try {
+      const cli = JSON.parse(await runCli("trigger", "preview", created.id, "--limit", "3", "--json"));
+      const console = await hostRequest("/api/triggers/manage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation: "trigger.preview", input: { triggerId: created.id, limit: 3 } }) }); expect(console).toEqual(cli);
+      expect(JSON.parse(await runCli("trigger", "runs", created.id, "--json"))).toEqual([]);
+      expect(await runCliFailure("trigger", "update", created.id, "--cron", "60 * * * *", "--timezone", "UTC", "--json")).toMatchObject({ error: { code: "CLI_USAGE" } });
+      const response = await fetch(`${coreOrigin}/api/triggers/manage`, { method: "POST", headers: { Authorization: `Bearer ${CORE_TOKEN}`, "Content-Type": "application/json" }, body: JSON.stringify({ operation: "trigger.update", input: { triggerId: created.id, config: { condition: { kind: "schedule", cron: "60 * * * *", timezone: "UTC" } } } }) }); expect(response.status).toBe(400);
+    } finally { await runCli("trigger", "delete", created.id, "--yes", "--json"); }
+  });
+
 });
 
 async function writeAppManifest(appId: string, tables: string[]): Promise<void> {
@@ -465,6 +568,7 @@ async function writeAppManifest(appId: string, tables: string[]): Promise<void> 
     description: `${appId} end-to-end test App.`,
     runtime: {
       ui: { command: ["node", "server.mjs"], port: 3000 },
+      ...(appId === "trigger-app" ? { jobs: { inbox: { command: ["node", "inbox.mjs"] } } } : {}),
     },
     permissions: { writes: { files: [], tables } },
   }, null, 2)}\n`, "utf8");

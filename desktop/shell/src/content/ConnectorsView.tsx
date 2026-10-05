@@ -65,7 +65,7 @@ const PAUSE_PRESETS = [
 
 const CONNECTOR_MARKETPLACE_URL = "https://app.lamarck.ai/connectors";
 
-export function ConnectorsView() {
+export function ConnectorsView({ onManageTriggers }: { onManageTriggers?: (sourceId: string) => void } = {}) {
   const { sources, packages, loading, error, refresh } = useConnectors();
   const [busy, setBusy] = useState<Record<string, string>>({});
   const [authPending, setAuthPending] = useState<Record<string, AuthPendingAttempt>>({});
@@ -273,6 +273,7 @@ export function ConnectorsView() {
             <ConnectorCard
               key={group.connector.connectorId}
               connector={group.connector}
+              onManageTriggers={onManageTriggers}
               sources={group.sources}
               index={index}
               busy={busy}
@@ -325,6 +326,7 @@ function TallyItem({
 }
 
 interface ConnectorCardProps {
+  onManageTriggers?: (sourceId: string) => void;
   connector: InstalledConnectorView;
   sources: ConnectorSourceView[];
   index: number;
@@ -346,6 +348,7 @@ function ConnectorCard({
   onOpenConfigPanel,
   onTrackAuthAttempt,
   onDismissAuthAttempt,
+  onManageTriggers,
 }: ConnectorCardProps) {
   const connectorId = connector.connectorId;
   const trust = trustView(connector);
@@ -541,6 +544,7 @@ function ConnectorCard({
           ) : sources.map((c) => (
             <SourceRow
               key={c.id}
+              onManageTriggers={onManageTriggers}
               connector={c}
               trusted={trusted}
               interactive={interactive}
@@ -559,6 +563,7 @@ function ConnectorCard({
 }
 
 interface SourceRowProps {
+  onManageTriggers?: (sourceId: string) => void;
   connector: ConnectorSourceView;
   trusted: boolean;
   interactive: boolean;
@@ -580,6 +585,7 @@ function SourceRow({
   onOpenConfigPanel,
   onTrackAuthAttempt,
   onDismissAuthAttempt,
+  onManageTriggers,
 }: SourceRowProps) {
   const state = sourceLifecycle(c);
   const needs = setupNeeds(c);
@@ -655,6 +661,7 @@ function SourceRow({
                   : "Clear error"}
           </button>
         )}
+        {onManageTriggers && c.mode === "poll" && <button className={styles.ghostBtn} onClick={() => onManageTriggers(c.id)}>Manage Triggers</button>}
         {canRunNow && (
           <button
             className={styles.primaryBtn}

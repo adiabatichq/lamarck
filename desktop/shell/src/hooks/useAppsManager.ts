@@ -2,18 +2,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useCorePolling } from "./useCorePolling";
 import {
   getAppRuntimeStates,
+  closeAppUi,
+  stopApp,
+  stopAppJob,
   listAppVersions,
   rebuildAppVersionHistory,
   restoreAppVersion,
   type AppInfo,
   type AppVersionRecordV1,
 } from "../lib/api";
+import type { AppRuntimeAggregate } from "../../shared/app-runtime";
 
-export interface AppRuntimeView {
-  readonly appId: string;
-  readonly runningWorkloads: number;
-  readonly latestFailure: string | null;
-}
+export interface AppRuntimeView extends Pick<AppRuntimeAggregate, "appId" | "runningWorkloads" | "latestFailure">,
+  Partial<Pick<AppRuntimeAggregate, "ui" | "stopping" | "jobs">> {}
 
 export interface AppHistoryView {
   readonly versions: readonly AppVersionRecordV1[];
@@ -32,14 +33,16 @@ const EMPTY_HISTORY: AppHistoryView = Object.freeze({
 export function useAppsManager(
   seedApps: readonly AppInfo[],
   onInventoryChanged: () => void | Promise<void>,
-  pollMs = 5_000,
+  pollMs = 1_500,
 ) {
   const apps = seedApps;
   const [runtimeByApp, setRuntimeByApp] = useState<ReadonlyMap<string, AppRuntimeView>>(new Map());
   const [selectedAppId, setSelectedAppId] = useState<string | null>(seedApps[0]?.id ?? null);
   const [histories, setHistories] = useState<ReadonlyMap<string, AppHistoryView>>(new Map());
   const [busyByApp, setBusyByApp] = useState<ReadonlyMap<string, "restore" | "rebuild">>(new Map());
-  const [loading, setLoading] = useState(seedApps.length === 0);
+  const [loading, setLoading] = useState(true);
+  const [executionPending, setExecutionPending] = useState<ReadonlySet<string>>(new Set());
+  const [executionErrors, setExecutionErrors] = useState<ReadonlyMap<string, string>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const historiesRef = useRef(histories);
   const aliveRef = useRef(true);
@@ -70,6 +73,16 @@ export function useAppsManager(
     }
   }, []);
   const refreshRuntime = useCorePolling(read, pollMs);
+  const manageExecution = useCallback(async (appId: string, key: string, operation: () => Promise<unknown>) => {
+    setExecutionPending(current => new Set([...current, key]));
+    setExecutionErrors(current => { const next = new Map(current); next.delete(appId); return next; });
+    try { await operation(); }
+    catch (cause) { if (aliveRef.current) setExecutionErrors(current => withMapValue(current, appId, errorMessage(cause))); throw cause; }
+    finally {
+      await refreshRuntime();
+      if (aliveRef.current) setExecutionPending(current => { const next = new Set(current); next.delete(key); return next; });
+    }
+  }, [refreshRuntime]);
   const refresh = useCallback(async () => {
     await Promise.all([refreshRuntime(), onInventoryChanged()]);
   }, [refreshRuntime, onInventoryChanged]);
@@ -162,6 +175,11 @@ export function useAppsManager(
     busy: selected ? busyByApp.get(selected.id) ?? null : null,
     loading,
     error,
+    executionPending,
+    executionError: selected ? executionErrors.get(selected.id) ?? null : null,
+    stopJob: (appId: string, runId: string) => manageExecution(appId, `job:${runId}`, () => stopAppJob(appId, runId)),
+    closeUi: (appId: string) => manageExecution(appId, `ui:${appId}`, () => closeAppUi(appId)),
+    stopApp: (appId: string) => manageExecution(appId, `app:${appId}`, () => stopApp(appId)),
     refresh,
     loadMore: selected ? () => loadHistory(selected.id, true) : async () => {},
     restore,

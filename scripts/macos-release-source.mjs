@@ -68,6 +68,7 @@ export const MACOS_RELEASE_SOURCE_DIRECTORIES = Object.freeze([
   "desktop/core/src",
   "desktop/core/scaffolds/app-v1",
   "desktop/shell/electron",
+  "desktop/shell/shared",
   "desktop/shell/src",
   "desktop/system-sdk/src",
 ]);

@@ -162,6 +162,23 @@ describe("auth", () => {
     appBAdmission?.release();
   });
 
+  test("UI revocation drains only that App's UI channels and preserves active job and service authority", async () => {
+    const registry = new AppCapabilityRegistry();
+    const ui = registry.issue("app-a", "ui", authorization());
+    const job = registry.issue("app-a", "job:refresh", authorization());
+    const service = registry.issue("app-a", "service:indexer", authorization());
+    const other = registry.issue("app-b", "ui", authorization());
+    const uiRequest = registry.admit(ui.capability)!, jobRequest = registry.admit(job.capability)!;
+    const revoked = registry.revokeApp("app-a", "ui");
+    expect(uiRequest.signal.aborted).toBe(true); expect(jobRequest.signal.aborted).toBe(false);
+    uiRequest.release(); expect(await revoked).toBe(1);
+    expect(registry.admit(ui.capability)).toBeNull();
+    for (const capability of [job.capability, service.capability, other.capability]) {
+      const admitted = registry.admit(capability); expect(admitted).not.toBeNull(); admitted?.release();
+    }
+    jobRequest.release(); expect(await registry.revokeApp("app-a")).toBe(2);
+  });
+
   test("returns immutable identity and never serializes the raw capability in registry state", () => {
     const registry = new AppCapabilityRegistry();
     const tables = ["notes"];

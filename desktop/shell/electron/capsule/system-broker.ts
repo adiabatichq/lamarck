@@ -9,7 +9,7 @@ import type { ComputerHost } from '../computer-use';
 
 export const AI_CONTROL_REQUEST_RESERVE_PER_SENDER = 4;
 export function isAiControlOperation(operation: SystemOperation): boolean {
-  return operation === 'ai.cancel' || operation === 'ai.toolResult' || operation === 'computer.close';
+  return operation === 'ai.cancel' || operation === 'ai.toolResult' || operation === 'computer.close' || operation === 'subscription.cancel';
 }
 
 const SYSTEM_OPERATION_SET: ReadonlySet<string> = new Set(SYSTEM_OPERATIONS);
@@ -117,6 +117,7 @@ export class SystemBroker {
   #maxAggregateBytesGlobal: number;
   #revokeCapability: SystemBrokerOptions["revokeCapability"];
   #aiCalls = new Map<SenderId, Set<string>>();
+  #subscriptions = new Map<SenderId, Set<string>>();
   #nextConnectionEpoch = 1;
   #connectionEpoch = new Map<SenderId, number>();
   #bindingsBySender = new Map<SenderId, PrivateBinding>();
@@ -326,6 +327,7 @@ export class SystemBroker {
     const timeout = setTimeout(() => {
       controller.abort(new SystemBrokerError("request_timeout", "System SDK request timed out"));
     }, this.#timeoutMs);
+    let registeredSubscription: string | undefined;
 
     try {
       if (computer) {
@@ -355,17 +357,22 @@ export class SystemBroker {
 
       let response: Response;
       try {
-        response = await raceWithAbort(
-          Promise.resolve(this.#fetch(url, {
-            method: coreRequest.method,
-            headers,
-            body,
-            cache: "no-store",
-            redirect: "error",
-            signal: controller.signal,
-          })),
-          controller.signal,
-        );
+        const fetching = Promise.resolve(this.#fetch(url, {
+          method: coreRequest.method,
+          headers,
+          body,
+          cache: "no-store",
+          redirect: "error",
+          signal: controller.signal,
+        }));
+        if (operation === 'subscription.start') {
+          // A transport can reply after abort/disconnect. The invocation has
+          // already failed, but its late handle still needs owner-bound cleanup.
+          void fetching.then((lateResponse) => {
+            if (controller.signal.aborted) this.#discardSubscriptionReply(binding, lateResponse);
+          }).catch(() => {});
+        }
+        response = await raceWithAbort(fetching, controller.signal);
       } catch (error) {
         if (error instanceof SystemBrokerError) throw error;
         throw new SystemBrokerError("transport_error", `Core request failed: ${errorMessage(error)}`);
@@ -396,6 +403,16 @@ export class SystemBroker {
       const boundData = operation === "vfs.open"
         ? viewerVfsOpenResult(data, binding.viewerResources!)
         : data;
+      if (operation === 'subscription.start' && isRecord(data) && typeof data.subscriptionId === 'string') {
+        if (this.#bindingsBySender.get(senderId) !== binding || epoch !== this.#connectionEpoch.get(senderId)) {
+          this.#cancelSubscription(binding, data.subscriptionId);
+          throw new SystemBrokerError('request_aborted', 'Subscription runtime disconnected');
+        }
+        registeredSubscription = data.subscriptionId;
+        const listeners = this.#subscriptions.get(senderId) ?? new Set<string>();
+        listeners.add(data.subscriptionId); this.#subscriptions.set(senderId, listeners);
+      }
+      if (operation === 'subscription.cancel') this.#subscriptions.get(senderId)?.delete((input as { subscriptionId: string }).subscriptionId);
       if (operation === 'ai.start' && isRecord(data) && typeof data.invocationId === 'string') {
         if (epoch !== this.#connectionEpoch.get(senderId)) {
           this.#cancelAiCall(binding, data.invocationId);
@@ -408,6 +425,15 @@ export class SystemBroker {
         this.#aiCalls.get(senderId)?.delete((input as { invocationId: string }).invocationId);
       }
       return finish({ data: boundData }, lease);
+    } catch (error) {
+      if (operation === 'subscription.start') {
+        controller.abort(error);
+        if (registeredSubscription) {
+          this.#subscriptions.get(senderId)?.delete(registeredSubscription);
+          this.#cancelSubscription(binding, registeredSubscription);
+        }
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
       this.#releaseLease(lease);
@@ -424,11 +450,34 @@ export class SystemBroker {
 
   cancelAi(senderId: SenderId): void {
     if (this.#bindingsBySender.has(senderId)) this.#connectionEpoch.set(senderId, this.#nextConnectionEpoch++);
+    const subscriptions = this.#subscriptions.get(senderId);
+    this.#subscriptions.delete(senderId);
+    const subscriptionBinding = this.#bindingsBySender.get(senderId);
+    if (subscriptionBinding) for (const id of subscriptions ?? []) this.#cancelSubscription(subscriptionBinding, id);
     const calls = this.#aiCalls.get(senderId);
     this.#aiCalls.delete(senderId);
     const binding = this.#bindingsBySender.get(senderId);
     if (binding) void this.#computer?.closeOwner(binding.channelId).catch(() => {});
     if (binding) for (const invocationId of calls ?? []) this.#cancelAiCall(binding, invocationId);
+  }
+
+  #discardSubscriptionReply(binding: PrivateBinding, response: Response): void {
+    void (async () => {
+      const text = await readBoundedResponse(response, this.#maxResponseBytes, AbortSignal.timeout(5000), () => {});
+      const data: unknown = JSON.parse(text);
+      if (response.ok && isRecord(data) && typeof data.subscriptionId === 'string') this.#cancelSubscription(binding, data.subscriptionId);
+    })().catch(() => {});
+  }
+
+  #cancelSubscription(binding: PrivateBinding, subscriptionId: string): void {
+    void (async () => {
+      const base = typeof this.#coreBaseUrl === 'function' ? await this.#coreBaseUrl() : this.#coreBaseUrl;
+      const response = await this.#fetch(new URL('/api/subscription/cancel', base), {
+        method: 'POST', headers: { 'Content-Type': 'application/json', [APP_CAPABILITY_HEADER]: binding.capability },
+        body: JSON.stringify({ subscriptionId }), signal: AbortSignal.timeout(5000), redirect: 'error',
+      });
+      await response.body?.cancel();
+    })().catch(() => {});
   }
 
   #cancelAiCall(binding: PrivateBinding, invocationId: string): void {
@@ -585,6 +634,14 @@ function mapCoreRequest(operation: string, input: unknown): CoreRequest {
       const route = { 'ai.listOptions': 'options', 'ai.start': 'invoke/start', 'ai.next': 'invoke/next', 'ai.cancel': 'invoke/cancel', 'ai.toolResult': 'invoke/tool-result' }[operation as 'ai.start'];
       const body = expectJson(value, operation);
       return { method: 'POST', path: `/api/ai/${route}`, body, sizeValue: body };
+    }
+    case 'job.input': {
+      if (Object.keys(value).length) throw new SystemBrokerError('operation_denied', 'Job input does not accept invocation selectors');
+      return { method: 'POST', path: '/api/app-runtime/job-input', body: {}, sizeValue: {} };
+    }
+    case "subscription.start": case "subscription.next": case "subscription.cancel": {
+      const body = expectJson(value, operation);
+      return { method: "POST", path: `/api/subscription/${operation.split('.')[1]}`, body, sizeValue: body };
     }
     case "query":
     case "mutate": {

@@ -32,6 +32,7 @@ class FakeBackend implements CapsuleBackend {
   starts: CapsuleUiSpec[] = [];
   stops: string[] = [];
   appStops: string[] = [];
+  appUiStops: string[] = [];
   appRetires: string[] = [];
   replacements: Array<{ instanceId: string; spec: CapsuleUiSpec }> = [];
   preparations: Array<{
@@ -129,6 +130,7 @@ class FakeBackend implements CapsuleBackend {
     if (this.failStopUi) throw new Error("stop failed");
   }
   async stopApp(appId: string) { this.appStops.push(appId); }
+  async stopAppUi(appId: string) { this.appUiStops.push(appId); }
   async retireApp(appId: string) {
     this.appRetires.push(appId);
     await this.retireGate;
@@ -160,7 +162,7 @@ function createFetch(
           activationId: ACTIVATION_ID,
           activationSequence: ACTIVATION_SEQUENCE,
           appId,
-          workload: "ui",
+          workload: JSON.parse(String(init.body)).workload,
           version: APP_VERSION,
           manifestDigest: MANIFEST_DIGEST,
           packageDigest: PACKAGE_DIGEST,
@@ -207,6 +209,7 @@ function createFetch(
     if (/\/api\/apps\/[^/]+\/save$/.test(url) && init?.method === "POST") {
       return Response.json({ version: APP_VERSION, created: false });
     }
+    if (url.endsWith("/api/triggers/manage") && init?.method === "POST") return Response.json({ ok: true });
     return Response.json({ error: "not found" }, { status: 404 });
   }) as typeof globalThis.fetch;
   return { fetch, calls };
@@ -284,6 +287,7 @@ describe("CapsuleManager", () => {
     expect(manager.appRuntimeStates()).toEqual([{
       appId: "app-a",
       runningWorkloads: 1,
+      ui: "running", stopping: false, jobs: [],
       latestFailure: null,
     }]);
 
@@ -293,6 +297,7 @@ describe("CapsuleManager", () => {
     expect(manager.appRuntimeStates()).toEqual([{
       appId: "app-a",
       runningWorkloads: 1,
+      ui: "running", stopping: false, jobs: [],
       latestFailure: "replacement build failed",
     }]);
 
@@ -303,12 +308,14 @@ describe("CapsuleManager", () => {
     expect(manager.appRuntimeStates()).toEqual([{
       appId: "app-a",
       runningWorkloads: 1,
+      ui: "running", stopping: false, jobs: [],
       latestFailure: "replacement build failed",
     }]);
 
     await manager.reloadApp("app-a", verifyPreparedViewer, publishReloadedViewer);
     expect(manager.appRuntimeStates()[0]).toMatchObject({
       runningWorkloads: 1,
+      ui: "running", stopping: false, jobs: [],
       latestFailure: null,
     });
     await manager.closeViewer(opened.viewerId, viewerOwner(7));
@@ -342,6 +349,7 @@ describe("CapsuleManager", () => {
     expect(manager.appRuntimeStates()).toEqual([{
       appId: "app-a",
       runningWorkloads: 1,
+      ui: "running", stopping: false, jobs: [],
       latestFailure: null,
     }]);
   });
@@ -456,8 +464,8 @@ describe("CapsuleManager", () => {
         rejectPreparation = reject;
       });
     };
-    backend.stopApp = async (appId) => {
-      backend.appStops.push(appId);
+    backend.stopAppUi = async (appId) => {
+      backend.appUiStops.push(appId);
       rejectPreparation(new Error("launch cancelled for replaced renderer"));
     };
     const { fetch } = createFetch();
@@ -485,7 +493,7 @@ describe("CapsuleManager", () => {
 
     await manager.closeOwner(retiredOwner);
     await openingFailure;
-    expect(backend.appStops).toEqual(["app-a"]);
+    expect(backend.appUiStops).toEqual(["app-a"]); expect(backend.appStops).toEqual([]);
     expect(backend.committedPreparations).toEqual([]);
     expect(bindings.unbindSystemSender).toHaveBeenCalledWith(
       backend.starts[0]!.sdkSenderId,
@@ -564,7 +572,7 @@ describe("CapsuleManager", () => {
         await revocation;
         return Response.json({ error: "channel revocation result" }, { status });
       }
-      if (init?.method === "DELETE" && url.endsWith("/apps/app-a/channels")) appWideRevoked();
+      if (init?.method === "DELETE" && (url.endsWith("/apps/app-a/channels?workload=ui") || url.endsWith("/apps/app-a/channels"))) appWideRevoked();
       return normalFetch(input, init);
     };
     const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace",
@@ -743,6 +751,7 @@ describe("CapsuleManager", () => {
         async replaceUi() { throw new Error("must not replace"); },
         async openUiStream() { throw new Error("must not stream"); },
         async stopUi() {},
+        async stopAppUi() {},
         async stopApp() {},
         async retireApp() {},
         async stopAll() {},
@@ -1694,5 +1703,329 @@ describe("CapsuleManager", () => {
     );
     expect(calls.some((call) => call.url.endsWith("/channels/channel-app-a-1"))).toBe(true);
     expect(calls.some((call) => call.url.endsWith("/channels/channel-app-a-2"))).toBe(true);
+  });
+});
+
+describe("declared job Host authority", () => {
+  test("fast cleanup waits for one shared Core cancellation before completion can be reported", async () => {
+    const backend = new FakeBackend(); let running = false;
+    Object.assign(backend, { runJob: async (_spec: unknown, signal: AbortSignal) => {
+      running = true; await new Promise<void>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    } });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    const gate = Promise.withResolvers<void>(); let cancellations = 0;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      if (String(input).endsWith("/api/triggers/manage")) { cancellations++; await gate.promise; }
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    let completed = false; const done = rejectionOf(manager.runJob("run-a", "notes", "inbox", new AbortController().signal, "trigger-a")).then(() => { completed = true; });
+    await vi.waitFor(() => expect(running).toBe(true));
+    const first = manager.stopJob("notes", "run-a"), second = manager.stopJob("notes", "run-a");
+    await vi.waitFor(() => expect(cancellations).toBe(1)); await new Promise(resolve => setImmediate(resolve));
+    expect(completed).toBe(false); expect(manager.appRuntimeStates()[0].jobs[0].state).toBe("stopping");
+    gate.resolve(); expect(await Promise.all([first, second])).toEqual([{ active: true }, { active: true }]); await done;
+    expect(manager.appRuntimeStates()).toEqual([]);
+  });
+  test("App stop recovers failed channel cleanup after its final App-wide revocation", async () => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: async () => {} });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    let channelRevocations = 0;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      if (String(input).includes("/api/app-runtime/channels/") && init?.method === "DELETE") {
+        channelRevocations++;
+        return Response.json({ error: "revocation temporarily unavailable" }, { status: 503 });
+      }
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("authority cleanup failed");
+    expect(manager.appRuntimeStates()[0].jobs[0]).toMatchObject({ state: "cleanup-failed", cleanupError: expect.stringContaining("not confirmed") });
+    await expect(manager.stopJob("notes", "run-a")).rejects.toThrow("not confirmed");
+    await expect(manager.stopApp("notes")).resolves.toBeUndefined();
+    expect(base.calls.filter(call => call.url.endsWith("/api/app-runtime/apps/notes/channels"))).toHaveLength(2);
+    expect(channelRevocations).toBe(1);
+    expect(manager.appRuntimeStates()).toEqual([]);
+    expect(await manager.stopJob("notes", "run-a")).toEqual({ active: false });
+  });
+  test("activation cleanup remains retryable and App stop waits for its exact acknowledgement", async () => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: async () => {} });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    const gate = Promise.withResolvers<void>(); let releases = 0;
+    const releaseUrls: string[] = [];
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      if (String(input).includes("/api/apps/activation/") && init?.method === "DELETE") {
+        releaseUrls.push(String(input));
+        releases++;
+        if (releases <= 2) return Response.json({ error: "activation release unavailable" }, { status: 503 });
+        await gate.promise;
+      }
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("authority cleanup failed");
+    await expect(manager.stopApp("notes")).rejects.toThrow("Could not stop App");
+    expect(releases).toBe(2);
+    expect(manager.appRuntimeStates()[0].jobs[0]).toMatchObject({ state: "cleanup-failed" });
+    let stopped = false;
+    const stop = manager.stopApp("notes").then(() => { stopped = true; });
+    await vi.waitFor(() => expect(releases).toBe(3));
+    let exactStopped = false;
+    const exactStop = manager.stopJob("notes", "run-a").then(result => { exactStopped = true; return result; });
+    expect(stopped).toBe(false);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(exactStopped).toBe(false);
+    expect(manager.appRuntimeStates()[0]).toMatchObject({ stopping: true, jobs: [{ state: "stopping", cleanupError: null }] });
+    gate.resolve(); await stop;
+    expect(await exactStop).toEqual({ active: true });
+    expect(releaseUrls).toEqual(Array(3).fill(`http://core/api/apps/activation/${ACTIVATION_ID}`));
+    expect(manager.appRuntimeStates()).toEqual([]);
+  });
+  test("failed final App-wide revocation does not clear pending channel cleanup", async () => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: async () => {} });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    let broadRevocations = 0;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if (init?.method === "DELETE" && url.includes("/api/app-runtime/channels/")) return Response.json({ error: "channel unavailable" }, { status: 503 });
+      if (init?.method === "DELETE" && url.endsWith("/api/app-runtime/apps/notes/channels") && ++broadRevocations === 2) return Response.json({ error: "final revocation unavailable" }, { status: 503 });
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("authority cleanup failed");
+    await expect(manager.stopApp("notes")).rejects.toThrow("Could not stop App");
+    expect(manager.appRuntimeStates()[0].jobs[0]).toMatchObject({ state: "cleanup-failed" });
+    await manager.stopApp("notes");
+    expect(manager.appRuntimeStates()).toEqual([]);
+  });
+  test("successful final revocation supersedes a transient first App-wide failure", async () => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: async () => {} });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    let broadRevocations = 0;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if (init?.method === "DELETE" && (url.includes("/api/app-runtime/channels/") || (url.endsWith("/api/app-runtime/apps/notes/channels") && ++broadRevocations === 1))) return Response.json({ error: "temporary failure" }, { status: 503 });
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("authority cleanup failed");
+    await manager.stopApp("notes");
+    expect(broadRevocations).toBe(2);
+    expect(manager.appRuntimeStates()).toEqual([]);
+  });
+  test("authority recovery preserves the execution failure and another App's pending cleanup", async () => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: async (spec: { appId: string }) => {
+      if (spec.appId === "notes") throw new Error("job command failed");
+    } });
+    const runtime = { jobs: { inbox: { command: ["node", "inbox.js"] } } };
+    const base = createFetch({ notes: runtime, other: runtime });
+    const fetch: typeof globalThis.fetch = async (input, init) => String(input).includes("/api/app-runtime/channels/") && init?.method === "DELETE"
+      ? Response.json({ error: "temporary failure" }, { status: 503 }) : base.fetch(input, init);
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("authority cleanup failed");
+    await expect(manager.runJob("run-b", "other", "inbox", new AbortController().signal)).rejects.toThrow("authority cleanup failed");
+    await manager.stopApp("notes");
+    expect(manager.appRuntimeStates().find(app => app.appId === "notes")).toMatchObject({ jobs: [], latestFailure: "job command failed" });
+    expect(manager.appRuntimeStates().find(app => app.appId === "other")?.jobs).toMatchObject([{ runId: "run-b", state: "cleanup-failed" }]);
+    expect(backend.appStops).toEqual(["notes"]);
+    expect(base.calls.filter(call => call.url.includes("/api/app-runtime/apps/")).every(call => call.url.includes("/apps/notes/"))).toBe(true);
+  });
+  test("recovering authority never erases an unconfirmed VM stop", async () => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: async () => { throw new CapsuleRestartRequiredError("VM stop unconfirmed; restart required"); } });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    let releases = 0;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      if (init?.method === "DELETE" && String(input).includes("/api/apps/activation/") && ++releases === 1) return Response.json({ error: "temporary failure" }, { status: 503 });
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("authority cleanup failed");
+    await expect(manager.stopApp("notes")).rejects.toThrow("Could not stop App");
+    expect(releases).toBe(2);
+    expect(manager.appRuntimeStates()[0].jobs[0]).toMatchObject({ state: "cleanup-failed", cleanupError: "VM stop unconfirmed; restart required" });
+  });
+  test("App-wide channel revocation cannot discharge an activation cleanup failure", async () => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: async () => {} });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    let activationReleases = 0;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if (init?.method === "DELETE" && url.includes("/api/app-runtime/channels/")) return Response.json({ error: "channel unavailable" }, { status: 503 });
+      if (init?.method === "DELETE" && url.includes("/api/apps/activation/") && ++activationReleases <= 2) return Response.json({ error: "activation unavailable" }, { status: 503 });
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("authority cleanup failed");
+    await expect(manager.stopApp("notes")).rejects.toThrow("Could not stop App");
+    expect(manager.appRuntimeStates()[0].jobs[0].state).toBe("cleanup-failed");
+    await manager.stopApp("notes");
+    expect(activationReleases).toBe(3);
+    expect(manager.appRuntimeStates()).toEqual([]);
+  });
+  test.each(["Host stop", "App retirement"] as const)("%s joins retained authority cleanup", async operation => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: async () => {} });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    let activationReleases = 0;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if (init?.method === "DELETE" && url.includes("/api/app-runtime/channels/")) return Response.json({ error: "channel unavailable" }, { status: 503 });
+      if (init?.method === "DELETE" && url.includes("/api/apps/activation/") && ++activationReleases === 1) return Response.json({ error: "activation unavailable" }, { status: 503 });
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("authority cleanup failed");
+    if (operation === "Host stop") await manager.stopAll();
+    else { manager.beginAppRetirement("notes"); await manager.retireApp("notes"); manager.finishAppRetirement("notes"); }
+    expect(activationReleases).toBe(2);
+    expect(manager.appRuntimeStates()).toEqual([]);
+  });
+  test("lost Core teardown discards old authority cleanup without calling the dead control plane", async () => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: async () => {} });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    let lost = false;
+    const fetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      if (lost) throw new Error("dead Core must not be contacted");
+      if (init?.method === "DELETE") return Response.json({ error: "temporary failure" }, { status: 503 });
+      return base.fetch(input, init);
+    });
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("authority cleanup failed");
+    lost = true; const requests = fetch.mock.calls.length;
+    await manager.stopAll({ controlPlaneLost: true });
+    expect(fetch.mock.calls).toHaveLength(requests);
+    expect(manager.appRuntimeStates()).toEqual([]);
+  });
+  test("lists authoritative job phases and stops an exact invocation without touching sibling jobs or UI", async () => {
+    const backend = new FakeBackend();
+    const starts = new Map<string, () => void>(), signals = new Map<string, AbortSignal>();
+    const cleanup = new Map<string, ReturnType<typeof Promise.withResolvers<void>>>();
+    Object.assign(backend, { runJob: async (spec: { sdkSenderId: string }, signal: AbortSignal, onState: (state: "running" | "stopping") => void) => {
+      signals.set(spec.sdkSenderId, signal); starts.set(spec.sdkSenderId, () => onState("running"));
+      await new Promise<void>(resolve => signal.addEventListener("abort", () => { onState("stopping"); resolve(); }, { once: true }));
+      const gate = Promise.withResolvers<void>(); cleanup.set(spec.sdkSenderId, gate); await gate.promise; signal.throwIfAborted();
+    } });
+    const bindings = systemBindings(), { fetch, calls } = createFetch({ notes: { ui: { command: ["node", "ui.js"], port: 3000 }, jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...bindings });
+    const viewer = await manager.openViewer("notes", viewerOwner(7), verifyPreparedViewer);
+    const a = rejectionOf(manager.runJob("run-a", "notes", "inbox", new AbortController().signal, "trigger-a"));
+    const b = rejectionOf(manager.runJob("run-b", "notes", "inbox", new AbortController().signal, "trigger-b"));
+    expect(manager.appRuntimeStates()[0].jobs).toEqual([
+      { jobId: "inbox", runId: "run-a", triggerId: "trigger-a", state: "starting", cleanupError: null },
+      { jobId: "inbox", runId: "run-b", triggerId: "trigger-b", state: "starting", cleanupError: null },
+    ]);
+    await vi.waitFor(() => expect(signals.size).toBe(2));
+    const [senderA, senderB] = signals.keys(); starts.get(senderA)!(); starts.get(senderB)!();
+    expect(manager.appRuntimeStates()[0].jobs.every(job => job.state === "running")).toBe(true);
+    await expect(manager.stopJob("other", "run-a")).rejects.toThrow("belong");
+    expect(signals.get(senderA)!.aborted).toBe(false);
+    let stopped = false; const stop = manager.stopJob("notes", "run-a").then(result => { stopped = true; return result; });
+    await vi.waitFor(() => expect(cleanup.has(senderA)).toBe(true));
+    expect(stopped).toBe(false); expect(manager.appRuntimeStates()[0].jobs[0].state).toBe("stopping");
+    expect(signals.get(senderB)!.aborted).toBe(false); expect(backend.appStops).toEqual([]);
+    expect(manager.appRuntimeStates()[0].ui).toBe("running");
+    expect(bindings.unbindSystemSender).not.toHaveBeenCalledWith(senderB);
+    expect(JSON.parse(String(calls.find(call => call.url.endsWith("/api/triggers/manage"))!.init!.body))).toEqual({ operation: "trigger.cancel", input: { runId: "run-a" } });
+    cleanup.get(senderA)!.resolve(); expect(await stop).toEqual({ active: true }); await a;
+    expect(manager.appRuntimeStates()[0].jobs.map(job => job.runId)).toEqual(["run-b"]);
+    expect(await manager.stopJob("notes", "run-a")).toEqual({ active: false });
+    await manager.closeAppUi("notes"); expect(signals.get(senderB)!.aborted).toBe(false);
+    expect(backend.stops).toContain(viewer.instanceId);
+    const secondStop = manager.stopJob("notes", "run-b");
+    await vi.waitFor(() => expect(cleanup.has(senderB)).toBe(true)); cleanup.get(senderB)!.resolve(); await secondStop; await b;
+    expect(manager.appRuntimeStates()).toEqual([]);
+  });
+  test.each(["initialization", "execution"] as const)("App stop joins job cleanup during %s", async phase => {
+    const backend = new FakeBackend(), gate = Promise.withResolvers<void>(); let entered = false;
+    const runJob = vi.fn(async (_spec: unknown, signal: AbortSignal, onState: (state: "running" | "stopping") => void) => {
+      onState("running"); entered = true; await gate.promise; signal.throwIfAborted();
+    }); Object.assign(backend, { runJob });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      if (phase === "initialization" && String(input).endsWith("/activation/prepare")) { entered = true; await gate.promise; }
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    const done = rejectionOf(manager.runJob("run-a", "notes", "inbox", new AbortController().signal, "trigger-a"));
+    await vi.waitFor(() => expect(entered).toBe(true));
+    let stopped = false; const stop = manager.stopApp("notes").then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(stopped).toBe(false); expect(manager.appRuntimeStates()[0]).toMatchObject({ stopping: true, jobs: [{ state: "stopping" }] });
+    gate.resolve(); await stop; expect((await done).message).toContain("App stopped");
+    expect(base.calls.filter(call => call.url.endsWith("/api/triggers/manage")).map(call => JSON.parse(String(call.init!.body)))).toEqual([{ operation: "trigger.cancel", input: { runId: "run-a" } }]);
+    expect(manager.appRuntimeStates()).toEqual([]);
+    expect(runJob).toHaveBeenCalledTimes(phase === "execution" ? 1 : 0);
+  });
+  test("unconfirmed Guest cleanup stays visible and exact stop does not claim completion", async () => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: async () => { throw new CapsuleRestartRequiredError("VM stop unconfirmed; restart required"); } });
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch: createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } }).fetch, ...systemBindings() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("unconfirmed");
+    expect(manager.appRuntimeStates()[0].jobs).toEqual([{ jobId: "inbox", runId: "run-a", triggerId: null, state: "cleanup-failed", cleanupError: "VM stop unconfirmed; restart required" }]);
+    await expect(manager.stopJob("notes", "run-a")).rejects.toThrow("unconfirmed");
+    await expect(manager.stopApp("notes")).rejects.toThrow();
+    expect(manager.appRuntimeStates()[0].jobs[0].state).toBe("cleanup-failed");
+  });
+  test("canceling an opening viewer stops and revokes only UI work while its App job remains bound", async () => {
+    const backend = new FakeBackend(); const completion = Promise.withResolvers<void>(); let running = false, jobSignal: AbortSignal;
+    Object.assign(backend, { runJob: async (_spec: unknown, signal: AbortSignal) => { jobSignal = signal; running = true; await completion.promise; signal.throwIfAborted(); } });
+    const { fetch, calls } = createFetch({ notes: {
+      ui: { command: ["node", "ui.js"], port: 3000 },
+      jobs: { inbox: { command: ["node", "inbox.js"] } },
+    } });
+    const bindings = systemBindings();
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...bindings });
+    const done = manager.runJob("run-a", "notes", "inbox", new AbortController().signal);
+    try {
+      await vi.waitFor(() => expect(running).toBe(true)); const jobSender = bindings.bindSystemSender.mock.calls[0][0];
+      let verifying = false; const owner = viewerOwner(7);
+      const opening = manager.openViewer("notes", owner, async binding => {
+        verifying = true; await new Promise<void>((_, reject) => binding.signal.addEventListener("abort", () => reject(binding.signal.reason), { once: true }));
+      });
+      const failed = expect(opening).rejects.toThrow(); await vi.waitFor(() => expect(verifying).toBe(true));
+      await manager.closeOwner(owner); await failed;
+      expect(backend.appUiStops).toEqual(["notes"]); expect(backend.appStops).toEqual([]);
+      expect(jobSignal!.aborted).toBe(false); expect(bindings.unbindSystemSender).not.toHaveBeenCalledWith(jobSender);
+      const appRevocations = calls.filter(call => call.init?.method === "DELETE" && call.url.includes("/app-runtime/apps/"));
+      expect(appRevocations.length).toBeGreaterThan(0); expect(appRevocations.every(call => call.url.endsWith("?workload=ui"))).toBe(true);
+      completion.resolve(); await done; expect(bindings.unbindSystemSender).toHaveBeenCalledWith(jobSender);
+    } finally { completion.resolve(); await done; await manager.stopAll(); }
+  });
+  test("heartbeats share a cached cold backend probe and shutdown immediately fences availability", async () => {
+    vi.useFakeTimers();
+    try {
+      const backend = new FakeBackend(); Object.assign(backend, { runJob: vi.fn() });
+      const status = vi.spyOn(backend, "status");
+      const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch: createFetch({}).fetch as typeof globalThis.fetch, bindSystemSender: vi.fn(), unbindSystemSender: vi.fn() });
+      expect(await Promise.all([manager.jobAvailability(), manager.jobAvailability()])).toEqual([true, true]);
+      await manager.jobAvailability(); expect(status).toHaveBeenCalledOnce();
+      vi.advanceTimersByTime(30_000); status.mockResolvedValueOnce({ available: false, backend: "fake" });
+      expect(await manager.jobAvailability()).toBe(false); expect(status).toHaveBeenCalledTimes(2);
+      vi.advanceTimersByTime(30_000); expect(await manager.jobAvailability()).toBe(true);
+      const gate = Promise.withResolvers<void>(); vi.spyOn(backend, "stopAll").mockReturnValueOnce(gate.promise);
+      const stopped = manager.stopAll(); expect(await manager.jobAvailability()).toBe(false);
+      gate.resolve(); await stopped;
+    } finally { vi.useRealTimers(); }
+  });
+  test("cold launch uses exact job activation/capability and cleans only its authority", async () => {
+    const backend = new FakeBackend(); const runJob = vi.fn(async (_spec: unknown, _signal: AbortSignal) => {}); Object.assign(backend, { runJob });
+    const fetch = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } }); const bind = vi.fn(), unbind = vi.fn();
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch: fetch.fetch as typeof globalThis.fetch, bindSystemSender: bind, unbindSystemSender: unbind });
+    await manager.runJob("run-a", "notes", "inbox", new AbortController().signal);
+    expect(runJob.mock.calls[0][0]).toMatchObject({ appId: "notes", jobId: "inbox", command: ["node", "inbox.js"], version: APP_VERSION, manifestDigest: MANIFEST_DIGEST, packageDigest: PACKAGE_DIGEST });
+    const channel = fetch.calls.find(c => c.url.endsWith("/api/app-runtime/channels") && c.init?.method === "POST")!;
+    expect(JSON.parse(String(channel.init!.body))).toMatchObject({ workload: "job:inbox", activationId: ACTIVATION_ID, jobRunId: "run-a" });
+    expect(bind).toHaveBeenCalledOnce(); expect(unbind).toHaveBeenCalledOnce(); expect(fetch.calls.filter(c => c.init?.method === "DELETE")).toHaveLength(2); expect(manager.appRuntimeStates()).toEqual([]);
+  });
+  test("cancellation during activation never launches and releases a late activation reply", async () => {
+    const backend = new FakeBackend(), runJob = vi.fn(); Object.assign(backend, { runJob }); const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    const gate = Promise.withResolvers<void>(); let entered = false;
+    const fetch: typeof globalThis.fetch = async (input, init) => { if (String(input).endsWith("/activation/prepare")) { entered = true; await gate.promise; } return base.fetch(input, init); };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, bindSystemSender: vi.fn(), unbindSystemSender: vi.fn() });
+    const cancel = new AbortController(); const done = manager.runJob("run-a", "notes", "inbox", cancel.signal); const rejected = expect(done).rejects.toThrow("Canceled"); await vi.waitFor(() => expect(entered).toBe(true)); cancel.abort(new Error("Canceled")); gate.resolve(); await rejected;
+    expect(runJob).not.toHaveBeenCalled(); expect(base.calls.some(c => c.url.includes("/api/apps/activation/") && c.init?.method === "DELETE")).toBe(true);
+  });
+  test("undeclared jobs are refused before issuing runtime authority", async () => {
+    const backend = new FakeBackend(); Object.assign(backend, { runJob: vi.fn() }); const fetch = createFetch({ notes: { jobs: {} } });
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch: fetch.fetch as typeof globalThis.fetch, bindSystemSender: vi.fn(), unbindSystemSender: vi.fn() });
+    await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("declare"); expect(fetch.calls.some(c => c.url.endsWith("/api/app-runtime/channels") && c.init?.method === "POST")).toBe(false);
   });
 });

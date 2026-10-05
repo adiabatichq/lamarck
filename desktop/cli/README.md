@@ -12,6 +12,52 @@ Core token, gateway token, Workspace selector, or managed socket path.
 
 Use `lamarck --help` for the complete local command surface.
 
+## Triggers
+
+Host CLI and Console share validation, storage, scheduling, and execution history.
+First discover a declared App job or supported concrete poll Source:
+
+```sh
+lamarck trigger targets --json
+lamarck trigger create --name Inbox --target app:notes:job:inbox \
+  --sql 'SELECT id FROM events WHERE type = ?' --params '["telegram.message.received"]'
+lamarck trigger create --name Daily --target 'source:<source-id>:run' \
+  --cron '0 9 * * *' --timezone Asia/Taipei
+lamarck trigger preview --sql 'SELECT id FROM events WHERE type = ?' \
+  --params '["telegram.message.received"]' --limit 5 --json
+lamarck trigger preview --cron '0 9 * * *' --timezone Asia/Taipei --json
+lamarck trigger create --config '{"name":"Inbox","target":"app:notes:job:inbox","condition":{"kind":"event","sql":"SELECT id FROM events"}}'
+lamarck trigger create --file trigger-settings.json
+lamarck trigger list --json
+lamarck trigger inspect <trigger-id> --json
+lamarck trigger update <trigger-id> --name 'Renamed' --revision 1
+lamarck trigger enable <trigger-id>
+lamarck trigger disable <trigger-id>
+lamarck trigger runs <trigger-id> --limit 50 --json
+lamarck trigger cancel <run-id>
+lamarck trigger delete <trigger-id> --yes
+```
+
+Replace placeholder IDs with discovered values. Configuration files are optional,
+local UTF-8 JSON capped at 16 KiB; `--config` accepts the same settings directly.
+Create defaults to disabled (`--enabled` opts in). Update accepts editable fields
+and an optional revision fence. Enable/disable/delete also accept `--revision`.
+Noninteractive deletion requires `--yes`, following existing CLI conventions.
+`--json` returns domain data; errors use the usual stderr envelope and exit code.
+
+Event previews are bounded historical samples and schedule previews show upcoming
+times (1–20 results); neither executes a target or advances consumption. History
+is bounded to 1–500 results and remains inspectable by ID after configuration
+deletion. Creation, enablement, and condition/target edits start future evaluation
+from now. Pending runs retain saved settings; disabling pauses them, deletion
+cancels them, and running work can finish. Failures/interruption are recorded
+without automatic retry. Manual run/retry/replay commands are not advertised.
+
+Only Host CLI can manage Triggers; managed App/Connector CLI has no such authority.
+Runtime subscriptions remain separate temporary listeners. App `system.jobInput()`
+and execution policies are preview contracts in this pre-1.0 release; protocol
+and manifest versions remain v1. Connector event-input targets are not offered.
+
 ## Filenames
 
 Workspace filenames follow the local filesystem, so macOS and Linux names such

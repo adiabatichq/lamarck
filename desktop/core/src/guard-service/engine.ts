@@ -312,6 +312,89 @@ export class GuardEngine {
     }
   }
 
+  eventBoundary(principal: GuardPrincipal): number {
+    this.assertOpen();
+    normalizePrincipal(principal);
+    return this.withPolicy({ mode: "internal" }, () =>
+      Number(this.db.prepare("SELECT coalesce(max(rowid), 0) AS cursor FROM events").get()!.cursor));
+  }
+
+  matchEvents(principal: GuardPrincipal, input: GuardStatement & { after: number; preview?: boolean; limit?: number }): import("./protocol").EventMatchResult {
+    this.assertOpen();
+    normalizePrincipal(principal);
+    if (!Number.isSafeInteger(input.after) || input.after < 0) throw new Error("Invalid append cursor");
+    const limit = input.limit ?? 100;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new Error("Event batch limit must be 1–500");
+    const sql = this.validateSql(input.sql, "subscribe");
+    const bound = normalizeParams(input.params);
+    this.withPolicy({ mode: "internal" }, () => this.db.exec("BEGIN"));
+    try {
+      // The candidate window and submitted query share a read snapshot. Never
+      // push a cursor, LIMIT, or candidate predicate into the submitted SQL.
+      const candidates = input.preview ? [] : this.withPolicy({ mode: "internal" }, () =>
+        this.db.prepare("SELECT rowid AS _append, * FROM events WHERE rowid > ? ORDER BY rowid LIMIT ?").all(input.after, limit));
+      const candidatesById = new Set(candidates.map((row) => String(row.id)));
+      const ids = new Set<string>();
+      let truncated = false;
+      this.withPolicy({ mode: "query" }, () => {
+        const statement = this.db.prepare(sql);
+        if (statement.columns().filter((column) => column.name === "id").length !== 1) {
+          throw new Error("Subscription query must return exactly one column named id identifying D0 events");
+        }
+        statement.setReadBigInts(true);
+        statement.setAllowBareNamedParameters(true);
+        // Iterate Q without materializing history. Memory is bounded by the
+        // candidate window; Guard's existing executor deadline bounds CPU.
+        for (const row of iterateStatement(statement, bound)) {
+          if (typeof row.id !== "string") throw new Error("Subscription result id must be a D0 event ID string");
+          if (input.preview || candidatesById.has(row.id)) ids.add(row.id);
+          if (input.preview && ids.size > limit) { truncated = true; break; }
+        }
+      });
+      if (input.preview) this.withPolicy({ mode: "internal" }, () => {
+        const read = this.db.prepare("SELECT rowid AS _append, * FROM events WHERE id = ?");
+        for (const id of [...ids].slice(0, limit)) {
+          const row = read.get(id);
+          if (row) candidates.push(row);
+        }
+      });
+      let cursor = input.after;
+      const events: import("@lamarck/system/protocol").D0Event[] = [];
+      // Reserve JSON framing for either matching or delivery responses, with
+      // the largest possible cursor/sequence. Event contents stay untouched.
+      const framingBytes = Buffer.byteLength(JSON.stringify({ cursor: Number.MAX_SAFE_INTEGER, events: [], truncated: false }));
+      let bytes = framingBytes;
+      for (const row of candidates) {
+        if (!row) continue;
+        if (!ids.has(String(row.id))) {
+          if (!input.preview) cursor = Number(row._append);
+          continue;
+        }
+        const { _append, ...original } = row;
+        const event = { ...original, payload: JSON.parse(String(original.payload)) } as unknown as import("@lamarck/system/protocol").D0Event;
+        const eventBytes = Buffer.byteLength(JSON.stringify(event));
+        const addedBytes = eventBytes + (events.length ? 1 : 0);
+        if (bytes + addedBytes > this.maxResultBytes) {
+          if (!events.length && framingBytes + eventBytes > this.maxResultBytes) {
+            throw new GuardServiceError("GUARD_SUBSCRIPTION_EVENT_TOO_LARGE", `Guard: subscription event ${event.id} exceeds ${this.maxResultBytes} response bytes`);
+          }
+          // This matching append remains unread. Preceding nonmatches have
+          // been evaluated safely, but nothing after this boundary has.
+          truncated = true;
+          break;
+        }
+        bytes += addedBytes;
+        events.push(event);
+        if (!input.preview) cursor = Number(row._append);
+      }
+      this.commit();
+      return { cursor, events, ...(input.preview ? { truncated } : {}) };
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
   mutate(
     principalInput: GuardPrincipal,
     sql: string,
@@ -636,6 +719,8 @@ export class GuardEngine {
   dispatch(method: GuardRpcMethod, rawParams: unknown): unknown {
     const params = requireObject(rawParams, "params");
     switch (method) {
+      case "events.boundary": return this.eventBoundary(params.principal as GuardPrincipal);
+      case "events.match": return this.matchEvents(params.principal as GuardPrincipal, params as unknown as GuardStatement & { after: number });
       case "query":
         return this.query(
           params.principal as GuardPrincipal,

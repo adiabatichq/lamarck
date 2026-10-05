@@ -322,6 +322,7 @@ function ActiveWorkspaceShell({ workspace }: { workspace: HostWorkspaceDescripto
           identityBusy={identityBusy}
           onReturnToUse={() => setMode("use")}
           onOpenApp={openApp}
+          onUiClosed={closeApp}
           onCoreChanged={refreshApps}
           onIdentitySignIn={handleIdentitySignIn}
           onIdentitySignOut={handleIdentitySignOut}

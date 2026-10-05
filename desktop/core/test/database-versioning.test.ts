@@ -45,6 +45,9 @@ describe("greenfield data.db and system.db V1 schemas", () => {
     expect(schemaObject(systemDb, "d1_history_exclusions")).toBeTruthy();
     expect(schemaObject(systemDb, "connector_official_release_hashes")).toBeTruthy();
     expect(schemaObject(systemDb, "connector_installations")).toBeTruthy();
+    for (const name of ["triggers", "trigger_runs", "idx_trigger_runs_history", "idx_trigger_runs_pending"]) {
+      expect(schemaObject(systemDb, name)).toBeTruthy();
+    }
     expect(schemaObject(systemDb, "connector_marketplace_approvals")).toBeUndefined();
     systemDb.close();
 
@@ -60,7 +63,7 @@ describe("greenfield data.db and system.db V1 schemas", () => {
     expect(sha256(DATA_SCHEMA_V1))
       .toBe("0dad836ef5969c2dc2eb71202881ca802281de079ec73866a62dfa19c5ed0979");
     expect(sha256(SYSTEM_SCHEMA_V1))
-      .toBe("cdbd863ccc6434451b15e712cb4636aaebf3ee1f4374f355cbbf9b08ea334440");
+      .toBe("2c7dfacd612f8f668ae13a189caf84e99be8e6d0ac53f5648695c89523c791fa");
   });
 
   test("persists current Marketplace Connector release metadata across restart", () => {
@@ -152,12 +155,14 @@ describe("greenfield data.db and system.db V1 schemas", () => {
 
     const futureSystem = new DatabaseSync(systemPath());
     futureSystem.exec(`${SYSTEM_SCHEMA_V1}\nPRAGMA user_version = ${SYSTEM_DATABASE_VERSION + 1};`);
+    futureSystem.prepare("INSERT INTO d1_history_exclusions (path, is_prefix) VALUES ('keep/', 1)").run();
     futureSystem.close();
     expect(() => openSystemDatabase(workspace))
       .toThrowError(expect.objectContaining({ code: "DB_VERSION_TOO_NEW" }));
     const system = new DatabaseSync(systemPath());
     expect(readDatabaseVersion(system, SYSTEM_DB_FILENAME)).toBe(SYSTEM_DATABASE_VERSION + 1);
     expect(journalMode(system)).toBe("delete");
+    expect(system.prepare("SELECT path FROM d1_history_exclusions").get()?.path).toBe("keep/");
     system.close();
   });
 

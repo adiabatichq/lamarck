@@ -197,6 +197,7 @@ export interface ConnectorWarningsHandle {
 }
 
 export interface ConnectorRunContext<TConfig = unknown, TState = unknown> {
+  subscribe: import("@lamarck/system").System["subscribe"];
   guard: BoundConnectorGuard;
   auth: ConnectorAuthHandle;
   state: ConnectorStateHandle<TState>;

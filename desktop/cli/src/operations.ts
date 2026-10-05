@@ -3,6 +3,17 @@ export { CLI_PROTOCOL_VERSION, CLI_MAX_CONTROL_BYTES, CLI_MAX_INLINE_BYTES, MANA
 export type { CliEnvironment, CliHostCapabilities, CliUpload, CliByteStreams, CliErrorValue } from "./transport.js";
 
 export const CLI_OPERATIONS = [
+  "trigger.targets",
+  "trigger.list",
+  "trigger.inspect",
+  "trigger.create",
+  "trigger.update",
+  "trigger.enable",
+  "trigger.disable",
+  "trigger.delete",
+  "trigger.preview",
+  "trigger.runs",
+  "trigger.cancel",
   "query",
   "schema.change",
   "file.command",
@@ -35,7 +46,7 @@ export const HOST_CLI_OPERATIONS: readonly CliOperation[] = Object.freeze(
   CLI_OPERATIONS.filter((operation) => operation !== "app.refresh"),
 );
 export const MANAGED_CLI_OPERATIONS: readonly CliOperation[] = Object.freeze(
-  CLI_OPERATIONS.filter((operation) => operation !== "file.import" && operation !== "file.export"),
+  CLI_OPERATIONS.filter((operation) => operation !== "file.import" && operation !== "file.export" && !operation.startsWith("trigger.")),
 );
 export type JsonObject = { readonly [key: string]: unknown };
 
@@ -160,6 +171,18 @@ export interface AppVersionRecord {
 }
 
 export interface CliOperationInputMap {
+  "trigger.targets": Record<string, never>;
+  "trigger.list": Record<string, never>;
+  "trigger.inspect": { readonly triggerId: string };
+  "trigger.create": { readonly config: JsonObject };
+  "trigger.update": { readonly triggerId: string; readonly config: JsonObject; readonly revision?: number };
+  "trigger.enable": { readonly triggerId: string; readonly revision?: number };
+  "trigger.disable": { readonly triggerId: string; readonly revision?: number };
+  "trigger.delete": { readonly triggerId: string; readonly revision?: number };
+  "trigger.preview": { readonly triggerId?: string; readonly config?: JsonObject; readonly limit?: number };
+  "trigger.runs": { readonly triggerId: string; readonly limit?: number };
+  "trigger.cancel": { readonly runId: string };
+
   query: { readonly sql: string };
   "schema.change": { readonly ddl: string; readonly author?: string; readonly context?: string };
   "file.command": { readonly argv: readonly string[]; readonly author?: string; readonly stdinBase64?: string };
@@ -215,6 +238,18 @@ export interface ConnectorMutationResult {
 }
 
 export interface CliOperationResultMap {
+  "trigger.targets": readonly JsonObject[];
+  "trigger.list": readonly JsonObject[];
+  "trigger.inspect": JsonObject;
+  "trigger.create": JsonObject;
+  "trigger.update": JsonObject;
+  "trigger.enable": JsonObject;
+  "trigger.disable": JsonObject;
+  "trigger.delete": JsonObject;
+  "trigger.preview": JsonObject;
+  "trigger.runs": readonly JsonObject[];
+  "trigger.cancel": JsonObject;
+
   query: readonly unknown[];
   "schema.change": { readonly id: string; readonly status: "pending" };
   "file.command": FileCommandResult;

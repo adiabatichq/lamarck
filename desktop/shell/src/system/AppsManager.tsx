@@ -36,7 +36,11 @@ export function AppsManager({
   inventoryError = null,
   onOpenApp,
   onInventoryChanged,
+  onManageTriggers,
+  onUiClosed,
 }: {
+  onManageTriggers?: (appId: string, triggerId?: string) => void;
+  onUiClosed?: (appId: string) => void;
   seedApps: readonly AppInfo[];
   inventoryLoading?: boolean;
   inventoryError?: string | null;
@@ -71,12 +75,18 @@ export function AppsManager({
       selected={manager.selected}
       runtimeByApp={manager.runtimeByApp}
       selectedRuntime={runtime}
+      executionPending={manager.executionPending}
+      executionError={manager.executionError ?? manager.error}
+      onStopJob={(appId, runId) => { void manager.stopJob(appId, runId).catch(() => {}); }}
+      onCloseUi={appId => { void manager.closeUi(appId).then(() => onUiClosed?.(appId)).catch(() => {}); }}
+      onStopApp={appId => { void manager.stopApp(appId).then(() => onUiClosed?.(appId)).catch(() => {}); }}
       history={manager.history}
       loading={inventoryLoading || manager.loading}
       error={actionError ?? inventoryError ?? manager.error}
       busy={manager.busy}
       pending={pending}
       onSelect={manager.select}
+      onManageTriggers={onManageTriggers}
       onOpenApp={onOpenApp}
       onLoadMore={() => void manager.loadMore()}
       onRequestRestore={(app, version) => setPending({ kind: "restore", app, version })}
@@ -107,7 +117,19 @@ export function AppsManagerView({
   onRequestRebuild,
   onCancel,
   onConfirm,
+  onManageTriggers,
+  executionPending = new Set(),
+  executionError = null,
+  onStopJob,
+  onCloseUi,
+  onStopApp,
 }: {
+  onManageTriggers?: (appId: string, triggerId?: string) => void;
+  executionPending?: ReadonlySet<string>;
+  executionError?: string | null;
+  onStopJob?: (appId: string, runId: string) => void;
+  onCloseUi?: (appId: string) => void;
+  onStopApp?: (appId: string) => void;
   apps: readonly AppInfo[];
   selected: AppInfo | null;
   runtimeByApp: ReadonlyMap<string, AppRuntimeView>;
@@ -190,6 +212,10 @@ export function AppsManagerView({
             </div>
             <GrantList label="Writable file prefixes" values={grants.files} empty="No writable file prefixes" />
             <GrantList label="Writable D2 tables" values={grants.tables} empty="No writable D2 tables" />
+            <AppExecutionView appId={selected.id} runtime={selectedRuntime} loading={loading}
+              pending={executionPending} error={executionError} onStopJob={onStopJob}
+              onCloseUi={onCloseUi} onStopApp={onStopApp} onManageTriggers={onManageTriggers} />
+            {onManageTriggers && Object.keys(selected.runtime?.jobs ?? {}).length > 0 && <button type="button" className={styles.openApp} onClick={() => onManageTriggers(selected.id)}>Manage Triggers <span>↗</span></button>}
             {selected.runtime?.ui && (
               <button type="button" className={styles.openApp} onClick={() => onOpenApp(selected.id)}>
                 Open in Use <span>↗</span>
@@ -283,6 +309,49 @@ export function AppsManagerView({
       )}
     </div>
   );
+}
+
+export function AppExecutionView({ appId, runtime, loading, pending, error, onStopJob, onCloseUi, onStopApp, onManageTriggers }: {
+  appId: string; runtime?: AppRuntimeView; loading: boolean; pending: ReadonlySet<string>; error: string | null;
+  onStopJob?: (appId: string, runId: string) => void;
+  onCloseUi?: (appId: string) => void; onStopApp?: (appId: string) => void;
+  onManageTriggers?: (appId: string, triggerId?: string) => void;
+}): ReactElement {
+  const appStopping = !!runtime?.stopping || pending.has(`app:${appId}`);
+  const uiPending = pending.has(`ui:${appId}`);
+  const jobs = runtime?.jobs ?? [];
+  const ui = runtime?.ui ?? "closed";
+  const labels = { starting: "Starting", running: "Running", stopping: "Stopping · waiting for cleanup", "cleanup-failed": "Cleanup failed · stop unconfirmed" };
+  return <section className={styles.appExecution} aria-label="Active App execution">
+    <h3>Active execution</h3>
+    {error && <p className={styles.appFailure} role="alert">{error}</p>}
+    {appStopping && <p role="status">Stopping App · waiting for cleanup</p>}
+    <div className={styles.executionActions}>
+      <span>UI: {uiPending ? "Closing · waiting for cleanup" : ui}</span>
+      {onCloseUi && <button type="button" disabled={loading || appStopping || uiPending || ui === "closed" || ui === "stopping"}
+        onClick={() => onCloseUi(appId)}>{uiPending ? "Closing UI…" : "Close UI"}</button>}
+      {onStopApp && <button type="button" disabled={loading || appStopping}
+        onClick={() => onStopApp(appId)}>{appStopping ? "Stopping App…" : "Stop App"}</button>}
+    </div>
+    <p className={styles.executionHint}>Close UI keeps jobs running. Stop App stops the UI and all owned jobs. Enabled Triggers may start future jobs.</p>
+    <h4>Active jobs</h4>
+    {loading && !runtime ? <p role="status">Checking active jobs…</p>
+      : !jobs.length ? <p>{error ? "Active job state could not be confirmed." : "No active jobs."}</p>
+      : <ul className={styles.activeJobs}>{jobs.map(job => {
+        const stopping = pending.has(`job:${job.runId}`) || job.state === "stopping";
+        return <li key={job.runId}>
+          <strong>{job.jobId}</strong><code>Run {job.runId}</code>
+          <span role="status">{job.state === "cleanup-failed" ? labels[job.state] : stopping ? labels.stopping : labels[job.state]}</span>
+          {job.triggerId && (onManageTriggers
+            ? <button type="button" onClick={() => onManageTriggers(appId, job.triggerId!)}>Trigger {job.triggerId} ↗</button>
+            : <span>Trigger {job.triggerId}</span>)}
+          {job.cleanupError && <p className={styles.appFailure} role="alert">{job.cleanupError}</p>}
+          {onStopJob && <button type="button" aria-label={`Stop job ${job.jobId}, run ${job.runId}`}
+            disabled={appStopping || stopping || job.state === "cleanup-failed"}
+            onClick={() => onStopJob(appId, job.runId)}>{stopping ? "Stopping job…" : "Stop job"}</button>}
+        </li>;
+      })}</ul>}
+  </section>;
 }
 
 function GrantList({ label, values, empty }: { label: string; values: readonly string[]; empty: string }) {

@@ -6,6 +6,9 @@ import { describe, expect, test, vi } from "vitest";
 const PRELOAD_SOURCE = readFileSync(new URL("./preload.cjs", import.meta.url), "utf8");
 
 interface WorkspacePreloadHost {
+  stopAppJob(appId: string, runId: string): Promise<unknown>;
+  closeAppUi(appId: string): Promise<unknown>;
+  stopApp(appId: string): Promise<unknown>;
   onCoreRuntimeState(callback: (state: unknown) => void): () => void;
   getWorkspaceState(): Promise<unknown>;
   chooseWorkspacePath(purpose: "create" | "open"): Promise<unknown>;
@@ -42,6 +45,11 @@ function loadPreload(ipcInvoke: ReturnType<typeof vi.fn>, events = new EventEmit
 }
 
 describe("Shell Workspace preload contract", () => {
+  test("dispatches exact job, UI-only and whole-App management through distinct Host IPC", async () => {
+    const invoke = vi.fn(async () => ({ ok: true })); const host = loadPreload(invoke);
+    await host.stopAppJob("notes", "run-a"); await host.closeAppUi("notes"); await host.stopApp("notes");
+    expect(invoke.mock.calls).toEqual([["app-runtime:stop-job", "notes", "run-a"], ["app-runtime:close-ui", "notes"], ["app-runtime:stop", "notes"]]);
+  });
   test("delivers wake notifications without exposing IPC objects and removes subscriptions", () => {
     const events = new EventEmitter();
     const host = loadPreload(vi.fn(), events);

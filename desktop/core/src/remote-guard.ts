@@ -211,6 +211,14 @@ export class RemoteGuard {
     return guard;
   }
 
+  async eventBoundary(): Promise<number> {
+    return this.call("events.boundary", { principal: this.principal() });
+  }
+
+  async matchEvents(input: GuardStatement & { after: number; preview?: boolean; limit?: number }): Promise<import("./guard-service/protocol").EventMatchResult> {
+    return this.call("events.match", { ...input, principal: this.principal() });
+  }
+
   async query(sql: string, params?: GuardSqlParams): Promise<unknown[]> {
     return this.call<unknown[]>("query", { principal: this.principal(), sql, params });
   }

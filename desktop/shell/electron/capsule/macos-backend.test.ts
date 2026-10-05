@@ -2145,6 +2145,251 @@ describe("MacOsCapsuleBackend orchestration", () => {
   });
 });
 
+describe("declared Capsule jobs", () => {
+  const job = (appId = "weather", packageDigest = PACKAGE_A) => {
+    const { port: _, ...ui } = spec(`job-${appId}`, packageDigest);
+    return { ...ui, appId, packageDir: `/workspace/apps/${appId}`, jobId: "inbox", command: ["node", "inbox.js"] };
+  };
+  test("retention failure after job startup tears down its exact workload, streams and runtime lease", async () => {
+    const h = createHarness(); const capacity = enableCapacity(h); h.session.holdJob = true;
+    try {
+      const ui = await h.backend.startUi(spec("ui-sender"));
+      const siblingCancel = new AbortController();
+      const sibling = rejectionOf(h.backend.runJob({ ...job(), sdkSenderId: "sibling" }, siblingCancel.signal));
+      await vi.waitFor(() => expect(h.store.retained.size).toBe(1));
+      const memoryBefore = capacity.admission.snapshot().runtimeMemoryBytes;
+      h.store.failNextRetain = true;
+      await expect(h.backend.runJob({ ...job(), sdkSenderId: "failed" }, new AbortController().signal)).rejects.toThrow("retention failure");
+      const failed = h.system.attachments.find(entry => entry.senderId === "failed")!;
+      const failedWorkload = [...h.session.workloadKinds.keys()].at(-1)!;
+      expect(h.session.stoppedApps).toEqual([h.session.workloadApps.get(failedWorkload)]);
+      expect(failed.stream.destroyed).toBe(true);
+      expect(h.cli.detached).toBe(1);
+      expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(memoryBefore);
+      expect(capacity.released).toHaveLength(3);
+      expect(h.store.retained.size).toBe(1);
+      expect(h.system.attachments.find(entry => entry.senderId === "sibling")!.stream.destroyed).toBe(false);
+      (await h.backend.openUiStream(ui.instanceId)).destroy();
+      expect(h.vm.stopCalls).toBe(0);
+      siblingCancel.abort(new Error("Canceled sibling")); await sibling;
+      await h.backend.stopApp("weather");
+      expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(0);
+    } finally { await h.backend.stopAll(); }
+  });
+  test("App stop joins failed initialization cleanup before the job enters published instances", async () => {
+    const h = createHarness(); const capacity = enableCapacity(h); h.session.holdJob = true; h.store.failNextRetain = true;
+    const gate = Promise.withResolvers<void>(); let entered = false;
+    const request = h.session.request.bind(h.session);
+    h.session.request = async (op, body) => { if (op === "workload.stop") { entered = true; await gate.promise; } return request(op, body); };
+    const done = rejectionOf(h.backend.runJob(job(), new AbortController().signal));
+    try {
+      await vi.waitFor(() => expect(entered).toBe(true));
+      let stopped = false; const stop = h.backend.stopApp("weather").then(() => { stopped = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(stopped).toBe(false); expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(512 * 1024 ** 2);
+      gate.resolve(); await stop; expect((await done).message).toContain("retention failure");
+      expect(h.session.stoppedApps).toHaveLength(1); expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(0);
+      expect(h.system.detached).toBe(1); expect(h.cli.detached).toBe(1); expect(capacity.released).toHaveLength(1);
+    } finally { gate.resolve(); await h.backend.stopAll(); }
+  });
+  test("post-launch observation failure still releases retained artifact and launch admission", async () => {
+    const h = createHarness(); const capacity = enableCapacity(h); h.session.holdJob = true;
+    try {
+      await expect(h.backend.runJob(job(), new AbortController().signal, () => { throw new Error("injected observation failure"); })).rejects.toThrow("observation failure");
+      expect(h.session.stoppedApps).toHaveLength(1); expect(h.store.retained.size).toBe(0);
+      expect(h.system.detached).toBe(1); expect(h.cli.streams.every(stream => stream.destroyed)).toBe(true);
+      expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(0); expect(capacity.released).toHaveLength(1);
+    } finally { await h.backend.stopAll(); }
+  });
+  test("App stop cancels a started job whose startup reply is still pending and joins resource cleanup", async () => {
+    const h = createHarness(); const capacity = enableCapacity(h); h.session.holdJob = true;
+    const gate = Promise.withResolvers<void>(); let started = false;
+    const request = h.session.request.bind(h.session);
+    h.session.request = async (op, body) => {
+      const result = await request(op, body);
+      if (op === "workload.start") { started = true; await gate.promise; }
+      return result;
+    };
+    const done = rejectionOf(h.backend.runJob(job(), new AbortController().signal));
+    try {
+      await vi.waitFor(() => expect(started).toBe(true));
+      let stopped = false; const stop = h.backend.stopApp("weather").then(() => { stopped = true; });
+      await new Promise(resolve => setImmediate(resolve)); expect(stopped).toBe(false);
+      expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(512 * 1024 ** 2);
+      gate.resolve(); await stop; expect((await done).message).toContain("App stop requested");
+      expect(h.session.stoppedApps).toHaveLength(1); expect(h.system.detached).toBeGreaterThan(0);
+      expect(h.cli.streams.every(stream => stream.destroyed)).toBe(true);
+      expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(0); expect(capacity.released).toHaveLength(1);
+    } finally { gate.resolve(); await h.backend.stopAll(); }
+  });
+  test("unconfirmed job teardown quarantines the boundary and keeps the artifact pinned", async () => {
+    const h = createHarness(); const capacity = enableCapacity(h); h.session.holdJob = true;
+    const cancel = new AbortController(); const lost = vi.fn(); h.backend.setBoundaryLostHandler(lost);
+    const done = rejectionOf(h.backend.runJob(job(), cancel.signal));
+    await vi.waitFor(() => expect(h.store.retained.size).toBe(1));
+    h.session.failAppStop = true; h.vm.failStop = true; cancel.abort(new Error("Canceled"));
+    expect(await done).toBeInstanceOf(CapsuleRestartRequiredError);
+    expect(lost).toHaveBeenCalledOnce(); expect(h.store.retained.size).toBe(1);
+    expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(512 * 1024 ** 2);
+    expect(h.system.attachments.every(entry => entry.stream.destroyed)).toBe(true); expect(h.cli.detached).toBe(1);
+    await expect(h.backend.stopApp("weather")).rejects.toThrow();
+    await expect(h.backend.runJob(job(), new AbortController().signal)).rejects.toBeInstanceOf(CapsuleRestartRequiredError);
+  });
+  test("cold job completes on authenticated exit before start reply and releases its Guest aggregate", async () => {
+    const h = createHarness(); const uiLost = vi.fn(); h.backend.setUiLostHandler(uiLost);
+    try {
+      await h.backend.runJob(job(), new AbortController().signal);
+      expect(h.session.sdkWasAttachedAtStart).toBe(true); expect([...h.session.workloadKinds.values()]).toEqual(["job"]);
+      expect(h.session.operations).toContain("build.start"); expect(h.session.operations).toContain("workload.stop"); expect(h.session.stoppedApps).toHaveLength(1); expect(uiLost).not.toHaveBeenCalled();
+    } finally { await h.backend.stopAll(); }
+  });
+  test("nonzero exit reports failure and still cleans Guest resources", async () => {
+    const h = createHarness(); h.session.jobExitCode = 7;
+    try { await expect(h.backend.runJob(job(), new AbortController().signal)).rejects.toThrow("exited (7)"); expect(h.session.stoppedApps).toHaveLength(1); }
+    finally { await h.backend.stopAll(); }
+  });
+  test("canceling a running job preserves the App's independently running UI", async () => {
+    const h = createHarness(); h.session.holdJob = true;
+    try {
+      const ui = await h.backend.startUi(spec("ui-sender")); const cancel = new AbortController();
+      const done = h.backend.runJob(job(), cancel.signal); const rejected = expect(done).rejects.toThrow("Canceled");
+      await vi.waitFor(() => expect([...h.session.workloadKinds.values()]).toContain("job"));
+      await vi.waitFor(() => expect(h.session.operations.filter(op => op === "workload.start")).toHaveLength(2));
+      cancel.abort(new Error("Canceled")); await rejected; (await h.backend.openUiStream(ui.instanceId)).destroy(); expect(h.vm.stopCalls).toBe(0);
+    } finally { await h.backend.stopAll(); }
+  });
+  test.each(["stopUi", "stopAppUi"] as const)("%s preserves the App's running job and runtime resources until authenticated completion", async method => {
+    const h = createHarness(); const capacity = enableCapacity(h); h.session.holdJob = true;
+    const cancel = new AbortController(); let outcome: unknown;
+    try {
+      const ui = await h.backend.startUi(spec("ui-sender"));
+      const done = h.backend.runJob(job(), cancel.signal).then(() => { outcome = "success"; }, error => { outcome = error; });
+      await vi.waitFor(() => expect(h.store.retained.size).toBe(1));
+      const workload = [...h.session.workloadKinds.keys()].find(k => h.session.workloadKinds.get(k) === "job")!;
+      const appHandle = h.session.workloadApps.get(workload)!;
+      const sdk = h.system.attachments.find(entry => entry.senderId === job().sdkSenderId)!;
+      await (method === "stopUi" ? h.backend.stopUi(ui.instanceId) : h.backend.stopAppUi("weather"));
+      await new Promise(resolve => setImmediate(resolve));
+      expect(outcome).toBeUndefined(); expect(sdk.stream.destroyed).toBe(false);
+      expect(h.session.stoppedApps).not.toContain(appHandle);
+      expect(capacity.admission.snapshot().runtimeMemoryBytes).toBeGreaterThan(0);
+      expect(h.store.retained.size).toBe(1); expect(h.vm.stopCalls).toBe(0);
+      h.session.guestEvent("workload.exited", { appHandle, workloadHandle: workload, exitCode: 0, signal: null });
+      await done; expect(outcome).toBe("success"); expect(sdk.stream.destroyed).toBe(true);
+      expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(0); expect(h.store.retained.size).toBe(0);
+    } finally { cancel.abort(new Error("Test cleanup")); await h.backend.stopAll(); }
+  });
+  test("closing the UI does not cancel or wait for a job's in-flight build", async () => {
+    const h = createHarness(); const build = Promise.withResolvers<void>(); const cancel = new AbortController();
+    h.session.holdJob = true; let outcome: unknown;
+    try {
+      const ui = await h.backend.startUi(spec("ui-sender")); h.packageDigest = PACKAGE_B;
+      let building = false;
+      h.session.beforeBuildComplete = async () => { building = true; await build.promise; };
+      const done = h.backend.runJob(job("weather", PACKAGE_B), cancel.signal).then(() => { outcome = "success"; }, error => { outcome = error; });
+      await vi.waitFor(() => expect(building).toBe(true));
+      let closed = false; const closing = h.backend.stopUi(ui.instanceId).then(() => { closed = true; });
+      await vi.waitFor(() => expect(closed).toBe(true)); await closing;
+      expect(outcome).toBeUndefined(); expect(h.session.operations).not.toContain("build.cancel");
+      build.resolve(); await vi.waitFor(() => expect(h.store.retained.size).toBe(1));
+      const workload = [...h.session.workloadKinds.keys()].find(k => h.session.workloadKinds.get(k) === "job")!;
+      h.session.guestEvent("workload.exited", { appHandle: h.session.workloadApps.get(workload)!, workloadHandle: workload, exitCode: 0, signal: null });
+      await done; expect(outcome).toBe("success");
+    } finally { build.resolve(); cancel.abort(new Error("Test cleanup")); await h.backend.stopAll(); }
+  });
+  test("UI stop admits same-App jobs while an overlapping App stop fences and cleans them", async () => {
+    const h = createHarness(); const capacity = enableCapacity(h); h.session.holdJob = true;
+    const stopAck = Promise.withResolvers<void>(); const cancel = new AbortController(); let outcome: unknown;
+    try {
+      const ui = await h.backend.startUi(spec("ui-sender"));
+      const uiWorkload = [...h.session.workloadKinds.keys()].find(k => h.session.workloadKinds.get(k) === "ui")!;
+      const request = h.session.request.bind(h.session); let stoppingUi = false;
+      h.session.request = async (op, body) => {
+        if (op === "app.stop" && body.appHandle === h.session.workloadApps.get(uiWorkload)) { stoppingUi = true; await stopAck.promise; }
+        return request(op, body);
+      };
+      const closing = h.backend.stopUi(ui.instanceId); void closing.catch(() => {});
+      await vi.waitFor(() => expect(stoppingUi).toBe(true));
+      await expect(h.backend.startUi(spec("replacement"))).rejects.toThrow("App is stopping");
+      const done = h.backend.runJob(job(), cancel.signal).then(() => { outcome = "success"; }, error => { outcome = error; });
+      await vi.waitFor(() => expect(h.store.retained.size).toBe(1)); expect(outcome).toBeUndefined();
+      const stoppingApp = h.backend.stopApp("weather"); void stoppingApp.catch(() => {});
+      await expect(h.backend.runJob(job(), new AbortController().signal)).rejects.toThrow("App is stopping");
+      stopAck.resolve(); await Promise.all([closing, stoppingApp, done]);
+      expect(outcome).toMatchObject({ message: "App stop requested" });
+      expect(h.store.retained.size).toBe(0); expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(0);
+      const reopened = await h.backend.startUi(spec("reopened")); (await h.backend.openUiStream(reopened.instanceId)).destroy();
+    } finally { stopAck.resolve(); cancel.abort(new Error("Test cleanup")); await h.backend.stopAll(); }
+  });
+  test("canceling an unreturned UI preparation cleans its build while the same-App job remains active", async () => {
+    const h = createHarness(); h.session.holdJob = true; const cancel = new AbortController(); let outcome: unknown;
+    try {
+      const done = h.backend.runJob(job(), cancel.signal).then(() => { outcome = "success"; }, error => { outcome = error; });
+      await vi.waitFor(() => expect(h.store.retained.size).toBe(1));
+      h.packageDigest = PACKAGE_B; h.session.holdBuild = true;
+      const opening = rejectionOf(h.backend.prepareUi(spec("opening-ui", PACKAGE_B)));
+      await vi.waitFor(() => expect(h.session.buildStarts).toBe(2));
+      await h.backend.stopAppUi("weather"); expect((await opening).message).toMatch(/UI stop requested/);
+      expect(outcome).toBeUndefined(); expect(h.store.retained.size).toBe(1);
+      const workload = [...h.session.workloadKinds.keys()].find(k => h.session.workloadKinds.get(k) === "job")!;
+      h.session.guestEvent("workload.exited", { appHandle: h.session.workloadApps.get(workload)!, workloadHandle: workload, exitCode: 0, signal: null });
+      await done; expect(outcome).toBe("success");
+    } finally { cancel.abort(new Error("Test cleanup")); await h.backend.stopAll(); }
+  });
+  test("two running jobs release Build admission so a third App can cold-start while retaining their runtime leases", async () => {
+    const packageC = `sha256:${"c".repeat(64)}`, artifactC = `sha256:${"e".repeat(64)}`;
+    const h = createHarness({ snapshotDigest: path => path.endsWith("/weather") ? PACKAGE_A : path.endsWith("/notes") ? PACKAGE_B : packageC });
+    const capacity = enableCapacity(h); h.session.holdJob = true;
+    let builds = 0; h.session.beforeBuildComplete = async (_, descriptor) => { descriptor.digest = [ARTIFACT_A, ARTIFACT_B, artifactC][builds++]; };
+    const a = new AbortController(), b = new AbortController(); let firstOutcome: unknown, secondOutcome: unknown;
+    try {
+      const first = h.backend.runJob(job(), a.signal).then(() => { firstOutcome = "success"; }, error => { firstOutcome = error; });
+      await vi.waitFor(() => expect(h.store.retained.size).toBe(1));
+      const second = h.backend.runJob(job("notes", PACKAGE_B), b.signal).then(() => { secondOutcome = "success"; }, error => { secondOutcome = error; });
+      await vi.waitFor(() => expect(h.store.retained.size).toBe(2));
+      const jobsMemory = capacity.admission.snapshot().runtimeMemoryBytes;
+      let third: Awaited<ReturnType<MacOsCapsuleBackend["startUi"]>> | undefined;
+      const opening = h.backend.startUi({ ...spec("third", packageC), appId: "calendar", packageDir: "/workspace/apps/calendar" }).then(result => { third = result; });
+      void opening.catch(() => {}); // Cleanup also observes a still-queued launch on failure.
+      await vi.waitFor(() => expect(third).toBeDefined()); await opening;
+      expect(builds).toBe(3); expect(firstOutcome).toBeUndefined(); expect(secondOutcome).toBeUndefined();
+      expect(capacity.released).toHaveLength(3); expect(new Set(capacity.released).size).toBe(3);
+      expect(jobsMemory).toBeGreaterThan(0); expect(capacity.admission.snapshot().runtimeMemoryBytes).toBeGreaterThan(jobsMemory);
+      expect(h.store.retained.size).toBe(2);
+      (await h.backend.openUiStream(third!.instanceId)).destroy();
+      for (const workload of h.session.workloadKinds.keys()) if (h.session.workloadKinds.get(workload) === "job") {
+        h.session.guestEvent("workload.exited", { appHandle: h.session.workloadApps.get(workload)!, workloadHandle: workload, exitCode: 0, signal: null });
+      }
+      await Promise.all([first, second]); expect(firstOutcome).toBe("success"); expect(secondOutcome).toBe("success");
+      expect(h.store.retained.size).toBe(0); expect(capacity.admission.snapshot().runtimeMemoryBytes).toBeGreaterThan(0);
+    } finally { a.abort(new Error("Test cleanup")); b.abort(new Error("Test cleanup")); await h.backend.stopAll(); }
+  });
+  test.each(["stopApp", "retireApp", "stopAll"] as const)("%s still cancels a running job and joins its resource cleanup", async method => {
+    const h = createHarness(); const capacity = enableCapacity(h); h.session.holdJob = true;
+    const done = rejectionOf(h.backend.runJob(job(), new AbortController().signal));
+    try {
+      await vi.waitFor(() => expect(h.store.retained.size).toBe(1));
+      await (method === "stopAll" ? h.backend.stopAll() : h.backend[method]("weather"));
+      expect((await done).message).toMatch(/stop|retirement/);
+      expect(h.store.retained.size).toBe(0); expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(0);
+      expect(capacity.released).toHaveLength(1); expect(h.system.detached).toBe(1);
+    } finally { await h.backend.stopAll(); }
+  });
+  test("Host teardown cancels an in-flight cold build and confirms cleanup", async () => {
+    const h = createHarness(); h.session.holdBuild = true;
+    const done = rejectionOf(h.backend.runJob(job(), new AbortController().signal));
+    await vi.waitFor(() => expect(h.session.operations).toContain("build.start")); await h.backend.stopAll(); expect((await done).message).toMatch(/stopping|cancel/i); expect(h.vm.stopCalls).toBe(1);
+  });
+  test("forged terminal provenance loses the boundary instead of completing another job", async () => {
+    const h = createHarness(); h.session.holdJob = true; const lost = vi.fn(); h.backend.setBoundaryLostHandler(lost);
+    const done = rejectionOf(h.backend.runJob(job(), new AbortController().signal));
+    await vi.waitFor(() => expect(h.session.operations).toContain("workload.start"));
+    const workload = [...h.session.workloadKinds.keys()].find(k => h.session.workloadKinds.get(k) === "job")!;
+    h.session.guestEvent("workload.exited", { appHandle: "X".repeat(22), workloadHandle: workload, exitCode: 0, signal: null });
+    expect((await done).message).toMatch(/provenance/); expect(lost).toHaveBeenCalledOnce(); await h.backend.stopAll();
+  });
+});
+
 function spec(sender: string, packageDigest: string = PACKAGE_A, activationSequence = 1) {
   return {
     appId: "weather",
@@ -2386,6 +2631,11 @@ function createHarness(overrides: {
   const system = new FakeSystemStreamServer();
   const session = new FakeSession(system, lifecycleEvents);
   const store = new FakeArtifactStore(lifecycleEvents);
+  const cli = { detached: 0, streams: [] as Duplex[], attach: (_binding: unknown, stream: Duplex) => {
+    cli.streams.push(stream);
+    let detached = false;
+    return () => { if (!detached) { detached = true; cli.detached++; stream.destroy(); } };
+  } };
   const removeStorage = vi.fn(async (path: string, removeOptions?: { recursive?: boolean }) => {
     if (staleStateResiduePresent) {
       throw new Error("stale state residue reached non-state storage admission");
@@ -2423,7 +2673,7 @@ function createHarness(overrides: {
     workspaceFilesPath: overrides.workspaceFilesPath ?? (() => "/workspace/files"),
     appVersionsPath: overrides.appVersionsPath ?? (() => "/workspace/.lamarck/cache/app-edit-bases"),
     systemStreamServer: system as unknown as SystemStreamServer,
-    appCliStreamServer: fakeAppCliStreamServer(),
+    appCliStreamServer: cli as unknown as AppCliStreamServer,
     dependencies: {
       hostPlatform: "darwin",
       exists: () => true,
@@ -2476,6 +2726,7 @@ function createHarness(overrides: {
     vm,
     session,
     system,
+    cli,
     store,
     dependencies,
     removeStorage,
@@ -2627,6 +2878,9 @@ class FakeSession extends EventEmitter {
   readonly appPrepares: Array<{ appHandle: string; mappedHostUid: number }> = [];
   readonly buildPrepares: Array<Record<string, any>> = [];
   readonly stoppedApps: string[] = [];
+  readonly workloadKinds = new Map<string, string>();
+  jobExitCode = 0;
+  holdJob = false;
   readonly workloadPorts = new Map<string, number>();
   readonly workloadApps = new Map<string, string>();
   buildStarts = 0;
@@ -2809,6 +3063,7 @@ class FakeSession extends EventEmitter {
           return { awaitingStreams: false, reused: true };
         }
         this.workloadPorts.set(body.workloadHandle, body.uiPort);
+        this.workloadKinds.set(body.workloadHandle, body.workloadKind);
         this.workloadApps.set(body.workloadHandle, body.appHandle);
         return { awaitingStreams: true };
       }
@@ -2819,6 +3074,10 @@ class FakeSession extends EventEmitter {
           appHandle: body.appHandle,
           workloadHandle: body.workloadHandle,
         });
+        if (this.workloadKinds.get(body.workloadHandle) === "job") {
+          if (!this.holdJob) this.guestEvent("workload.exited", { appHandle: body.appHandle, workloadHandle: body.workloadHandle, exitCode: this.jobExitCode, signal: null });
+          return { started: true };
+        }
         if (this.failNextReady) {
           this.failNextReady = false;
           this.guestEvent("workload.faulted", {

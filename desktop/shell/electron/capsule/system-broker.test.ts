@@ -44,6 +44,82 @@ function createBroker(
 }
 
 describe("SystemBroker", () => {
+  test('cancels subscription handles on connection teardown under the original capability', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (url) => jsonResponse(String(url).endsWith('/start') ? { subscriptionId: 'owned-listener' } : { ok: true }));
+    const { broker } = createBroker(fetchImpl);
+    broker.bindSender(1, { channelId: 'runtime', capability: 'host-bound' });
+    await broker.invoke(1, 'subscription.start', { sql: 'SELECT id FROM events' });
+    broker.unbindSender(1);
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+    const [url, init] = fetchImpl.mock.calls[1];
+    expect(String(url)).toContain('/api/subscription/cancel');
+    expect(new Headers(init?.headers).get('x-lamarck-app-capability')).toBe('host-bound');
+    expect(JSON.parse(String(init?.body))).toEqual({ subscriptionId: 'owned-listener' });
+    await expect(broker.invoke(1, 'subscription.next', { subscriptionId: 'owned-listener', acknowledged: 0 })).rejects.toMatchObject({ code: 'sender_unbound' });
+  });
+  test('cancels a late subscription registration after its connection generation ended', async () => {
+    let finish!: (response: Response) => void;
+    const fetchImpl = vi.fn<typeof fetch>(async url => String(url).endsWith('/start') ? new Promise(resolve => { finish = resolve; }) : jsonResponse({ ok: true }));
+    const { broker } = createBroker(fetchImpl);
+    broker.bindSender(1, { channelId: 'runtime', capability: 'host-bound' });
+    const registration = broker.invoke(1, 'subscription.start', { sql: 'SELECT id FROM events' });
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    broker.cancelAi(1);
+    finish(jsonResponse({ subscriptionId: 'late-listener' }));
+    await expect(registration).rejects.toMatchObject({ code: 'request_aborted' });
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+    expect(JSON.parse(String(fetchImpl.mock.calls[1][1]?.body))).toEqual({ subscriptionId: 'late-listener' });
+  });
+  test('reclaims a reply arriving after abort and rebind under the original owner', async () => {
+    let finish!: (response: Response) => void;
+    const fetchImpl = vi.fn<typeof fetch>(async (url, init) => {
+      if (String(url).endsWith('/start') && new Headers(init?.headers).get('x-lamarck-app-capability') === 'old-cap') {
+        return new Promise(resolve => { finish = resolve; });
+      }
+      return jsonResponse(String(url).endsWith('/start') ? { subscriptionId: 'new-listener' } : { ok: true });
+    });
+    const { broker } = createBroker(fetchImpl);
+    broker.bindSender(1, { channelId: 'old-runtime', capability: 'old-cap' });
+    const registration = broker.invoke(1, 'subscription.start', { sql: 'SELECT id FROM events' });
+    const rejected = expect(registration).rejects.toMatchObject({ code: 'request_aborted' });
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    const signal = fetchImpl.mock.calls[0][1]?.signal;
+    broker.unbindSender(1); await rejected; expect(signal?.aborted).toBe(true);
+    broker.bindSender(1, { channelId: 'new-runtime', capability: 'new-cap' });
+    await broker.invoke(1, 'subscription.start', { sql: 'SELECT id FROM events' });
+    finish(jsonResponse({ subscriptionId: 'late-listener' }));
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(3));
+    const cleanup = fetchImpl.mock.calls[2][1];
+    expect(new Headers(cleanup?.headers).get('x-lamarck-app-capability')).toBe('old-cap');
+    expect(JSON.parse(String(cleanup?.body))).toEqual({ subscriptionId: 'late-listener' });
+    broker.unbindSender(1);
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(4));
+    expect(new Headers(fetchImpl.mock.calls[3][1]?.headers).get('x-lamarck-app-capability')).toBe('new-cap');
+    expect(JSON.parse(String(fetchImpl.mock.calls[3][1]?.body))).toEqual({ subscriptionId: 'new-listener' });
+  });
+  test('failed start transport aborts its initialization request and releases broker capacity', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => { throw new Error('response lost'); });
+    const { broker } = createBroker(fetchImpl, { maxInFlightPerSender: 1 });
+    broker.bindSender(1, { channelId: 'runtime', capability: 'cap' });
+    for (let attempt = 0; attempt < 24; attempt++) {
+      await expect(broker.invoke(1, 'subscription.start', { sql: 'SELECT id FROM events' })).rejects.toMatchObject({ code: 'transport_error' });
+      expect(fetchImpl.mock.calls[attempt][1]?.signal?.aborted).toBe(true);
+    }
+  });
+  test('cleans up a created handle when the broker cannot return the start result', async () => {
+    const response = { subscriptionId: 'orphan' };
+    const fetchImpl = vi.fn<typeof fetch>(async url => jsonResponse(String(url).endsWith('/start') ? response : { ok: true }));
+    const { broker } = createBroker(fetchImpl, { maxResponseBytes: Buffer.byteLength(JSON.stringify(response)) });
+    broker.bindSender(1, { channelId: 'runtime', capability: 'cap' });
+    const result = browserEnvelope(await broker.invokeSerialized(1, browserRequest('subscription.start', { sql: 'SELECT id FROM events' })));
+    expect(result.error?.code).toBe('response_too_large');
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+    expect(fetchImpl.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(new Headers(fetchImpl.mock.calls[1][1]?.headers).get('x-lamarck-app-capability')).toBe('cap');
+    expect(JSON.parse(String(fetchImpl.mock.calls[1][1]?.body))).toEqual(response);
+    broker.unbindSender(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
   test('Computer Use derives App identity from Host binding and closes on disconnect', async () => {
     const fetchImpl = vi.fn<typeof fetch>();
     const computer = { invoke: vi.fn(async () => ({ sessionId: 's', tools: [], instructions: '' })), closeOwner: vi.fn(async () => {}) };
@@ -67,8 +143,10 @@ describe("SystemBroker", () => {
   });
   test("exposes the closed System operation allowlist and rejects unknown operations", async () => {
     expect(SYSTEM_OPERATIONS).toEqual([
+      "job.input",
       'computer.open', 'computer.call', 'computer.close',
       "ai.listOptions", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
+      "subscription.start", "subscription.next", "subscription.cancel",
       "query",
       "resolveContentRef",
       "mutate",
@@ -636,4 +714,11 @@ describe("SystemBroker", () => {
     await expect(broker.invoke(1, "query", { sql: "SELECT 1" }))
       .rejects.toMatchObject({ code: "sender_unbound" });
   });
+});
+
+test("job input has one closed route and no caller-supplied invocation identity", async () => {
+  const fetchImpl = vi.fn<typeof fetch>(async () => jsonResponse({ version: 1, runId: "bound-run" })); const { broker } = createBroker(fetchImpl); broker.bindSender("job", { channelId: "job-channel", capability: "job-secret" });
+  await expect(broker.invoke("job", "job.input", {})).resolves.toMatchObject({ runId: "bound-run" });
+  expect(fetchImpl.mock.calls[0][0]).toBe("http://127.0.0.1:32100/api/app-runtime/job-input"); expect(JSON.parse(String(fetchImpl.mock.calls[0][1]!.body))).toEqual({});
+  await expect(broker.invoke("job", "job.input", { runId: "other-run" } as never)).rejects.toThrow();
 });

@@ -50,6 +50,11 @@ const identitySource: ConnectorSourceView = {
 };
 
 describe("Connector surface responsibilities", () => {
+  test("links concrete poll Sources, but not watch Sources, to Trigger management", () => {
+    mocks.useConnectors.mockReturnValue({ sources: [identitySource, { ...identitySource, id: "watch-source", mode: "watch" }], packages: [installedConnector], loading: false, error: null, refresh: vi.fn() });
+    const markup = renderToStaticMarkup(<ConnectorsView onManageTriggers={vi.fn()} />);
+    expect(markup.match(/Manage Triggers/g)).toHaveLength(1);
+  });
   beforeEach(() => {
     mocks.useConnectors.mockReset();
     mocks.useConnectors.mockReturnValue({

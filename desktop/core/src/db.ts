@@ -1,3 +1,4 @@
+import { TRIGGER_SCHEMA } from "./triggers/store";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import {
@@ -12,7 +13,7 @@ export {
 } from "./data-schema";
 export const SYSTEM_DB_FILENAME = "system.db";
 
-// Greenfield V1 includes the control plane and rebuildable D1 observer state.
+// Complete greenfield V1 control plane, including Trigger storage and D1 state.
 export const SYSTEM_SCHEMA_V1 = `
 CREATE TABLE IF NOT EXISTS ai_access_sources (
   id TEXT PRIMARY KEY,
@@ -155,6 +156,7 @@ CREATE TABLE IF NOT EXISTS connector_installations (
   installed_at           INTEGER NOT NULL,
   updated_at             INTEGER NOT NULL
 );
+${TRIGGER_SCHEMA}
 `;
 
 export const SYSTEM_SCHEMA = SYSTEM_SCHEMA_V1;
@@ -163,7 +165,7 @@ export const SYSTEM_DATABASE_VERSION = 1;
 const SYSTEM_MIGRATIONS: readonly DatabaseMigration[] = [
   {
     version: 1,
-    name: "baseline control-plane and D1 observer schema",
+    name: "baseline control-plane, Trigger, and D1 observer schema",
     up(db) {
       db.exec(SYSTEM_SCHEMA_V1);
     },

@@ -1,3 +1,4 @@
+import { CapsuleJobWorker } from "./capsule/job-worker";
 import { isStartupFailure, startupFailureText, type StartupFailureMessage } from "../../core/src/startup-failure";
 import { DesktopUpdater, supportsDesktopUpdates } from "./desktop-updater";
 import { MacUpdater } from "electron-updater";
@@ -146,9 +147,11 @@ const runtimeSupervisor = new DesktopRuntimeSupervisor<ChildProcess, UtilityProc
   {
     start: startRuntimeProcesses,
     stopGateway: () => cliGateway.stop(),
-    stopApps: (controlPlaneLost) => controlPlaneLost
-      ? capsuleManager.stopAll({ controlPlaneLost: true })
-      : stopAllAppViewers(),
+    stopApps: async (controlPlaneLost) => {
+      await Promise.all([capsuleJobWorker.stop(), controlPlaneLost
+        ? capsuleManager.stopAll({ controlPlaneLost: true })
+        : stopAllAppViewers()]);
+    },
     stopCore,
     stopGuard,
   },
@@ -291,7 +294,7 @@ interface AppViewerSessionState {
 const appViewers = new Map<string, AppViewerRecord>();
 // Renderer operation handles only; Manager/backend own cancellation and cleanup.
 const appOpenings = new Map<string, {
-  owner: AppViewerOwner; controller: AbortController; viewerId?: string;
+  appId: string; owner: AppViewerOwner; controller: AbortController; viewerId?: string;
 }>();
 // Includes hidden first-launch renderers during the narrow interval after
 // their browser authority is bound but before they can enter appViewers.
@@ -398,6 +401,7 @@ const capsuleManager = new CapsuleManager({
     });
   },
 });
+const capsuleJobWorker = new CapsuleJobWorker(capsuleManager, CORE_TOKEN);
 cliDispatcher = new CliOperationDispatcher({
   coreBaseUrl: () => coreBaseUrl(),
   coreToken: CORE_TOKEN,
@@ -1321,6 +1325,7 @@ async function startRuntimeProcesses(
   startCore(generation);
   await waitForCore(generation);
   await cliGateway.start();
+  capsuleJobWorker.start(coreBaseUrl());
 }
 
 async function activateWorkspace(
@@ -2986,8 +2991,8 @@ app.whenReady().then(async () => {
     const owner = requireShellRendererOwner(event);
     if (typeof openingId !== "string" || !/^[0-9a-f-]{36}$/.test(openingId)
       || appOpenings.has(openingId) || appOpenings.size >= 64) throw new Error("Invalid or excessive App opening handles");
-    const opening: { owner: AppViewerOwner; controller: AbortController; viewerId?: string } = {
-      owner, controller: new AbortController(),
+    const opening: { appId: string; owner: AppViewerOwner; controller: AbortController; viewerId?: string } = {
+      appId, owner, controller: new AbortController(),
     };
     appOpenings.set(openingId, opening);
     try {
@@ -3043,6 +3048,29 @@ app.whenReady().then(async () => {
   ipcMain.handle("app-runtime:states", (event) => {
     requireShellIpc(event);
     return capsuleManager.appRuntimeStates();
+  });
+  ipcMain.handle("app-runtime:stop-job", async (event, appId: string, runId: string) => {
+    requireShellIpc(event);
+    return capsuleManager.stopJob(appId, runId);
+  });
+  ipcMain.handle("app-runtime:close-ui", async (event, appId: string) => {
+    requireShellIpc(event);
+    if (typeof appId !== "string" || !PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    for (const opening of appOpenings.values()) if (opening.appId === appId) opening.controller.abort(new Error("UI closed by user"));
+    const results = await Promise.allSettled([capsuleManager.closeAppUi(appId), stopAppViewers(appId)]);
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) throw new AggregateError(failures, "UI cleanup failed");
+    return { ok: true };
+  });
+  ipcMain.handle("app-runtime:stop", async (event, appId: string) => {
+    requireShellIpc(event);
+    // Fence all App operations before detaching the Shell's UI records.
+    const stop = capsuleManager.stopApp(appId);
+    for (const opening of appOpenings.values()) if (opening.appId === appId) opening.controller.abort(new Error("App stopped by user"));
+    const results = await Promise.allSettled([stop, stopAppViewers(appId)]);
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) throw new AggregateError(failures, "App stop was not confirmed");
+    return { ok: true };
   });
   ipcMain.handle("app-runtime:archive", async (event, appId: string) => {
     requireShellIpc(event);

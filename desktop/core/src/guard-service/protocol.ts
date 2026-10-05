@@ -81,7 +81,17 @@ export interface GuardSchemaPlan {
 export const SCHEMA_CHANGE_AUTHOR_MAX_CHARS = 200;
 export const SCHEMA_CHANGE_CONTEXT_MAX_CHARS = 2_000;
 
+export interface EventMatchResult {
+  truncated?: boolean;
+  cursor: number;
+  events: import("@lamarck/system/protocol").D0Event[];
+}
 export interface GuardRpcMethods {
+  "events.boundary": { params: { principal: GuardPrincipal }; result: number };
+  "events.match": {
+    params: GuardStatement & { principal: GuardPrincipal; after: number; preview?: boolean; limit?: number };
+    result: EventMatchResult;
+  };
   query: {
     params: GuardStatement & { principal: GuardPrincipal };
     result: Array<Record<string, unknown>>;
@@ -184,6 +194,7 @@ export const GUARD_RPC_DESCRIPTOR = Object.freeze({
   rpcPath: "/rpc" as const,
   cancelPath: "/cancel" as const,
   methods: [
+    "events.boundary", "events.match",
     "query",
     "mutate",
     "transaction",

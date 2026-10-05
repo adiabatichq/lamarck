@@ -10,6 +10,17 @@ export interface CommandDefinition {
 
 const both = ["host", "managed"] as const;
 export const COMMAND_REGISTRY: readonly CommandDefinition[] = Object.freeze([
+  command(["trigger", "targets"], "trigger.targets", "trigger targets [--json]", "List declared invocation targets.", ["host"]),
+  command(["trigger", "list"], "trigger.list", "trigger list [--json]", "List persistent Triggers.", ["host"]),
+  command(["trigger", "inspect"], "trigger.inspect", "trigger inspect <trigger-id> [--json]", "Inspect settings and recent executions.", ["host"]),
+  command(["trigger", "create"], "trigger.create", "trigger create --name <name> --target <target> --sql <sql> [--params <json>] | --cron <cron> --timezone <IANA> | --config <json> | --file <json-file> [--enabled] [--json]", "Create a Trigger; disabled by default.", ["host"]),
+  command(["trigger", "update"], "trigger.update", "trigger update <trigger-id> <configuration options> [--revision <n>] [--json]", "Update editable settings.", ["host"]),
+  command(["trigger", "enable"], "trigger.enable", "trigger enable <trigger-id> [--revision <n>] [--json]", "Enable from the current boundary.", ["host"]),
+  command(["trigger", "disable"], "trigger.disable", "trigger disable <trigger-id> [--revision <n>] [--json]", "Pause evaluation and queued execution.", ["host"]),
+  command(["trigger", "delete"], "trigger.delete", "trigger delete <trigger-id> [--revision <n>] [--yes] [--json]", "Delete settings and cancel pending runs; retain history.", ["host"]),
+  command(["trigger", "preview"], "trigger.preview", "trigger preview [<trigger-id> | --sql <sql> | --cron <cron> --timezone <IANA> | --config <json> | --file <json-file>] [--limit <n>] [--json]", "Sample history or upcoming times without execution.", ["host"]),
+  command(["trigger", "runs"], "trigger.runs", "trigger runs <trigger-id> [--limit <n>] [--json]", "Inspect execution history, including deleted Triggers.", ["host"]),
+  command(["trigger", "cancel"], "trigger.cancel", "trigger cancel <run-id> [--json]", "Cancel a pending or running invocation.", ["host"]),
   command(["query"], "query", 'query "<read-only-sql>" [--json]', "Run a read-only D0 or D2 query.", both),
   command(["schema", "change"], "schema.change", 'schema change <ddl>|--file <schema.sql> [--author <author>] [--context <text>] [--json]', "Submit a schema change for human approval.", both),
   command(["file"], "file.command", "file [--author <author>] <ls|cat|stat|tee|cp|mv|rm|mkdir> ...", "Use the Workspace file authority.", both),

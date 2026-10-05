@@ -5,8 +5,11 @@ import type {
   CapsuleBackendStatus,
   CapsuleUiLostEvent,
   CapsuleUiSpec,
+  CapsuleJobSpec,
 } from "./backend";
-import { CapsuleRestartRequiredError } from "./backend";
+import { CapsuleRestartRequiredError, isCapsuleRestartRequiredError } from "./backend";
+import type { AppActiveJob, AppRuntimeAggregate } from "../../shared/app-runtime";
+export type { AppRuntimeAggregate } from "../../shared/app-runtime";
 import {
   APP_MANIFEST_DIGEST_PATTERN,
   type AppManifestDigest,
@@ -20,7 +23,7 @@ interface PreparedActivation {
   activationId: string;
   activationSequence: number;
   appId: string;
-  workload: "ui";
+  workload: "ui" | `job:${string}`;
   version: string;
   manifestDigest: AppManifestDigest;
   packageDigest: `sha256:${string}`;
@@ -28,6 +31,7 @@ interface PreparedActivation {
   manifest: {
     runtime: {
       ui?: { command: string[]; port: number };
+      jobs?: Record<string, { command: string[] }>;
     };
     permissions: {
       writes: {
@@ -116,10 +120,24 @@ export interface ReloadedApp {
   readonly browserBindings: readonly ReloadedBrowserBinding[];
 }
 
-export interface AppRuntimeAggregate {
-  readonly appId: string;
-  readonly runningWorkloads: number;
-  readonly latestFailure: string | null;
+interface JobOperation {
+  appId: string;
+  jobId: string;
+  triggerId: string | null;
+  state: AppActiveJob["state"];
+  cleanupError: string | null;
+  boundaryCleanupError: string | null;
+  cleanupChannelId: string | null;
+  cleanupActivationId: string | null;
+  cancellation?: Promise<unknown>;
+  controller: AbortController;
+  task: Promise<void>;
+}
+
+interface AppRuntimeFailure {
+  message: string;
+  recoverableCleanup: boolean;
+  previous?: AppRuntimeFailure;
 }
 
 interface StoredViewer extends OpenedAppViewer {
@@ -206,6 +224,7 @@ export class CapsuleManager {
   readonly #unbindSystemSender: CapsuleManagerOptions["unbindSystemSender"];
   readonly #onBackendBoundaryLost: ((error: unknown) => void) | undefined;
   readonly #onUiLost: CapsuleManagerOptions["onUiLost"];
+  readonly #jobs = new Map<string, JobOperation>();
   readonly #viewers = new Map<string, StoredViewer>();
   readonly #openingApps = new Set<string>();
   readonly #openingOperations = new Map<string, OpeningViewerOperation>();
@@ -214,7 +233,7 @@ export class CapsuleManager {
   readonly #stopOperations = new Map<string, Promise<void>>();
   readonly #retireOperations = new Map<string, Promise<void>>();
   readonly #unexpectedUiLossOperations = new Set<Promise<void>>();
-  readonly #latestFailureByApp = new Map<string, string>();
+  readonly #latestFailureByApp = new Map<string, AppRuntimeFailure>();
   readonly #stoppingApps = new Set<string>();
   #stoppingAll = false;
   #stopAllOperation: Promise<void> | null = null;
@@ -222,6 +241,8 @@ export class CapsuleManager {
   #controlPlaneRequests = new AbortController();
   #controlPlaneLost = false;
   #generation = 0;
+  #jobAvailabilityCache: { available: boolean; checkedAt: number } | null = null;
+  #jobAvailabilityProbe: Promise<boolean> | null = null;
 
   constructor(options: CapsuleManagerOptions) {
     this.#backend = options.backend;
@@ -257,12 +278,174 @@ export class CapsuleManager {
   appRuntimeStates(): readonly AppRuntimeAggregate[] {
     const appIds = new Set<string>(this.#latestFailureByApp.keys());
     for (const viewer of this.#viewers.values()) appIds.add(viewer.appId);
+    for (const job of this.#jobs.values()) appIds.add(job.appId);
+    for (const id of this.#openingOperations.keys()) appIds.add(id);
+    for (const id of this.#stoppingApps) appIds.add(id);
     return Object.freeze([...appIds].sort().map((appId) => Object.freeze({
       appId,
       runningWorkloads: [...this.#viewers.values()]
-        .filter((viewer) => viewer.appId === appId).length,
-      latestFailure: this.#latestFailureByApp.get(appId) ?? null,
+        .filter((viewer) => viewer.appId === appId).length + [...this.#jobs.values()].filter(job => job.appId === appId).length,
+      latestFailure: this.#latestFailureByApp.get(appId)?.message ?? null,
+      ui: this.#stoppingApps.has(appId) ? "stopping" as const
+        : [...this.#viewers.values()].some(viewer => viewer.appId === appId) ? "running" as const
+        : this.#openingOperations.has(appId) ? "starting" as const : "closed" as const,
+      stopping: this.#stoppingApps.has(appId) || this.#stoppingAll,
+      jobs: Object.freeze([...this.#jobs].filter(([, job]) => job.appId === appId).map(([runId, job]) => Object.freeze({
+        runId, jobId: job.jobId, triggerId: job.triggerId, state: job.state, cleanupError: job.cleanupError,
+      }))),
     })));
+  }
+
+  async jobAvailability(): Promise<boolean> {
+    if (this.#stoppingAll || this.#terminalFailure || !this.#backend.runJob) return false;
+    // A cold backend status probe can launch a helper. Heartbeats must not
+    // launch one every 500 ms; actual job admission still checks the boundary.
+    if (!this.#jobAvailabilityCache || Date.now() - this.#jobAvailabilityCache.checkedAt >= 30_000) {
+      this.#jobAvailabilityProbe ??= Promise.resolve().then(() => this.#backend.status())
+        .then(status => status.available, () => false)
+        .then(available => { this.#jobAvailabilityCache = { available, checkedAt: Date.now() }; return available; })
+        .finally(() => { this.#jobAvailabilityProbe = null; });
+      await this.#jobAvailabilityProbe;
+    }
+    return !this.#stoppingAll && !this.#terminalFailure && !!this.#jobAvailabilityCache?.available;
+  }
+
+  runJob(runId: string, appId: string, jobId: string, requestSignal: AbortSignal, triggerId?: string): Promise<void> {
+    if (!PACKAGE_ID_PATTERN.test(appId) || !/^[a-z0-9][a-z0-9-]*$/.test(jobId) || !runId || this.#jobs.has(runId)) return Promise.reject(new Error("Invalid or duplicate job dispatch"));
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, requestSignal]);
+    const entry: JobOperation = {
+      appId, jobId, triggerId: triggerId ?? null, controller, state: "starting",
+      cleanupError: null, boundaryCleanupError: null, cleanupChannelId: null,
+      cleanupActivationId: null, task: Promise.resolve(),
+    };
+    const stopping = () => { if (!entry.cleanupError) entry.state = "stopping"; };
+    signal.addEventListener("abort", stopping, { once: true });
+    if (signal.aborted) stopping();
+    const current = () => { signal.throwIfAborted(); if (this.#terminalFailure) throw this.#terminalFailure; if (this.#stoppingAll || this.#stoppingApps.has(appId)) throw new Error("App Capsule is stopping"); };
+    const task = Promise.resolve().then(async () => {
+      current();
+      if (!await this.jobAvailability()) throw new Error("App job Capsule backend is unavailable");
+      current();
+      let activation: PreparedActivation | undefined, issued: IssuedCapability | undefined;
+      const sender = `capsule_job_${randomBytes(24).toString("base64url")}`;
+      try {
+        activation = await this.#prepareActivation(appId, `job:${jobId}`);
+        entry.cleanupActivationId = activation.activationId; current();
+        const job = activation.manifest.runtime.jobs?.[jobId];
+        if (!job || !Array.isArray(job.command) || !job.command.length || job.command.some(arg => typeof arg !== "string")) throw new Error("App does not declare this job");
+        issued = await this.#issueCapability(activation, runId);
+        entry.cleanupChannelId = issued.channelId; current();
+        this.#bindSystemSender(sender, { ...issued, appId }); current();
+        const spec: CapsuleJobSpec = {
+          appId, jobId, activationId: activation.activationId, activationSequence: activation.activationSequence,
+          version: activation.version, manifestDigest: activation.manifestDigest, packageDigest: activation.packageDigest,
+          packageDir: activation.immutablePackagePath, command: [...job.command],
+          writeTables: [...activation.manifest.permissions.writes.tables],
+          fileGrants: [`apps/${appId}/`, ...activation.manifest.permissions.writes.files], sdkSenderId: sender,
+        };
+        await this.#backend.runJob!(spec, signal, state => {
+          entry.state = signal.aborted ? "stopping" : state;
+        }); current();
+      } catch (error) {
+        if (isCapsuleRestartRequiredError(error)) {
+          entry.state = "cleanup-failed";
+          entry.cleanupError = entry.boundaryCleanupError = error instanceof Error ? error.message : String(error);
+        }
+        if (!signal.aborted || entry.cleanupError) this.#recordFailure(appId, error);
+        throw error;
+      }
+      finally {
+        stopping();
+        this.#unbindSystemSender(sender);
+        await this.#cleanupJobAuthority(entry);
+      }
+    }).finally(async () => {
+      // Completion reporting must follow the shared Core cancellation intent,
+      // including a fast job whose teardown finishes before the HTTP reply.
+      await entry.cancellation?.catch(() => {});
+      signal.removeEventListener("abort", stopping);
+      if (!entry.cleanupError) this.#jobs.delete(runId);
+    });
+    entry.task = task;
+    this.#jobs.set(runId, entry);
+    return task;
+  }
+
+  async #cleanupJobAuthority(job: JobOperation, appChannelsRevoked = false): Promise<void> {
+    // Only a post-quiescence App revocation can discharge a failed channel
+    // DELETE. Activation release has its own idempotent acknowledgement.
+    if (appChannelsRevoked || this.#controlPlaneLost) job.cleanupChannelId = null;
+    if (this.#controlPlaneLost) job.cleanupActivationId = null;
+    job.cleanupError = job.boundaryCleanupError;
+    job.state = job.cleanupError ? "cleanup-failed" : "stopping";
+    const results = await Promise.allSettled([
+      ...(job.cleanupChannelId ? [this.#revokeCapability(job.cleanupChannelId).then(() => { job.cleanupChannelId = null; })] : []),
+      ...(job.cleanupActivationId ? [this.#releaseActivation(job.cleanupActivationId).then(() => { job.cleanupActivationId = null; })] : []),
+    ]);
+    if (this.#controlPlaneLost) {
+      job.cleanupChannelId = null;
+      job.cleanupActivationId = null;
+      return;
+    }
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) {
+      const error = new AggregateError(failures, "Job authority cleanup failed; stop was not confirmed");
+      job.state = "cleanup-failed";
+      job.cleanupError = job.boundaryCleanupError ?? error.message;
+      if (!job.boundaryCleanupError) this.#recordFailure(job.appId, error, true);
+      throw error;
+    }
+  }
+
+  async #cleanupRetainedJobs(appId: string, appChannelsRevoked: boolean): Promise<unknown[]> {
+    const results = await Promise.allSettled([...this.#jobs].filter(([, job]) => job.appId === appId).map(async ([runId, job]) => {
+      await this.#cleanupJobAuthority(job, appChannelsRevoked);
+      // HTTP cleanup cannot prove containment of an unconfirmed VM stop.
+      if (job.boundaryCleanupError) throw new Error(job.boundaryCleanupError);
+      this.#jobs.delete(runId);
+    }));
+    return results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+  }
+
+  /** Stops exactly one owned invocation and joins its existing teardown. */
+  async stopJob(appId: string, runId: string): Promise<{ active: boolean }> {
+    if (typeof appId !== "string" || !PACKAGE_ID_PATTERN.test(appId) || typeof runId !== "string" || !runId || runId.length > 64) throw new Error("Invalid job identity");
+    const job = this.#jobs.get(runId);
+    if (!job) return { active: false };
+    if (job.appId !== appId) throw new Error("Job does not belong to this App");
+    const appTeardown = this.#stopOperations.get(appId) ?? this.#stopAllOperation;
+    if (appTeardown) {
+      await appTeardown;
+      return { active: true };
+    }
+    if (job.cleanupError) throw new Error(job.cleanupError);
+    // Use Trigger's existing cancellation to revoke input and record intent;
+    // the same Host AbortController provides prompt, exact execution stop.
+    const cancellation = this.#requestJobCancellation(runId, job);
+    job.controller.abort(new Error("Job stopped by user"));
+    const [cancelResult] = await Promise.allSettled([cancellation, job.task]);
+    if (job.cleanupError) throw new Error(job.cleanupError);
+    if (cancelResult.status === "rejected") throw cancelResult.reason;
+    return { active: true };
+  }
+
+  #requestJobCancellation(runId: string, job: JobOperation): Promise<unknown> {
+    return job.cancellation ??= job.triggerId && !this.#controlPlaneLost ? this.#hostRequest("/api/triggers/manage", {
+      method: "POST", body: JSON.stringify({ operation: "trigger.cancel", input: { runId } }),
+    }) : Promise.resolve();
+  }
+
+  async closeAppUi(appId: string): Promise<void> {
+    if (typeof appId !== "string" || !PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    const opening = this.#openingOperations.get(appId);
+    const tasks = [
+      ...(opening ? [this.#cancelOpeningOperation(opening, new Error("UI closed by user"))] : []),
+      ...[...this.#viewers.values()].filter(viewer => viewer.appId === appId).map(viewer => this.closeViewer(viewer.viewerId, viewer.owner)),
+    ];
+    const results = await Promise.allSettled(tasks);
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) throw new AggregateError(failures, "UI cleanup failed");
   }
 
   async openViewer(
@@ -514,15 +697,15 @@ export class CapsuleManager {
     let backendStop: Promise<void>;
     try {
       // A first launch has no committed instance whose stopUi() could abort
-      // the backend preparation. Stop this App identity to cancel work that
-      // has not returned a preparation id yet.
-      backendStop = this.#backend.stopApp(opening.appId);
+      // the backend preparation. Cancel UI work whose preparation id has not
+      // returned yet; independently running jobs retain their own lifetime.
+      backendStop = this.#backend.stopAppUi(opening.appId);
     } catch (error) {
       backendStop = Promise.reject(error);
     }
     const initialRevocation = this.#controlPlaneLost
       ? Promise.resolve()
-      : this.#revokeAppCapabilities(opening.appId);
+      : this.#revokeAppCapabilities(opening.appId, "ui");
     void (async () => {
       const [, backendResult, revokeResult] = await Promise.allSettled([
         opening.operation,
@@ -532,7 +715,7 @@ export class CapsuleManager {
       const finalRevokeResult = this.#controlPlaneLost
         ? ({ status: "fulfilled", value: undefined } as PromiseFulfilledResult<void>)
         : (await Promise.allSettled([
-          this.#revokeAppCapabilities(opening.appId),
+          this.#revokeAppCapabilities(opening.appId, "ui"),
         ]))[0]!;
       const failures = [
         backendResult,
@@ -730,11 +913,15 @@ export class CapsuleManager {
   }
 
   stopApp(appId: string): Promise<void> {
-    if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
+    if (typeof appId !== "string" || !PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
     if (this.#stopAllOperation) return this.#stopAllOperation;
     if (this.#terminalFailure) return Promise.reject(this.#terminalFailure);
     const existing = this.#stopOperations.get(appId);
     if (existing) return existing;
+    for (const [runId, job] of this.#jobs) if (job.appId === appId) {
+      void this.#requestJobCancellation(runId, job).catch(() => {});
+      job.controller.abort(new Error("App stopped"));
+    }
     const ownsFence = !this.#stoppingApps.has(appId);
     if (ownsFence) this.#stoppingApps.add(appId);
     this.#generation += 1;
@@ -746,7 +933,10 @@ export class CapsuleManager {
       );
     }
     let tracked: Promise<void>;
-    tracked = this.#stopApp(appId).finally(() => {
+    tracked = this.#stopApp(appId).catch(error => {
+      this.#recordFailure(appId, error, true);
+      throw error;
+    }).finally(() => {
       if (ownsFence) this.#stoppingApps.delete(appId);
       if (this.#stopOperations.get(appId) === tracked) this.#stopOperations.delete(appId);
     });
@@ -758,6 +948,7 @@ export class CapsuleManager {
     const pending = [
       this.#openingOperations.get(appId)?.operation,
       this.#rebuildOperations.get(appId),
+      ...[...this.#jobs.values()].filter(job => job.appId === appId).map(job => job.task),
     ].filter((operation): operation is Promise<unknown> => operation !== undefined);
     const viewers = [...this.#viewers.values()].filter((viewer) => viewer.appId === appId);
     for (const viewer of viewers) {
@@ -766,19 +957,21 @@ export class CapsuleManager {
     }
     // stopApp is the backend cancellation source for a preparation whose
     // prepareUi() has not returned an abortable preparation id yet.
-    const results = await Promise.allSettled([
+    const [backendResult, , ...cancellationResults] = await Promise.allSettled([
       this.#backend.stopApp(appId),
       this.#revokeAppCapabilities(appId),
+      ...[...this.#jobs.values()].filter(job => job.appId === appId).map(job => job.cancellation),
     ]);
     await Promise.allSettled(pending);
-    const finalRevocation = await Promise.allSettled([
+    const [finalRevocation] = await Promise.allSettled([
       this.#revokeAppCapabilities(appId),
     ]);
-    const failures = results
-      .concat(finalRevocation)
+    const failures = [backendResult, ...cancellationResults, finalRevocation]
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => result.reason);
+    failures.push(...await this.#cleanupRetainedJobs(appId, finalRevocation.status === "fulfilled"));
     if (failures.length > 0) throw new AggregateError(failures, `Could not stop App "${appId}"`);
+    this.#clearCleanupFailure(appId);
   }
 
   /** Establishes a synchronous fence which remains held across Core archive. */
@@ -788,6 +981,7 @@ export class CapsuleManager {
     if (this.#stoppingAll) throw new Error("App Capsule is stopping");
     if (this.#stoppingApps.has(appId)) throw new Error(`App "${appId}" is stopping`);
     this.#stoppingApps.add(appId);
+    for (const job of this.#jobs.values()) if (job.appId === appId) job.controller.abort(new Error("App retired"));
     this.#generation += 1;
     const pending = this.#pendingUiOperations.get(appId);
     if (pending) {
@@ -824,6 +1018,7 @@ export class CapsuleManager {
 
   async #retireApp(appId: string): Promise<void> {
     const pending = [
+      ...[...this.#jobs.values()].filter(job => job.appId === appId).map(job => job.task),
       this.#openingOperations.get(appId)?.operation,
       this.#rebuildOperations.get(appId),
       this.#stopOperations.get(appId),
@@ -841,14 +1036,17 @@ export class CapsuleManager {
     // have settled.
     const revoke = this.#revokeAppCapabilities(appId);
     const backend = this.#backend.retireApp(appId);
-    const [revokeResult, backendResult] = await Promise.allSettled([revoke, backend]);
+    const [, backendResult] = await Promise.allSettled([revoke, backend]);
     await Promise.allSettled(pending);
-    const failures = [revokeResult, backendResult]
+    const [finalRevocation] = await Promise.allSettled([this.#revokeAppCapabilities(appId)]);
+    const failures = [finalRevocation, backendResult]
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => result.reason);
+    failures.push(...await this.#cleanupRetainedJobs(appId, finalRevocation.status === "fulfilled"));
     if (failures.length > 0) {
       throw new AggregateError(failures, `Could not retire App "${appId}"`);
     }
+    this.#clearCleanupFailure(appId);
   }
 
   stopAll(options: StopAllOptions = {}): Promise<void> {
@@ -867,10 +1065,12 @@ export class CapsuleManager {
     // a synchronous reentrant stop must join this teardown, not start another.
     this.#stopAllOperation = shared;
     this.#stoppingAll = true;
+    for (const job of this.#jobs.values()) job.controller.abort(new Error("Host stopped"));
     this.#generation += 1;
 
     try {
       const pending = [
+        ...[...this.#jobs.values()].map(job => job.task),
         ...[...this.#openingOperations.values()].map((opening) => opening.operation),
         ...this.#rebuildOperations.values(),
         ...this.#stopOperations.values(),
@@ -880,6 +1080,7 @@ export class CapsuleManager {
       const pendingUi = [...this.#pendingUiOperations.values()];
       const viewers = [...this.#viewers.values()];
       const affectedApps = new Set([
+        ...[...this.#jobs.values()].map(job => job.appId),
         ...this.#openingOperations.keys(),
         ...this.#rebuildOperations.keys(),
         ...this.#stopOperations.keys(),
@@ -934,9 +1135,14 @@ export class CapsuleManager {
         ]
           .filter((result): result is PromiseRejectedResult => result.status === "rejected")
           .map((result) => result.reason);
+        const jobCleanup = await Promise.all([...affectedApps].map((appId, index) => this.#cleanupRetainedJobs(
+          appId, this.#controlPlaneLost || finalRevocations[index]?.status === "fulfilled",
+        )));
+        failures.push(...jobCleanup.flat());
         if (failures.length > 0) {
           throw new AggregateError(failures, "Could not fully stop App Capsules");
         }
+        for (const appId of affectedApps) this.#clearCleanupFailure(appId);
       })();
       void withDeadline(
         teardown,
@@ -978,6 +1184,7 @@ export class CapsuleManager {
   }
 
   async #collapseBackendBoundary(causes: unknown[]): Promise<never> {
+    for (const job of this.#jobs.values()) job.controller.abort(new Error("Capsule boundary lost"));
     this.#generation += 1;
     for (const pending of this.#pendingUiOperations.values()) {
       this.#cancelPendingUiOperation(
@@ -1051,15 +1258,26 @@ export class CapsuleManager {
     void settlement.catch(() => {});
   }
 
-  #recordFailure(appId: string, error: unknown): void {
+  #recordFailure(appId: string, error: unknown, recoverableCleanup = false): void {
     if (
       error instanceof AppControlPlaneError
       && (error.code === "APP_PACKAGE_INVALID" || error.code === "APP_VERSION_HISTORY_UNAVAILABLE")
     ) return;
-    this.#latestFailureByApp.set(
-      appId,
-      error instanceof Error ? error.message : String(error),
-    );
+    const latest = this.#latestFailureByApp.get(appId);
+    this.#latestFailureByApp.set(appId, {
+      message: error instanceof Error ? error.message : String(error),
+      recoverableCleanup,
+      // Retrying cleanup replaces its prior attempt, not the execution error
+      // that preceded it. A later execution failure remains authoritative.
+      ...(recoverableCleanup ? { previous: latest?.recoverableCleanup ? latest.previous : latest } : {}),
+    });
+  }
+
+  #clearCleanupFailure(appId: string): void {
+    const latest = this.#latestFailureByApp.get(appId);
+    if (!latest?.recoverableCleanup) return;
+    if (latest.previous) this.#latestFailureByApp.set(appId, latest.previous);
+    else this.#latestFailureByApp.delete(appId);
   }
 
   #beginPendingUiOperation(
@@ -1414,17 +1632,17 @@ export class CapsuleManager {
     await this.#collapseBackendBoundary([cause, ...failures]);
   }
 
-  async #prepareActivation(appId: string): Promise<PreparedActivation> {
+  async #prepareActivation(appId: string, workload: PreparedActivation["workload"] = "ui"): Promise<PreparedActivation> {
     const response = await this.#hostRequest(
       `/api/apps/${encodeURIComponent(appId)}/activation/prepare`,
-      { method: "POST", body: JSON.stringify({ workload: "ui" }) },
+      { method: "POST", body: JSON.stringify({ workload }) },
     );
     const body = await response.json() as { activation?: Partial<PreparedActivation> };
     const activation = body.activation;
     if (
       activation?.schemaVersion !== 1
       || activation.appId !== appId
-      || activation.workload !== "ui"
+      || activation.workload !== workload
       || !/^activation_[A-Za-z0-9_-]{32}$/.test(activation.activationId ?? "")
       || !Number.isSafeInteger(activation.activationSequence)
       || (activation.activationSequence ?? 0) < 1
@@ -1440,13 +1658,14 @@ export class CapsuleManager {
     return activation as PreparedActivation;
   }
 
-  async #issueCapability(activation: PreparedActivation): Promise<IssuedCapability> {
+  async #issueCapability(activation: PreparedActivation, jobRunId?: string): Promise<IssuedCapability> {
     const response = await this.#hostRequest("/api/app-runtime/channels", {
       method: "POST",
       body: JSON.stringify({
         appId: activation.appId,
         workload: activation.workload,
         activationId: activation.activationId,
+        ...(jobRunId === undefined ? {} : { jobRunId }),
       }),
     });
     const issued = await response.json() as Partial<IssuedCapability>;
@@ -1477,8 +1696,8 @@ export class CapsuleManager {
     }, true);
   }
 
-  async #revokeAppCapabilities(appId: string): Promise<void> {
-    await this.#hostRequest(`/api/app-runtime/apps/${encodeURIComponent(appId)}/channels`, {
+  async #revokeAppCapabilities(appId: string, workload?: "ui"): Promise<void> {
+    await this.#hostRequest(`/api/app-runtime/apps/${encodeURIComponent(appId)}/channels${workload === "ui" ? "?workload=ui" : ""}`, {
       method: "DELETE",
     });
   }

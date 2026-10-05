@@ -1,6 +1,6 @@
 {
   "name": "@lamarck/system",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Canonical Lamarck Personal System client SDK and protocol types",
   "license": "Apache-2.0",
   "type": "module",
@@ -47,6 +47,10 @@
     "./protocol": {
       "types": "./dist/protocol.d.ts",
       "default": "./dist/protocol.js"
+    },
+    "./internal/subscription": {
+      "types": "./dist/subscription.d.ts",
+      "default": "./dist/subscription.js"
     },
     "./internal/vfs": {
       "node": {
