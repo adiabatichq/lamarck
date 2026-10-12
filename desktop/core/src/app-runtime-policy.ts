@@ -34,7 +34,7 @@ export function isDeclaredWorkload(manifest: AppManifest, workload: AppWorkload)
  */
 export function isAppSystemRoute(path: string, method: string): boolean {
   if (path === '/api/app-runtime/job-input' && method === 'POST') return true;
-  if (method === "POST" && ["/api/ai/options", "/api/ai/invoke/start", "/api/ai/invoke/next", "/api/ai/invoke/cancel", "/api/ai/invoke/tool-result"].includes(path)) return true;
+  if (method === "POST" && ["/api/ai/options", "/api/ai/capabilities", "/api/ai/invoke/start", "/api/ai/invoke/next", "/api/ai/invoke/cancel", "/api/ai/invoke/tool-result"].includes(path)) return true;
   if (method === "POST" && ["/api/subscription/start", "/api/subscription/next", "/api/subscription/cancel"].includes(path)) return true;
   if (path === "/api/query" && method === "POST") return true;
   if (path === "/api/content-ref/resolve" && method === "POST") return true;

@@ -24,6 +24,7 @@ export interface AppManifest {
     packageId: string;
     releaseId: string;
   };
+  ai?: { accessSources: Record<string, { name: string; provider: string }> };
   runtime: {
     ui?: {
       command: string[];
@@ -77,6 +78,7 @@ const MANIFEST_FIELDS = new Set([
   "createdFrom",
   "runtime",
   "permissions",
+  "ai",
 ]);
 const RUNTIME_FIELDS = new Set(["ui", "services", "jobs"]);
 const UI_FIELDS = new Set(["command", "port"]);
@@ -388,6 +390,30 @@ export function validateAppManifest(
     };
   }
 
+  let ai: AppManifest["ai"];
+  if (hasOwn(value, "ai")) {
+    if (!isObject(value.ai) || Object.keys(value.ai).length !== 1 || !hasOwn(value.ai, "accessSources")) {
+      return invalid("ai must contain exactly one accessSources object");
+    }
+    const declarations = value.ai.accessSources;
+    if (!isObject(declarations) || Object.keys(declarations).length === 0) {
+      return invalid("ai.accessSources must be a non-empty object");
+    }
+    const accessSources: NonNullable<AppManifest["ai"]>["accessSources"] = Object.create(null);
+    for (const [reference, definition] of Object.entries(declarations)) {
+      if (!ENTRY_ID_PATTERN.test(reference)) return invalid(`invalid ai.accessSources reference "${reference}"`);
+      if (!isObject(definition) || Object.keys(definition).length !== 2
+        || findUnexpectedField(definition, new Set(["name", "provider"]))) {
+        return invalid(`ai.accessSources.${reference} must contain exactly name and provider`);
+      }
+      if ([definition.name, definition.provider].some(field => typeof field !== "string" || !field.length || field.trim() !== field)) {
+        return invalid(`ai.accessSources.${reference} name and provider must be non-empty, trimmed strings`);
+      }
+      accessSources[reference] = { name: definition.name as string, provider: definition.provider as string };
+    }
+    ai = { accessSources };
+  }
+
   if (!isObject(value.runtime)) {
     return invalid("runtime must be an object");
   }
@@ -468,6 +494,7 @@ export function validateAppManifest(
       name: value.name,
       description: value.description,
       ...(createdFrom === undefined ? {} : { createdFrom }),
+      ...(ai === undefined ? {} : { ai }),
       runtime,
       permissions: {
         writes: {

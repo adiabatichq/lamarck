@@ -96,6 +96,39 @@ describe("App Loader", () => {
     expect(registry.getTableGrants("unknown-app")).toEqual([]);
   });
 
+  test("retains strict AI declarations in normalized manifests and registry authority", async () => {
+    const manifest = { ...validManifest('ai-app'), ai: { accessSources: {
+      summary: { name: 'Summaries', provider: 'openai' },
+      constructor: { name: 'Chat', provider: 'anthropic' },
+    } } };
+    const validation = validateAppManifest(manifest);
+    expect(validation).toEqual({ ok: true, manifest });
+    if (!validation.ok) throw new Error(validation.error);
+    expect(Object.getPrototypeOf(validation.manifest.ai!.accessSources)).toBeNull();
+    writeApp('ai-app', manifest);
+    const loaded = (await loadApps(appsDir)).apps.get('ai-app')!;
+    expect(loaded.manifest.ai).toEqual(manifest.ai);
+    manifest.ai.accessSources.summary.provider = 'anthropic';
+    expect(loaded.manifest.ai!.accessSources.summary.provider).toBe('openai');
+    writeApp('ai-app', manifest);
+    expect((await loadApps(appsDir)).apps.get('ai-app')!.manifestDigest).not.toBe(loaded.manifestDigest);
+  });
+
+  test.each([
+    null, [], {}, { accessSources: {} }, { accessSources: [] }, { accessSources: null },
+    { accessSources: { summary: { name: 'Summary', provider: 'openai' } }, required: true },
+    ...['Summary', 'access_abc', 'summary.chat', '', '-summary'].map(key => ({ accessSources: { [key]: { name: 'Summary', provider: 'openai' } } })),
+    ...[null, [], {}, { name: 'Summary' }, { provider: 'openai' },
+      { name: 'Summary', provider: 'openai', model: 'gpt' },
+      { name: '', provider: 'openai' }, { name: ' Summary', provider: 'openai' },
+      { name: 'Summary ', provider: 'openai' }, { name: 1, provider: 'openai' },
+      { name: 'Summary', provider: '' }, { name: 'Summary', provider: ' openai' },
+      { name: 'Summary', provider: 'openai ' }, { name: 'Summary', provider: false },
+    ].map(definition => ({ accessSources: { summary: definition } })),
+  ])('rejects malformed AI declaration %j rather than discarding it', ai => {
+    expect(validateAppManifest({ ...validManifest('ai-app'), ai }).ok).toBe(false);
+  });
+
   test("accepts dotted package ids while named workload ids remain unscoped", async () => {
     const manifest = validManifest("lamarck.daily-review");
     manifest.runtime.services = {

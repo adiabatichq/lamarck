@@ -16,6 +16,13 @@
 .page :is(button, input, select, a, summary):focus-visible { outline: 2px solid var(--system-active); outline-offset: 3px; }
 .page .quiet { border-color: transparent; background: transparent; color: var(--system-muted); }
 .sources { display: grid; gap: 14px; }
+.requirements { margin-bottom: 28px; border: 1px solid var(--system-line); border-radius: 9px; padding: 22px; background: var(--system-panel); }
+.requirements h2, .requirements h3 { font-family: var(--font-display); font-weight: 550; }
+.requirements h2 { font-size: 18px; margin: 0 0 20px; }
+.requirements h3 { font-size: 14px; margin: 18px 0 8px; }
+.requirement { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px; padding: 14px 0; border-top: 1px solid var(--system-line); }
+.requirement strong { font-size: 13px; }
+.requirement p { margin: 5px 0 0; }
 .source { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; border: 1px solid var(--system-line); padding: 22px; border-radius: 9px; background: var(--system-panel); }
 .sourceIdentity { display: flex; gap: 13px; align-items: center; min-width: 0; }
 .sourceIdentity > div { min-width: 0; }

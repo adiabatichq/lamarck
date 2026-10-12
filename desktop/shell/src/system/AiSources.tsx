@@ -1,17 +1,20 @@
 import { useCorePolling } from "../hooks/useCorePolling";
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { aiSourceLogin, listAiSources, removeAiSource, saveAiSource, type AiLoginStatus, type AiSourceInput, type AppInfo, type ManagedAiSource } from '../lib/api';
+import { aiSourceLogin, bindAppAiSource, listAiSources, removeAiSource, saveAiSource, type AppAiRequirement, type AiLoginStatus, type AiSourceInput, type AppInfo, type ManagedAiSource } from '../lib/api';
 import styles from './AiSources.module.css';
 
 type Inventory = Awaited<ReturnType<typeof listAiSources>>;
 type Login = { id: string; name: string; provider: string; attempt: number; starting: boolean; opened: boolean; state: AiLoginStatus; pollError?: string };
-const fresh = (): AiSourceInput => ({ name: '', provider: 'openai', kind: 'api-key', allow: { mode: 'all' }, config: {} });
+const fresh = (provider = 'openai'): AiSourceInput => ({ name: '', provider, kind: provider === 'local' ? 'local' : 'api-key', allow: { mode: 'all' }, config: {} });
 const providerName = (provider: string) => ({ openai: 'OpenAI', anthropic: 'Anthropic', local: 'Local service' })[provider] ?? provider;
 const subscriptionName = (provider: string) => provider === 'openai' ? 'Codex' : 'Claude Code';
 const errorMessage = (reason: unknown) => reason instanceof Error ? reason.message : String(reason);
+const connectionState = (status?: string) => status === 'ready' ? 'Connected' : status === 'login-required' ? 'Sign-in needed' : status === 'unavailable' ? 'Unavailable' : 'Checking…';
 
 export function AiSources({ apps }: { apps: AppInfo[] }) {
-  const [inventory, setInventory] = useState<Inventory>({ models: [], accessSources: [], sources: [] });
+  const [inventory, setInventory] = useState<Inventory>({ models: [], accessSources: [], sources: [], requirements: [] });
+  const [requirement, setRequirement] = useState<AppAiRequirement>();
+  const [selectedSource, setSelectedSource] = useState('');
   const [draft, setDraft] = useState<AiSourceInput | null>(null);
   const [editingId, setEditingId] = useState<string>();
   const [error, setError] = useState<string>();
@@ -20,8 +23,14 @@ export function AiSources({ apps }: { apps: AppInfo[] }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const loginAttempt = useRef(0);
   const refresh = useCallback(async () => setInventory(await listAiSources()), []);
-  useEffect(() => { void refresh().catch(reason => setError(errorMessage(reason))); }, [refresh]);
-  const dialogView = draft ? 'form' : login ? login.state.status : undefined;
+  useEffect(() => { void refresh().catch(reason => setError(errorMessage(reason))); }, [refresh, apps]);
+  const dialogView = draft ? 'form' : login ? login.state.status : requirement ? 'picker' : undefined;
+  const compatibleSources = inventory.sources.filter(source => source.provider === requirement?.provider
+    && (source.allow.mode === 'all' || source.allow.appIds.includes(requirement.appId)));
+  function choose(item: AppAiRequirement) {
+    setError(undefined); setRequirement(item);
+    setSelectedSource(item.state === 'configured' ? item.sourceId ?? '' : '');
+  }
   useEffect(() => {
     const element = dialog.current;
     if (!element) return;
@@ -83,6 +92,7 @@ export function AiSources({ apps }: { apps: AppInfo[] }) {
       loginAttempt.current++;
       setLogin(undefined);
       setDraft(null);
+      if (!draft && !login) setRequirement(undefined);
       setError(undefined);
     }
   }
@@ -95,14 +105,37 @@ export function AiSources({ apps }: { apps: AppInfo[] }) {
     <div className={styles.content}>
       <header className={styles.header}>
         <div><span className={styles.eyebrow}>Model access</span><h1>AI</h1><p>Connect the accounts and services your Apps use.</p></div>
-        <button className={styles.primary} disabled={busy} onClick={() => { setError(undefined); setEditingId(undefined); setDraft(fresh()); }}>Add access source</button>
+        <button className={styles.primary} disabled={busy} onClick={() => { setError(undefined); setRequirement(undefined); setEditingId(undefined); setDraft(fresh()); }}>Add access source</button>
       </header>
       {error && !dialogView && <p role="alert" className={styles.error}>{error}</p>}
+      {!!inventory.requirements.length && <section className={styles.requirements} aria-label="App AI requirements">
+        <h2>App AI requirements</h2>
+        {[...new Set(inventory.requirements.map(item => item.appId))].map(appId => <div key={appId}>
+          <h3>{inventory.requirements.find(item => item.appId === appId)!.appName}</h3>
+          {inventory.requirements.filter(item => item.appId === appId).map(item => {
+            const source = inventory.sources.find(source => source.id === item.sourceId);
+            const view = inventory.accessSources.find(source => source.id === item.sourceId);
+            const issue = item.issue === 'source-missing' ? 'Source removed' : item.issue === 'source-denied' ? 'App access denied' : 'Provider changed';
+            return <article key={item.reference} className={styles.requirement}>
+              <div><strong>{item.name}</strong><p>{providerName(item.provider)} · {item.state === 'setup-required' ? 'Setup required' : item.state === 'attention' ? `Needs attention: ${issue}` : `${source?.name ?? item.sourceId} · ${connectionState(view?.status)}`}</p></div>
+              <div className={styles.actions}>
+                <button disabled={busy} onClick={() => choose(item)}>{item.sourceId ? 'Change source' : 'Choose source'}</button>
+                {item.sourceId && <button disabled={busy} onClick={() => void act(() => bindAppAiSource(item.appId, item.reference, null))}>Clear</button>}
+                {item.state === 'configured' && source && view?.status !== 'ready' && <button disabled={busy} onClick={() => {
+                  choose(item);
+                  if (source.kind === 'subscription') void act(() => beginLogin(source));
+                  else edit(source);
+                }}>{source.kind === 'subscription' ? 'Sign in' : 'Connection settings'}</button>}
+              </div>
+            </article>;
+          })}
+        </div>)}
+      </section>}
       <section className={styles.sources} aria-label="Access sources">
         {!inventory.sources.length && <div className={styles.empty}><h2>Your AI, connected</h2><p>Add an API key, sign in to Codex or Claude Code, or connect a local model.</p></div>}
         {inventory.sources.map(source => {
           const view = inventory.accessSources.find(item => item.id === source.id);
-          const status = view?.status === 'ready' ? 'Connected' : view?.status === 'login-required' ? 'Sign-in needed' : view?.status === 'unavailable' ? 'Unavailable' : 'Checking…';
+          const status = connectionState(view?.status);
           return <article key={source.id} className={styles.source}>
             <div className={styles.sourceIdentity}>
               <span className={styles.providerMark} aria-hidden="true">{providerName(source.provider).slice(0, 1)}</span>
@@ -129,7 +162,13 @@ export function AiSources({ apps }: { apps: AppInfo[] }) {
       {draft ? <form onSubmit={event => {
         event.preventDefault();
         void act(async () => {
+          if (requirement && !editingId && draft.allow?.mode === 'apps' && !draft.allow.appIds.includes(requirement.appId)) {
+            throw new Error('Allow this App in the source settings before binding it.');
+          }
           const source = await saveAiSource(draft, editingId);
+          if (requirement && !editingId) {
+            setSelectedSource(source.id);
+          }
           if (!editingId && draft.kind === 'subscription') await beginLogin(source);
           else setDraft(null);
         });
@@ -141,7 +180,7 @@ export function AiSources({ apps }: { apps: AppInfo[] }) {
         <div className={styles.formBody}>
           {error && <p role="alert" className={styles.error}>{error}</p>}
           <div className={styles.fields}>
-            <label>Provider<select disabled={!!editingId || busy} value={draft.provider} onChange={event => setDraft({ ...draft, provider: event.target.value, kind: event.target.value === 'local' ? 'local' : 'api-key', config: {}, apiKey: undefined })}>
+            <label>Provider<select disabled={!!editingId || !!requirement || busy} value={draft.provider} onChange={event => setDraft({ ...draft, provider: event.target.value, kind: event.target.value === 'local' ? 'local' : 'api-key', config: {}, apiKey: undefined })}>
               <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="local">Local service</option>
             </select></label>
             <label>Connect with<select disabled={!!editingId || busy || draft.provider === 'local'} value={draft.kind} onChange={event => setDraft({ ...draft, kind: event.target.value as AiSourceInput['kind'], apiKey: undefined })}>
@@ -165,7 +204,7 @@ export function AiSources({ apps }: { apps: AppInfo[] }) {
           </fieldset>
         </div>
         <footer className={styles.dialogFooter}><button type="button" disabled={busy} onClick={closeDialog}>Cancel</button><button className={styles.primary} type="submit" disabled={busy}>{busy ? 'Saving…' : !editingId && draft.kind === 'subscription' ? 'Save and sign in' : 'Save source'}</button></footer>
-      </form> : login && <div>
+      </form> : login ? <div>
         <header className={styles.dialogHeader}>
           <span className={styles.eyebrow}>{providerName(login.provider)} · {login.name}</span>
           <button type="button" className={styles.close} aria-label="Close" disabled={busy} onClick={closeDialog}>×</button>
@@ -188,7 +227,26 @@ export function AiSources({ apps }: { apps: AppInfo[] }) {
             {login.state.status !== 'ready' && <button className={styles.primary} disabled={busy} onClick={() => void act(() => beginLogin(login))}>Try again</button>}
           </>}
         </footer>
-      </div>}
+      </div> : requirement && <form onSubmit={event => {
+        event.preventDefault();
+        void act(async () => { await bindAppAiSource(requirement.appId, requirement.reference, selectedSource); setRequirement(undefined); });
+      }}>
+        <header className={styles.dialogHeader}>
+          <div><span className={styles.eyebrow}>{requirement.appName}</span><h2 id="ai-dialog-title">{requirement.name}</h2></div>
+          <button type="button" className={styles.close} aria-label="Close" disabled={busy} onClick={closeDialog}>×</button>
+        </header>
+        <div className={styles.formBody}>
+          {error && <p role="alert" className={styles.error}>{error}</p>}
+          <label>Access source<select data-initial-focus required disabled={busy} value={selectedSource} onChange={event => setSelectedSource(event.target.value)}>
+            <option value="">Choose a source</option>
+            {compatibleSources.map(source => <option key={source.id} value={source.id}>{source.name} · {connectionState(inventory.accessSources.find(view => view.id === source.id)?.status)}</option>)}
+          </select></label>
+          <p>Sources must use {providerName(requirement.provider)} and allow this App. Connection status does not guarantee support for every model.</p>
+          {!compatibleSources.length && <p>No compatible sources yet.</p>}
+          <button type="button" disabled={busy || !['openai', 'anthropic', 'local'].includes(requirement.provider)} onClick={() => { setEditingId(undefined); setDraft(fresh(requirement.provider)); }}>Create access source</button>
+        </div>
+        <footer className={styles.dialogFooter}><button type="button" disabled={busy} onClick={closeDialog}>Cancel</button><button className={styles.primary} disabled={busy || !selectedSource} type="submit">Use source</button></footer>
+      </form>}
     </dialog>
   </div>;
 }

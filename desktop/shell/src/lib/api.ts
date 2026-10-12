@@ -353,6 +353,7 @@ export interface AppInfo {
     packageId: string;
     releaseId: string;
   };
+  ai?: { accessSources: Record<string, { name: string; provider: string }> };
   runtime?: {
     ui?: {
       command: string[];
@@ -918,8 +919,17 @@ export function rejectSchemaRequest(id: string): Promise<{ request: SchemaReques
 
 // AI access is managed only by the trusted System Console.
 export type { AiSourceInput, ManagedAiSource, AiOptions, AiAccessSource } from '@lamarck/system/protocol';
-export function listAiSources(): Promise<import('@lamarck/system/protocol').AiOptions & { sources: import('@lamarck/system/protocol').ManagedAiSource[] }> {
+export interface AppAiRequirement {
+  appId: string; appName: string; reference: string; name: string; provider: string;
+  sourceId?: string;
+  state: 'setup-required' | 'configured' | 'attention';
+  issue?: 'source-missing' | 'source-denied' | 'provider-mismatch';
+}
+export function listAiSources(): Promise<import('@lamarck/system/protocol').AiOptions & { sources: import('@lamarck/system/protocol').ManagedAiSource[]; requirements: AppAiRequirement[] }> {
   return request('/api/ai/sources');
+}
+export function bindAppAiSource(appId: string, reference: string, sourceId: string | null): Promise<{ ok: true }> {
+  return request('/api/ai/bindings', { method: 'POST', body: JSON.stringify({ appId, reference, sourceId }) });
 }
 export function saveAiSource(input: import('@lamarck/system/protocol').AiSourceInput, id?: string): Promise<import('@lamarck/system/protocol').ManagedAiSource> {
   return request('/api/ai/sources', { method: 'POST', body: JSON.stringify({ ...input, ...(id ? { id } : {}) }) });

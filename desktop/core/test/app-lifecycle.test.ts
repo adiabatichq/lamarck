@@ -22,7 +22,14 @@ afterEach(async () => {
 describe("AppLifecycleService inventory", () => {
   test("lists unversioned physical Apps with editable Host paths and actual grants", async () => {
     const fixture = await setup();
+    const manifest = JSON.parse(await readFile(join(fixture.appDir, 'manifest.json'), 'utf8'));
+    manifest.ai = { accessSources: { summary: { name: 'Summaries', provider: 'openai' } } };
+    await writeFile(join(fixture.appDir, 'manifest.json'), JSON.stringify(manifest));
     const [app] = await fixture.lifecycle.inventory();
+    expect(app.ai).toEqual(manifest.ai);
+    await fixture.lifecycle.save('example');
+    await writeFile(join(fixture.appDir, 'manifest.json'), '{broken');
+    expect((await fixture.lifecycle.inventory())[0]).not.toHaveProperty('ai');
 
     expect(app).toMatchObject({
       schemaVersion: 1,

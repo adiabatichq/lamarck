@@ -158,10 +158,10 @@ export function createAi(invoke: SystemInvoke): SystemAi {
     listOptions: () => invoke('ai.listOptions', {}),
     languageModel,
     embeddingModel(selection: ModelSelection): EmbeddingModelV4 {
-      const metadata = () => invoke('ai.listOptions', {}).then(options => {
-        const support = options.accessSources.find(s => s.id === selection.accessSource)?.support.find(s => s.model === selection.model);
-        if (!support || support.maxEmbeddingsPerCall === undefined) throw new Error('Embedding model/source is unavailable');
-        return support;
+      const metadata = () => invoke('ai.capabilities', {
+        model: selection.model,
+        accessSource: selection.accessSource,
+        operation: 'embed',
       });
       return {
         specificationVersion: 'v4', provider: 'lamarck', modelId: selection.model,
@@ -192,5 +192,5 @@ export function createAi(invoke: SystemInvoke): SystemAi {
 function fromFailure(error: AiFailure): Error {
   if (error.code === 'cancelled') return new DOMException(error.message, 'AbortError');
   if (error.statusCode !== undefined || error.retryable) return new APICallError({ message: error.message, url: 'lamarck:ai', requestBodyValues: {}, statusCode: error.statusCode, isRetryable: error.retryable });
-  return Object.assign(new Error(error.message), { code: error.code });
+  return Object.assign(new Error(error.message), { code: error.code, retryable: error.retryable });
 }

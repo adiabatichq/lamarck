@@ -65,9 +65,9 @@ export type SystemBrokerErrorCode =
   | "revoke_failed";
 
 export class SystemBrokerError extends Error {
-  readonly code: SystemBrokerErrorCode;
+  readonly code: string;
 
-  constructor(code: SystemBrokerErrorCode, message: string) {
+  constructor(code: string, message: string, readonly retryable?: boolean) {
     super(message);
     this.name = "SystemBrokerError";
     this.code = code;
@@ -398,6 +398,9 @@ export class SystemBroker {
         const message = isRecord(data) && typeof data.error === "string"
           ? data.error
           : `Core returned HTTP ${response.status}`;
+        if (operation.startsWith('ai.') && isRecord(data) && typeof data.code === 'string' && data.retryable === false) {
+          throw new SystemBrokerError(data.code, message, false);
+        }
         throw new SystemBrokerError("core_error", message);
       }
       const boundData = operation === "vfs.open"
@@ -614,7 +617,7 @@ function serializeBrowserSuccess(data: unknown): string {
 function serializeBrowserFailure(error: unknown): string {
   const message = errorMessage(error).slice(0, 1_024) || "System SDK request failed";
   const code = error instanceof SystemBrokerError ? error.code : "transport_error";
-  return JSON.stringify({ ok: false, error: { message, code } });
+  return JSON.stringify({ ok: false, error: { message, code, ...(error instanceof SystemBrokerError && error.retryable !== undefined ? { retryable: error.retryable } : {}) } });
 }
 
 function mapCoreRequest(operation: string, input: unknown): CoreRequest {
@@ -627,11 +630,12 @@ function mapCoreRequest(operation: string, input: unknown): CoreRequest {
     case 'computer.open': case 'computer.call': case 'computer.close':
       throw new SystemBrokerError('operation_denied', 'Computer Use is a Host operation');
     case 'ai.listOptions':
+    case 'ai.capabilities':
     case 'ai.start':
     case 'ai.next':
     case 'ai.cancel':
     case 'ai.toolResult': {
-      const route = { 'ai.listOptions': 'options', 'ai.start': 'invoke/start', 'ai.next': 'invoke/next', 'ai.cancel': 'invoke/cancel', 'ai.toolResult': 'invoke/tool-result' }[operation as 'ai.start'];
+      const route = { 'ai.listOptions': 'options', 'ai.capabilities': 'capabilities', 'ai.start': 'invoke/start', 'ai.next': 'invoke/next', 'ai.cancel': 'invoke/cancel', 'ai.toolResult': 'invoke/tool-result' }[operation as 'ai.start'];
       const body = expectJson(value, operation);
       return { method: 'POST', path: `/api/ai/${route}`, body, sizeValue: body };
     }

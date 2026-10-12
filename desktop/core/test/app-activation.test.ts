@@ -56,6 +56,11 @@ describe("AppActivationCoordinator", () => {
     const activation = await coordinator.prepare({ appId: "example", appDir, workload: "ui" });
 
     await writeFile(join(appDir, "src", "index.ts"), "export const version = 2;\n");
+    const edited = JSON.parse(await readFile(join(appDir, 'manifest.json'), 'utf8'));
+    edited.ai.accessSources = { chat: { name: 'New chat', provider: 'anthropic' } };
+    await writeFile(join(appDir, 'manifest.json'), JSON.stringify(edited));
+    expect(coordinator.require(activation.activationId, 'example', 'ui').manifest.ai)
+      .toEqual({ accessSources: { summary: { name: 'Summaries', provider: 'openai' } } });
     expect(await readFile(join(activation.immutablePackagePath, "src", "index.ts"), "utf8"))
       .toBe("export const version = 1;\n");
     expect(validateAppPackageTree(
@@ -102,6 +107,7 @@ async function fixture(): Promise<{ appDir: string; cacheDir: string }> {
     id: "example",
     name: "Example",
     description: "An exact-version fixture.",
+    ai: { accessSources: { summary: { name: 'Summaries', provider: 'openai' } } },
     runtime: {
       ui: { command: ["npm", "run", "start"], port: 3000 },
       services: { sync: { command: ["node", "sync.mjs"] } },

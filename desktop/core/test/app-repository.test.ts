@@ -22,6 +22,22 @@ afterEach(async () => {
 });
 
 describe("AppRepositoryService", () => {
+  test('save and Capsule package writeback retain validated AI declarations in exact versions', async () => {
+    const appDir = await fixture();
+    const service = new AppRepositoryService({ eventWriter: new IdempotentEvents() });
+    const manifest = JSON.parse(await readFile(join(appDir, 'manifest.json'), 'utf8'));
+    manifest.ai = { accessSources: { summary: { name: 'Summaries', provider: 'openai' } } };
+    await writeFile(join(appDir, 'manifest.json'), JSON.stringify(manifest));
+    const saved = await service.save({ appId: 'example', appDir });
+    expect((await service.readVersionPackage('example', appDir, saved.version)).manifest.ai).toEqual(manifest.ai);
+    const base = await collectAppPackageTree(appDir);
+    manifest.ai.accessSources.summary.name = 'Renamed summary';
+    const entries = base.map(entry => entry.path === 'manifest.json'
+      ? { path: entry.path, kind: 'file' as const, bytes: Buffer.from(JSON.stringify(manifest)) } : entry);
+    const changed = await service.savePackage({ appId: 'example', appDir, entries, baseVersion: saved.version, basePackageDigest: hashAppPackageTree(base) });
+    expect((await service.readVersionPackage('example', appDir, changed.version)).manifest.ai).toEqual(manifest.ai);
+    expect((await service.readVersionPackage('example', appDir, saved.version)).manifest.ai!.accessSources.summary.name).toBe('Summaries');
+  });
   test("first save initializes one root version and unchanged save/activation are no-ops", async () => {
     const appDir = await fixture();
     const events = new IdempotentEvents();

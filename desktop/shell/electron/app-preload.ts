@@ -38,8 +38,9 @@ contextBridge.exposeInMainWorld("__LAMARCK_SYSTEM_HOST__", Object.freeze({
       && isRecord(failure)
       && typeof failure.message === "string"
     ) {
-      const error = new Error(failure.message) as Error & { code?: string };
+      const error = new Error(failure.message) as Error & { code?: string; retryable?: boolean };
       if (typeof failure.code === "string") error.code = failure.code;
+      if (typeof failure.retryable === "boolean") error.retryable = failure.retryable;
       throw error;
     }
     throw new Error("Lamarck Host returned a malformed System SDK envelope");

@@ -196,7 +196,14 @@ const deviceIdentity = await resolveDeviceIdentity(coreSettings.vaultId ?? "");
 const vaultKey = process.env.LAMARCK_VAULT_KEY ?? encodeVaultKey(randomBytes(32));
 const secretStore = new SqliteEncryptedSecretStore(systemDb, vaultKey);
 const credentialStore = new CredentialStore(systemDb);
-const aiService = new AiService(systemDb, credentialStore, secretStore, join(workspacePath, '.lamarck', 'ai'));
+const aiService = new AiService(systemDb, credentialStore, secretStore, join(workspacePath, '.lamarck', 'ai'), undefined, {
+  activated(caller) {
+    return appActivationCoordinator.require(caller.authorization.activationId, caller.appId, caller.workload).manifest;
+  },
+  async current() {
+    return (await appLifecycle.inventory()).filter(app => app.manifestHealth.status === 'valid');
+  },
+});
 const lamarckSessionManager = new LamarckSessionManager(secretStore, {
   credentialStore,
   apiOrigin: lamarckApiOrigin,
@@ -2253,7 +2260,7 @@ const server = await serve<{ cwd: string }>({
         : err instanceof ConnectorLifecycleConflictError
           ? 409
           : 500;
-      return json({ error: message }, status);
+      return json({ error: message, ...(err instanceof AiError ? { code: err.code, retryable: err.retryable } : {}) }, status);
     } finally {
       // App revocation closes admission immediately, then waits on this lease.
       // Every successful admission is released exactly once on all route exits.

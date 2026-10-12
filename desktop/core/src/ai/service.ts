@@ -3,7 +3,7 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import type { LanguageModelV4CallOptions, EmbeddingModelV4CallOptions, ProviderV4 } from '@ai-sdk/provider';
-import { decodeAi, type AiAccessSource, type AiModel, type AiOptions, type AiStart, type ManagedAiSource } from '@lamarck/system/protocol';
+import { decodeAi, type AiAccessSource, type AiModel, type AiOptions, type AiStart, type AiSupport, type ModelSelection, type ManagedAiSource } from '@lamarck/system/protocol';
 import type { DatabaseSync } from 'node:sqlite';
 import type { AuthAdmission, AppAuthContext } from '../auth';
 import { CredentialStore } from '../credentials/credential-store';
@@ -13,6 +13,19 @@ import { AI_CATALOG, apiSupport } from './catalog';
 import { AiInvocations, type InvocationContext } from './invocations';
 import { AiSubscriptions } from './subscriptions';
 import { AiError, aiFailure } from './errors';
+import type { AppManifest } from '../app-loader';
+import { ENTRY_ID_PATTERN } from '../package-id';
+
+export interface AiManifestAuthority {
+  activated(caller: AppAuthContext): AppManifest;
+  current(): Promise<readonly Pick<AppManifest, 'id' | 'name' | 'ai'>[]>;
+}
+export interface AppAiRequirement {
+  appId: string; appName: string; reference: string; name: string; provider: string;
+  sourceId?: string;
+  state: 'setup-required' | 'configured' | 'attention';
+  issue?: 'source-missing' | 'source-denied' | 'provider-mismatch';
+}
 
 export interface AiAdapter {
   describe(source: ManagedAiSource): Promise<{ view: AiAccessSource; models: AiModel[] }>;
@@ -24,11 +37,69 @@ export class AiService {
   readonly subscriptions: AiSubscriptions;
   private descriptions = new Map<string, { generation: number; time: number; promise: Promise<AiAccessSource> }>();
   private catalog = new Map(AI_CATALOG.map(model => [model.id, model]));
-  constructor(db: DatabaseSync, credentials: CredentialStore, secrets: SecretStore, runtimeRoot: string, private adapter?: AiAdapter) {
+  constructor(db: DatabaseSync, credentials: CredentialStore, secrets: SecretStore, runtimeRoot: string, private adapter?: AiAdapter, private manifests?: AiManifestAuthority) {
     this.sources = new AiSourceStore(db, credentials, secrets, id => {
       this.descriptions.delete(id); this.invocations.cancelSource(id); this.subscriptions.invalidate(id);
     });
     this.subscriptions = new AiSubscriptions(this.sources, runtimeRoot);
+  }
+  async requirements(): Promise<AppAiRequirement[]> {
+    return (await this.manifests?.current() ?? []).flatMap(app => Object.entries(app.ai?.accessSources ?? {}).map(([reference, definition]) => {
+      const sourceId = this.sources.binding(app.id, reference);
+      const source = sourceId ? this.sources.get(sourceId) : undefined;
+      const issue = !sourceId ? undefined : !source ? 'source-missing' : !allowed(source, app.id) ? 'source-denied'
+        : source.provider !== definition.provider ? 'provider-mismatch' : undefined;
+      return { appId: app.id, appName: app.name, reference, ...definition, ...(sourceId ? { sourceId } : {}),
+        state: !sourceId ? 'setup-required' : issue ? 'attention' : 'configured', ...(issue ? { issue } : {}) };
+    }));
+  }
+  async bind(appId: string, reference: string, sourceId: string | null): Promise<void> {
+    const app = (await this.manifests?.current() ?? []).find(app => app.id === appId);
+    const definitions = app?.ai?.accessSources;
+    if (!definitions || !Object.hasOwn(definitions, reference)) throw new AiError('unknown_reference', 'AI source reference is not declared by this App');
+    if (sourceId !== null) {
+      const source = this.sources.get(sourceId);
+      if (!source || !allowed(source, appId)) throw new AiError('source_denied', 'AI source is unavailable to this App');
+      if (source.provider !== definitions[reference].provider) throw new AiError('provider_mismatch', 'Declared and source providers must match');
+    }
+    this.sources.bind(appId, reference, sourceId);
+  }
+  async capabilities(caller: AppAuthContext, selection: ModelSelection, operation: AiStart['operation'], signal?: AbortSignal): Promise<AiSupport> {
+    if (!['generate', 'stream', 'embed'].includes(operation)) throw new AiError('invalid_request', 'Invalid AI operation');
+    const source = this.resolve(caller, selection);
+    const support = await this.support(source, selection.model, operation);
+    signal?.throwIfAborted();
+    return support;
+  }
+  private resolve(caller: AppAuthContext, selection: ModelSelection): ManagedAiSource {
+    if (!selection || typeof selection.model !== 'string' || typeof selection.accessSource !== 'string') throw new AiError('invalid_request', 'Invalid AI selection');
+    // Configured IDs and manifest references are explicit, disjoint forms.
+    if (selection.accessSource.startsWith('access_')) return this.validateSource(caller.appId, selection);
+    if (!ENTRY_ID_PATTERN.test(selection.accessSource)) throw new AiError('unknown_reference', 'Invalid AI source reference');
+    const manifest = this.manifests?.activated(caller);
+    const definitions = manifest?.id === caller.appId ? manifest.ai?.accessSources : undefined;
+    if (!definitions || !Object.hasOwn(definitions, selection.accessSource)) throw new AiError('unknown_reference', 'AI source reference is not declared in this activation');
+    const sourceId = this.sources.binding(caller.appId, selection.accessSource);
+    if (!sourceId) throw new AiError('source_configuration_required', `Configure AI source "${selection.accessSource}" for this App in Console`);
+    return this.validateSource(caller.appId, { ...selection, accessSource: sourceId }, definitions[selection.accessSource].provider);
+  }
+  private validateSource(appId: string, selection: ModelSelection, provider?: string): ManagedAiSource {
+    const source = this.sources.get(selection.accessSource);
+    if (!source || !allowed(source, appId)) throw new AiError('source_denied', 'AI source is unavailable to this App');
+    const separator = selection.model.indexOf(':');
+    if ((provider !== undefined && provider !== source.provider) || separator < 1 || selection.model.slice(0, separator) !== source.provider || !selection.model.slice(separator + 1)) throw new AiError('provider_mismatch', 'Declared, model and source providers must match');
+    return source;
+  }
+  private async support(source: ManagedAiSource, modelId: string, operation: AiStart['operation']): Promise<AiSupport> {
+    const view = await this.describe(source);
+    if (this.sources.get(source.id)?.generation !== source.generation) throw new AiError('source_changed', 'AI source configuration changed');
+    const support = view.support.find(candidate => candidate.model === modelId);
+    const model = this.catalog.get(modelId);
+    if (view.status !== 'ready' || view.discovery !== 'known') throw new AiError('source_unavailable', 'AI source is not ready; check its connection or login in System');
+    if (!support || !model || model.type !== (operation === 'embed' ? 'embedding' : 'language')
+      || (operation === 'embed' && support.maxEmbeddingsPerCall === undefined)
+      || (operation === 'stream' && !support.streaming)) throw new AiError('unsupported', 'This source does not support the selected model or operation');
+    return support;
   }
   async options(caller?: AppAuthContext): Promise<AiOptions> {
     const sources = this.sources.list().filter(source => !caller || allowed(source, caller.appId));
@@ -45,10 +116,7 @@ export class AiService {
   start(admission: AuthAdmission, input: AiStart): { invocationId: string } {
     if (admission.context.kind !== 'app') throw new AiError('unauthorized', 'App identity required');
     if (!input || !['generate', 'stream', 'embed'].includes(input.operation) || typeof input.model !== 'string' || typeof input.accessSource !== 'string' || typeof input.callbacks !== 'boolean') throw new AiError('invalid_request', 'Invalid AI invocation');
-    const source = this.sources.get(input.accessSource);
-    if (!source || !allowed(source, admission.context.appId)) throw new AiError('source_denied', 'AI source is unavailable to this App');
-    const separator = input.model.indexOf(':');
-    if (separator < 1 || input.model.slice(0, separator) !== source.provider || !input.model.slice(separator + 1)) throw new AiError('provider_mismatch', 'Model and source providers must match');
+    const source = this.resolve(admission.context, input);
     const options = decodeAi(input.options) as LanguageModelV4CallOptions;
     if (!options || typeof options !== 'object' || Array.isArray(options)) throw new AiError('invalid_request', 'Invalid AI call options');
     if (options.headers && Object.keys(options.headers).some(name => name.toLowerCase() !== 'user-agent')) throw new AiError('unsupported', 'Custom provider HTTP headers are unsupported');
@@ -57,16 +125,11 @@ export class AiService {
     if (input.operation === 'embed') {
       if (!Array.isArray((options as unknown as EmbeddingModelV4CallOptions).values)) throw new AiError('invalid_request', 'Embedding values are required');
     } else if (!Array.isArray(options.prompt)) throw new AiError('invalid_request', 'Language prompt is required');
-    return this.invocations.start(admission, input, async context => {
+    return this.invocations.start(admission, { ...input, accessSource: source.id }, async context => {
       let handle: Awaited<ReturnType<AiAdapter['open']>> | undefined;
       try {
-        const view = await this.describe(source);
+        const support = await this.support(source, input.model, input.operation);
         context.signal.throwIfAborted();
-        if (this.sources.get(source.id)?.generation !== source.generation) throw new AiError('source_changed', 'AI source configuration changed');
-        const support = view.support.find(candidate => candidate.model === input.model);
-        const model = this.catalog.get(input.model);
-        if (view.status !== 'ready' || view.discovery !== 'known') throw new AiError('source_unavailable', 'AI source is not ready; check its connection or login in System');
-        if (!support || !model || model.type !== (input.operation === 'embed' ? 'embedding' : 'language')) throw new AiError('unsupported', 'This source does not support the selected model or operation');
         if ((input.operation === 'stream' && !support.streaming) || (options.responseFormat?.type === 'json' && !support.structuredOutput) || (options.tools?.length && !support.tools)) throw new AiError('unsupported', 'The selected source does not support this capability');
         if (source.kind === 'subscription' && options.tools?.length && !input.callbacks) throw new AiError('tools_require_scope', 'Use system.ai.withTools for subscription tools');
         handle = this.adapter ? await this.adapter.open(source, options, context) : await this.open(source, options, context);

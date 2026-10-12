@@ -25,6 +25,13 @@ CREATE TABLE IF NOT EXISTS ai_access_sources (
   generation INTEGER NOT NULL CHECK (generation > 0)
 );
 
+CREATE TABLE IF NOT EXISTS app_ai_source_bindings (
+  app_id TEXT NOT NULL,
+  reference TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  PRIMARY KEY (app_id, reference)
+);
+
 CREATE TABLE IF NOT EXISTS connector_sources (
   id            TEXT PRIMARY KEY,
   connector_id  TEXT NOT NULL,

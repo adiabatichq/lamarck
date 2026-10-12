@@ -1,6 +1,7 @@
 import { APICallError } from '@ai-sdk/provider';
 import type { AiFailure } from '@lamarck/system/protocol';
 export class AiError extends Error {
+  readonly retryable = false;
   constructor(readonly code: string, message: string) { super(message); }
 }
 export function aiFailure(error: unknown, signal?: AbortSignal): AiFailure {

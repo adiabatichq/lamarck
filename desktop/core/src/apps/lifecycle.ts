@@ -38,6 +38,7 @@ export interface AppInventoryItemV1 {
   readonly description: string;
   readonly runtime?: AppManifest["runtime"];
   readonly permissions?: AppManifest["permissions"];
+  readonly ai?: AppManifest["ai"];
   readonly createdFrom?: AppManifest["createdFrom"];
 }
 
@@ -273,6 +274,7 @@ export class AppLifecycleService {
         description: details?.description ?? "N/A",
         ...(details?.runtime === undefined ? {} : { runtime: details.runtime }),
         ...(details?.permissions === undefined ? {} : { permissions: details.permissions }),
+        ...(draft?.manifest.ai === undefined ? {} : { ai: draft.manifest.ai }),
         ...(details?.createdFrom === undefined ? {} : { createdFrom: details.createdFrom }),
       }));
     }

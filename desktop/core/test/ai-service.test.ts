@@ -24,6 +24,7 @@ async function restartService() { await service.close(); db.close(); db = new Da
 function system() {
   return createSystem(async (operation, input: any): Promise<any> => {
     if (operation === 'ai.listOptions') return service.options(caller);
+    if (operation === 'ai.capabilities') return service.capabilities(caller, input, input.operation);
     if (operation === 'ai.start') return service.start({ context: caller, signal: new AbortController().signal, release() {} }, input);
     if (operation === 'ai.next') return service.invocations.next(caller, input.invocationId, input.sequence);
     if (operation === 'ai.cancel') { service.invocations.cancel(caller, input.invocationId); return { ok: true }; }

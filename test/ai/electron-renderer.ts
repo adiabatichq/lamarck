@@ -1,7 +1,7 @@
 import { system } from '@lamarck/system/browser';
 import { generateText, streamText, tool, Output } from 'ai';
 import { z } from 'zod';
-const assert = (condition: unknown) => { if (!condition) throw new Error('Renderer assertion failed'); };
+const assert = (condition: unknown, message = 'Renderer assertion failed') => { if (!condition) throw new Error(message); };
 Object.assign(window, {
   async exercise(accessSource: string) {
     assert(typeof (globalThis as any).require === 'undefined');
@@ -51,6 +51,7 @@ import '../../desktop/shell/src/styles/reset.css';
 import '../../desktop/shell/src/styles/global.css';
 const externalUrls: string[] = [];
 let consoleBase = '', failNextExternal = false;
+let consoleRoot: ReturnType<typeof createRoot> | undefined;
 const wait = async (predicate: () => unknown) => { for (let n = 0; n < 200; n++) { if (predicate()) return; await new Promise(r => setTimeout(r, 25)); } throw new Error('Console timed out'); };
 const button = (name: string, root: ParentNode = document) => [...root.querySelectorAll('button')].find(button => button.textContent === name)!;
 const set = (selector: string, value: string) => {
@@ -65,8 +66,17 @@ const settle = () => new Promise(resolve => requestAnimationFrame(() => requestA
 const setLoginState = async (status: string) => {
   await fetch(`${consoleBase}/fixture/login-state`, { method: 'POST', headers: { Authorization: 'Bearer console-fixture', 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) });
 };
+const bindingFixture = async (path: string, body?: unknown) => {
+  const response = await fetch(`${consoleBase}/fixture/${path}`, {
+    method: body === undefined ? 'GET' : 'POST', headers: { Authorization: 'Bearer console-fixture', 'Content-Type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  assert(response.ok, `Binding fixture failed: ${path}`);
+  return response.json();
+};
 Object.assign(window, {
   showConsole(base: string) {
+    consoleRoot?.unmount(); document.querySelector('main')?.remove();
     consoleBase = base;
     Object.assign(window, { lamarckHost: { getCoreBaseUrl: async () => base, getCoreToken: async () => 'console-fixture', getCoreRuntimeState: async () => ({ phase: 'ready', generation: 1 }), onCoreRuntimeState: () => () => {}, openExternal: async (url: string) => {
       if (failNextExternal) { failNextExternal = false; throw new Error('Could not open the browser. Please try again.'); }
@@ -74,7 +84,8 @@ Object.assign(window, {
     } } });
     // Match SystemRoom's bounded, non-scrolling content container.
     const element = document.createElement('main'); element.style.cssText = 'height:100%;min-height:0;overflow:hidden'; document.body.append(element);
-    createRoot(element).render(createElement(AiSources, { apps: [{ id: 'browser-fixture', name: 'Fixture App' } as any] }));
+    consoleRoot = createRoot(element);
+    consoleRoot.render(createElement(AiSources, { apps: [{ id: 'browser-fixture', name: 'Fixture App' } as any] }));
   },
   async exerciseConsole() {
     const article = () => [...document.querySelectorAll('article')].find(article => article.textContent?.includes('Console fixture'))!;
@@ -119,7 +130,7 @@ Object.assign(window, {
     const subscription = () => [...document.querySelectorAll('article')].find(article => article.querySelector('h2')?.textContent === 'Codex personal')!;
     button('Sign in again', subscription()).click(); await wait(() => loginLink() && !button('Cancel sign-in').disabled);
     button('Cancel sign-in').click(); await wait(() => !dialog().open && !button('Add access source').disabled);
-    button('Sign in again', subscription()).click(); await wait(() => loginLink() && !button('Cancel sign-in').disabled);
+    button('Sign in', subscription()).click(); await wait(() => loginLink() && !button('Cancel sign-in').disabled);
     await setLoginState('failed'); await wait(() => button('Try again'));
     assert(dialog().textContent?.includes('Sign-in didn’t finish'));
     button('Try again').click(); await wait(() => loginLink() && !button('Cancel sign-in').disabled);
@@ -135,5 +146,62 @@ Object.assign(window, {
     assert(action.top >= 0 && action.bottom <= innerHeight);
     dialog().scrollTop = 0;
     await settle();
+  },
+  async exerciseConsoleBindings() {
+    // Real React controls and Host binding management; only login is simulated.
+    button('Cancel sign-in').click(); await wait(() => !dialog().open && !button('Add access source').disabled);
+    for (const bound of [true, false]) {
+      for (const outcome of ['api-key', 'ready', 'cancel', 'cancelled', 'failed', 'start-failed']) {
+        const baseline = await bindingFixture('binding-reset', { bound, failLogin: outcome === 'start-failed' });
+        (window as any).showConsole(consoleBase);
+        const requirement = () => document.querySelector<HTMLElement>('[aria-label="App AI requirements"] article')!;
+        await wait(() => requirement() && button(bound ? 'Change source' : 'Choose source', requirement()));
+        const openPicker = async () => {
+          button(bound ? 'Change source' : 'Choose source', requirement()).click();
+          await wait(() => dialog().open && button('Use source', dialog())?.disabled === !bound);
+        };
+        await openPicker();
+        button('Create access source', dialog()).click(); await wait(() => button('Save source', dialog()));
+        const name = `Binding ${bound ? 'bound' : 'unbound'} ${outcome}`;
+        set('dialog form input:not([type])', name);
+        if (outcome === 'api-key') set('dialog form input[type=password]', 'fixture-only');
+        else {
+          set('dialog form select:not(:disabled)', 'subscription');
+          await wait(() => button('Save and sign in', dialog()));
+        }
+        button(outcome === 'api-key' ? 'Save source' : 'Save and sign in', dialog()).click();
+        if (outcome !== 'api-key') {
+          await wait(() => (outcome === 'start-failed' ? dialog().textContent?.includes('Fixture login start failed') : button('Cancel sign-in', dialog())) && !button('Add access source').disabled);
+          const state = await bindingFixture('binding-state');
+          assert(state.calls.length === 0 && state.sourceId === baseline.sourceId, `${name}: login must not bind`);
+          if (outcome === 'cancel') button('Cancel sign-in', dialog()).click();
+          else {
+            if (outcome !== 'start-failed') await setLoginState(outcome);
+            await wait(() => button(outcome === 'ready' ? 'Done' : 'Close', dialog()));
+            button(outcome === 'ready' ? 'Done' : 'Close', dialog()).click();
+          }
+        }
+        await wait(() => button('Use source', dialog()) && !button('Use source', dialog()).disabled);
+        const saved = await bindingFixture('binding-state');
+        const created = saved.sources.find((source: any) => source.name === name);
+        assert(created && saved.calls.length === 0 && saved.sourceId === baseline.sourceId, `${name}: creation must only save the source`);
+        const picker = () => dialog().querySelector<HTMLSelectElement>('select')!;
+        assert(picker().value === created.id, `${name}: new source must be the pending choice`);
+        const readiness = ['api-key', 'ready'].includes(outcome) ? 'Connected' : 'Sign-in needed';
+        assert(picker().selectedOptions[0].textContent === `${name} · ${readiness}`, `${name}: picker must show actual readiness`);
+        button('Cancel', dialog()).click(); await wait(() => !dialog().open);
+        const cancelled = await bindingFixture('binding-state');
+        assert(cancelled.calls.length === 0 && cancelled.sourceId === baseline.sourceId, `${name}: picker cancellation must preserve the binding`);
+        assert(cancelled.sources.some((source: any) => source.id === created.id), `${name}: cancellation must retain the saved source`);
+        await openPicker();
+        assert(picker().value === (baseline.sourceId ?? ''), `${name}: reopening must show the persisted choice`);
+        set('dialog form select', created.id); await wait(() => !button('Use source', dialog()).disabled);
+        button('Use source', dialog()).click(); await wait(() => !dialog().open && !button('Add access source').disabled);
+        const confirmed = await bindingFixture('binding-state');
+        assert(JSON.stringify(confirmed.calls) === JSON.stringify([{ appId: 'browser-fixture', reference: 'summary', sourceId: created.id }]), `${name}: only confirmation may call binding management`);
+        assert(confirmed.sourceId === created.id && requirement().textContent?.includes(`${name} · ${readiness}`), `${name}: confirmation must persist B and show its readiness`);
+      }
+    }
+    return 'passed';
   },
 });

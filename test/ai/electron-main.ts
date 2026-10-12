@@ -13,6 +13,7 @@ import { SqliteEncryptedSecretStore } from '../../desktop/core/src/credentials/s
 import { handleAiRequest } from '../../desktop/core/src/ai/routes';
 import { SystemBroker } from '../../desktop/shell/electron/capsule/system-broker';
 import { serve } from '../../desktop/core/src/node-server';
+import { validateAppManifest } from '../../desktop/core/src/app-loader';
 app.on('window-all-closed', () => {});
 async function main() {
 const root = await mkdtemp(join(tmpdir(), 'lamarck-ai-electron-'));
@@ -26,8 +27,9 @@ let retryAttempts = 0, retryInvocation: string | undefined;
 let retryErrorSent = false, retryPulling = false, cancelledDuringPull = false;
 let retryPollEntered!: () => void;
 const retryPoll = new Promise<void>(resolve => { retryPollEntered = resolve; });
+const connectionStates = new Map<string, 'ready' | 'login-required'>();
 const adapter: AiAdapter = {
-  async describe(source) { return { models: [{ id: 'openai:fixture', name: 'Fixture', provider: 'openai', type: 'language' }], view: { ...source, status: 'ready', discovery: 'known', support: [{ model: 'openai:fixture', streaming: true, structuredOutput: true, tools: true }] } }; },
+  async describe(source) { return { models: [{ id: 'openai:fixture', name: 'Fixture', provider: 'openai', type: 'language' }], view: { ...source, status: connectionStates.get(source.id) ?? 'ready', discovery: 'known', support: [{ model: 'openai:fixture', streaming: true, structuredOutput: true, tools: true }] } }; },
   async open(source, options, context) {
     const model = { specificationVersion: 'v4' as const, provider: 'fixture', modelId: 'fixture', supportedUrls: {},
       async doGenerate(options: any) {
@@ -55,7 +57,13 @@ const adapter: AiAdapter = {
 };
 const guard = new GuardEngine({ workspacePath: root });
 const principal = { source: 'app:browser-fixture:ui', producerRef: `producer:v1:sha256:${'3'.repeat(64)}`, tableGrants: [] };
-const service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter);
+const manifest = validateAppManifest({ manifestVersion: 1, id: 'browser-fixture', name: 'Fixture App', description: 'Console binding fixture',
+  runtime: { ui: { command: ['node', 'app.mjs'], port: 3000 } }, permissions: { writes: { files: [], tables: [] } },
+  ai: { accessSources: { summary: { name: 'Summaries', provider: 'openai' } } } });
+if (!manifest.ok) throw new Error(manifest.error);
+const service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter, {
+  activated: () => manifest.manifest, current: async () => [manifest.manifest],
+});
 const next = service.invocations.next.bind(service.invocations);
 service.invocations.next = async (...args) => {
   const held = args[1] === retryInvocation && retryErrorSent;
@@ -72,25 +80,46 @@ const source = await service.sources.save({ provider: 'openai', kind: 'subscript
 const caller = { kind: 'app', appId: 'browser-fixture', channelId: 'browser', workload: 'ui', authorization: {} } as any;
 const signal = new AbortController();
 let loginState = 'pending', loginStarts = 0, loginCancels = 0;
+let failNextLogin = false;
+const bindingCalls: { appId: string; reference: string; sourceId: string | null }[] = [];
 const server = await serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
   const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS' };
   if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
   if (request.headers.get('authorization') === 'Bearer console-fixture') {
     // Exercise the full Console sign-in lifecycle without a real account.
     const path = new URL(request.url).pathname;
+    if (path === '/fixture/binding-reset') {
+      const { bound, failLogin } = await request.json();
+      service.sources.bind('browser-fixture', 'summary', bound ? source.id : null);
+      bindingCalls.length = 0;
+      failNextLogin = !!failLogin;
+      return Response.json({ sourceId: bound ? source.id : null }, { headers: cors });
+    }
+    if (path === '/fixture/binding-state') return Response.json({
+      calls: bindingCalls, sourceId: service.sources.binding('browser-fixture', 'summary') ?? null, sources: service.sources.list(),
+    }, { headers: cors });
     if (path === '/fixture/login-state') {
       loginState = (await request.json()).status;
       return Response.json({ ok: true }, { headers: cors });
     }
-    const loginAction = path.match(/^\/api\/ai\/sources\/[^/]+\/(login|login-status|cancel-login)$/)?.[1];
+    const loginMatch = path.match(/^\/api\/ai\/sources\/([^/]+)\/(login|login-status|cancel-login)$/);
+    const loginAction = loginMatch?.[2];
     if (loginAction) {
+      const sourceId = loginMatch![1];
       if (loginAction === 'login') {
         loginStarts++; loginState = 'pending';
+        connectionStates.set(sourceId, 'login-required'); service.refreshSource(sourceId);
+        if (failNextLogin) {
+          failNextLogin = false;
+          return Response.json({ error: 'Fixture login start failed' }, { status: 400, headers: cors });
+        }
         return Response.json({ status: 'pending' }, { headers: cors });
       }
       if (loginAction === 'cancel-login') { loginCancels++; loginState = 'cancelled'; }
+      connectionStates.set(sourceId, loginState === 'ready' ? 'ready' : 'login-required'); service.refreshSource(sourceId);
       return Response.json({ status: loginState, ...(loginState === 'pending' ? { url: 'https://example.invalid/subscription-login' } : {}) }, { headers: cors });
     }
+    if (path === '/api/ai/bindings' && request.method === 'POST') bindingCalls.push(await request.clone().json());
     try { return Response.json((await handleAiRequest(service, request, { context: { kind: 'host' }, signal: new AbortController().signal, release() {} } as any)).body, { headers: cors }); }
     catch (error) { return Response.json({ error: String(error) }, { status: 400, headers: cors }); }
   }
@@ -151,6 +180,10 @@ try {
     await consoleWindow.webContents.executeJavaScript('window.exerciseConsoleLayout()');
     await writeFile(join(import.meta.dirname, 'console-small.png'), (await consoleWindow.webContents.capturePage()).toPNG());
     console.log('AI_CONSOLE_SMOKE_PASS: page/dialog scrolling, create, secret custody, App policy, subscription save-and-sign-in, external link failure/retry, completion, cancellation, login failure/retry, keyboard dismissal');
+    consoleWindow.setSize(1000, 640);
+    const bindings = await consoleWindow.webContents.executeJavaScript('window.exerciseConsoleBindings().catch(error => { throw new Error(error.stack); })');
+    if (bindings !== 'passed') throw new Error('Console binding confirmation failed');
+    console.log('AI_CONSOLE_BINDINGS_PASS: bound/unbound requirements; API-key creation; subscription completion, cancellation and failure; pending selection; picker cancellation; explicit confirmation; real readiness');
   } catch (error) {
     await writeFile(join(import.meta.dirname, 'console-failure.png'), (await consoleWindow.webContents.capturePage()).toPNG());
     throw error;

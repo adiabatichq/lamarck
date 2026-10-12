@@ -20,6 +20,7 @@ async function fixture() {
     id: "lamarck.notes",
     name: "Notes",
     description: "Editable notes.",
+    ai: { accessSources: { summary: { name: 'Summaries', provider: 'openai' } } },
     runtime: { ui: { command: ["npm", "run", "start"], port: 3000 } },
     permissions: { writes: { files: [], tables: [] } },
   };
@@ -30,6 +31,14 @@ async function fixture() {
 }
 
 describe("Marketplace App instantiation", () => {
+  test('rejects unknown AI declaration fields during Store import and rolls back the local copy', async () => {
+    const { source, apps } = await fixture();
+    const manifest = JSON.parse(await readFile(join(source, 'manifest.json'), 'utf8'));
+    manifest.ai.accessSources.summary.sourceId = 'access_not-a-declaration';
+    await writeFile(join(source, 'manifest.json'), JSON.stringify(manifest));
+    await expect(instantiateMarketplaceApp({ verifiedSourceDir: source, appsDir: apps, packageId: 'lamarck.notes', releaseId: 'release-1', initializeRepository: async () => {} })).rejects.toThrow('failed App Manifest V1 validation');
+    await expect(stat(join(apps, 'lamarck.notes'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
   test("adds provenance only to a normalized editable local copy", async () => {
     const { source, apps } = await fixture();
     const result = await instantiateMarketplaceApp({
@@ -44,6 +53,8 @@ describe("Marketplace App instantiation", () => {
       packageId: "lamarck.notes",
       releaseId: "release-1",
     });
+    expect(result.manifest.ai).toEqual({ accessSources: { summary: { name: 'Summaries', provider: 'openai' } } });
+    expect(JSON.parse(await readFile(join(result.dir, 'manifest.json'), 'utf8')).ai).toEqual(result.manifest.ai);
     expect(JSON.parse(await readFile(join(source, "manifest.json"), "utf8")))
       .not.toHaveProperty("createdFrom");
     expect((await stat(result.dir)).mode & 0o777).toBe(0o755);
@@ -67,6 +78,7 @@ describe("Marketplace App instantiation", () => {
     });
     expect(result.id).toBe("my-notes");
     expect(result.manifest.id).toBe("my-notes");
+    expect(result.manifest.ai?.accessSources.summary.provider).toBe('openai');
     expect(result.manifest.createdFrom?.packageId).toBe("lamarck.notes");
   });
 

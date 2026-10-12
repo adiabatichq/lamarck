@@ -8,7 +8,7 @@ import { createConnection, createServer, type Socket } from 'node:net';
 import { once } from 'node:events';
 import { buildSync } from 'esbuild';
 import { runInNewContext } from 'node:vm';
-import { generateText, streamText, embedMany, tool, stepCountIs, Output } from 'ai';
+import { generateText, streamText, embed, embedMany, tool, stepCountIs, Output } from 'ai';
 import { z } from 'zod';
 import { createSystem } from '@lamarck/system/browser';
 import { decodeAi, SYSTEM_OPERATIONS } from '@lamarck/system/protocol';
@@ -33,6 +33,8 @@ import { CredentialStore } from '../../desktop/core/src/credentials/credential-s
 import { SqliteEncryptedSecretStore } from '../../desktop/core/src/credentials/secret-store';
 import { serve, type NodeFetchServer } from '../../desktop/core/src/node-server';
 import type { AppAuthContext } from '../../desktop/core/src/auth';
+import { validateAppManifest, type AppManifest } from '../../desktop/core/src/app-loader';
+import { AiError } from '../../desktop/core/src/ai/errors';
 
 const usage = { inputTokens: { total: 3, noCache: 3, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 2, text: 2, reasoning: 0 } };
 const finishReason = { unified: 'stop' as const, raw: 'stop' };
@@ -52,6 +54,16 @@ let outstanding = 0;
 const disposed = vi.fn();
 const callers = new Map<string, AppAuthContext>();
 const signals = new Map<string, AbortController>();
+const manifests = new Map<string, AppManifest>();
+const activated = new Map<string, AppManifest>();
+const openedSources: { id: string; generation: number }[] = [];
+function declareApp(id = 'app-a', provider = 'openai') {
+  const result = validateAppManifest({ manifestVersion: 1, id, name: id, description: 'AI reference fixture',
+    runtime: { ui: { command: ['node', 'app.mjs'], port: 3000 }, services: { sync: { command: ['node', 'sync.mjs'] } }, jobs: { daily: { command: ['node', 'daily.mjs'] } } },
+    permissions: { writes: { files: [], tables: [] } }, ai: { accessSources: { summary: { name: 'Summaries', provider }, indexing: { name: 'Indexing', provider } } } });
+  if (!result.ok) throw new Error(result.error);
+  manifests.set(id, result.manifest);
+}
 const adapter: AiAdapter = {
   async describe(source) {
     return {
@@ -68,6 +80,7 @@ const adapter: AiAdapter = {
     };
   },
   async open(source, options, context) {
+    openedSources.push({ id: source.id, generation: source.generation });
     const model = {
       specificationVersion: 'v4' as const, provider: source.provider, modelId: 'fixture', supportedUrls: {},
       async doGenerate(options: any) {
@@ -100,11 +113,14 @@ const adapter: AiAdapter = {
 };
 beforeEach(async () => {
   disposed.mockClear(); callers.clear(); signals.clear(); outstanding = 0;
+  manifests.clear(); activated.clear(); openedSources.length = 0;
   root = await mkdtemp(join(tmpdir(), 'ai-path-'));
   db = new DatabaseSync(':memory:'); db.exec(SYSTEM_SCHEMA_V1);
   guard = new GuardEngine({ workspacePath: root }); expectedTurns = []; expectedBlobs = [];
   vfs = new VfsService(root, new D1ObserverState(db), new ContentBlobStore(root), new D1Sequencer()); await vfs.initialize();
-  service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter);
+  service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter, {
+    activated: caller => activated.get(caller.channelId)!, current: async () => [...manifests.values()],
+  });
   server = await serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     const token = request.headers.get('x-lamarck-app-capability')!;
     const caller = callers.get(token);
@@ -122,7 +138,7 @@ beforeEach(async () => {
       if (path === '/api/vfs/command') { const body = await request.json(); return Response.json(await vfs.command({ guard: writer(caller.appId), fileGrants: ['answer.txt'], trustedHost: false, workloadId: caller.channelId }, body.command, body.options)); }
       const result = await handleAiRequest(service, request, admission); retained = !!result.retained;
       return Response.json(result.body);
-    } catch (error) { return Response.json({ error: String(error) }, { status: 400 }); }
+    } catch (error) { return Response.json({ error: String(error), ...(error instanceof AiError ? { code: error.code, retryable: error.retryable } : {}) }, { status: 400 }); }
     finally { if (!retained) admission.release(); }
   } });
   broker = new SystemBroker({ coreBaseUrl: async () => `http://127.0.0.1:${server.port}`, revokeCapability: async channelId => { for (const [token, caller] of callers) if (caller.channelId === channelId) signals.get(token)!.abort(); } });
@@ -137,13 +153,14 @@ afterEach(async () => {
     expect(await blobFiles()).toEqual(expectedBlobs);
   } finally { db.close(); guard.close(); await rm(root, { recursive: true, force: true }); }
 });
-function bind(id: string) {
-  const caller = { kind: 'app', appId: id, workload: 'ui', channelId: `ch-${id}`, authorization: {} } as AppAuthContext;
+function bind(id: string, workload: AppAuthContext['workload'] = 'ui') {
+  const caller = { kind: 'app', appId: id, workload, channelId: `ch-${id}`, authorization: {} } as AppAuthContext;
   callers.set(id, caller); signals.set(id, new AbortController());
+  if (manifests.has(id)) activated.set(caller.channelId, structuredClone(manifests.get(id)!));
   broker.bindSender(id, { capability: id, channelId: caller.channelId });
 }
-async function systemFor(path: 'browser' | 'node', id = 'app-a') {
-  bind(id);
+async function systemFor(path: 'browser' | 'node', id = 'app-a', workload: AppAuthContext['workload'] = 'ui') {
+  bind(id, workload);
   if (path === 'browser') {
     const compiled = buildSync({ entryPoints: ['desktop/shell/electron/app-preload.ts'], bundle: true, write: false, platform: 'node', format: 'cjs', external: ['electron'] }).outputFiles[0].text;
     let host: any;
@@ -165,6 +182,122 @@ async function systemFor(path: 'browser' | 'node', id = 'app-a') {
   return createSystem(client.invoke);
 }
 for (const path of ['browser', 'node'] as const) describe(`${path} Capsule channel`, () => {
+  test.each(['service:sync', 'job:daily'] as const)('same-key App bindings are isolated for %s and channel revocation cancels the real source', async workload => {
+    declareApp(); declareApp('app-b');
+    const first = await service.sources.save({ provider: 'openai', kind: 'subscription', name: 'First' });
+    const second = await service.sources.save({ provider: 'openai', kind: 'subscription', name: 'Second' });
+    await service.bind('app-a', 'summary', first.id); await service.bind('app-b', 'summary', second.id);
+    const a = await systemFor(path, 'app-a', workload), b = await systemFor(path, 'app-b', workload);
+    const selection = { model: 'openai:fixture', accessSource: 'summary' };
+    await generateText({ model: a.ai.languageModel(selection), prompt: 'first' });
+    await generateText({ model: b.ai.languageModel(selection), prompt: 'second' });
+    expect(openedSources.map(source => source.id)).toEqual([first.id, second.id]);
+    const pending = generateText({ model: a.ai.languageModel(selection), prompt: 'wait-for-abort', maxRetries: 0 });
+    const rejected = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(service.invocations.hasSource(first.id)).toBe(true));
+    signals.get('app-a')!.abort(); await rejected;
+    expect((await generateText({ model: b.ai.languageModel(selection), prompt: 'still allowed' })).text).toBe('hello');
+  });
+  test('declared references generate, stream and batch embeddings without changing listings', async () => {
+    declareApp();
+    expect((await service.requirements())[0]).toMatchObject({ reference: 'summary', state: 'setup-required' });
+    const source = await service.sources.save({ provider: 'openai', kind: 'api-key', name: 'Fixture', apiKey: 'fixture' });
+    await service.bind('app-a', 'summary', source.id); await service.bind('app-a', 'indexing', source.id);
+    const system = await systemFor(path);
+    const listing = await system.ai.listOptions();
+    expect(Object.keys(listing).sort()).toEqual(['accessSources', 'models']);
+    expect(listing.accessSources.map(source => source.id)).toEqual([source.id]);
+    const model = system.ai.languageModel({ model: 'openai:fixture', accessSource: 'summary' });
+    expect((await generateText({ model, prompt: 'hello' })).text).toBe('hello');
+    const parts = []; for await (const part of streamText({ model, prompt: 'hello' }).textStream) parts.push(part);
+    expect(parts).toEqual(['hel', 'lo']);
+    const embedding = system.ai.embeddingModel({ model: 'openai:embedding', accessSource: 'indexing' });
+    expect(await embedding.maxEmbeddingsPerCall).toBe(2); expect(await embedding.supportsParallelCalls).toBe(true);
+    expect((await embedMany({ model: embedding, values: ['a', 'bb', 'ccc'] })).embeddings).toEqual([[1], [2], [3]]);
+    expect(openedSources.every(opened => opened.id === source.id && opened.generation === source.generation)).toBe(true);
+  });
+  test.each(['configured-id', 'reference'])('embedding settings with App fields use the strict Host endpoint (%s)', async form => {
+    declareApp();
+    const source = await service.sources.save({ provider: 'openai', kind: 'api-key', name: 'Fixture', apiKey: 'fixture' });
+    await service.bind('app-a', 'indexing', source.id);
+    const system = await systemFor(path);
+    const settings = { model: 'openai:embedding', accessSource: form === 'reference' ? 'indexing' : source.id, label: 'Search index' };
+    // The Host remains strict even though App settings may contain other fields.
+    await expect(broker.invoke('app-a', 'ai.capabilities', { ...settings, operation: 'embed' })).rejects.toMatchObject({
+      code: 'invalid_request', message: expect.stringContaining('Invalid AI capability query'),
+    });
+    const model = system.ai.embeddingModel(settings);
+    expect(await model.maxEmbeddingsPerCall).toBe(2);
+    expect(await model.supportsParallelCalls).toBe(true);
+    expect((await embed({ model, value: 'abc' })).embedding).toEqual([3]);
+    expect((await embedMany({ model, values: ['a', 'bb', 'ccc', 'dddd', 'eeeee'] })).embeddings).toEqual([[1], [2], [3], [4], [5]]);
+    expect(openedSources).toEqual(Array.from({ length: 4 }, () => ({ id: source.id, generation: source.generation })));
+  });
+  test.each(['openai', 'anthropic'])('%s subscription reference callbacks retain the originating channel', async provider => {
+    declareApp('app-a', provider);
+    const source = await service.sources.save({ provider, kind: 'subscription', name: 'Fixture' });
+    await service.bind('app-a', 'summary', source.id);
+    const system = await systemFor(path);
+    const execute = vi.fn(async () => (await system.query('select identity')).rows[0].appId);
+    const selection = { model: `${provider}:${provider === 'anthropic' ? 'claude-sonnet-5' : 'fixture'}`, accessSource: 'summary', tools: { lookup: tool({ inputSchema: z.object({ value: z.string() }), execute }) } };
+    expect((await system.ai.withTools(selection, ({ model, tools }) => generateText({ model, tools, prompt: 'lookup' }))).text).toBe('app-a');
+    expect(await system.ai.withTools(selection, ({ model, tools }) => streamText({ model, tools, prompt: 'lookup' }).text)).toBe('app-a');
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+  test('unbound and unknown references fail explicitly before adapter execution for calls and getters', async () => {
+    declareApp(); const system = await systemFor(path);
+    for (const operation of ['generate', 'stream', 'embed'] as const) {
+      const language = system.ai.languageModel({ model: 'openai:fixture', accessSource: 'summary' });
+      const call = operation === 'embed' ? system.ai.embeddingModel({ model: 'openai:embedding', accessSource: 'summary' }).doEmbed({ values: ['a'] })
+        : operation === 'stream' ? language.doStream({ prompt: [] }) : language.doGenerate({ prompt: [] });
+      await expect(call).rejects.toMatchObject({ code: 'source_configuration_required', retryable: false });
+    }
+    await expect(system.ai.embeddingModel({ model: 'openai:embedding', accessSource: 'indexing' }).maxEmbeddingsPerCall).rejects.toMatchObject({ code: 'source_configuration_required', retryable: false });
+    await expect(generateText({ model: system.ai.languageModel({ model: 'openai:fixture', accessSource: 'constructor' }), prompt: 'unknown', maxRetries: 0 })).rejects.toMatchObject({ code: 'unknown_reference' });
+    expect(openedSources).toEqual([]); expect(service.invocations.size).toBe(0);
+  });
+  test('rebinding keeps admitted calls on the real source and removal still cancels them', async () => {
+    declareApp();
+    const first = await service.sources.save({ provider: 'openai', kind: 'api-key', name: 'First', apiKey: 'fixture' });
+    const second = await service.sources.save({ provider: 'openai', kind: 'api-key', name: 'Second', apiKey: 'fixture' });
+    await service.bind('app-a', 'summary', first.id);
+    const system = await systemFor(path);
+    const model = system.ai.languageModel({ model: 'openai:fixture', accessSource: 'summary' });
+    const pending = generateText({ model, prompt: 'wait-for-abort', maxRetries: 0 });
+    const rejected = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(openedSources).toEqual([{ id: first.id, generation: first.generation }]));
+    await service.bind('app-a', 'summary', second.id);
+    expect(service.invocations.hasSource(first.id)).toBe(true);
+    expect(service.invocations.hasSource(second.id)).toBe(false);
+    expect((await generateText({ model, prompt: 'next' })).text).toBe('hello');
+    expect(openedSources[1].id).toBe(second.id);
+    await service.sources.remove(first.id); await rejected;
+    expect(service.invocations.hasSource(first.id)).toBe(false);
+    expect((await generateText({ model, prompt: 'next' })).text).toBe('hello');
+  });
+  test('current manifest edits cannot replace an active channel declaration; source allow revocation still cancels it', async () => {
+    declareApp();
+    const source = await service.sources.save({ provider: 'openai', kind: 'api-key', name: 'Fixture', apiKey: 'fixture' });
+    await service.bind('app-a', 'summary', source.id);
+    const system = await systemFor(path);
+    declareApp('app-a', 'anthropic');
+    const model = system.ai.languageModel({ model: 'openai:fixture', accessSource: 'summary' });
+    const nextCaller = { ...callers.get('app-a')!, channelId: 'next-activation' };
+    activated.set(nextCaller.channelId, structuredClone(manifests.get('app-a')!));
+    await expect(service.capabilities(nextCaller, { model: 'openai:fixture', accessSource: 'summary' }, 'generate')).rejects.toMatchObject({ code: 'provider_mismatch' });
+    delete manifests.get('app-a')!.ai!.accessSources.summary;
+    activated.set(nextCaller.channelId, structuredClone(manifests.get('app-a')!));
+    await expect(service.capabilities(nextCaller, { model: 'openai:fixture', accessSource: 'summary' }, 'generate')).rejects.toMatchObject({ code: 'unknown_reference' });
+    declareApp('app-a', 'anthropic');
+    expect((await generateText({ model, prompt: 'old activation' })).text).toBe('hello');
+    expect((await service.requirements())[0].issue).toBe('provider-mismatch');
+    const pending = generateText({ model, prompt: 'wait-for-abort', maxRetries: 0 }); const rejected = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(service.invocations.hasSource(source.id)).toBe(true));
+    await service.sources.save({ provider: source.provider, kind: source.kind, name: source.name, allow: { mode: 'apps', appIds: [] } }, source.id);
+    await rejected;
+    await expect(generateText({ model, prompt: 'denied', maxRetries: 0 })).rejects.toMatchObject({ code: 'source_denied' });
+    await expect(system.ai.embeddingModel({ model: 'openai:embedding', accessSource: 'indexing' }).maxEmbeddingsPerCall).rejects.toMatchObject({ code: 'source_configuration_required' });
+  });
   test('discovered subscription selection and App callbacks are independent of family names', async () => {
     const source = await service.sources.save({ provider: 'anthropic', kind: 'subscription', name: 'Fixture' });
     const system = await systemFor(path);

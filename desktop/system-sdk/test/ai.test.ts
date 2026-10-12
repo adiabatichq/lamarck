@@ -12,6 +12,10 @@ function fixture(mode = 'text') {
   const cancelled: string[] = [];
   const invoke = vi.fn(async (op: string, input: any): Promise<any> => {
     if (op === 'ai.listOptions') return { models: [], accessSources: [{ id: 'source', support: [{ model: 'openai:embedding', maxEmbeddingsPerCall: 2, supportsParallelCalls: true }] }] };
+    if (op === 'ai.capabilities') {
+      expect(Object.keys(input).sort()).toEqual(['accessSource', 'model', 'operation']);
+      return { model: input.model, maxEmbeddingsPerCall: 2, supportsParallelCalls: true };
+    }
     if (op === 'ai.start') {
       expect(Object.keys(input).sort()).toEqual(['accessSource', 'callbacks', 'model', 'operation', 'options']);
       const invocationId = String(++id); calls.set(invocationId, { input, sequence: 0, polls: 0 }); return { invocationId };
@@ -86,6 +90,17 @@ describe('official Vercel operations through System model proxies', () => {
     const result = await embedMany({ model, values: ['a', 'bb', 'ccc', 'dddd', 'eeeee'] });
     expect(result.embeddings).toEqual([[1, 1], [2, 1], [3, 1], [4, 1], [5, 1]]);
     expect(invoke.mock.calls.filter(([op]) => op === 'ai.start')).toHaveLength(4);
+  });
+  test('embedding capability getters send only selection fields from App settings', async () => {
+    const { system, invoke } = fixture();
+    const settings = { model: 'openai:embedding', accessSource: 'indexing', label: 'Search index' };
+    const model = system.ai.embeddingModel(settings);
+    expect(await model.maxEmbeddingsPerCall).toBe(2);
+    expect(await model.supportsParallelCalls).toBe(true);
+    expect(invoke.mock.calls).toEqual([
+      ['ai.capabilities', { model: settings.model, accessSource: settings.accessSource, operation: 'embed' }],
+      ['ai.capabilities', { model: settings.model, accessSource: settings.accessSource, operation: 'embed' }],
+    ]);
   });
   test('streamText keeps polling after empty batches', async () => {
     const { model, invoke } = fixture('empty-poll');

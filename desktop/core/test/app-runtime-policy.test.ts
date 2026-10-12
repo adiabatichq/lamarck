@@ -51,6 +51,7 @@ describe("App runtime policy", () => {
   test("allows App capabilities to call only the System SDK HTTP surface", () => {
     const allowed: Array<[string, string]> = [
       ["/api/query", "POST"],
+      ["/api/ai/capabilities", "POST"],
       ["/api/content-ref/resolve", "POST"],
       ["/api/mutate", "POST"],
       ["/api/transaction", "POST"],
@@ -68,6 +69,9 @@ describe("App runtime policy", () => {
   test("fails closed for Host, lifecycle, approval, terminal, and method variants", () => {
     const denied: Array<[string, string]> = [
       ["/api/health", "GET"],
+      ["/api/ai/bindings", "POST"],
+      ["/api/ai/sources", "GET"],
+      ["/api/ai/capabilities", "GET"],
       ["/api/workspace", "GET"],
       ["/api/apps", "GET"],
       ["/api/apps/app-a/source", "GET"],

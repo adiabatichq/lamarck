@@ -9,6 +9,11 @@ export async function handleAiRequest(service: AiService, request: Request, admi
   const auth = admission.context;
   const body = request.method === 'POST' ? await readJsonBody<any>(request, 20 * 1024 * 1024) : {};
   if (path === '/api/ai/options' && request.method === 'POST') return { body: await service.options(auth.kind === 'app' ? auth : undefined) };
+  if (path === '/api/ai/capabilities' && request.method === 'POST') {
+    if (auth.kind !== 'app') throw new AiError('unauthorized', 'App identity required');
+    if (!body || Object.keys(body).some(key => !['model', 'accessSource', 'operation'].includes(key))) throw new AiError('invalid_request', 'Invalid AI capability query');
+    return { body: await service.capabilities(auth, body, body.operation, AbortSignal.any([admission.signal, request.signal])) };
+  }
   if (path.startsWith('/api/ai/invoke/') && request.method === 'POST') {
     if (auth.kind !== 'app') throw new AiError('unauthorized', 'App identity required');
     if (path === '/api/ai/invoke/start') {
@@ -26,7 +31,13 @@ export async function handleAiRequest(service: AiService, request: Request, admi
     }
   }
   if (auth.kind !== 'host') throw new AiError('unauthorized', 'Host management required');
-  if (path === '/api/ai/sources' && request.method === 'GET') return { body: { sources: service.sources.list(), ...await service.options() } };
+  if (path === '/api/ai/sources' && request.method === 'GET') return { body: { sources: service.sources.list(), ...await service.options(), requirements: await service.requirements() } };
+  if (path === '/api/ai/bindings' && request.method === 'POST') {
+    if (!body || Object.keys(body).length !== 3 || Object.keys(body).some(key => !['appId', 'reference', 'sourceId'].includes(key))
+      || typeof body.appId !== 'string' || typeof body.reference !== 'string' || !(body.sourceId === null || typeof body.sourceId === 'string')) throw new AiError('invalid_request', 'Invalid AI source binding');
+    await service.bind(body.appId, body.reference, body.sourceId);
+    return { body: { ok: true } };
+  }
   if (path === '/api/ai/sources' && request.method === 'POST') {
     const { id, ...input } = body;
     if (id !== undefined && typeof id !== 'string') throw new AiError('invalid_request', 'Invalid source id');

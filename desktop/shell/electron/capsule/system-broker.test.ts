@@ -145,7 +145,7 @@ describe("SystemBroker", () => {
     expect(SYSTEM_OPERATIONS).toEqual([
       "job.input",
       'computer.open', 'computer.call', 'computer.close',
-      "ai.listOptions", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
+      "ai.listOptions", "ai.capabilities", "ai.start", "ai.next", "ai.cancel", "ai.toolResult",
       "subscription.start", "subscription.next", "subscription.cancel",
       "query",
       "resolveContentRef",

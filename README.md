@@ -169,6 +169,17 @@ or disturb a running App. Activation uses the same manifest-only admission and
 runs the exact retained commit. Restore creates a new forward version. SQL and
 DDL files inside an App remain ordinary package reference files.
 
+Apps that need user-configured AI access can declare optional `ai.accessSources`
+in their v1 manifest, for example `summary: { "name": "AI for summaries",
+"provider": "openai" }`. Use `accessSource: 'summary'` in the existing
+`system.ai.languageModel`, `embeddingModel`, or `withTools` selection. Console
+discovers these requirements from validated manifests and stores the user-selected
+source per App/reference. Setup is independent of installation and startup;
+unbound references fail explicitly when called. Models remain App arguments,
+source allow policy still applies, and direct configured-source-ID calls remain
+valid. See the [SDK AI usage guide](desktop/system-sdk/README.md#ai-model-access)
+for the manifest, generation, streaming, and embedding examples.
+
 ## How it works
 
 Lamarck separates the history you own from the software that interprets it.

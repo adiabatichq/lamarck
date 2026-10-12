@@ -104,7 +104,42 @@ Publishing uses npm trusted publishing from the protected GitHub `npm-publish` e
 
 ## AI model access
 
-Install the official `ai` package in the App. The verified pairing is `ai@7.0.105` with the SDK's provider V4 contracts. Browser and Node workloads share the same API:
+Install the official `ai` package in the App. The verified pairing is `ai@7.0.105` with the SDK's provider V4 contracts. Browser, Service, and Job workloads share the same API.
+
+Apps can declare stable source references in `manifest.json`. Add this optional fragment alongside the required package, runtime, and permission fields:
+
+```json
+{
+  "ai": {
+    "accessSources": {
+      "summary": { "name": "AI for summaries", "provider": "openai" },
+      "indexing": { "name": "AI for indexing", "provider": "openai" }
+    }
+  }
+}
+```
+
+Console's AI page discovers these requirements before any AI call. Choose an existing source or create one using the existing API-key, subscription sign-in, or local-endpoint form. Console stores each `(appId, reference)` binding independently in `system.db`; it never changes the manifest or grants source access by selecting a binding. A saved source may still need login or connection repair.
+
+```ts
+import { generateText, streamText, embed } from 'ai';
+import { system } from '@lamarck/system';
+
+const selection = { model: 'openai:gpt-5.6-luna', accessSource: 'summary' };
+const model = system.ai.languageModel(selection);
+const result = await generateText({ model, prompt: 'Summarize this note.' });
+const streamed = await streamText({ model, prompt: 'Explain this idea.' }).text;
+const vector = await embed({
+  model: system.ai.embeddingModel({ model: 'openai:text-embedding-3-small', accessSource: 'indexing' }),
+  value: 'Text to index',
+});
+```
+
+`withTools()` accepts the same reference selection, including existing Computer Use tools. References must match `^[a-z0-9][a-z0-9-]*$`; declarations contain exactly trimmed, non-empty `name` and `provider` strings. The declared provider, configured source provider, and model prefix must agree. Model choices stay in App code/settings, and readiness alone does not guarantee model support.
+
+Missing setup does not block installation or startup. A declared unbound reference fails with `code: 'source_configuration_required'` and `retryable: false` before contacting an adapter. Unknown references, denied sources, unavailable connections, and unsupported combinations fail explicitly. Services and Jobs receive the error; they decide when to retry. Each invocation uses the exact activated manifest and remains pinned to its resolved source ID/generation even if Console rebinds the reference.
+
+Exact configured source IDs remain valid. `listOptions()` keeps its existing collections and exposes actual caller-visible configured IDs, without reference aliases or unbound entries. For direct selection, use the existing discovery flow:
 
 ```ts
 import { generateText, streamText, embed } from 'ai';

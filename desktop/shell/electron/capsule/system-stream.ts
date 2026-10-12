@@ -195,6 +195,7 @@ export class SystemStreamServer {
         error: {
           message: error instanceof Error ? error.message : "System SDK request failed",
           ...(error instanceof SystemBrokerError ? { code: error.code } : {}),
+          ...(error instanceof SystemBrokerError && error.retryable !== undefined ? { retryable: error.retryable } : {}),
         },
       };
     }

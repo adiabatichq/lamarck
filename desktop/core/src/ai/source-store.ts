@@ -15,6 +15,19 @@ export class AiSourceStore {
     const row = this.db.prepare('SELECT * FROM ai_access_sources WHERE id = ?').get(id) as unknown as Row | undefined;
     return row && fromRow(row);
   }
+  binding(appId: string, reference: string): string | undefined {
+    const row = this.db.prepare('SELECT source_id FROM app_ai_source_bindings WHERE app_id = ? AND reference = ?')
+      .get(appId, reference) as { source_id: string } | undefined;
+    return row?.source_id;
+  }
+  bind(appId: string, reference: string, sourceId: string | null): void {
+    if (sourceId === null) {
+      this.db.prepare('DELETE FROM app_ai_source_bindings WHERE app_id = ? AND reference = ?').run(appId, reference);
+    } else {
+      this.db.prepare(`INSERT INTO app_ai_source_bindings (app_id, reference, source_id) VALUES (?, ?, ?)
+        ON CONFLICT(app_id, reference) DO UPDATE SET source_id=excluded.source_id`).run(appId, reference, sourceId);
+    }
+  }
   save(input: AiSourceInput, id?: string): Promise<ManagedAiSource> {
     return this.serial(async () => {
       const existing = id ? this.get(id) : undefined;

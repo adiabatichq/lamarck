@@ -157,7 +157,7 @@ export class FramedRpcClient {
     clearTimeout(pending.timer);
     this.#pending.delete(value.requestId);
     if (value.ok) pending.resolve(value.result);
-    else pending.reject(new Error(value.error.message));
+    else pending.reject(Object.assign(new Error(value.error.message), value.error));
   }
 
   #fail(error: Error): void {
@@ -194,16 +194,12 @@ function isSystemRpcResponse(value: unknown): value is SystemRpcResponse {
     keys.length !== 4
     || keys.some((key, index) => key !== ["error", "ok", "requestId", "version"][index])
   ) return false;
-  const error = (value as { error?: { message?: unknown; code?: unknown } }).error;
+  const error = (value as { error?: { message?: unknown; code?: unknown; retryable?: unknown } }).error;
   if (!error || typeof error !== "object" || typeof error.message !== "string") return false;
   const errorKeys = Object.keys(error).sort();
-  return (errorKeys.length === 1 && errorKeys[0] === "message")
-    || (
-      errorKeys.length === 2
-      && errorKeys[0] === "code"
-      && errorKeys[1] === "message"
-      && typeof error.code === "string"
-    );
+  return errorKeys.every(key => ['message', 'code', 'retryable'].includes(key))
+    && (error.code === undefined || typeof error.code === 'string')
+    && (error.retryable === undefined || typeof error.retryable === 'boolean');
 }
 
 function positiveInteger(value: number | undefined, fallback: number): number {
