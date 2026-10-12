@@ -74,7 +74,7 @@ export function TriggerView({ records, targets, detail, selected, draft, preview
           <small>{record.target}</small>
           {!record.available && <span className={styles.warning}>{record.unavailableReason}</span>}
           {record.error && <span className={styles.warning}>{record.error}</span>}
-          <span>{record.lastRun ? `Last run: ${record.lastRun.status}` : "No runs"}{record.nextRunAt ? ` · Next: ${time(record.nextRunAt)}` : ""}</span>
+          <span>{record.lastRun ? `Last run: ${record.lastRun.status}` : "No runs"}{record.enabled && record.nextRunAt ? ` · Next: ${time(record.nextRunAt)}` : ""}</span>
         </button>)}
       </div>
     </section>
