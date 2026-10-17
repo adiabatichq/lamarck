@@ -84,6 +84,7 @@ describe("RemoteGuard capability binding", () => {
         appCommit: "a".repeat(40),
         writeTables: [],
         fileGrants: [],
+        aiAccessSources: {},
       });
       const admission = admitRequest(new Request("http://localhost/api/query", {
         headers: { [APP_CAPABILITY_HEADER]: issued.capability },

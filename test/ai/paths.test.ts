@@ -55,7 +55,6 @@ const disposed = vi.fn();
 const callers = new Map<string, AppAuthContext>();
 const signals = new Map<string, AbortController>();
 const manifests = new Map<string, AppManifest>();
-const activated = new Map<string, AppManifest>();
 const openedSources: { id: string; generation: number }[] = [];
 function declareApp(id = 'app-a', provider = 'openai') {
   const result = validateAppManifest({ manifestVersion: 1, id, name: id, description: 'AI reference fixture',
@@ -113,13 +112,13 @@ const adapter: AiAdapter = {
 };
 beforeEach(async () => {
   disposed.mockClear(); callers.clear(); signals.clear(); outstanding = 0;
-  manifests.clear(); activated.clear(); openedSources.length = 0;
+  manifests.clear(); openedSources.length = 0;
   root = await mkdtemp(join(tmpdir(), 'ai-path-'));
   db = new DatabaseSync(':memory:'); db.exec(SYSTEM_SCHEMA_V1);
   guard = new GuardEngine({ workspacePath: root }); expectedTurns = []; expectedBlobs = [];
   vfs = new VfsService(root, new D1ObserverState(db), new ContentBlobStore(root), new D1Sequencer()); await vfs.initialize();
   service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter, {
-    activated: caller => activated.get(caller.channelId)!, current: async () => [...manifests.values()],
+    current: async () => [...manifests.values()],
   });
   server = await serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     const token = request.headers.get('x-lamarck-app-capability')!;
@@ -154,9 +153,8 @@ afterEach(async () => {
   } finally { db.close(); guard.close(); await rm(root, { recursive: true, force: true }); }
 });
 function bind(id: string, workload: AppAuthContext['workload'] = 'ui') {
-  const caller = { kind: 'app', appId: id, workload, channelId: `ch-${id}`, authorization: {} } as AppAuthContext;
+  const caller = { kind: 'app', appId: id, workload, channelId: `ch-${id}`, authorization: { aiAccessSources: structuredClone(manifests.get(id)?.ai?.accessSources ?? {}) } } as AppAuthContext;
   callers.set(id, caller); signals.set(id, new AbortController());
-  if (manifests.has(id)) activated.set(caller.channelId, structuredClone(manifests.get(id)!));
   broker.bindSender(id, { capability: id, channelId: caller.channelId });
 }
 async function systemFor(path: 'browser' | 'node', id = 'app-a', workload: AppAuthContext['workload'] = 'ui') {
@@ -282,12 +280,11 @@ for (const path of ['browser', 'node'] as const) describe(`${path} Capsule chann
     const system = await systemFor(path);
     declareApp('app-a', 'anthropic');
     const model = system.ai.languageModel({ model: 'openai:fixture', accessSource: 'summary' });
-    const nextCaller = { ...callers.get('app-a')!, channelId: 'next-activation' };
-    activated.set(nextCaller.channelId, structuredClone(manifests.get('app-a')!));
+    const nextCaller = { ...callers.get('app-a')!, channelId: 'next-activation', authorization: { ...callers.get('app-a')!.authorization, aiAccessSources: structuredClone(manifests.get('app-a')!.ai!.accessSources) } };
     await expect(service.capabilities(nextCaller, { model: 'openai:fixture', accessSource: 'summary' }, 'generate')).rejects.toMatchObject({ code: 'provider_mismatch' });
     delete manifests.get('app-a')!.ai!.accessSources.summary;
-    activated.set(nextCaller.channelId, structuredClone(manifests.get('app-a')!));
-    await expect(service.capabilities(nextCaller, { model: 'openai:fixture', accessSource: 'summary' }, 'generate')).rejects.toMatchObject({ code: 'unknown_reference' });
+    const removedCaller = { ...nextCaller, authorization: { ...nextCaller.authorization, aiAccessSources: structuredClone(manifests.get('app-a')!.ai!.accessSources) } };
+    await expect(service.capabilities(removedCaller, { model: 'openai:fixture', accessSource: 'summary' }, 'generate')).rejects.toMatchObject({ code: 'unknown_reference' });
     declareApp('app-a', 'anthropic');
     expect((await generateText({ model, prompt: 'old activation' })).text).toBe('hello');
     expect((await service.requirements())[0].issue).toBe('provider-mismatch');

@@ -197,9 +197,6 @@ const vaultKey = process.env.LAMARCK_VAULT_KEY ?? encodeVaultKey(randomBytes(32)
 const secretStore = new SqliteEncryptedSecretStore(systemDb, vaultKey);
 const credentialStore = new CredentialStore(systemDb);
 const aiService = new AiService(systemDb, credentialStore, secretStore, join(workspacePath, '.lamarck', 'ai'), undefined, {
-  activated(caller) {
-    return appActivationCoordinator.require(caller.authorization.activationId, caller.appId, caller.workload).manifest;
-  },
   async current() {
     return (await appLifecycle.inventory()).filter(app => app.manifestHealth.status === 'valid');
   },
@@ -2042,6 +2039,7 @@ const server = await serve<{ cwd: string }>({
               `apps/${body.appId}/`,
               ...activation.manifest.permissions.writes.files,
             ],
+            aiAccessSources: activation.manifest.ai?.accessSources ?? {},
           });
           if (body.jobRunId !== undefined) {
             try {

@@ -27,11 +27,11 @@ function declaration(id: string, provider = 'openai') {
   manifests.set(id, result.manifest); return result.manifest;
 }
 function caller(appId = 'app-a'): AppAuthContext {
-  return { kind: 'app', appId, workload: 'job:run', channelId: appId, authorization: { activationId: 'fixture', manifestDigest: `sha256:${'1'.repeat(64)}`, packageDigest: `sha256:${'2'.repeat(64)}`, appCommit: '3'.repeat(40), writeTables: [], fileGrants: [] } };
+  return { kind: 'app', appId, workload: 'job:run', channelId: appId, authorization: { activationId: 'fixture', manifestDigest: `sha256:${'1'.repeat(64)}`, packageDigest: `sha256:${'2'.repeat(64)}`, appCommit: '3'.repeat(40), writeTables: [], fileGrants: [], aiAccessSources: structuredClone(manifests.get(appId)!.ai?.accessSources ?? {}) } };
 }
 function createService() {
   return new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter,
-    { activated: auth => manifests.get(auth.appId)!, current: async () => [...manifests.values()] });
+    { current: async () => [...manifests.values()] });
 }
 async function management(path: string, body?: unknown, context: AuthAdmission['context'] = { kind: 'host' }) {
   const request = new Request(`http://localhost/api/ai/${path}`, body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) });

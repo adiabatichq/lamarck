@@ -23,6 +23,8 @@ export type AppAuthorizationSnapshot = Readonly<{
   appCommit: string;
   writeTables: readonly string[];
   fileGrants: readonly string[];
+  /** Exact activated declarations, retained for the lifetime of this channel. */
+  aiAccessSources: Readonly<Record<string, Readonly<{ name: string; provider: string }>>>;
 }>;
 
 export type AppAuthContext = Readonly<{
@@ -293,6 +295,18 @@ function freezeAuthorizationSnapshot(
   ) {
     throw new Error("App authorization grants must be string arrays");
   }
+  const declarations = authorization.aiAccessSources;
+  if (!declarations || typeof declarations !== "object" || Array.isArray(declarations)) {
+    throw new Error("App authorization AI sources must be an object");
+  }
+  const aiAccessSources = Object.fromEntries(Object.entries(declarations).map(([reference, definition]) => {
+    if (!ENTRY_ID_PATTERN.test(reference) || !definition
+      || typeof definition.name !== "string" || !definition.name.trim() || definition.name !== definition.name.trim()
+      || typeof definition.provider !== "string" || !definition.provider.trim() || definition.provider !== definition.provider.trim()) {
+      throw new Error("Invalid App authorization AI source declaration");
+    }
+    return [reference, Object.freeze({ name: definition.name, provider: definition.provider })];
+  }));
   return Object.freeze({
     activationId: authorization.activationId,
     manifestDigest: authorization.manifestDigest,
@@ -300,5 +314,6 @@ function freezeAuthorizationSnapshot(
     appCommit: validateFullGitCommit(authorization.appCommit, "App authorization commit"),
     writeTables: Object.freeze([...authorization.writeTables]),
     fileGrants: Object.freeze([...authorization.fileGrants]),
+    aiAccessSources: Object.freeze(aiAccessSources),
   });
 }

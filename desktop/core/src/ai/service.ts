@@ -17,7 +17,6 @@ import type { AppManifest } from '../app-loader';
 import { ENTRY_ID_PATTERN } from '../package-id';
 
 export interface AiManifestAuthority {
-  activated(caller: AppAuthContext): AppManifest;
   current(): Promise<readonly Pick<AppManifest, 'id' | 'name' | 'ai'>[]>;
 }
 export interface AppAiRequirement {
@@ -76,9 +75,8 @@ export class AiService {
     // Configured IDs and manifest references are explicit, disjoint forms.
     if (selection.accessSource.startsWith('access_')) return this.validateSource(caller.appId, selection);
     if (!ENTRY_ID_PATTERN.test(selection.accessSource)) throw new AiError('unknown_reference', 'Invalid AI source reference');
-    const manifest = this.manifests?.activated(caller);
-    const definitions = manifest?.id === caller.appId ? manifest.ai?.accessSources : undefined;
-    if (!definitions || !Object.hasOwn(definitions, selection.accessSource)) throw new AiError('unknown_reference', 'AI source reference is not declared in this activation');
+    const definitions = caller.authorization.aiAccessSources;
+    if (!Object.hasOwn(definitions, selection.accessSource)) throw new AiError('unknown_reference', 'AI source reference is not declared in this activation');
     const sourceId = this.sources.binding(caller.appId, selection.accessSource);
     if (!sourceId) throw new AiError('source_configuration_required', `Configure AI source "${selection.accessSource}" for this App in Console`);
     return this.validateSource(caller.appId, { ...selection, accessSource: sourceId }, definitions[selection.accessSource].provider);

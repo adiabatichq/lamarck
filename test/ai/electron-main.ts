@@ -62,7 +62,7 @@ const manifest = validateAppManifest({ manifestVersion: 1, id: 'browser-fixture'
   ai: { accessSources: { summary: { name: 'Summaries', provider: 'openai' } } } });
 if (!manifest.ok) throw new Error(manifest.error);
 const service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter, {
-  activated: () => manifest.manifest, current: async () => [manifest.manifest],
+  current: async () => [manifest.manifest],
 });
 const next = service.invocations.next.bind(service.invocations);
 service.invocations.next = async (...args) => {
@@ -77,7 +77,7 @@ service.invocations.next = async (...args) => {
 const cancel = service.invocations.cancel.bind(service.invocations);
 service.invocations.cancel = (caller, id) => { if (id === retryInvocation) cancelledDuringPull ||= retryPulling; cancel(caller, id); };
 const source = await service.sources.save({ provider: 'openai', kind: 'subscription', name: 'Fixture' });
-const caller = { kind: 'app', appId: 'browser-fixture', channelId: 'browser', workload: 'ui', authorization: {} } as any;
+const caller = { kind: 'app', appId: 'browser-fixture', channelId: 'browser', workload: 'ui', authorization: { aiAccessSources: structuredClone(manifest.manifest.ai!.accessSources) } } as any;
 const signal = new AbortController();
 let loginState = 'pending', loginStarts = 0, loginCancels = 0;
 let failNextLogin = false;

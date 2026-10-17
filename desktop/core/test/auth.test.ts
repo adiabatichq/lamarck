@@ -37,6 +37,7 @@ function authorization(
     appCommit: APP_COMMIT,
     writeTables,
     fileGrants,
+    aiAccessSources: {},
   };
 }
 
@@ -82,6 +83,7 @@ describe("auth", () => {
         appCommit: APP_COMMIT,
         writeTables: ["notes"],
         fileGrants: ["apps/app-a/"],
+        aiAccessSources: {},
       },
     });
     expect(Object.isFrozen(admission?.context)).toBe(true);
@@ -183,9 +185,12 @@ describe("auth", () => {
     const registry = new AppCapabilityRegistry();
     const tables = ["notes"];
     const files = ["apps/app-a/"];
-    const issued = registry.issue("app-a", "ui", authorization(tables, files));
+    const declarations = { summary: { name: "Summary", provider: "openai" } };
+    const issued = registry.issue("app-a", "ui", { ...authorization(tables, files), aiAccessSources: declarations });
     tables.push("secrets");
     files.push("private/");
+    declarations.summary.provider = "anthropic";
+    Object.assign(declarations, { coding: { name: "Coding", provider: "openai" } });
     const admission = admitRequest(appRequest(issued.capability), secrets, registry);
     const auth = admission?.context;
     if (!auth || auth.kind !== "app") throw new Error("Expected App auth");
@@ -199,6 +204,11 @@ describe("auth", () => {
     expect(Object.isFrozen(auth.authorization)).toBe(true);
     expect(Object.isFrozen(auth.authorization.writeTables)).toBe(true);
     expect(Object.isFrozen(auth.authorization.fileGrants)).toBe(true);
+    expect(auth.authorization.aiAccessSources).toEqual({ summary: { name: "Summary", provider: "openai" } });
+    expect(Object.isFrozen(auth.authorization.aiAccessSources)).toBe(true);
+    expect(Object.isFrozen(auth.authorization.aiAccessSources.summary)).toBe(true);
+    expect(Reflect.set(auth.authorization.aiAccessSources.summary, "provider", "anthropic")).toBe(false);
+    expect(issued).not.toHaveProperty("aiAccessSources");
     expect(JSON.stringify(registry)).not.toContain(issued.capability);
     admission.release();
   });

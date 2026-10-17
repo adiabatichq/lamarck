@@ -57,6 +57,7 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
       writeAppManifest("history-app", []),
       writeAppManifest("archive-app", []),
       writeAppManifest("trigger-app", []),
+      writeAppManifest("ai-reference-app", [], { summary: { name: "Summary", provider: "openai" } }),
       writeConnectorPackage("lamarck.cli-fixture"),
     ]);
     seedDataDatabase();
@@ -116,6 +117,42 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     await stopProcess(coreProcess);
     await stopProcess(guardProcess);
     if (testRoot) await rm(testRoot, { recursive: true, force: true });
+  });
+
+  test("AI references survive activation release and stay pinned until a new channel is issued", async () => {
+    // issueCapability releases the preparation record, as the real UI open does.
+    const original = await issueCapability("ai-reference-app");
+    const broker = new SystemBroker({
+      coreBaseUrl: coreOrigin,
+      revokeCapability: async (channelId) => {
+        await hostRequest(`/api/app-runtime/channels/${encodeURIComponent(channelId)}`, { method: "DELETE" });
+      },
+    });
+    broker.bindSender("ai-original", original);
+    const system = createSystem((operation, input) => broker.invoke("ai-original", operation, input));
+    const selection = { model: "openai:gpt-5.6-luna", accessSource: "summary" };
+    const call = () => system.ai.languageModel(selection).doGenerate({ prompt: [] });
+
+    await expect(call()).rejects.toMatchObject({ code: "source_configuration_required", retryable: false });
+    await expect(system.ai.embeddingModel({ model: "openai:text-embedding-3-small", accessSource: "summary" }).maxEmbeddingsPerCall)
+      .rejects.toMatchObject({ code: "source_configuration_required", retryable: false });
+
+    await writeAppManifest("ai-reference-app", [], { chat: { name: "Chat", provider: "anthropic" } });
+    await expect(call()).rejects.toMatchObject({ code: "source_configuration_required", retryable: false });
+    await expect(system.ai.languageModel({ ...selection, accessSource: "chat" }).doGenerate({ prompt: [] }))
+      .rejects.toMatchObject({ code: "unknown_reference", retryable: false });
+
+    const updated = await issueCapability("ai-reference-app");
+    broker.bindSender("ai-updated", updated);
+    const nextSystem = createSystem((operation, input) => broker.invoke("ai-updated", operation, input));
+    await expect(nextSystem.ai.languageModel(selection).doGenerate({ prompt: [] }))
+      .rejects.toMatchObject({ code: "unknown_reference", retryable: false });
+    await expect(nextSystem.ai.languageModel({ model: "anthropic:claude-sonnet-5", accessSource: "chat" }).doGenerate({ prompt: [] }))
+      .rejects.toMatchObject({ code: "source_configuration_required", retryable: false });
+
+    await hostRequest(`/api/app-runtime/channels/${encodeURIComponent(original.channelId)}`, { method: "DELETE" });
+    await expect(call()).rejects.toThrow(/unauthorized/i);
+    await hostRequest(`/api/app-runtime/channels/${encodeURIComponent(updated.channelId)}`, { method: "DELETE" });
   });
 
   test("binds two App identities and commits or rolls back D2 audit atomically", async () => {
@@ -558,7 +595,7 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
 
 });
 
-async function writeAppManifest(appId: string, tables: string[]): Promise<void> {
+async function writeAppManifest(appId: string, tables: string[], aiAccessSources?: Record<string, { name: string; provider: string }>): Promise<void> {
   const appDir = join(workspace || join(testRoot, "workspace"), "apps", appId);
   await mkdir(appDir, { recursive: true });
   await writeFile(join(appDir, "manifest.json"), `${JSON.stringify({
@@ -571,6 +608,7 @@ async function writeAppManifest(appId: string, tables: string[]): Promise<void> 
       ...(appId === "trigger-app" ? { jobs: { inbox: { command: ["node", "inbox.mjs"] } } } : {}),
     },
     permissions: { writes: { files: [], tables } },
+    ...(aiAccessSources ? { ai: { accessSources: aiAccessSources } } : {}),
   }, null, 2)}\n`, "utf8");
   if (!existsSync(join(appDir, ".git"))) {
     runAppGit(appDir, "init", "--quiet");
