@@ -20,22 +20,29 @@ interface ExposedSystemHost {
 }
 
 function loadPreload(ipcInvoke: ReturnType<typeof vi.fn>): ExposedSystemHost {
-  let exposed: unknown;
+  const mainWorld: Record<string, unknown> = {};
   runInNewContext(PRELOAD_SOURCE, {
     require(id: string) {
       if (id !== "electron") throw new Error(`Unexpected preload require: ${id}`);
       return {
         contextBridge: {
-          exposeInMainWorld(name: string, value: unknown) {
-            if (name !== "__LAMARCK_SYSTEM_HOST__") throw new Error(`Unexpected global: ${name}`);
-            exposed = value;
+          executeInMainWorld({ func, args }: { func: Function; args: unknown[] }) {
+            mainWorld.args = args;
+            runInNewContext(`(${func.toString()})(...args)`, mainWorld);
+            delete mainWorld.args;
           },
         },
         ipcRenderer: { invoke: ipcInvoke },
       };
     },
   }, { filename: "app-preload.cjs" });
+  const exposed = mainWorld.__LAMARCK_SYSTEM_HOST__;
   if (!exposed || typeof exposed !== "object") throw new Error("Preload did not expose the System Host");
+  expect(Object.keys(mainWorld)).toEqual(["__LAMARCK_SYSTEM_HOST__"]);
+  expect(Object.getOwnPropertyDescriptor(mainWorld, "__LAMARCK_SYSTEM_HOST__"))
+    .toMatchObject({ writable: false, configurable: false });
+  expect(Object.keys(exposed)).toEqual(["invoke"]);
+  expect(Object.isFrozen(exposed)).toBe(true);
   return exposed as ExposedSystemHost;
 }
 

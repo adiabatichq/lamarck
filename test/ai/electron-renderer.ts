@@ -3,6 +3,24 @@ import { generateText, streamText, tool, Output } from 'ai';
 import { z } from 'zod';
 const assert = (condition: unknown, message = 'Renderer assertion failed') => { if (!condition) throw new Error(message); };
 Object.assign(window, {
+  async exerciseErrors() {
+    const host = (globalThis as any).__LAMARCK_SYSTEM_HOST__;
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, '__LAMARCK_SYSTEM_HOST__');
+    assert(Object.isFrozen(host) && Object.keys(host).join() === 'invoke');
+    assert(descriptor?.writable === false && descriptor.configurable === false);
+    const failure = async (run: () => Promise<unknown>, code: string, retryable?: boolean) => {
+      const error = await run().then(() => { throw new Error('Expected SDK failure'); }, error => error);
+      assert(error instanceof Error, 'SDK failure must be an Error in the App realm');
+      assert(error.code === code, `Expected error code ${code}; received ${String(error.code)}`);
+      assert(error.retryable === retryable, `Expected retryable ${String(retryable)}; received ${String(error.retryable)}`);
+    };
+    const selection = { model: 'openai:fixture', accessSource: 'summary' };
+    await failure(() => generateText({ model: system.ai.languageModel(selection), prompt: 'unbound', maxRetries: 0 }), 'source_configuration_required', false);
+    await failure(() => Promise.resolve(system.ai.embeddingModel({ model: 'openai:text-embedding-3-small', accessSource: 'summary' }).maxEmbeddingsPerCall), 'source_configuration_required', false);
+    await failure(() => generateText({ model: system.ai.languageModel({ ...selection, accessSource: 'missing' }), prompt: 'unknown', maxRetries: 0 }), 'unknown_reference', false);
+    await failure(() => system.query('fixture-error'), 'core_error');
+    return 'passed';
+  },
   async exercise(accessSource: string) {
     assert(typeof (globalThis as any).require === 'undefined');
     assert(Object.keys((globalThis as any).__LAMARCK_SYSTEM_HOST__).join() === 'invoke');

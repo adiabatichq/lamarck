@@ -161,9 +161,11 @@ async function systemFor(path: 'browser' | 'node', id = 'app-a', workload: AppAu
   bind(id, workload);
   if (path === 'browser') {
     const compiled = buildSync({ entryPoints: ['desktop/shell/electron/app-preload.ts'], bundle: true, write: false, platform: 'node', format: 'cjs', external: ['electron'] }).outputFiles[0].text;
-    let host: any;
-    runInNewContext(compiled, { require: () => ({ contextBridge: { exposeInMainWorld: (_: string, value: unknown) => { host = value; } }, ipcRenderer: { invoke: (_: string, serialized: string) => broker.invokeSerialized(id, serialized) } }) });
-    return createSystem(host.invoke);
+    const mainWorld: any = {};
+    runInNewContext(compiled, { require: () => ({ contextBridge: { executeInMainWorld: ({ func, args }: { func: Function; args: unknown[] }) => {
+      mainWorld.args = args; runInNewContext(`(${func.toString()})(...args)`, mainWorld); delete mainWorld.args;
+    } }, ipcRenderer: { invoke: (_: string, serialized: string) => broker.invokeSerialized(id, serialized) } }) });
+    return createSystem(mainWorld.__LAMARCK_SYSTEM_HOST__.invoke);
   }
   const listener = createServer();
   listener.listen(join(root, `${id}.sock`)); await once(listener, 'listening');

@@ -9,8 +9,45 @@ const SYSTEM_OPERATION_SET: ReadonlySet<string> = new Set(SYSTEM_OPERATIONS);
 // WebContents in Electron main; App code supplies only a System operation and
 // its arguments. No App id, Core URL, bearer, filesystem, or Host IPC is
 // exposed to the page.
-contextBridge.exposeInMainWorld("__LAMARCK_SYSTEM_HOST__", Object.freeze({
-  invoke: async (operation: unknown, input: unknown): Promise<unknown> => {
+// Construct SDK Errors in the App world: contextBridge drops custom properties
+// from Errors thrown in the isolated world. Only bounded JSON crosses here.
+contextBridge.executeInMainWorld({
+  func: (invokeSerialized: (operation: unknown, input: unknown) => Promise<string>) => {
+    Object.defineProperty(globalThis, "__LAMARCK_SYSTEM_HOST__", {
+      enumerable: true,
+      value: Object.freeze({
+        invoke: async (operation: unknown, input: unknown): Promise<unknown> => {
+          const serializedResponse = await invokeSerialized(operation, input);
+          let envelope: unknown;
+          try {
+            envelope = JSON.parse(serializedResponse) as unknown;
+          } catch {
+            throw new Error("Lamarck Host returned malformed System SDK JSON");
+          }
+          if (!isRecord(envelope)) {
+            throw new Error("Lamarck Host returned a malformed System SDK envelope");
+          }
+          if (envelope.ok === true && Object.hasOwn(envelope, "result")) {
+            return envelope.result;
+          }
+          const failure = envelope.error;
+          if (envelope.ok === false && isRecord(failure) && typeof failure.message === "string") {
+            const error = new Error(failure.message) as Error & { code?: string; retryable?: boolean };
+            if (typeof failure.code === "string") error.code = failure.code;
+            if (typeof failure.retryable === "boolean") error.retryable = failure.retryable;
+            throw error;
+          }
+          throw new Error("Lamarck Host returned a malformed System SDK envelope");
+        },
+      }),
+    });
+
+    // executeInMainWorld serializes this function without its outer scope.
+    function isRecord(value: unknown): value is Record<string, unknown> {
+      return typeof value === "object" && value !== null && !Array.isArray(value);
+    }
+  },
+  args: [async (operation: unknown, input: unknown): Promise<string> => {
     const request = serializeRequest(operation, input);
     const serializedResponse: unknown = await ipcRenderer.invoke("app-system:invoke", request);
     if (
@@ -20,32 +57,9 @@ contextBridge.exposeInMainWorld("__LAMARCK_SYSTEM_HOST__", Object.freeze({
       throw new Error("Lamarck Host returned an invalid System SDK response");
     }
 
-    let envelope: unknown;
-    try {
-      envelope = JSON.parse(serializedResponse) as unknown;
-    } catch {
-      throw new Error("Lamarck Host returned malformed System SDK JSON");
-    }
-    if (!isRecord(envelope)) {
-      throw new Error("Lamarck Host returned a malformed System SDK envelope");
-    }
-    if (envelope.ok === true && Object.hasOwn(envelope, "result")) {
-      return envelope.result;
-    }
-    const failure = envelope.error;
-    if (
-      envelope.ok === false
-      && isRecord(failure)
-      && typeof failure.message === "string"
-    ) {
-      const error = new Error(failure.message) as Error & { code?: string; retryable?: boolean };
-      if (typeof failure.code === "string") error.code = failure.code;
-      if (typeof failure.retryable === "boolean") error.retryable = failure.retryable;
-      throw error;
-    }
-    throw new Error("Lamarck Host returned a malformed System SDK envelope");
-  },
-}));
+    return serializedResponse;
+  }],
+});
 
 function serializeRequest(operation: unknown, input: unknown): string {
   if (typeof operation !== "string" || !SYSTEM_OPERATION_SET.has(operation)) {
@@ -129,8 +143,4 @@ function utf8ByteLength(value: string): number {
     } else bytes += 3;
   }
   return bytes;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

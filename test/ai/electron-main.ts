@@ -7,6 +7,7 @@ import { GuardEngine } from '../../desktop/core/src/guard-service/engine';
 import { existsSync } from 'node:fs';
 import { decodeAi } from '@lamarck/system/protocol';
 import { AiService, type AiAdapter } from '../../desktop/core/src/ai/service';
+import { AiError } from '../../desktop/core/src/ai/errors';
 import { SYSTEM_SCHEMA_V1 } from '../../desktop/core/src/db';
 import { CredentialStore } from '../../desktop/core/src/credentials/credential-store';
 import { SqliteEncryptedSecretStore } from '../../desktop/core/src/credentials/secret-store';
@@ -23,6 +24,7 @@ const db = new DatabaseSync(':memory:'); db.exec(SYSTEM_SCHEMA_V1);
 const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } } as any;
 const finishReason = { unified: 'stop', raw: 'stop' } as const;
 let outstanding = 0;
+let adapterOpens = 0;
 let retryAttempts = 0, retryInvocation: string | undefined;
 let retryErrorSent = false, retryPulling = false, cancelledDuringPull = false;
 let retryPollEntered!: () => void;
@@ -31,6 +33,7 @@ const connectionStates = new Map<string, 'ready' | 'login-required'>();
 const adapter: AiAdapter = {
   async describe(source) { return { models: [{ id: 'openai:fixture', name: 'Fixture', provider: 'openai', type: 'language' }], view: { ...source, status: connectionStates.get(source.id) ?? 'ready', discovery: 'known', support: [{ model: 'openai:fixture', streaming: true, structuredOutput: true, tools: true }] } }; },
   async open(source, options, context) {
+    adapterOpens++;
     const model = { specificationVersion: 'v4' as const, provider: 'fixture', modelId: 'fixture', supportedUrls: {},
       async doGenerate(options: any) {
         if (JSON.stringify(options.prompt).includes('abort-me')) await new Promise((_, reject) => context.signal.addEventListener('abort', () => reject(new DOMException('Cancelled', 'AbortError')), { once: true }));
@@ -129,10 +132,12 @@ const server = await serve({ hostname: '127.0.0.1', port: 0, async fetch(request
   try {
     if (new URL(request.url).pathname === '/api/query') {
       const body = await request.json(); if (body.sql === 'retry-poll') await retryPoll;
+      if (body.sql === 'fixture-error') return Response.json({ error: 'Fixture query failed' }, { status: 400 });
       return Response.json({ rows: body.sql === 'timeline-count' ? [{ count: guard.query(principal, 'SELECT id FROM events').length }] : [{ appId: caller.appId }] });
     }
     const result = await handleAiRequest(service, request, admission); retained = !!result.retained; return Response.json(result.body);
-  } catch (error) { return Response.json({ error: String(error) }, { status: 400 }); }
+  } catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error),
+    ...(error instanceof AiError ? { code: error.code, retryable: error.retryable } : {}) }, { status: 400 }); }
   finally { if (!retained) admission.release(); }
 } });
 let computerScope: string | undefined;
@@ -157,6 +162,9 @@ let code = 0;
 try {
   console.log('Checking sandboxed App renderer');
   await window.loadFile(join(import.meta.dirname, 'index.html'));
+  const errors = await window.webContents.executeJavaScript('window.exerciseErrors()');
+  if (errors !== 'passed' || adapterOpens !== 0) throw new Error('Structured SDK error regression failed or contacted an adapter');
+  console.log('AI_ELECTRON_ERRORS_PASS: App-realm Error identity, unbound generation/embedding, unknown reference, generic failure, code and retryable through real contextBridge');
   const result = await window.webContents.executeJavaScript(`window.exercise(${JSON.stringify(source.id)})`);
   if (result !== 'passed') throw new Error('Renderer did not complete');
   // Destroying the real sandboxed renderer must cancel its pending generation.
