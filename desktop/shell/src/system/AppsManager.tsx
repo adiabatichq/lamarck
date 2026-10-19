@@ -1,4 +1,4 @@
-import { useState, type ReactElement } from "react";
+import { useEffect, useRef, useState, type ReactElement } from "react";
 import { AppManagementDetails } from "./AppManagementDetails";
 export { AppExecutionView } from "./AppManagementDetails";
 import { AppMark } from "../components/AppMark";
@@ -132,6 +132,19 @@ export interface AppsManagerViewProps {
 export function AppsManagerView({ apps, selected, runtimeByApp, selectedRuntime, history, loading, error, busy, pending,
   onSelect, onOpenApp, onLoadMore, onRequestRestore, onRequestRebuild, onCancel, onConfirm, onManageTriggers,
   executionPending, executionError, onStopJob, onCloseUi, onAppDisabled, onPolicyChanged }: AppsManagerViewProps): ReactElement {
+  const confirmDialog = useRef<HTMLDialogElement>(null);
+  const confirming = pending !== null;
+  useEffect(() => {
+    if (!confirming) return;
+    const dialog = confirmDialog.current!;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialog.showModal();
+    return () => {
+      dialog.close();
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, [confirming]);
+
   return <div className={styles.appsManager} data-testid="apps-manager">
     <section className={styles.appsMaster} aria-label="Installed Apps">
       <header className={styles.appsManagerHeader}><h1>Apps</h1><span>{apps.length}</span></header>
@@ -156,17 +169,25 @@ export function AppsManagerView({ apps, selected, runtimeByApp, selectedRuntime,
       onManageTriggers={onManageTriggers} onPolicyChanged={onPolicyChanged} onLoadMore={onLoadMore}
       onRequestRestore={onRequestRestore} onRequestRebuild={onRequestRebuild} />
       : <div className={styles.empty}>{error && <p className={styles.failure} role="alert">{error}</p>}Select an app to manage it.</div>}
-    {pending && <div className={styles.confirmScrim} role="presentation">
-      <section className={styles.confirmDialog} role="dialog" aria-modal="true" aria-labelledby="app-confirm-title">
+    {pending && <dialog ref={confirmDialog} className={styles.confirmDialog} tabIndex={-1} aria-modal="true" aria-labelledby="app-confirm-title"
+      onCancel={event => { event.preventDefault(); if (busy === null) onCancel(); }}
+      onKeyDown={event => {
+        if (event.key !== "Tab") return;
+        const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+        const edge = event.shiftKey ? buttons[0] : buttons.at(-1);
+        if (!buttons.includes(document.activeElement as HTMLButtonElement) || document.activeElement === edge) {
+          event.preventDefault();
+          (event.shiftKey ? buttons.at(-1) : buttons[0])?.focus();
+        }
+      }}>
         <h2 id="app-confirm-title">{pending.kind === "restore" ? `Restore ${pending.app.name}?` : "Rebuild version history?"}</h2>
         <p>{pending.kind === "restore"
           ? "This creates a new version from the selected package. It does not launch the App."
           : "Lamarck will preserve the current package and recover readable history when possible. Unrecoverable versions will disappear from this list; historical D0 evidence is not changed."}</p>
-        <div className={styles.rowActions}><button type="button" className={styles.secondaryButton} disabled={busy !== null} onClick={onCancel}>Cancel</button>
+        <div className={styles.rowActions}><button type="button" autoFocus className={styles.secondaryButton} disabled={busy !== null} onClick={onCancel}>Cancel</button>
           <button type="button" className={styles.primaryButton} disabled={busy !== null} onClick={onConfirm}>
             {busy ? "Working…" : pending.kind === "restore" ? "Restore version" : "Rebuild version history"}</button></div>
         {error && <p className={styles.failure} role="alert">{error}</p>}
-      </section>
-    </div>}
+    </dialog>}
   </div>;
 }

@@ -87,8 +87,8 @@
 .versionList > li { padding: 20px 0; border-bottom: 1px solid var(--system-line); }
 .historyUnavailable { display: grid; justify-items: start; gap: 14px; padding: 24px 0; }
 .historyUnavailable p { color: var(--system-muted); line-height: 1.6; }
-.confirmScrim { position: absolute; z-index: 20; inset: 0; display: grid; place-items: center; padding: 22px; background: color-mix(in srgb, var(--system-ground) 80%, transparent); }
-.confirmDialog { width: min(440px, 100%); max-height: 100%; overflow-y: auto; border: 1px solid var(--system-line-strong); border-radius: 12px; padding: 24px; background: var(--system-panel); box-shadow: 0 20px 60px #0005; }
+.confirmDialog { position: fixed; inset: 0; margin: auto; width: min(440px, calc(100vw - 44px)); max-height: calc(100dvh - 44px); overflow-y: auto; border: 1px solid var(--system-line-strong); border-radius: 12px; padding: 24px; background: var(--system-panel); color: var(--system-text); box-shadow: 0 20px 60px #0005; }
+.confirmDialog::backdrop { background: color-mix(in srgb, var(--system-ground) 80%, transparent); }
 .confirmDialog h2 { font-family: var(--font-display); font-size: 22px; font-weight: 600; }
 .confirmDialog > p { margin-top: 14px; color: var(--system-muted); font-size: 13px; line-height: 1.6; }
 .confirmDialog .rowActions { margin-top: 24px; }

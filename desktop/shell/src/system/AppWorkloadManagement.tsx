@@ -88,13 +88,17 @@ export function AppActivityView({ diagnostics, loading, error }: {
     <p className={styles.hint}>Recent service and job activity is kept for up to an hour while Desktop is running.</p>
     {error && <p role="alert" className={styles.failure}>{error}</p>}
     {!diagnostics.length ? <p className={styles.empty} role="status">{loading ? "Loading recent activity…" : error ? "Recent activity could not be loaded." : "No recent activity."}</p>
-      : <ul className={styles.activityList}>{diagnostics.map(run => <li key={run.executionId}>
+      : <ul className={styles.activityList}>{diagnostics.map(run => {
+        const stopped = run.endedAt !== null && run.failure !== null && NORMAL_STOP_REASONS.has(run.failure);
+        const needsAttention = !!run.failure && !stopped;
+        const status = needsAttention ? "Needs attention" : stopped ? run.kind === "job" ? "Canceled" : "Stopped" : run.endedAt === null ? "Running" : "Finished";
+        return <li key={run.executionId}>
         <details className={styles.activityEntry}>
           <summary><span><strong>{workloadName(run.workloadId)}</strong><small>{run.kind === "service" ? "Background service" : "Job"} · {new Date(run.startedAt).toLocaleString("en")}</small></span>
-            <span className={run.failure ? styles.failureText : styles.hint}>{run.failure ? "Needs attention" : run.endedAt === null ? "Running" : "Finished"}</span></summary>
+            <span className={needsAttention ? styles.failureText : styles.hint}>{status}</span></summary>
           <div className={styles.activityDetails}>
             <p className={styles.hint}>Started {new Date(run.startedAt).toLocaleString("en")}{run.endedAt !== null ? ` · Ended ${new Date(run.endedAt).toLocaleString("en")}` : ""}</p>
-            {run.failure && <p className={styles.failure} role="alert">{run.failure}</p>}
+            {run.failure && (needsAttention ? <p className={styles.failure} role="alert">{run.failure}</p> : <p className={styles.hint}>{run.failure}</p>)}
             <details className={styles.technicalDetails}>
               <summary>Technical details</summary>
               <dl><dt>Workload ID</dt><dd><code>{run.workloadId}</code></dd><dt>Execution ID</dt><dd><code>{run.executionId}</code></dd>{run.version && <><dt>Version</dt><dd><code>{run.version}</code></dd></>}</dl>
@@ -103,7 +107,12 @@ export function AppActivityView({ diagnostics, loading, error }: {
             </details>
           </div>
         </details>
-      </li>)}</ul>}
+      </li>; })}</ul>}
   </section>;
 }
+// Exact Host stop reasons only; cleanup errors and unexpected exits remain failures.
+const NORMAL_STOP_REASONS = new Set([
+  "Job stopped by user", "Service disabled", "App stopped", "Host stopped",
+  "Service activation replaced", "Service declaration retired", "App retired",
+]);
 function message(cause: unknown): string { return cause instanceof Error ? cause.message : String(cause); }

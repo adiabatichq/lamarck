@@ -143,7 +143,8 @@ describe("Apps Manager", () => {
     const notes = app("notes");
     const markup = render(notes, history, { kind: "restore", app: notes, version: older });
 
-    expect(markup).toContain('role="dialog"');
+    expect(markup).toContain('<dialog');
+    expect(markup).toContain('aria-modal="true"');
     expect(markup).toContain("Restore Notes?");
     expect(markup).toContain("creates a new version");
     expect(markup).toContain("It does not launch the App");
@@ -183,6 +184,35 @@ describe("Apps Manager", () => {
     expect(html).not.toMatch(/<details[^>]*\sopen[\s=>]/);
     expect(html).toContain("64 bytes");
     expect(renderToStaticMarkup(<AppActivityView diagnostics={[]} loading={false} error="Host unavailable" />)).toContain("could not be loaded");
+  });
+
+  test.each([
+    ["job", "Job stopped by user", "Canceled"],
+    ["service", "Service disabled", "Stopped"],
+    ["service", "App stopped", "Stopped"],
+    ["job", "Host stopped", "Canceled"],
+    ["service", "Service activation replaced", "Stopped"],
+    ["service", "Service declaration retired", "Stopped"],
+    ["job", "App retired", "Canceled"],
+  ] as const)("shows a normally stopped %s (%s) without a failure alert", (kind, failure, status) => {
+    const html = renderToStaticMarkup(<AppActivityView loading={false} error={null} diagnostics={[{
+      appId: "notes", kind, workloadId: "inbox", executionId: "run-a", version: latest.version,
+      startedAt: 1_700_000_000_000, endedAt: 1_700_000_001_000, failure, output: "", droppedBytes: 0,
+    }]} />);
+    expect(html).toContain(status);
+    expect(html).toContain(failure);
+    expect(html).not.toContain("Needs attention");
+    expect(html).not.toContain('role="alert"');
+  });
+
+  test.each(["Job authority cleanup failed", "Service exited unexpectedly", "Job stopped by user; cleanup failed", "Capsule boundary lost"])("retains the failure alert for %s", failure => {
+    const html = renderToStaticMarkup(<AppActivityView loading={false} error={null} diagnostics={[{
+      appId: "notes", kind: "job", workloadId: "inbox", executionId: "run-a", version: latest.version,
+      startedAt: 1_700_000_000_000, endedAt: 1_700_000_001_000, failure, output: "", droppedBytes: 0,
+    }]} />);
+    expect(html).toContain("Needs attention");
+    expect(html).toContain('role="alert"');
+    expect(html).toContain(failure);
   });
 
   test("declared idle jobs retain their last result and hide Next for a disabled schedule or App", () => {
