@@ -3,6 +3,7 @@ import { Children, isValidElement, type ReactNode, type ReactElement } from "rea
 import { describe, expect, test, vi } from "vitest";
 import type { AppHistoryView, AppRuntimeView } from "../hooks/useAppsManager";
 import type { AppInfo, AppVersionRecordV1 } from "../lib/api";
+import { AppWorkloadManagement } from "./AppWorkloadManagement";
 import { AppExecutionView, AppsManagerView, deriveAppPrimaryStatus } from "./AppsManager";
 
 const latest: AppVersionRecordV1 = {
@@ -38,20 +39,29 @@ describe("Apps Manager", () => {
     runtime: { ...runtime("notes", 3), ui: "running", jobs: [
       { runId: "run-a", jobId: "inbox", triggerId: "trigger-a", state: "starting", cleanupError: null },
       { runId: "run-b", jobId: "inbox", triggerId: null, state: "running", cleanupError: null },
-    ] }, onStopJob: vi.fn(), onCloseUi: vi.fn(), onStopApp: vi.fn(), onManageTriggers: vi.fn(), ...overrides,
+    ] }, onStopJob: vi.fn(), onCloseUi: vi.fn(), onManageTriggers: vi.fn(), ...overrides,
+  });
+  test("App and declared Service toggles show independent persisted choices without Stop App or restart controls", () => {
+    const html = renderToStaticMarkup(<AppWorkloadManagement appId="notes" appEnabled={false} services={[
+      { serviceId: "indexer", enabled: true, state: "stopped", executionId: null, restartAt: null, failure: null },
+      { serviceId: "sync", enabled: false, state: "disabled", executionId: null, restartAt: null, failure: null },
+    ]} />);
+    expect(html).toContain('aria-label="App enabled" aria-checked="false"');
+    expect(html).toContain('aria-label="Service indexer enabled" aria-checked="true"');
+    expect(html).toContain('aria-label="Service sync enabled" aria-checked="false"');
+    expect(html).not.toMatch(/Stop App|Restart service|Resume service/);
   });
   test("shows starting and running invocations by declared job/run and available Trigger association", () => {
     const html = renderToStaticMarkup(execution());
-    for (const text of ["inbox", "run-a", "run-b", "Starting", "Running", "Trigger trigger-a", "Close UI", "Stop App", "keeps jobs running"]) expect(html).toContain(text);
-    expect(html).not.toContain("Launch job"); expect(html).not.toContain("Service"); expect(html).not.toContain("Retry");
+    for (const text of ["inbox", "run-a", "run-b", "Starting", "Running", "Trigger trigger-a", "Close UI", "keeps jobs and Services running"]) expect(html).toContain(text);
+    expect(html).not.toContain("Launch job"); expect(html).not.toContain("Retry");
   });
   test("job, UI, App and Trigger actions carry only the selected execution identity", () => {
-    const onStopJob = vi.fn(), onCloseUi = vi.fn(), onStopApp = vi.fn(), onManageTriggers = vi.fn();
-    const buttons = elements(execution({ onStopJob, onCloseUi, onStopApp, onManageTriggers })).filter(node => node.type === "button");
+    const onStopJob = vi.fn(), onCloseUi = vi.fn(), onManageTriggers = vi.fn();
+    const buttons = elements(execution({ onStopJob, onCloseUi, onManageTriggers })).filter(node => node.type === "button");
     buttons.find(node => node.props["aria-label"] === "Stop job inbox, run run-a")!.props.onClick();
     expect(onStopJob.mock.calls).toEqual([["notes", "run-a"]]);
     buttons.find(node => node.props.children === "Close UI")!.props.onClick(); expect(onCloseUi.mock.calls).toEqual([["notes"]]);
-    buttons.find(node => node.props.children === "Stop App")!.props.onClick(); expect(onStopApp.mock.calls).toEqual([["notes"]]);
     buttons.find(node => renderToStaticMarkup(node).includes("Trigger trigger-a"))!.props.onClick(); expect(onManageTriggers.mock.calls).toEqual([["notes", "trigger-a"]]);
   });
   test("pending and failed cleanup remain visible with stop actions disabled instead of reporting completion", () => {
@@ -71,15 +81,11 @@ describe("Apps Manager", () => {
     expect(renderToStaticMarkup(execution({ runtime: undefined, error: "Host unavailable" }))).toContain("could not be confirmed");
     expect(renderToStaticMarkup(execution({ runtime: undefined, loading: true }))).toContain("Checking active jobs");
   });
-  test("App stop stays available for failed authority cleanup and confirmed recovery clears the active row", () => {
-    const onStopApp = vi.fn();
+  test("failed authority cleanup stays visible and confirmed recovery clears the active row", () => {
     const failed: AppRuntimeView = { ...runtime("notes", 1, "Job authority cleanup failed"), ui: "closed", jobs: [
       { jobId: "inbox", runId: "run-a", triggerId: null, state: "cleanup-failed", cleanupError: "Job authority cleanup failed; stop was not confirmed" },
     ] };
-    const tree = execution({ runtime: failed, onStopApp });
-    const stop = elements(tree).find(node => node.type === "button" && node.props.children === "Stop App")!;
-    expect(stop.props.disabled).toBe(false);
-    stop.props.onClick(); expect(onStopApp).toHaveBeenCalledWith("notes");
+    const tree = execution({ runtime: failed });
     const stopping = execution({ runtime: { ...failed, stopping: true, jobs: [{ ...failed.jobs![0], state: "stopping", cleanupError: null }] } });
     expect(renderToStaticMarkup(stopping)).toContain("waiting for cleanup");
     expect(renderToStaticMarkup(stopping)).not.toContain("No active jobs");

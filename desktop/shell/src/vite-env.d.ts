@@ -98,10 +98,12 @@ interface Window {
     ): void;
     closeAppViewer(viewerId: string): Promise<{ ok: true }>;
     reloadAppRuntime(appId: string): Promise<{ active: boolean }>;
+    setAppServiceEnabled(appId: string, serviceId: string, enabled: boolean): Promise<{ ok: true }>;
+    getAppWorkloadDiagnostics(appId: string, executionId?: string): Promise<readonly import("../shared/app-runtime").AppWorkloadDiagnostic[]>;
     getAppRuntimeStates(): Promise<Array<import("../shared/app-runtime").AppRuntimeAggregate>>;
     stopAppJob(appId: string, runId: string): Promise<{ active: boolean }>;
     closeAppUi(appId: string): Promise<{ ok: true }>;
-    stopApp(appId: string): Promise<{ ok: true }>;
+    setAppEnabled(appId: string, enabled: boolean): Promise<{ ok: true }>;
     archiveApp(appId: string): Promise<{ ok: true; id: string }>;
     createTerminal(): Promise<{ id: string }>;
     writeTerminal(id: string, data: string): void;

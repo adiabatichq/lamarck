@@ -3,7 +3,6 @@ import { useCorePolling } from "./useCorePolling";
 import {
   getAppRuntimeStates,
   closeAppUi,
-  stopApp,
   stopAppJob,
   listAppVersions,
   rebuildAppVersionHistory,
@@ -14,7 +13,7 @@ import {
 import type { AppRuntimeAggregate } from "../../shared/app-runtime";
 
 export interface AppRuntimeView extends Pick<AppRuntimeAggregate, "appId" | "runningWorkloads" | "latestFailure">,
-  Partial<Pick<AppRuntimeAggregate, "ui" | "stopping" | "jobs">> {}
+  Partial<Pick<AppRuntimeAggregate, "ui" | "stopping" | "jobs" | "services" | "enabled">> {}
 
 export interface AppHistoryView {
   readonly versions: readonly AppVersionRecordV1[];
@@ -179,7 +178,6 @@ export function useAppsManager(
     executionError: selected ? executionErrors.get(selected.id) ?? null : null,
     stopJob: (appId: string, runId: string) => manageExecution(appId, `job:${runId}`, () => stopAppJob(appId, runId)),
     closeUi: (appId: string) => manageExecution(appId, `ui:${appId}`, () => closeAppUi(appId)),
-    stopApp: (appId: string) => manageExecution(appId, `app:${appId}`, () => stopApp(appId)),
     refresh,
     loadMore: selected ? () => loadHistory(selected.id, true) : async () => {},
     restore,

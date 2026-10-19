@@ -3,6 +3,7 @@ import { accessSync, constants, createWriteStream } from "node:fs";
 import { chown, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { PassThrough } from "node:stream";
+import { drainWorkloadOutput } from "./workload-output";
 import {
   assertRuncLaunchRequest,
   type RuncDriver,
@@ -207,12 +208,7 @@ export class LinuxRuncDriver implements RuncDriver {
     }
     child.stderr?.pipe(stderrCapture);
     if (diagnosticFile) child.stderr?.pipe(diagnosticFile, { end: false });
-    if (request.logsChannel) {
-      child.stdout?.pipe(request.logsChannel.source, { end: false });
-      child.stderr?.pipe(request.logsChannel.source, { end: false });
-    } else {
-      child.stdout?.resume();
-    }
+    const output = drainWorkloadOutput([child.stdout, child.stderr].filter((stream): stream is NonNullable<typeof stream> => stream != null), request.logsChannel?.source);
 
     const active: ActiveExecution = {
       child,
@@ -226,6 +222,7 @@ export class LinuxRuncDriver implements RuncDriver {
     active.exit = waitForChild(child).then(
       async (exit) => {
         active.exited = true;
+        await output.finish();
         diagnosticFile?.end();
         await this.closeSdkBridge(plan.containerId, sdkBridge);
         return exit;

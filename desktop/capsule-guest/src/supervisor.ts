@@ -130,6 +130,7 @@ interface WorkloadRecord {
   readinessAbort?: AbortController;
   memoryController?: RuntimeMemoryController;
   resourceLease?: GuestResourceLease;
+  uiAdmitted?: boolean;
   finalized: boolean;
 }
 
@@ -178,6 +179,10 @@ export class CapsuleGuestSupervisor {
     TICKET_TTL_MS,
   );
   private readonly retiredApps = new BoundedTtlTombstones(
+    MAX_RETIRED_APP_TOMBSTONES,
+    RETIRED_APP_TOMBSTONE_TTL_MS,
+  );
+  private readonly retiredWorkloads = new BoundedTtlTombstones(
     MAX_RETIRED_APP_TOMBSTONES,
     RETIRED_APP_TOMBSTONE_TTL_MS,
   );
@@ -743,6 +748,7 @@ export class CapsuleGuestSupervisor {
   }
 
   private async prepareWorkload(body: WorkloadPrepareBody, sessionId: string): Promise<JsonValue> {
+    if (this.retiredWorkloads.has(`${body.appHandle}:${body.workloadHandle}`)) throw new Error("Workload handle was retired");
     const existing = this.workloads.get(body.workloadHandle);
     this.state = transitionSupervisor(this.state, {
       type: "workload.prepare",
@@ -854,6 +860,16 @@ export class CapsuleGuestSupervisor {
       resources,
     };
     try {
+      if (record.body.workloadKind === "ui") {
+        const owner = this.appBlobReferences.get(appHandle)?.ownerKey;
+        if (!owner) throw new Error("UI has no authenticated App owner");
+        if ([...this.workloads.values()].some(other => other !== record && other.uiAdmitted
+          && this.appBlobReferences.get(other.body.appHandle)?.ownerKey === owner)) {
+          throw new Error("App already owns an executing UI or unconfirmed UI cleanup");
+        }
+        // Claim before the first await, across every filesystem aggregate.
+        record.uiAdmitted = true;
+      }
       if (record.resourceLease) throw new Error("workload already owns a resource reservation");
       record.resourceLease = await this.admission.reserve(`workload:${workloadHandle}`, {
         memoryBytes: resources.memoryBytes,
@@ -943,6 +959,7 @@ export class CapsuleGuestSupervisor {
       }
     } catch (error) {
       if (!record.execution && !isFatalGuestError(error)) {
+        record.uiAdmitted = false;
         record.resourceLease?.release();
         record.resourceLease = undefined;
       }
@@ -987,6 +1004,7 @@ export class CapsuleGuestSupervisor {
       );
     }
     record.execution = undefined;
+    record.uiAdmitted = false;
     record.resourceLease?.release();
     record.resourceLease = undefined;
     record.logs?.socket.end();
@@ -1038,6 +1056,7 @@ export class CapsuleGuestSupervisor {
   }
 
   private async stopWorkload(appHandle: string, workloadHandle: string, graceMs: number): Promise<void> {
+    if (this.retiredWorkloads.has(`${appHandle}:${workloadHandle}`)) return;
     const record = this.requireWorkload(appHandle, workloadHandle);
     record.readinessAbort?.abort();
     await record.readiness;
@@ -1073,6 +1092,11 @@ export class CapsuleGuestSupervisor {
       record.cli?.socket.destroy();
       record.logs?.socket.end();
     }
+    // A long-lived App can supervise many successive executions. Retain only
+    // bounded stop tombstones after exact process and authority cleanup.
+    this.state = transitionSupervisor(this.state, { type: "workload.cleaned", appHandle, workloadHandle });
+    this.retireAppRecords(appHandle, [[workloadHandle, record]], false);
+    this.retiredWorkloads.add(`${appHandle}:${workloadHandle}`);
   }
 
   private async stopApp(appHandle: string): Promise<void> {
@@ -1745,6 +1769,7 @@ export class CapsuleGuestSupervisor {
   private retireAppRecords(
     appHandle: string,
     workloads: Array<[string, WorkloadRecord]>,
+    retireViewers = true,
   ): void {
     for (const [workloadHandle, record] of workloads) {
       this.revokeTicket(record.body.sdkTicket);
@@ -1753,8 +1778,15 @@ export class CapsuleGuestSupervisor {
       const sockets = this.viewerSockets.get(workloadHandle);
       if (sockets) for (const socket of sockets) socket.destroy();
       this.viewerSockets.delete(workloadHandle);
-      this.workloadLocks.delete(workloadHandle);
       this.workloads.delete(workloadHandle);
+    }
+    if (!retireViewers) {
+      for (const [ticket, viewer] of this.viewerTickets) {
+        if (!workloads.some(([handle]) => viewer.workloadHandle === handle)) continue;
+        this.viewerTickets.delete(ticket);
+        this.revokeTicket(ticket);
+      }
+      return;
     }
     for (const [ticket, viewer] of this.viewerTickets) {
       if (viewer.appHandle !== appHandle) continue;
@@ -1868,6 +1900,7 @@ export class CapsuleGuestSupervisor {
     this.forbiddenTickets.clear();
     this.consumedTickets.clear();
     this.retiredApps.clear();
+    this.retiredWorkloads.clear();
     this.control?.destroy(error);
     this.dataDialer.close();
     // The Host will terminate the VM after a lost boundary. Keep the rejection

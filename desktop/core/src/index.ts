@@ -1,3 +1,4 @@
+import { AppServiceStore } from "./apps/services";
 import { TriggerStore } from "./triggers/store";
 import { TriggerCoordinator } from "./triggers/coordinator";
 import { HostTriggerTargets } from "./triggers/targets";
@@ -182,12 +183,14 @@ const appEditMaterializations = new AppEditMaterializationCoordinator(
   appRepository,
   join(lamarckDir, "cache", "app-edit-bases"),
 );
+const appServices = new AppServiceStore(systemDb);
 const appLifecycle = new AppLifecycleService(
   appsDir,
   join(lamarckDir, "archived-apps"),
   appRepository,
   appActivationCoordinator,
   appEditMaterializations,
+  registry => appServices.admitInstalled(registry),
 );
 const contentBlobStore = new ContentBlobStore(workspacePath);
 const settings = new SettingsStore(lamarckDir);
@@ -255,7 +258,7 @@ const appJobDispatch = new AppJobDispatch(Date.now, channelId => { void appCapab
 const triggerCoordinator = new TriggerCoordinator(new TriggerStore(systemDb), guard.withSource("system:triggers", {
   producerRef: systemProducer.producerRef, prepareProducer: systemProducer.prepareProducer,
   writeTables: [], schemaGrant: false, signal: triggerLifetime.signal, deadlineMs: HOST_GUARD_DEADLINE_MS,
-}), new HostTriggerTargets(appLifecycle, connectorSupervisor, appJobDispatch));
+}), new HostTriggerTargets(appLifecycle, connectorSupervisor, appJobDispatch, id => appServices.appEnabled(id)));
 const marketplaceService = await MarketplaceService.initialize({
   workspacePath,
   apiOrigin: lamarckApiOrigin,
@@ -1144,11 +1147,20 @@ async function executeCoreCliOperation(
       await appCapabilities.revokeApp(appId);
       await appRepository.verifyRetainedVersions(appId, app.dir);
       await archiveApp(appsDir, join(lamarckDir, "archived-apps"), appId);
+      appServices.retire(appId);
       await appLifecycle.refreshRegistry();
       await requestGuard.writeLifecycleEvent({ type: "app.archived", startedAt: Date.now(), payload: { appId } });
       return { id: appId, archived: true };
     }
   }
+}
+
+function workloadAdmission(appId: string, workload: string): string {
+  const appRevision = appServices.requireAdmission(appId);
+  if (!workload.startsWith("service:")) return String(appRevision);
+  const policy = appServices.get(appId, workload.slice("service:".length));
+  if (!policy?.enabled) throw new Error("Service execution is disabled");
+  return `${appRevision}:${policy.revision}`;
 }
 
 function quoteCliWord(value: string): string {
@@ -1916,6 +1928,62 @@ const server = await serve<{ cwd: string }>({
         return json({ requirement });
       }
 
+      // Private Host Service control plane. Managed capabilities cannot use
+      // selector IDs to acquire runtime administration authority.
+      if (path === "/api/app-runtime/services" && method === "GET") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const inventory = await appLifecycle.inventory(req.signal);
+        return json({ apps: inventory.map(app => ({ appId: app.id, enabled: appServices.appEnabled(app.id) })), services: inventory.flatMap(app => app.manifestHealth.status === "valid"
+          ? Object.keys(app.runtime?.services ?? {}).map(serviceId => ({
+              appId: app.id, serviceId, version: app.version, appEnabled: appServices.appEnabled(app.id),
+              policy: appServices.get(app.id, serviceId),
+            })) : []) });
+      }
+      const appEnablementMatch = path.match(/^\/api\/app-runtime\/apps\/([^/]+)\/enablement$/);
+      if (appEnablementMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const appId = decodeURIComponent(appEnablementMatch[1]);
+        if (!PACKAGE_ID_PATTERN.test(appId)) return json({ error: "Invalid App identity" }, 400);
+        await appLifecycle.refreshRegistry(req.signal);
+        if (!appServices.appSetting(appId)) return json({ error: "Installed App not found" }, 404);
+        const body = await readBody<{ enabled?: unknown }>(req);
+        assertAllowedRequestFields(body, ["enabled"]);
+        if (typeof body.enabled !== "boolean") return json({ error: "enabled must be boolean" }, 400);
+        appServices.setAppEnabled(appId, body.enabled);
+        // Persist the admission fence before awaiting revocation. Host joins
+        // the exact process teardown; this response alone is no stop proof.
+        if (!body.enabled) {
+          for (const run of systemDb.prepare("SELECT id, json_extract(settings_json, '$.target') AS target FROM trigger_runs WHERE status = 'running'").all()) {
+            if (String(run.target).startsWith(`app:${appId}:job:`)) triggerCoordinator.cancelRun(String(run.id));
+          }
+          await appCapabilities.revokeApp(appId);
+        }
+        return json({ enabled: body.enabled });
+      }
+      const serviceStateMatch = path.match(/^\/api\/app-runtime\/services\/([^/]+)\/([^/]+)$/);
+      if (serviceStateMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const appId = decodeURIComponent(serviceStateMatch[1]), serviceId = decodeURIComponent(serviceStateMatch[2]);
+        if (!PACKAGE_ID_PATTERN.test(appId) || !/^[a-z0-9][a-z0-9-]*$/.test(serviceId)) return json({ error: "Invalid Service identity" }, 400);
+        const registry = await appLifecycle.refreshRegistry(req.signal);
+        const declared = registry.apps.get(appId)?.manifest.runtime.services;
+        if (!declared || !Object.hasOwn(declared, serviceId)) return json({ error: "Declared Service not found" }, 404);
+        const body = await readBody<Record<string, unknown>>(req);
+        if (body.operation === "enablement") {
+          assertAllowedRequestFields(body, ["operation", "enabled"]);
+          if (typeof body.enabled !== "boolean") return json({ error: "enabled must be boolean" }, 400);
+          return json({ policy: appServices.setEnabled(appId, serviceId, body.enabled) });
+        }
+        if (body.operation === "observe") {
+          assertAllowedRequestFields(body, ["operation", "revision", "crashCount", "restartAt", "lastError", "cleanupFailed"]);
+          return json({ accepted: appServices.observe(appId, serviceId, body.revision as number, {
+            crashCount: body.crashCount as number, restartAt: body.restartAt as number | null,
+            lastError: body.lastError as string | null, cleanupFailed: body.cleanupFailed as boolean,
+          }) });
+        }
+        return json({ error: "Invalid Service operation" }, 400);
+      }
+
       // -- Apps --
       if (path === "/api/apps/edit-bases" && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
@@ -1986,7 +2054,11 @@ const server = await serve<{ cwd: string }>({
         const workload = parseRequestedWorkload(body.workload);
         if (!workload) return json({ error: "valid workload is required" }, 400);
         try {
+          await appLifecycle.refreshRegistry(req.signal);
+          const revision = workloadAdmission(appId, workload);
           const activation = await appLifecycle.prepareActivation(appId, workload);
+          try { if (workloadAdmission(appId, workload) !== revision) throw new Error("App enablement changed during activation"); }
+          catch (error) { await appActivationCoordinator.release(activation.activationId); throw error; }
           return json({ activation });
         } catch (error) {
           return appLifecycleErrorResponse(error, json);
@@ -2017,12 +2089,14 @@ const server = await serve<{ cwd: string }>({
           return json({ error: "appId, workload, and activationId are required" }, 400);
         }
         try {
+          const admissionRevision = workloadAdmission(body.appId, workload);
           const activation = appActivationCoordinator.require(
             body.activationId,
             body.appId,
             workload,
           );
           await appRepository.verifyRetainedVersions(body.appId, join(appsDir, body.appId));
+          if (workloadAdmission(body.appId, workload) !== admissionRevision) throw new Error("App enablement changed during channel issuance");
           const descriptor = producerDescriptorStore.publish(createAppProducerDescriptor(
             body.appId,
             activation.version,
@@ -2216,6 +2290,7 @@ const server = await serve<{ cwd: string }>({
         await appCapabilities.revokeApp(appId);
         await appRepository.verifyRetainedVersions(appId, app.dir);
         await archiveApp(appsDir, join(lamarckDir, "archived-apps"), appId);
+        appServices.retire(appId);
         await appLifecycle.refreshRegistry();
 
         // D0 composition: the capability was retired (recoverable, not deleted).

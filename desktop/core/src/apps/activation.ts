@@ -33,6 +33,7 @@ export interface PreparedAppActivationV1 {
 export class AppActivationCoordinator {
   private readonly activations = new Map<string, PreparedAppActivationV1>();
   private sequence = 0;
+  private readonly materializations = new Map<string, Promise<unknown>>();
 
   constructor(
     private readonly repository: AppRepositoryService,
@@ -61,26 +62,28 @@ export class AppActivationCoordinator {
     if (!isDeclaredWorkload(packageValue.manifest, options.workload)) {
       throw new Error("Retained App version workload authority does not match activation admission");
     }
-    const immutablePackagePath = await this.materialize({
-      appId: options.appId,
-      appDir: options.appDir,
-      version: admitted.version,
-      expectedDigest: packageValue.digest,
+    return this.withMaterialization(options.appId, async () => {
+      const immutablePackagePath = await this.materialize({
+        appId: options.appId,
+        appDir: options.appDir,
+        version: admitted.version,
+        expectedDigest: packageValue.digest,
+      });
+      const activation = Object.freeze({
+        schemaVersion: 1 as const,
+        activationId: allocateActivationId(this.activations),
+        activationSequence: ++this.sequence,
+        appId: options.appId,
+        workload: options.workload,
+        version: admitted.version,
+        manifest: packageValue.manifest,
+        manifestDigest: digestNormalizedAppManifest(packageValue.manifest),
+        packageDigest: packageValue.digest,
+        immutablePackagePath,
+      });
+      this.activations.set(activation.activationId, activation);
+      return activation;
     });
-    const activation = Object.freeze({
-      schemaVersion: 1 as const,
-      activationId: allocateActivationId(this.activations),
-      activationSequence: ++this.sequence,
-      appId: options.appId,
-      workload: options.workload,
-      version: admitted.version,
-      manifest: packageValue.manifest,
-      manifestDigest: digestNormalizedAppManifest(packageValue.manifest),
-      packageDigest: packageValue.digest,
-      immutablePackagePath,
-    });
-    this.activations.set(activation.activationId, activation);
-    return activation;
   }
 
   require(
@@ -100,16 +103,30 @@ export class AppActivationCoordinator {
   }
 
   async release(activationId: string): Promise<boolean> {
-    const activation = this.activations.get(activationId);
-    if (!activation || !this.activations.delete(activationId)) return false;
-    if ([...this.activations.values()].some((value) => (
-      value.immutablePackagePath === activation.immutablePackagePath
-    ))) return true;
-    await makeTreeWritable(activation.immutablePackagePath).catch((error) => {
-      if (!isNodeError(error, "ENOENT")) throw error;
+    const admitted = this.activations.get(activationId);
+    if (!admitted) return false;
+    return this.withMaterialization(admitted.appId, async () => {
+      const activation = this.activations.get(activationId);
+      if (!activation) return false;
+      if ([...this.activations.values()].some((value) => (
+        value.activationId !== activationId && value.immutablePackagePath === activation.immutablePackagePath
+      ))) { this.activations.delete(activationId); return true; }
+      await makeTreeWritable(activation.immutablePackagePath).catch((error) => {
+        if (!isNodeError(error, "ENOENT")) throw error;
+      });
+      await rm(activation.immutablePackagePath, { recursive: true, force: true });
+      // Retain the exact release obligation until filesystem cleanup succeeds.
+      this.activations.delete(activationId);
+      return true;
     });
-    await rm(activation.immutablePackagePath, { recursive: true, force: true });
-    return true;
+  }
+
+  private async withMaterialization<T>(appId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.materializations.get(appId) ?? Promise.resolve();
+    const task = previous.catch(() => {}).then(operation);
+    this.materializations.set(appId, task);
+    try { return await task; }
+    finally { if (this.materializations.get(appId) === task) this.materializations.delete(appId); }
   }
 
   private async materialize(options: {

@@ -13,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import { HostCliTransport, runCli as runSharedCli, type CliIo } from "@lamarck/cli";
 import { CapsuleJobWorker } from "../../shell/electron/capsule/job-worker";
 import { CapsuleManager } from "../../shell/electron/capsule/manager";
-import type { CapsuleBackend } from "../../shell/electron/capsule/backend";
+import { UnavailableCapsuleBackend, type CapsuleBackend } from "../../shell/electron/capsule/backend";
 import type { JobInvocation } from "@lamarck/system/protocol";
 import { SystemBroker } from "../../shell/electron/capsule/system-broker";
 import { SystemStreamServer } from "../../shell/electron/capsule/system-stream";
@@ -57,6 +57,8 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
       writeAppManifest("history-app", []),
       writeAppManifest("archive-app", []),
       writeAppManifest("trigger-app", []),
+      writeAppManifest("service-app", []),
+      writeAppManifest("gated-app", []),
       writeAppManifest("ai-reference-app", [], { summary: { name: "Summary", provider: "openai" } }),
       writeConnectorPackage("lamarck.cli-fixture"),
     ]);
@@ -495,6 +497,93 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     expect(current.manifestDigest).not.toBe(stale.manifestDigest);
     await releaseActivation(current.activationId);
   });
+  test("Service policy is Host-only, persists in v1, and never grants runtime administration to App channels", async () => {
+    const path = "/api/app-runtime/services/service-app/indexer";
+    const initial = await hostRequest("/api/app-runtime/services") as { services: { appId: string; policy: unknown }[] };
+    expect(initial.services.find(value => value.appId === "service-app")?.policy).toMatchObject({ enabled: true });
+    const { policy } = await hostRequest(path, { method: "POST", body: JSON.stringify({ operation: "enablement", enabled: true }) }) as { policy: { enabled: boolean; revision: number } };
+    expect(policy.enabled).toBe(true);
+    const capability = await issueCapability("app-a");
+    for (const [target, init] of [["/api/app-runtime/services", {}], [path, { method: "POST", body: JSON.stringify({ operation: "enablement", enabled: false }) }]] as const) {
+      const denied = await fetch(`${coreOrigin}${target}`, { ...init, headers: { "x-lamarck-app-capability": capability.capability } });
+      expect(denied.status).toBe(403);
+    }
+    const persisted = new DatabaseSync(join(workspace, ".lamarck", "system.db"), { readOnly: true });
+    try {
+      expect(persisted.prepare("PRAGMA user_version").get()?.user_version).toBe(1);
+      expect(persisted.prepare("SELECT enabled FROM app_services WHERE app_id = ? AND service_id = ?").get("service-app", "indexer")?.enabled).toBe(1);
+    } finally { persisted.close(); }
+    await hostRequest(path, { method: "POST", body: JSON.stringify({ operation: "enablement", enabled: false }) });
+    await hostRequest(`/api/app-runtime/channels/${capability.channelId}`, { method: "DELETE" });
+  });
+
+  test("Core admission blocks every disabled-App workload and stale channel issuance while preserving child settings", async () => {
+    const activations: { workload: string; activationId: string }[] = [];
+    for (const workload of ["ui", "service:indexer", "job:inbox"]) {
+      const result = await hostRequest("/api/apps/gated-app/activation/prepare", { method: "POST", body: JSON.stringify({ workload }) }) as { activation: { activationId: string } };
+      activations.push({ workload, activationId: result.activation.activationId });
+    }
+    const capability = await issueCapability("gated-app");
+    const deniedSetting = await fetch(`${coreOrigin}/api/app-runtime/apps/gated-app/enablement`, { method: "POST", headers: { "x-lamarck-app-capability": capability.capability }, body: JSON.stringify({ enabled: false }) });
+    expect(deniedSetting.status).toBe(403);
+    await hostRequest("/api/app-runtime/apps/gated-app/enablement", { method: "POST", body: JSON.stringify({ enabled: false }) });
+    try {
+      for (const activation of activations) {
+        const prepared = await fetch(`${coreOrigin}/api/apps/gated-app/activation/prepare`, { method: "POST", headers: { Authorization: `Bearer ${CORE_TOKEN}` }, body: JSON.stringify({ workload: activation.workload }) });
+        expect(prepared.ok).toBe(false);
+        const issued = await fetch(`${coreOrigin}/api/app-runtime/channels`, { method: "POST", headers: { Authorization: `Bearer ${CORE_TOKEN}` }, body: JSON.stringify({ appId: "gated-app", ...activation }) });
+        expect(issued.status).toBe(409);
+      }
+      const inventory = await hostRequest("/api/app-runtime/services") as { apps: { appId: string; enabled: boolean }[]; services: { appId: string; policy: { enabled: boolean } }[] };
+      expect(inventory.apps.find(app => app.appId === "gated-app")?.enabled).toBe(false);
+      expect(inventory.services.find(app => app.appId === "gated-app")?.policy.enabled).toBe(true);
+      const catalog = await hostRequest("/api/triggers/manage", { method: "POST", body: JSON.stringify({ operation: "trigger.targets", input: {} }) }) as unknown;
+      expect(JSON.stringify(catalog)).toContain("App is disabled");
+    } finally {
+      await hostRequest("/api/app-runtime/apps/gated-app/enablement", { method: "POST", body: JSON.stringify({ enabled: true }) });
+      for (const activation of activations) await hostRequest(`/api/apps/activation/${activation.activationId}`, { method: "DELETE" });
+      await hostRequest("/api/app-runtime/services/gated-app/indexer", { method: "POST", body: JSON.stringify({ operation: "enablement", enabled: false }) });
+    }
+  });
+
+  test("a Service-only App starts from saved enabled policy, keeps its bound identity, and obeys persisted App enablement", async () => {
+    const path = "/api/app-runtime/services/service-app/indexer";
+    await hostRequest(path, { method: "POST", body: JSON.stringify({ operation: "enablement", enabled: true }) });
+    const broker = new SystemBroker({ coreBaseUrl: coreOrigin, revokeCapability: async channelId => { await hostRequest(`/api/app-runtime/channels/${channelId}`, { method: "DELETE" }); } });
+    let launches = 0;
+    const backend = Object.assign(new UnavailableCapsuleBackend(), {
+      status: async () => ({ available: true, backend: "isolated-Guest-fixture" }),
+      runService: async (spec: import("../../shell/electron/capsule/backend").CapsuleServiceSpec, signal: AbortSignal, state?: (value: "running" | "stopping") => void, output?: (bytes: Uint8Array) => void) => {
+        expect(spec).not.toHaveProperty("port");
+        expect(spec.serviceId).toBe("indexer");
+        const system = createSystem((operation, input) => broker.invoke(spec.sdkSenderId, operation, input));
+        await expect(system.jobInput()).rejects.toThrow();
+        await system.writeEvent({ type: "service.fixture.result", startedAt: Date.now(), payload: { value: "business output" } });
+        launches++; state?.("running"); output?.(Buffer.from("indexer alive\n"));
+        await new Promise<void>((_, reject) => {
+          if (signal.aborted) reject(signal.reason);
+          else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    });
+    const manager = new CapsuleManager({ backend, workspacePath: () => workspace, coreBaseUrl: () => coreOrigin, coreToken: CORE_TOKEN,
+      bindSystemSender: (id, binding) => broker.bindSender(id, binding), unbindSystemSender: id => broker.unbindSender(id) });
+    try {
+      manager.startServices(); await vi.waitFor(() => { expect(launches).toBe(1); expect(manager.appRuntimeStates().find(value => value.appId === "service-app")?.services?.[0].state).toBe("running"); }, { timeout: 10000 });
+      await manager.closeAppUi("service-app"); expect(manager.appRuntimeStates().find(value => value.appId === "service-app")?.services?.[0].state).toBe("running");
+      await manager.setAppEnabled("service-app", false); await manager.reconcileServices(); expect(launches).toBe(1);
+      expect(manager.appRuntimeStates().find(value => value.appId === "service-app")?.services?.[0].state).toBe("stopped");
+      expect((await hostRequest("/api/app-runtime/services") as { services: { appId: string; policy: { enabled: boolean } }[] }).services.find(value => value.appId === "service-app")?.policy.enabled).toBe(true);
+      await manager.setAppEnabled("service-app", true); await vi.waitFor(() => expect(launches).toBe(2), { timeout: 10000 });
+      const evidence = await hostRequest("/api/query", { method: "POST", body: JSON.stringify({ sql: "SELECT source FROM events WHERE type = ?", params: ["service.fixture.result"] }) }) as { rows: { source: string }[] };
+      expect(evidence.rows).toEqual([{ source: "app:service-app:service:indexer" }, { source: "app:service-app:service:indexer" }]);
+      expect(manager.workloadDiagnostics("service-app")).toHaveLength(2);
+    } finally {
+      await manager.stopAll();
+      await hostRequest(path, { method: "POST", body: JSON.stringify({ operation: "enablement", enabled: false }) });
+    }
+  });
+
   test("Host CLI and Console share Trigger management, dispatch a bound App job and persist its original event and completion", async () => {
     const broker = new SystemBroker({ coreBaseUrl: coreOrigin, revokeCapability: async channelId => { await hostRequest(`/api/app-runtime/channels/${channelId}`, { method: "DELETE" }); } });
     const received: JobInvocation[] = [];
@@ -604,8 +693,9 @@ async function writeAppManifest(appId: string, tables: string[], aiAccessSources
     name: appId === "app-a" ? "App A" : "App B",
     description: `${appId} end-to-end test App.`,
     runtime: {
-      ui: { command: ["node", "server.mjs"], port: 3000 },
-      ...(appId === "trigger-app" ? { jobs: { inbox: { command: ["node", "inbox.mjs"] } } } : {}),
+      ...(appId === "service-app" ? {} : { ui: { command: ["node", "server.mjs"], port: 3000 } }),
+      ...(["service-app", "gated-app"].includes(appId) ? { services: { indexer: { command: ["node", "indexer.mjs"] } } } : {}),
+      ...(["trigger-app", "gated-app"].includes(appId) ? { jobs: { inbox: { command: ["node", "inbox.mjs"] } } } : {}),
     },
     permissions: { writes: { files: [], tables } },
     ...(aiAccessSources ? { ai: { accessSources: aiAccessSources } } : {}),

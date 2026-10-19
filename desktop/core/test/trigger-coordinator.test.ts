@@ -11,6 +11,7 @@ import { manageTriggers } from '../src/triggers/management';
 import type { EventMatcher } from '../src/triggers/listeners';
 import { ConnectorSupervisor } from '../src/connectors/supervisor';
 import { HostTriggerTargets } from '../src/triggers/targets';
+import { AppServiceStore } from '../src/apps/services';
 import { AppJobDispatch } from '../src/triggers/app-jobs';
 import type { AppLifecycleService } from '../src/apps/lifecycle';
 import { DatabaseSync } from 'node:sqlite';
@@ -200,4 +201,24 @@ test('a due schedule invokes a concrete Source through real supervisor state and
     now += 60_000; await drain(3); expect(executions).toBe(1); expect(store.runs(record.id)[0].status).toBe('success'); expect(supervisor.getSource(source.id)?.syncState).toEqual({ completed: true });
     await supervisor.pauseSource(source.id); now += 60_000; await drain(2); expect(executions).toBe(1); expect(store.get(record.id).error).toBe('Source is paused');
   } finally { await coordinator.close(); data.close(); }
+});
+
+test('App enablement uses the existing unavailable-target queue policy and preserves Trigger and child Service settings', async () => {
+  await coordinator.close();
+  const apps = { inventory: async () => [{ id: 'notes', name: 'Notes', manifestHealth: { status: 'valid' }, versionHealth: { status: 'healthy' }, runtime: { jobs: { inbox: { command: ['node', 'job.js'] } } } }] };
+  const services = new AppServiceStore(db); db.prepare('INSERT INTO app_runtime_settings VALUES (?, 1, 1)').run('notes'); services.setEnabled('notes', 'indexer', false);
+  const jobs = new AppJobDispatch(() => now); jobs.heartbeat(true, []);
+  const sourceFixture = { listAdmitted: async () => [], listInstalledConnectors: () => [] };
+  const appTargets = new HostTriggerTargets(apps as unknown as AppLifecycleService, sourceFixture as unknown as ConnectorSupervisor, jobs, id => services.appEnabled(id));
+  appTargets.invoke = vi.fn(async (_, run) => { delivered.push(run); });
+  coordinator = new TriggerCoordinator(store, matcher, appTargets, () => now);
+  const record = await coordinator.create({ ...config, condition: { kind: 'schedule', cron: '*/5 * * * *', timezone: 'UTC' } });
+  const pending = store.insertRun(record, { kind: 'schedule', scheduledAt: now }, 'automatic', null, 'queued-before-disable', now);
+  services.setAppEnabled('notes', false); await drain(2);
+  expect(store.run(pending.id)).toMatchObject({ status: 'pending', error: 'App is disabled' });
+  expect(store.get(record.id)).toMatchObject({ settings: record.settings, cursor: record.cursor, nextRunAt: record.nextRunAt });
+  expect(services.get('notes', 'indexer')?.enabled).toBe(false); expect(delivered).toEqual([]);
+  services.setAppEnabled('notes', true); expect(delivered).toEqual([]);
+  await drain(2); expect(store.run(pending.id).status).toBe('success'); expect(delivered).toHaveLength(1);
+  expect(store.runs(record.id)).toHaveLength(1); expect(store.get(record.id).settings).toEqual(record.settings);
 });

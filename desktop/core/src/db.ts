@@ -1,4 +1,5 @@
 import { TRIGGER_SCHEMA } from "./triggers/store";
+import { APP_SERVICE_SCHEMA } from "./apps/services";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import {
@@ -164,6 +165,7 @@ CREATE TABLE IF NOT EXISTS connector_installations (
   updated_at             INTEGER NOT NULL
 );
 ${TRIGGER_SCHEMA}
+${APP_SERVICE_SCHEMA}
 `;
 
 export const SYSTEM_SCHEMA = SYSTEM_SCHEMA_V1;

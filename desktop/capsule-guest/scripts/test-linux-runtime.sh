@@ -64,6 +64,8 @@ trap cleanup EXIT HUP INT TERM
 	--format=cjs \
 	--external:node:sqlite \
 	--outfile="$context/guard-service.cjs"
+cp "$guest/native/net-helper.c" "$context/net-helper.c"
+cp "$guest/native/net-helper-network-test.c" "$context/net-helper-network-test.c"
 cp "$guest/test-linux/Dockerfile" "$context/Dockerfile"
 cp "$guest/test-linux/run.sh" "$context/run.sh"
 cp "$guest/test-linux/run-build.sh" "$context/run-build.sh"

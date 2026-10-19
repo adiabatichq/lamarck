@@ -6,9 +6,11 @@ import { describe, expect, test, vi } from "vitest";
 const PRELOAD_SOURCE = readFileSync(new URL("./preload.cjs", import.meta.url), "utf8");
 
 interface WorkspacePreloadHost {
+  setAppServiceEnabled(appId: string, serviceId: string, enabled: boolean): Promise<unknown>;
+  getAppWorkloadDiagnostics(appId: string, executionId?: string): Promise<unknown>;
   stopAppJob(appId: string, runId: string): Promise<unknown>;
   closeAppUi(appId: string): Promise<unknown>;
-  stopApp(appId: string): Promise<unknown>;
+  setAppEnabled(appId: string, enabled: boolean): Promise<unknown>;
   onCoreRuntimeState(callback: (state: unknown) => void): () => void;
   getWorkspaceState(): Promise<unknown>;
   chooseWorkspacePath(purpose: "create" | "open"): Promise<unknown>;
@@ -45,10 +47,20 @@ function loadPreload(ipcInvoke: ReturnType<typeof vi.fn>, events = new EventEmit
 }
 
 describe("Shell Workspace preload contract", () => {
+  test("exposes Service enablement and exact diagnostic reads only through Shell IPC", async () => {
+    const invoke = vi.fn(async () => ({})); const host = loadPreload(invoke);
+    await host.setAppServiceEnabled("notes", "indexer", false);
+    await host.setAppEnabled("notes", false);
+    await host.getAppWorkloadDiagnostics("notes", "run-a");
+    expect(invoke.mock.calls).toEqual([["app-runtime:service-enablement", "notes", "indexer", false], ["app-runtime:app-enablement", "notes", false], ["app-runtime:diagnostics", "notes", "run-a"]]);
+    const appPreload = readFileSync(new URL("./app-preload.ts", import.meta.url), "utf8");
+    expect(appPreload).not.toMatch(/app-runtime:(diagnostics|service-enablement|app-enablement)/);
+  });
+
   test("dispatches exact job, UI-only and whole-App management through distinct Host IPC", async () => {
     const invoke = vi.fn(async () => ({ ok: true })); const host = loadPreload(invoke);
-    await host.stopAppJob("notes", "run-a"); await host.closeAppUi("notes"); await host.stopApp("notes");
-    expect(invoke.mock.calls).toEqual([["app-runtime:stop-job", "notes", "run-a"], ["app-runtime:close-ui", "notes"], ["app-runtime:stop", "notes"]]);
+    await host.stopAppJob("notes", "run-a"); await host.closeAppUi("notes"); await host.setAppEnabled("notes", false);
+    expect(invoke.mock.calls).toEqual([["app-runtime:stop-job", "notes", "run-a"], ["app-runtime:close-ui", "notes"], ["app-runtime:app-enablement", "notes", false]]);
   });
   test("delivers wake notifications without exposing IPC objects and removes subscriptions", () => {
     const events = new EventEmitter();

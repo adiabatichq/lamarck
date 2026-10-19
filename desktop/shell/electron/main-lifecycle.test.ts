@@ -59,10 +59,10 @@ describe("Shell window lifecycle", () => {
 });
 
 describe("App viewer IPC contract", () => {
-  test.each(["stop-job", "close-ui", "stop"])("App execution %s is fenced behind trusted Shell IPC", operation => {
+  test.each(["stop-job", "close-ui", "app-enablement", "service-enablement", "diagnostics"])("App execution %s is fenced behind trusted Shell IPC", operation => {
     const handler = mainSource.slice(mainSource.indexOf(`  ipcMain.handle("app-runtime:${operation}"`)).split("\n  });")[0];
     expect(handler).toContain("requireShellIpc(event)");
-    const action = operation === "stop-job" ? "capsuleManager.stopJob" : operation === "close-ui" ? "capsuleManager.closeAppUi" : "capsuleManager.stopApp";
+    const action = operation === "stop-job" ? "capsuleManager.stopJob" : operation === "close-ui" ? "capsuleManager.closeAppUi" : operation === "service-enablement" ? "capsuleManager.setServiceEnabled" : operation === "diagnostics" ? "capsuleManager.workloadDiagnostics" : "capsuleManager.setAppEnabled";
     expect(handler.indexOf("requireShellIpc(event)")).toBeLessThan(handler.indexOf(action));
     expect(handler).toContain(action);
   });
@@ -652,32 +652,23 @@ describe("Shell Host configuration", () => {
     );
   });
 
-  test("keeps the prior renderer attached until the prepared replacement commits", () => {
-    const reload = mainSource.match(
-      /function reloadAppRuntime\([\s\S]*?\n\}\n\nfunction assertCurrentAppViewer/,
-    );
+  test("retires the old renderer and authority at handoff, then publishes only the verified replacement", () => {
+    const reload = mainSource.match(/function reloadAppRuntime\([\s\S]*?\n\}\n\nfunction assertCurrentAppViewer/)?.[0];
     if (!reload) throw new Error("App viewer reload lifecycle is missing");
-    const lifecycle = reload[0];
-    const managerCommit = lifecycle.indexOf("await capsuleManager.reloadApp");
-    const hiddenLoad = lifecycle.indexOf("await prepareReloadedAppViewer");
-    const rendererCommit = lifecycle.indexOf("commitReloadedAppViewer");
-    expect(managerCommit).toBeGreaterThan(-1);
-    expect(hiddenLoad).toBeGreaterThan(managerCommit);
-    expect(rendererCommit).toBeGreaterThan(hiddenLoad);
-
-    const cutover = mainSource.match(
-      /function commitReloadedAppViewer\([\s\S]*?\n\}\n\nfunction reloadAppRuntime/,
-    );
-    if (!cutover) throw new Error("App viewer renderer commit is missing");
-    const commit = cutover[0];
-    const captureVisibility = commit.indexOf("previousView.getVisible()");
-    const attachReplacement = commit.indexOf("addChildView(replacement.view)");
-    const restoreVisibility = commit.indexOf("replacement.view.setVisible(previousVisible)");
-    const removePrevious = commit.indexOf("removeChildView(previousView)");
-    expect(captureVisibility).toBeGreaterThan(-1);
-    expect(attachReplacement).toBeGreaterThan(captureVisibility);
-    expect(restoreVisibility).toBeGreaterThan(attachReplacement);
-    expect(removePrevious).toBeGreaterThan(restoreVisibility);
+    expect(reload).toContain("handoffStarted = true");
+    expect(reload).toContain("initialRecord.handoffPresentation =");
+    const revoke = reload.indexOf("systemBroker.unbindSender(initialRecord.appWebContentsId)");
+    const remove = reload.indexOf("removeChildView(initialRecord.view)");
+    const close = reload.indexOf("contents.close({ waitForBeforeUnload: false })");
+    expect(revoke).toBeGreaterThan(-1);
+    expect(remove).toBeGreaterThan(revoke);
+    expect(close).toBeGreaterThan(remove);
+    expect(reload).toContain("if (!backendCommitted && !handoffStarted)");
+    const commit = mainSource.match(/function commitReloadedAppViewer\([\s\S]*?\n\}\n\nfunction reloadAppRuntime/)?.[0];
+    if (!commit) throw new Error("App viewer renderer commit is missing");
+    expect(commit).toContain("const presentation = record.handoffPresentation");
+    expect(commit.indexOf("addChildView(replacement.view)")).toBeLessThan(commit.indexOf("replacement.view.setVisible(previousVisible)"));
+    expect(commit).not.toContain("removeChildView(previousView)");
   });
 
   test("hands prepared health monitoring to published renderer cleanup without a gap", () => {

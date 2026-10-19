@@ -1,4 +1,5 @@
 import { useMemo, useState, type ReactElement } from "react";
+import { AppWorkloadManagement } from "./AppWorkloadManagement";
 import { AppMark } from "../components/AppMark";
 import {
   useAppsManager,
@@ -75,11 +76,11 @@ export function AppsManager({
       selected={manager.selected}
       runtimeByApp={manager.runtimeByApp}
       selectedRuntime={runtime}
+      onAppDisabled={onUiClosed}
       executionPending={manager.executionPending}
       executionError={manager.executionError ?? manager.error}
       onStopJob={(appId, runId) => { void manager.stopJob(appId, runId).catch(() => {}); }}
       onCloseUi={appId => { void manager.closeUi(appId).then(() => onUiClosed?.(appId)).catch(() => {}); }}
-      onStopApp={appId => { void manager.stopApp(appId).then(() => onUiClosed?.(appId)).catch(() => {}); }}
       history={manager.history}
       loading={inventoryLoading || manager.loading}
       error={actionError ?? inventoryError ?? manager.error}
@@ -122,14 +123,14 @@ export function AppsManagerView({
   executionError = null,
   onStopJob,
   onCloseUi,
-  onStopApp,
+  onAppDisabled,
 }: {
   onManageTriggers?: (appId: string, triggerId?: string) => void;
+  onAppDisabled?: (appId: string) => void;
   executionPending?: ReadonlySet<string>;
   executionError?: string | null;
   onStopJob?: (appId: string, runId: string) => void;
   onCloseUi?: (appId: string) => void;
-  onStopApp?: (appId: string) => void;
   apps: readonly AppInfo[];
   selected: AppInfo | null;
   runtimeByApp: ReadonlyMap<string, AppRuntimeView>;
@@ -212,12 +213,13 @@ export function AppsManagerView({
             </div>
             <GrantList label="Writable file prefixes" values={grants.files} empty="No writable file prefixes" />
             <GrantList label="Writable D2 tables" values={grants.tables} empty="No writable D2 tables" />
+            <AppWorkloadManagement key={selected.id} appId={selected.id} services={selectedRuntime?.services ?? []} appEnabled={selectedRuntime?.enabled} onAppDisabled={onAppDisabled} />
             <AppExecutionView appId={selected.id} runtime={selectedRuntime} loading={loading}
               pending={executionPending} error={executionError} onStopJob={onStopJob}
-              onCloseUi={onCloseUi} onStopApp={onStopApp} onManageTriggers={onManageTriggers} />
+              onCloseUi={onCloseUi} onManageTriggers={onManageTriggers} />
             {onManageTriggers && Object.keys(selected.runtime?.jobs ?? {}).length > 0 && <button type="button" className={styles.openApp} onClick={() => onManageTriggers(selected.id)}>Manage Triggers <span>↗</span></button>}
             {selected.runtime?.ui && (
-              <button type="button" className={styles.openApp} onClick={() => onOpenApp(selected.id)}>
+              <button type="button" className={styles.openApp} disabled={selectedRuntime?.enabled === false} onClick={() => onOpenApp(selected.id)}>
                 Open in Use <span>↗</span>
               </button>
             )}
@@ -311,10 +313,10 @@ export function AppsManagerView({
   );
 }
 
-export function AppExecutionView({ appId, runtime, loading, pending, error, onStopJob, onCloseUi, onStopApp, onManageTriggers }: {
+export function AppExecutionView({ appId, runtime, loading, pending, error, onStopJob, onCloseUi, onManageTriggers }: {
   appId: string; runtime?: AppRuntimeView; loading: boolean; pending: ReadonlySet<string>; error: string | null;
   onStopJob?: (appId: string, runId: string) => void;
-  onCloseUi?: (appId: string) => void; onStopApp?: (appId: string) => void;
+  onCloseUi?: (appId: string) => void;
   onManageTriggers?: (appId: string, triggerId?: string) => void;
 }): ReactElement {
   const appStopping = !!runtime?.stopping || pending.has(`app:${appId}`);
@@ -330,10 +332,8 @@ export function AppExecutionView({ appId, runtime, loading, pending, error, onSt
       <span>UI: {uiPending ? "Closing · waiting for cleanup" : ui}</span>
       {onCloseUi && <button type="button" disabled={loading || appStopping || uiPending || ui === "closed" || ui === "stopping"}
         onClick={() => onCloseUi(appId)}>{uiPending ? "Closing UI…" : "Close UI"}</button>}
-      {onStopApp && <button type="button" disabled={loading || appStopping}
-        onClick={() => onStopApp(appId)}>{appStopping ? "Stopping App…" : "Stop App"}</button>}
     </div>
-    <p className={styles.executionHint}>Close UI keeps jobs running. Stop App stops the UI and all owned jobs. Enabled Triggers may start future jobs.</p>
+    <p className={styles.executionHint}>Close UI keeps jobs and Services running. Disable App to stop all its workloads and prevent new execution. Trigger settings and history are preserved.</p>
     <h4>Active jobs</h4>
     {loading && !runtime ? <p role="status">Checking active jobs…</p>
       : !jobs.length ? <p>{error ? "Active job state could not be confirmed." : "No active jobs."}</p>

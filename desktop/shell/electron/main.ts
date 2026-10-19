@@ -273,6 +273,7 @@ interface AppViewerRecord {
   protocolPartition: string;
   gateway: ViewerGatewayBinding;
   pendingReplacement: AppViewerReplacement | null;
+  handoffPresentation?: { bounds: Electron.Rectangle; visible: boolean };
 }
 
 interface AppViewerReplacement {
@@ -1326,6 +1327,7 @@ async function startRuntimeProcesses(
   await waitForCore(generation);
   await cliGateway.start();
   capsuleJobWorker.start(coreBaseUrl());
+  capsuleManager.startServices();
 }
 
 async function activateWorkspace(
@@ -2241,11 +2243,11 @@ function commitReloadedAppViewer(
   }
   assertCurrentAppViewer(record, binding.viewerId, lifecycleGeneration, replacement, binding);
   const previousGateway = record.gateway;
-  const previousView = record.view;
   const previousSession = record.viewerSession;
-  const previousProtocolPartition = record.protocolPartition;
-  const previousBounds = previousView.getBounds();
-  const previousVisible = previousView.getVisible();
+  const presentation = record.handoffPresentation;
+  if (!presentation) throw new Error("UI handoff did not retire its previous browser");
+  const previousBounds = presentation.bounds;
+  const previousVisible = presentation.visible;
   replacement.assertHealthy();
   replacement.view.setBounds(previousBounds);
   bindAppViewerCleanup(replacement.view, binding.viewerId, record.ownerLease);
@@ -2261,20 +2263,12 @@ function commitReloadedAppViewer(
   record.protocolPartition = replacement.protocolPartition;
   record.gateway = replacement.gateway;
   record.pendingReplacement = null;
+  record.handoffPresentation = undefined;
   // A committed renderer receives a fresh lifecycle generation. Any stale
   // async continuation from the previous generation must now fail CAS.
   const committedGeneration = appViewerLifecycle.invalidate(record.appId);
 
-  // The candidate document is already fully loaded. Retire the old renderer
-  // only after the new one is attached, so transient startup responses and
-  // failed candidate loads never blank the last-known-good UI.
-  systemBroker.unbindSender(previousView.webContents.id);
-  expectedAppViewerCloses.add(previousView.webContents);
-  try { record.owner.contentView.removeChildView(previousView); } catch {}
-  if (!previousView.webContents.isDestroyed()) {
-    previousView.webContents.close({ waitForBeforeUnload: false });
-  }
-  clearAppViewerBinding(previousProtocolPartition, binding.viewerId);
+  // The old renderer and its authority were retired when handoff began.
   assertCurrentAppViewer(record, binding.viewerId, committedGeneration, undefined, binding);
   const cleanup = Promise.allSettled([
     Promise.resolve().then(() => previousGateway.close()),
@@ -2298,6 +2292,7 @@ function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
     const lifecycleGeneration = appViewerLifecycle.generation(appId);
     let preparedSurface: PreparedAppViewerSurface | null = null;
     let backendCommitted = false;
+    let handoffStarted = false;
     try {
       const result = await capsuleManager.reloadApp(
         appId,
@@ -2328,6 +2323,22 @@ function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
           preparedSurface = null;
           return publication;
         },
+        () => {
+          handoffStarted = true;
+          if (!initialRecord || !initialViewerId) throw new Error("Previous App viewer is no longer attached");
+          assertCurrentAppViewer(initialRecord, initialViewerId, lifecycleGeneration);
+          const presentation = { bounds: initialRecord.view.getBounds(), visible: initialRecord.view.getVisible() };
+          const contents = initialRecord.view.webContents;
+          systemBroker.unbindSender(initialRecord.appWebContentsId);
+          clearAppViewerBinding(initialRecord.protocolPartition, initialViewerId);
+          expectedAppViewerCloses.add(contents);
+          initialRecord.owner.contentView.removeChildView(initialRecord.view);
+          if (!contents.isDestroyed()) contents.close({ waitForBeforeUnload: false });
+          initialRecord.handoffPresentation = presentation;
+          // Keep the reload record until publication or failure; its retired
+          // browser has no authority and no longer occupies the visible pane.
+          void initialRecord.gateway.close().catch(error => console.error("[electron] Retired viewer gateway cleanup failed", error));
+        },
       );
       if (!backendCommitted) return { active: result.active };
       return { active: result.active };
@@ -2345,9 +2356,9 @@ function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
         }
         preparedSurface = null;
       }
-      // Before Manager commit, verifier or Candidate failure leaves the
-      // previous Runtime, authority, activation, and renderer untouched.
-      if (!backendCommitted) {
+      // A Build failure precedes interruption. After handoff starts, failure
+      // leaves the UI unavailable and the prior verified artifact retained.
+      if (!backendCommitted && !handoffStarted) {
         if (cleanupFailures.length > 0) {
           throw new AggregateError(
             [error, ...cleanupFailures],
@@ -2370,9 +2381,9 @@ function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
         ));
       } else {
         // A trusted Shell caller can race reload against the final Host-side
-        // attachment step of openViewer. With no owner binding to close, stop
-        // the entire App identity rather than leave a manager-only generation.
-        cleanup.push(capsuleManager.stopApp(appId));
+        // attachment step of openViewer. Close all manager-owned UI work and
+        // authority while independent Services and Jobs keep their lifetime.
+        cleanup.push(capsuleManager.closeAppUi(appId));
       }
       const cleanupResults = await Promise.allSettled(cleanup);
       cleanupFailures.push(...cleanupResults
@@ -2465,11 +2476,16 @@ function detachAppViewerRecord(
     sessions.add(viewerSession);
     clearAppViewerBinding(protocolPartition, viewerId);
     expectedAppViewerCloses.add(contents);
-    captureCleanup(() => systemBroker.unbindSender(contents.id));
-    captureCleanup(() => record.owner.contentView.removeChildView(view));
-    captureCleanup(() => {
-      if (!contents.isDestroyed()) contents.close({ waitForBeforeUnload: false });
-    });
+    if (view !== record.view || !record.handoffPresentation) {
+      captureCleanup(() => {
+        if (view === record.view) systemBroker.unbindSender(record.appWebContentsId);
+        else if (!contents.isDestroyed()) systemBroker.unbindSender(contents.id);
+      });
+      captureCleanup(() => record.owner.contentView.removeChildView(view));
+      captureCleanup(() => {
+        if (!contents.isDestroyed()) contents.close({ waitForBeforeUnload: false });
+      });
+    }
   };
 
   detachView(record.view, record.viewerSession, record.protocolPartition);
@@ -2501,6 +2517,10 @@ function setAppViewerBounds(
   const y = Math.max(0, Math.round(value.y));
   const width = Math.max(0, Math.min(Math.round(value.width), contentBounds.width - x));
   const height = Math.max(0, Math.min(Math.round(value.height), contentBounds.height - y));
+  if (record.handoffPresentation) {
+    record.handoffPresentation = { bounds: { x, y, width, height }, visible: width > 0 && height > 0 };
+    return;
+  }
   record.view.setBounds({ x, y, width, height });
   record.view.setVisible(width > 0 && height > 0);
 }
@@ -3049,6 +3069,15 @@ app.whenReady().then(async () => {
     requireShellIpc(event);
     return capsuleManager.appRuntimeStates();
   });
+  ipcMain.handle("app-runtime:service-enablement", async (event, appId: string, serviceId: string, enabled: boolean) => {
+    requireShellIpc(event);
+    await capsuleManager.setServiceEnabled(appId, serviceId, enabled);
+    return { ok: true };
+  });
+  ipcMain.handle("app-runtime:diagnostics", (event, appId: string, executionId?: string) => {
+    requireShellIpc(event);
+    return capsuleManager.workloadDiagnostics(appId, executionId);
+  });
   ipcMain.handle("app-runtime:stop-job", async (event, appId: string, runId: string) => {
     requireShellIpc(event);
     return capsuleManager.stopJob(appId, runId);
@@ -3062,14 +3091,17 @@ app.whenReady().then(async () => {
     if (failures.length) throw new AggregateError(failures, "UI cleanup failed");
     return { ok: true };
   });
-  ipcMain.handle("app-runtime:stop", async (event, appId: string) => {
+  ipcMain.handle("app-runtime:app-enablement", async (event, appId: string, enabled: boolean) => {
     requireShellIpc(event);
-    // Fence all App operations before detaching the Shell's UI records.
-    const stop = capsuleManager.stopApp(appId);
-    for (const opening of appOpenings.values()) if (opening.appId === appId) opening.controller.abort(new Error("App stopped by user"));
-    const results = await Promise.allSettled([stop, stopAppViewers(appId)]);
+    const setting = capsuleManager.setAppEnabled(appId, enabled);
+    const cleanup: Promise<unknown>[] = [setting];
+    if (!enabled) {
+      for (const opening of appOpenings.values()) if (opening.appId === appId) opening.controller.abort(new Error("App disabled"));
+      cleanup.push(stopAppViewers(appId));
+    }
+    const results = await Promise.allSettled(cleanup);
     const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
-    if (failures.length) throw new AggregateError(failures, "App stop was not confirmed");
+    if (failures.length) throw new AggregateError(failures, "App enablement or cleanup was not confirmed");
     return { ok: true };
   });
   ipcMain.handle("app-runtime:archive", async (event, appId: string) => {

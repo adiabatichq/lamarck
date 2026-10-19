@@ -119,6 +119,15 @@ export async function getAppRuntimeStates(): ReturnType<Host["getAppRuntimeState
   return window.lamarckHost ? (await readHost("getAppRuntimeStates")).value : [];
 }
 
+export function setAppServiceEnabled(appId: string, serviceId: string, enabled: boolean): Promise<{ ok: true }> {
+  if (!window.lamarckHost) return Promise.reject(new Error("Service management requires the Desktop Host"));
+  return window.lamarckHost.setAppServiceEnabled(appId, serviceId, enabled);
+}
+export function getAppWorkloadDiagnostics(appId: string, executionId?: string): Promise<readonly import("../../shared/app-runtime").AppWorkloadDiagnostic[]> {
+  if (!window.lamarckHost) return Promise.reject(new Error("Diagnostics require the Desktop Host"));
+  return window.lamarckHost.getAppWorkloadDiagnostics(appId, executionId);
+}
+
 export function stopAppJob(appId: string, runId: string): Promise<{ active: boolean }> {
   if (!window.lamarckHost) return Promise.reject(new Error("App execution management requires the Desktop Host"));
   return window.lamarckHost.stopAppJob(appId, runId);
@@ -129,9 +138,9 @@ export function closeAppUi(appId: string): Promise<{ ok: true }> {
   return window.lamarckHost.closeAppUi(appId);
 }
 
-export function stopApp(appId: string): Promise<{ ok: true }> {
+export function setAppEnabled(appId: string, enabled: boolean): Promise<{ ok: true }> {
   if (!window.lamarckHost) return Promise.reject(new Error("App execution management requires the Desktop Host"));
-  return window.lamarckHost.stopApp(appId);
+  return window.lamarckHost.setAppEnabled(appId, enabled);
 }
 
 export async function getCoreBaseUrl(): Promise<string> {

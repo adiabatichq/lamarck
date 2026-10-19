@@ -367,7 +367,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     const first = await harness.backend.startUi(spec("sender-a"));
     harness.packageDigest = PACKAGE_B;
     const second = await harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B));
-    const candidate = await harness.backend.prepareUi(spec("sender-c", PACKAGE_B));
+    const candidate = await harness.backend.prepareUi(spec("sender-c", PACKAGE_B), second.instanceId);
     await harness.backend.abortPreparedUi(candidate.preparationId);
     await harness.backend.abortPreparedUi(candidate.preparationId);
     await harness.backend.stopUi(second.instanceId);
@@ -475,7 +475,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     ]);
   });
 
-  test("reuses the 4 GiB Guest for calibrated dependency builds and keeps the old UI usable until commit", async () => {
+  test("reuses the 4 GiB Guest and retires the old UI only after artifact preparation", async () => {
     const harness = createHarness();
     const first = await harness.backend.startUi(spec("sender-a"));
     harness.packageDigest = PACKAGE_B;
@@ -484,8 +484,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.dependencyBytes = 128 * 1024 * 1024;
     harness.session.cacheBlob("dependency", LARGE_DEPENDENCY);
     const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), first.instanceId);
-    const oldViewer = await harness.backend.openUiStream(first.instanceId);
-    oldViewer.destroy();
+    await expect(harness.backend.openUiStream(first.instanceId)).rejects.toThrow("no longer active");
     await harness.backend.commitPreparedUi(prepared.preparationId);
     expect(harness.vm.startCalls).toBe(1);
     expect(harness.vm.stopCalls).toBe(0);
@@ -582,41 +581,40 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await harness.backend.stopAll();
   });
 
-  test("aborts a prepared replacement without changing or stopping its last-known-good UI", async () => {
+  test("aborts a prepared replacement without executing the previous verified artifact", async () => {
     const harness = createHarness();
     const active = await harness.backend.startUi(spec("sender-a"));
     const activationWrites = harness.store.activationWrites;
     harness.packageDigest = PACKAGE_B;
-    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
     const oldViewer = await harness.backend.openUiStream(active.instanceId);
+    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
     const candidateViewer = await harness.backend.openUiStream(prepared.instanceId);
 
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
     expect(harness.store.activationWrites).toBe(activationWrites);
-    expect(harness.session.stoppedApps).toHaveLength(0);
+    expect(harness.session.stoppedApps).toHaveLength(1);
 
     await harness.backend.abortPreparedUi(prepared.preparationId);
     await expect(harness.backend.abortPreparedUi(prepared.preparationId)).resolves.toBeUndefined();
     await expect(harness.backend.commitPreparedUi(prepared.preparationId))
       .rejects.toThrow("already aborted");
     expect(candidateViewer.destroyed).toBe(true);
-    expect(oldViewer.destroyed).toBe(false);
+    expect(oldViewer.destroyed).toBe(true);
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
     await expect(harness.backend.openUiStream(prepared.instanceId))
       .rejects.toThrow("no longer active or prepared");
-    const stillActive = await harness.backend.openUiStream(active.instanceId);
+    await expect(harness.backend.openUiStream(active.instanceId)).rejects.toThrow("no longer active");
 
     oldViewer.destroy();
-    stillActive.destroy();
     await harness.backend.stopAll();
   });
 
-  test("replacement commit alone rotates activation, retires the old UI, and publishes the candidate", async () => {
+  test("sequential preparation retires the old UI; commit adopts and publishes the candidate", async () => {
     const harness = createHarness();
     const active = await harness.backend.startUi(spec("sender-a"));
     harness.packageDigest = PACKAGE_B;
-    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
     const oldViewer = await harness.backend.openUiStream(active.instanceId);
+    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
     const candidateViewer = await harness.backend.openUiStream(prepared.instanceId);
     const writesBeforeCommit = harness.store.activationWrites;
 
@@ -636,22 +634,18 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await harness.backend.stopAll();
   });
 
-  test("rejects a stale prepared activation after a newer activation commits", async () => {
-    const harness = createHarness();
-    const stale = await harness.backend.prepareUi(spec("sender-stale", PACKAGE_A, 2));
-    const current = await harness.backend.prepareUi(spec("sender-current", PACKAGE_A, 3));
-
-    await expect(harness.backend.commitPreparedUi(current.preparationId))
-      .resolves.toEqual({ instanceId: current.instanceId });
-    await expect(harness.backend.commitPreparedUi(stale.preparationId))
-      .rejects.toThrow("Prepared App activation is stale");
-    await harness.backend.stopAll();
+  test("rejects a second UI process while a prepared UI is awaiting adoption", async () => {
+    const h = createHarness();
+    const first = await h.backend.prepareUi(spec("pending", PACKAGE_A, 2));
+    await expect(h.backend.prepareUi(spec("competing", PACKAGE_A, 3))).rejects.toThrow("already owns a UI");
+    await h.backend.commitPreparedUi(first.preparationId);
+    await h.backend.stopAll();
   });
 
   test("accepts a restarted Core sequence only after confirmed full teardown", async () => {
     const harness = createHarness();
-    await harness.backend.startUi(spec("sender-old", PACKAGE_A, 7));
-    const stale = await harness.backend.prepareUi(spec("sender-pending", PACKAGE_A, 8));
+    const old = await harness.backend.startUi(spec("sender-old", PACKAGE_A, 7));
+    const stale = await harness.backend.prepareUi(spec("sender-pending", PACKAGE_A, 8), old.instanceId);
     await harness.backend.stopAll();
     await expect(harness.backend.commitPreparedUi(stale.preparationId)).rejects.toThrow("already aborted");
     await expect(harness.backend.startUi(spec("sender-restarted", PACKAGE_A, 1)))
@@ -659,26 +653,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await harness.backend.stopAll();
   });
 
-  test("rolls activation back instead of publishing when the previous UI exits during commit", async () => {
-    const harness = createHarness();
-    const active = await harness.backend.startUi(spec("sender-a"));
-    harness.packageDigest = PACKAGE_B;
-    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
-    harness.store.afterNextActivation = () => harness.session.emitOldestWorkloadExit();
-
-    await expect(harness.backend.commitPreparedUi(prepared.preparationId))
-      .rejects.toThrow("exited");
-
-    expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
-    expect(harness.store.retained.size).toBe(0);
-    await expect(harness.backend.openUiStream(prepared.instanceId))
-      .rejects.toThrow("no longer active or prepared");
-    await expect(harness.backend.openUiStream(active.instanceId))
-      .rejects.toThrow("no longer active or prepared");
-    await harness.backend.stopAll();
-  });
-
-  test("rejects a prepared candidate exit at commit while preserving the prior UI", async () => {
+  test("rejects a prepared candidate exit while retaining only the prior activation", async () => {
     const harness = createHarness();
     const uiLost = vi.fn();
     harness.backend.setUiLostHandler(uiLost);
@@ -695,15 +670,14 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await expect(harness.backend.commitPreparedUi(prepared.preparationId))
       .rejects.toThrow("exited");
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
-    const oldViewer = await harness.backend.openUiStream(active.instanceId);
+    await expect(harness.backend.openUiStream(active.instanceId)).rejects.toThrow("no longer active");
     await expect(harness.backend.openUiStream(prepared.instanceId))
       .rejects.toThrow("no longer active or prepared");
     await vi.waitFor(() => {
-      expect(harness.session.stoppedApps).toHaveLength(1);
+      expect(harness.session.stoppedApps).toHaveLength(2);
       expect(harness.store.retained.size).toBe(0);
     });
 
-    oldViewer.destroy();
     await harness.backend.stopAll();
   });
 
@@ -751,8 +725,8 @@ describe("MacOsCapsuleBackend orchestration", () => {
     const harness = createHarness();
     const active = await harness.backend.startUi(spec("sender-a"));
     harness.packageDigest = PACKAGE_B;
-    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
     const oldViewer = await harness.backend.openUiStream(active.instanceId);
+    const prepared = await harness.backend.prepareUi(spec("sender-b", PACKAGE_B), active.instanceId);
     const candidateViewer = await harness.backend.openUiStream(prepared.instanceId);
 
     await harness.backend.retireApp("weather");
@@ -1054,7 +1028,85 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await harness.backend.stopAll();
   });
 
-  test("keeps the old UI and activation on failed readiness, then atomically replaces it after success", async () => {
+  test("Build failure leaves the existing UI executing and does not begin the handoff deadline", async () => {
+    const h = createHarness();
+    const current = await h.backend.startUi(spec("old"));
+    const viewer = await h.backend.openUiStream(current.instanceId);
+    const onHandoff = vi.fn();
+    h.packageDigest = PACKAGE_B;
+    h.session.beforeBuildComplete = async () => { throw new Error("replacement Build failed"); };
+    await expect(h.backend.prepareUi(spec("candidate", PACKAGE_B), current.instanceId, { onHandoff })).rejects.toThrow("replacement Build failed");
+    expect(onHandoff).not.toHaveBeenCalled();
+    expect(viewer.destroyed).toBe(false);
+    expect(h.store.activation?.packageDigest).toBe(PACKAGE_A);
+    (await h.backend.openUiStream(current.instanceId)).destroy();
+    await h.backend.stopAll();
+  });
+
+  test("one 15-second handoff deadline includes old cleanup and replacement readiness", async () => {
+    const h = createHarness();
+    const current = await h.backend.startUi(spec("old"));
+    const other = await h.backend.startUi({ ...spec("other"), appId: "notes" });
+    const oldWorkload = [...h.session.workloadKinds.keys()][0]!;
+    const stopping = Promise.withResolvers<void>(), cleanup = Promise.withResolvers<void>(), starting = Promise.withResolvers<void>();
+    const request = h.session.request.bind(h.session), emit = h.session.guestEvent.bind(h.session);
+    h.session.request = async (op, body) => {
+      if (op === "workload.stop" && body.workloadHandle === oldWorkload) { stopping.resolve(); await cleanup.promise; }
+      const result = await request(op, body);
+      if (op === "workload.start") starting.resolve();
+      return result;
+    };
+    vi.spyOn(h.session, "guestEvent").mockImplementation((type, body) => { if (type !== "workload.ready") emit(type, body); });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    let settled = false;
+    const update = rejectionOf(h.backend.prepareUi(spec("replacement"), current.instanceId)).then(error => { settled = true; return error; });
+    try {
+      await stopping.promise;
+      await vi.advanceTimersByTimeAsync(7_000);
+      expect(h.session.executingWorkloads.has(oldWorkload)).toBe(true);
+      expect(h.session.operations.filter(op => op === "workload.start")).toHaveLength(2);
+      cleanup.resolve(); await starting.promise;
+      expect(h.session.executingWorkloads.has(oldWorkload)).toBe(false);
+      await vi.advanceTimersByTimeAsync(7_999); expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await update).message).toMatch(/handoff timed out|startup budget/);
+      expect(h.store.activation?.packageDigest).toBe(PACKAGE_A);
+      await expect(h.backend.openUiStream(current.instanceId)).rejects.toThrow("no longer active");
+      (await h.backend.openUiStream(other.instanceId)).destroy();
+      expect(h.vm.stopCalls).toBe(0);
+    } finally { cleanup.resolve(); vi.useRealTimers(); await h.backend.stopAll(); }
+  });
+
+  test.each(["cancel", "timeout", "disable", "shutdown"] as const)("%s during old UI teardown keeps admission fenced until exact cleanup", async action => {
+    const h = createHarness(), controller = new AbortController();
+    const current = await h.backend.startUi(spec("old"));
+    const oldWorkload = [...h.session.workloadKinds.keys()][0]!;
+    const entered = Promise.withResolvers<void>(), cleanup = Promise.withResolvers<void>();
+    const request = h.session.request.bind(h.session);
+    h.session.request = async (op, body) => {
+      if (op === "workload.stop" && body.workloadHandle === oldWorkload) { entered.resolve(); await cleanup.promise; }
+      return request(op, body);
+    };
+    if (action === "timeout") vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    let settled = false;
+    const update = rejectionOf(h.backend.prepareUi(spec("replacement"), current.instanceId, { signal: controller.signal })).then(error => { settled = true; return error; });
+    let stop: Promise<void> | undefined;
+    try {
+      await entered.promise;
+      if (action === "cancel") controller.abort(new Error("reload cancelled"));
+      if (action === "timeout") await vi.advanceTimersByTimeAsync(15_000);
+      if (action === "disable") stop = h.backend.stopApp("weather");
+      if (action === "shutdown") stop = h.backend.stopAll();
+      expect(settled).toBe(false);
+      expect(h.session.executingWorkloads.has(oldWorkload)).toBe(true);
+      expect(h.session.operations.filter(op => op === "workload.start")).toHaveLength(1);
+      cleanup.resolve(); await update; await stop;
+      expect(h.session.operations.filter(op => op === "workload.start")).toHaveLength(1);
+      expect(h.store.activation?.packageDigest).toBe(PACKAGE_A);
+    } finally { cleanup.resolve(); if (action === "timeout") vi.useRealTimers(); await h.backend.stopAll(); }
+  });
+
+  test("failed readiness leaves UI unavailable and retains the verified artifact for explicit recovery", async () => {
     const harness = createHarness();
     const first = await harness.backend.startUi(spec("sender-a"));
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
@@ -1064,13 +1116,9 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B)))
       .rejects.toThrow("not ready");
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
-    const oldViewer = await harness.backend.openUiStream(first.instanceId);
-    oldViewer.destroy();
+    await expect(harness.backend.openUiStream(first.instanceId)).rejects.toThrow("no longer active");
 
-    const replacement = await harness.backend.replaceUi(
-      first.instanceId,
-      spec("sender-c", PACKAGE_B),
-    );
+    const replacement = await harness.backend.startUi(spec("sender-c", PACKAGE_B));
     expect(replacement.instanceId).not.toBe(first.instanceId);
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_B);
     await expect(harness.backend.openUiStream(first.instanceId)).rejects.toThrow("no longer active");
@@ -1092,7 +1140,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.packageDigest = PACKAGE_B;
     harness.session.failAppStop = true;
     await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B)))
-      .rejects.toThrow("Could not stop UI");
+      .rejects.toThrow(/cleanup|stop UI/);
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
   });
 
@@ -1119,8 +1167,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     await expect(harness.backend.replaceUi(first.instanceId, spec("sender-b", PACKAGE_B)))
       .rejects.toThrow("exited");
     expect(harness.store.activation?.packageDigest).toBe(PACKAGE_A);
-    const oldViewer = await harness.backend.openUiStream(first.instanceId);
-    oldViewer.destroy();
+    await expect(harness.backend.openUiStream(first.instanceId)).rejects.toThrow("no longer active");
     await harness.backend.stopAll();
   });
 
@@ -1220,7 +1267,6 @@ describe("MacOsCapsuleBackend orchestration", () => {
       const h = createHarness();
       const current = await h.backend.startUi(spec("current"));
       const other = await h.backend.startUi({ ...spec("other"), appId: "notes" });
-      const prepared = await h.backend.prepareUi(spec("prepared"));
       h.packageDigest = PACKAGE_B;
       h.session.holdBuild = true;
       const cancel = Promise.withResolvers<void>();
@@ -1240,7 +1286,6 @@ describe("MacOsCapsuleBackend orchestration", () => {
       const repeated = stop().then(() => { completed += 1; });
       await vi.waitFor(() => expect(entered).toBe(true));
       const late = rejectionOf(h.backend.prepareUi(spec("late", PACKAGE_B)));
-      const commit = rejectionOf(h.backend.commitPreparedUi(prepared.preparationId));
       const stream = await h.backend.openUiStream(other.instanceId);
       stream.destroy();
       await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1250,14 +1295,11 @@ describe("MacOsCapsuleBackend orchestration", () => {
           .some((entry) => entry.path.includes("/dependencies/")),
       };
       cancel.resolve();
-      const [error, commitError, lateError] = await Promise.all([opening, commit, late, stopping, repeated]);
+      const [error, lateError] = await Promise.all([opening, late, stopping, repeated]);
       const vmStopsBeforeGlobalStop = h.vm.stopCalls;
-      // stopUi targets one instance; explicitly discard the other prepared UI.
-      await h.backend.abortPreparedUi(prepared.preparationId).catch(() => {});
       await h.backend.stopAll();
       expect(beforeAcknowledgement).toEqual({ completed: 0, deactivated: 0, removedDependencies: false });
       expect(lateError.message).toContain("App is stopping");
-      expect(commitError.message).toContain("App is stopping");
       expect(error.message).toMatch(/stop requested|retirement requested/);
       expect(vmStopsBeforeGlobalStop).toBe(0);
       expect(completed).toBe(2);
@@ -1270,7 +1312,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
       for (const phase of ["preparation", "commit"] as const) {
         const h = createHarness();
         const current = await h.backend.startUi(spec("existing"));
-        const prepared = phase === "commit" ? await h.backend.prepareUi(spec("candidate")) : undefined;
+        const prepared = phase === "commit" ? await h.backend.prepareUi(spec("candidate"), current.instanceId) : undefined;
         const lookup = Promise.withResolvers<void>();
         const entered = Promise.withResolvers<void>();
         const active = h.store.active.bind(h.store);
@@ -1283,7 +1325,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
           : h.backend.startUi(spec("pending")));
         await entered.promise;
         const stopping = method === "stopAll" ? h.backend.stopAll()
-          : h.backend[method](method === "stopUi" ? current.instanceId : "weather");
+          : h.backend[method](method === "stopUi" ? prepared?.instanceId ?? current.instanceId : "weather");
         const stopResult = stopping.then(() => undefined, (error: unknown) => error);
         lookup.resolve();
         const [launchError, stopError] = await Promise.all([opening, stopResult]);
@@ -1309,8 +1351,8 @@ describe("MacOsCapsuleBackend orchestration", () => {
     "%s still fails when an ordinary commit failure is followed by failed candidate cleanup",
     async (method) => {
       const h = createHarness();
-      await h.backend.startUi(spec("existing"));
-      const prepared = await h.backend.prepareUi(spec("candidate"));
+      const current = await h.backend.startUi(spec("existing"));
+      const prepared = await h.backend.prepareUi(spec("candidate"), current.instanceId);
       const lookup = Promise.withResolvers<void>();
       const entered = Promise.withResolvers<void>();
       h.store.active = async () => { entered.resolve(); await lookup.promise; throw new Error("lookup failed"); };
@@ -1362,7 +1404,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     },
   );
 
-  test.each(["lookup", "activation", "previous stop"] as const)(
+  test.each(["lookup", "activation"] as const)(
     "App stop fences an in-flight replacement commit during %s without losing another App",
     async (phase) => {
       const h = createHarness();
@@ -1582,7 +1624,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     const instance = await harness.backend.startUi(spec("sender-a"));
     harness.session.failAppStop = true;
 
-    await expect(harness.backend.stopUi(instance.instanceId)).rejects.toThrow("Could not stop UI");
+    await expect(harness.backend.stopUi(instance.instanceId)).rejects.toThrow(/cleanup|stop UI/);
     await vi.waitFor(() => expect(boundaryLost).toHaveBeenCalledOnce());
     await expect(harness.backend.openUiStream(instance.instanceId)).rejects.toThrow("no longer active");
     expect(harness.vm.stopCalls).toBeGreaterThan(0);
@@ -1773,7 +1815,7 @@ describe("MacOsCapsuleBackend orchestration", () => {
     harness.store.pruneCalls = 0;
     harness.session.failAppStop = true;
 
-    await expect(harness.backend.retireApp("weather")).rejects.toThrow("Could not stop UI");
+    await expect(harness.backend.retireApp("weather")).rejects.toThrow(/cleanup|stop UI/);
 
     expect(harness.store.deactivatedKeys).toEqual([]);
     expect(harness.storageRemovals).toEqual([]);
@@ -2506,8 +2548,8 @@ describe("replacement reservation ownership through Host preparation", () => {
     expect(launch.replacement).toMatchObject({ appHandle: h.session.appPrepares[0]!.appHandle, ownerKey: appKey("weather") });
     const earlierReleases = mode === "warm-fallback" ? 1 : 0;
     expect(c.released.filter(key => key === launch.launchKey)).toHaveLength(earlierReleases);
-    expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 3328 * 1024 ** 2, projectedRuntimeMemoryBytes: 2816 * 1024 ** 2 });
-    expect(old.destroyed).toBe(false);
+    expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 2816 * 1024 ** 2, projectedRuntimeMemoryBytes: 2816 * 1024 ** 2 });
+    expect(old.destroyed).toBe(true);
     await h.backend.commitPreparedUi(prepared.preparationId);
     expect(c.released.filter(key => key === launch.launchKey)).toHaveLength(earlierReleases + 1);
     expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 2816 * 1024 ** 2, reservations: 2 });
@@ -2522,11 +2564,9 @@ describe("replacement reservation ownership through Host preparation", () => {
       const first = await h.backend.startUi(spec("old"));
       const old = await h.backend.openUiStream(first.instanceId);
       const prepared = await h.backend.prepareUi(spec("candidate"), first.instanceId);
-      expect(c.admission.snapshot().reservations).toBe(3);
+      expect(c.admission.snapshot().reservations).toBe(2);
       if (mode === "expiry") {
-        await vi.advanceTimersByTimeAsync(120_001);
-        expect(c.admission.snapshot().reservations).toBe(3);
-        await vi.advanceTimersByTimeAsync(RUNTIME_STARTUP_TIMEOUT_MS - 120_001 + 1);
+        await vi.advanceTimersByTimeAsync(15_001);
       }
       else {
         if (mode === "exit") h.session.guestEvent("workload.exited", {
@@ -2535,33 +2575,12 @@ describe("replacement reservation ownership through Host preparation", () => {
         });
         await h.backend.abortPreparedUi(prepared.preparationId);
       }
-      expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 512 * 1024 ** 2, reservations: 1 });
-      expect(old.destroyed).toBe(false);
+      expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 0, reservations: 0 });
+      expect(old.destroyed).toBe(true);
     } finally { await h.backend.stopAll(); vi.useRealTimers(); }
   });
 
-  test("competing updates retry after finite replacement retirement and preserve unrelated viewers", async () => {
-    const h = createHarness(), c = enableCapacity(h);
-    const first = await h.backend.startUi(spec("old"));
-    const otherSpec = { ...spec("other"), appId: "other", packageDir: "/workspace/apps/other" };
-    const other = await h.backend.startUi(otherSpec);
-    await c.admission.reserve("background", { kind: "runtime", memoryBytes: 1792 * 1024 ** 2 });
-    const viewer = await h.backend.openUiStream(other.instanceId);
-    const prepared = await h.backend.prepareUi(spec("candidate"), first.instanceId);
-    let ready = false;
-    const waiting = h.backend.prepareUi({ ...otherSpec, sdkSenderId: "other-candidate" }, other.instanceId).then(value => { ready = true; return value; });
-    await new Promise(resolve => setImmediate(resolve));
-    expect(ready).toBe(false);
-    expect(c.admission.snapshot().reservedMemoryBytes).toBe(3328 * 1024 ** 2);
-    await h.backend.commitPreparedUi(prepared.preparationId);
-    const next = await waiting;
-    expect(viewer.destroyed).toBe(false);
-    await h.backend.abortPreparedUi(next.preparationId);
-    expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 2816 * 1024 ** 2, reservations: 3 });
-    await h.backend.stopAll();
-  });
-
-  test.each(["queued", "building"])("cancelling a %s replacement releases its launch without disturbing another App", async phase => {
+  test.each(["building"])("cancelling a %s replacement releases its launch without disturbing another App", async phase => {
     const h = createHarness(), c = enableCapacity(h);
     const first = await h.backend.startUi(spec("old"));
     const otherSpec = { ...spec("other"), appId: "other", packageDir: "/workspace/apps/other" };
@@ -2595,7 +2614,7 @@ describe("replacement reservation ownership through Host preparation", () => {
       return request(op, body);
     };
     await expect(h.backend.abortPreparedUi(prepared.preparationId)).rejects.toThrow(/acknowledgement lost/);
-    expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 1024 * 1024 ** 2, reservations: 2 });
+    expect(c.admission.snapshot()).toMatchObject({ reservedMemoryBytes: 512 * 1024 ** 2, reservations: 1 });
     expect(h.vm.stopCalls).toBe(1);
   });
 
@@ -2876,8 +2895,11 @@ class FakeSession extends EventEmitter {
   readonly outputReleases: Array<Record<string, any>> = [];
   readonly guestCache = new Set<string>();
   readonly appPrepares: Array<{ appHandle: string; mappedHostUid: number }> = [];
+  readonly appNetworks = new Map<string, object>();
+  readonly appOwners = new Map<string, string>();
   readonly buildPrepares: Array<Record<string, any>> = [];
   readonly stoppedApps: string[] = [];
+  readonly executingWorkloads = new Set<string>();
   readonly workloadKinds = new Map<string, string>();
   jobExitCode = 0;
   holdJob = false;
@@ -3055,6 +3077,8 @@ class FakeSession extends EventEmitter {
         this.exports.set(body.streamTicket, { digest: body.digest, bytes: body.bytes });
         return { ready: true };
       case "app.prepare":
+        this.appNetworks.set(body.appHandle, this.appNetworks.get([...this.appOwners].find(([, owner]) => owner === body.ownerKey)?.[0] ?? "") ?? {});
+        this.appOwners.set(body.appHandle, body.ownerKey);
         this.removeImport(body.artifactBlobHandle);
         this.appPrepares.push({ appHandle: body.appHandle, mappedHostUid: body.mappedHostUid });
         return { prepared: true };
@@ -3068,6 +3092,11 @@ class FakeSession extends EventEmitter {
         return { awaitingStreams: true };
       }
       case "workload.start": {
+        if (this.workloadKinds.get(body.workloadHandle) === "ui") {
+          const owner = this.appOwners.get(body.appHandle);
+          if ([...this.executingWorkloads].some(id => this.workloadKinds.get(id) === "ui" && this.appOwners.get(this.workloadApps.get(id)!) === owner)) throw new Error("UI processes overlapped");
+        }
+        this.executingWorkloads.add(body.workloadHandle);
         this.sdkWasAttachedAtStart = this.system.attachments.length > 0;
         if (!this.sdkWasAttachedAtStart) throw new Error("SDK was not attached");
         this.guestEvent("workload.started", {
@@ -3095,6 +3124,7 @@ class FakeSession extends EventEmitter {
         return { started: true };
       }
       case "workload.stop":
+        this.executingWorkloads.delete(body.workloadHandle);
         if (this.emitExitOnStop) {
           this.guestEvent("workload.exited", {
             appHandle: body.appHandle,
@@ -3106,6 +3136,7 @@ class FakeSession extends EventEmitter {
         return { stopped: true };
       case "app.stop":
         if (this.failAppStop) throw new Error("teardown failed");
+        for (const id of this.executingWorkloads) if (this.workloadApps.get(id) === body.appHandle) this.executingWorkloads.delete(id);
         this.stoppedApps.push(body.appHandle);
         if (this.trackRetirementLifecycle) this.lifecycleEvents.push("guest.app.stopped");
         return { stopped: true };
@@ -3500,3 +3531,170 @@ function guestRelease(): LoadedCapsuleGuestRelease {
     },
   };
 }
+
+describe("Capsule Services and authenticated diagnostics", () => {
+  const service = () => { const { port: _, ...ui } = spec("service-sender"); return { ...ui, serviceId: "indexer" }; };
+  test.each(["abort", "readiness"] as const)("same-version UI handoff preserves Service/Job localhost ownership through %s failure and explicit recovery", async failure => {
+    const h = createHarness(), cancelService = new AbortController(), cancelJob = new AbortController();
+    h.session.holdJob = true;
+    const serviceRun = rejectionOf(h.backend.runService(service(), cancelService.signal));
+    let jobRun: Promise<Error> | undefined;
+    try {
+      await vi.waitFor(() => expect([...h.session.workloadKinds.values()]).toContain("service"));
+      const { serviceId: _, ...base } = service();
+      jobRun = rejectionOf(h.backend.runJob({ ...base, sdkSenderId: "job-sender", jobId: "refresh" }, cancelJob.signal));
+      await vi.waitFor(() => expect([...h.session.workloadKinds.values()]).toContain("job"));
+      const serviceWorkload = [...h.session.workloadKinds.keys()].find(id => h.session.workloadKinds.get(id) === "service")!;
+      const jobWorkload = [...h.session.workloadKinds.keys()].find(id => h.session.workloadKinds.get(id) === "job")!;
+      const network = h.session.appNetworks.get(h.session.workloadApps.get(serviceWorkload)!);
+      const ui = await h.backend.startUi(spec("ui"));
+      if (failure === "abort") {
+        const prepared = await h.backend.prepareUi(spec("aborted"), ui.instanceId);
+        await h.backend.abortPreparedUi(prepared.preparationId);
+      } else {
+        h.session.failNextReady = true;
+        await expect(h.backend.prepareUi(spec("failed"), ui.instanceId)).rejects.toThrow("not ready");
+      }
+      await expect(h.backend.openUiStream(ui.instanceId)).rejects.toThrow("no longer active");
+      expect(h.session.executingWorkloads.has(serviceWorkload)).toBe(true);
+      expect(h.session.executingWorkloads.has(jobWorkload)).toBe(true);
+      expect([...h.session.executingWorkloads].filter(id => h.session.workloadKinds.get(id) === "ui")).toHaveLength(0);
+      expect(h.store.activation?.packageDigest).toBe(PACKAGE_A);
+      const recovered = await h.backend.startUi(spec("explicit-recovery"));
+      const replacement = await h.backend.replaceUi(recovered.instanceId, spec("replacement"));
+      const replacedWorkload = [...h.session.workloadKinds.keys()].at(-1)!;
+      expect(h.session.appNetworks.get(h.session.workloadApps.get(replacedWorkload)!)).toBe(network);
+      await h.backend.stopUi(replacement.instanceId);
+      expect(h.session.executingWorkloads.has(serviceWorkload)).toBe(true);
+      expect(h.session.executingWorkloads.has(jobWorkload)).toBe(true);
+      expect([...h.session.workloadKinds.values()].filter(kind => kind === "service")).toHaveLength(1);
+      expect([...h.session.workloadKinds.values()].filter(kind => kind === "job")).toHaveLength(1);
+      const other = await h.backend.startUi({ ...spec("other"), appId: "another-app" });
+      const otherWorkload = [...h.session.workloadKinds.keys()].at(-1)!;
+      expect(h.session.appNetworks.get(h.session.workloadApps.get(otherWorkload)!)).not.toBe(network);
+      (await h.backend.openUiStream(other.instanceId)).destroy();
+    } finally { cancelService.abort(); cancelJob.abort(); await serviceRun; await jobRun; await h.backend.stopAll(); }
+  });
+  test("clean-boundary recovery requires the exclusive state lease, not the availability probe", async () => {
+    const h = createHarness(), state = vi.spyOn(h.vm, "prepareState");
+    try {
+      await h.backend.status(); expect(state).not.toHaveBeenCalled();
+      state.mockRejectedValueOnce(new Error("previous VM still holds the state lease"));
+      await expect(h.backend.confirmCleanBoundary()).rejects.toThrow("state lease");
+      await expect(h.backend.confirmCleanBoundary()).resolves.toBeUndefined();
+      expect(state).toHaveBeenCalledTimes(2); expect(h.vm.startCalls).toBe(0);
+    } finally { await h.backend.stopAll(); }
+  });
+  test("a Service-only restart reuses its verified artifact without rebuilding", async () => {
+    const h = createHarness(), first = new AbortController(), second = new AbortController();
+    let running = rejectionOf(h.backend.runService(service(), first.signal));
+    try {
+      await vi.waitFor(() => expect(h.store.activation).toBeDefined());
+      expect(h.session.buildStarts).toBe(1);
+      first.abort(); await running;
+      running = rejectionOf(h.backend.runService(service(), second.signal));
+      await vi.waitFor(() => expect(h.session.operations.filter(operation => operation === "workload.start")).toHaveLength(2));
+      expect(h.session.buildStarts).toBe(1);
+    } finally { first.abort(); second.abort(); await running; await h.backend.stopAll(); }
+  });
+  test.each([true, false])("same-activation UI, Service, and Job share one Guest App while stopping independently (Service first: %s)", async serviceFirst => {
+    const h = createHarness(), cancel = new AbortController(); h.session.holdJob = true;
+    let running: Promise<Error> | undefined;
+    try {
+      if (serviceFirst) {
+        running = rejectionOf(h.backend.runService(service(), cancel.signal));
+        await vi.waitFor(() => expect([...h.session.workloadKinds.values()]).toContain("service"));
+      }
+      const ui = await h.backend.startUi(spec("ui-sender"));
+      if (!serviceFirst) {
+        running = rejectionOf(h.backend.runService(service(), cancel.signal));
+        await vi.waitFor(() => expect([...h.session.workloadKinds.values()]).toContain("service"));
+      }
+      const { serviceId: _, ...base } = service();
+      const job = h.backend.runJob({ ...base, jobId: "refresh" }, new AbortController().signal);
+      await vi.waitFor(() => expect(h.session.workloadKinds.size).toBe(3));
+      expect(new Set(h.session.workloadApps.values()).size).toBe(1);
+      expect(h.session.appPrepares).toHaveLength(1);
+      await h.backend.stopUi(ui.instanceId);
+      expect(h.session.stoppedApps).toEqual([]);
+      const workload = [...h.session.workloadKinds.keys()].find(key => h.session.workloadKinds.get(key) === "job")!;
+      h.session.guestEvent("workload.exited", { appHandle: h.session.workloadApps.get(workload)!, workloadHandle: workload, exitCode: 0, signal: null });
+      await job;
+      expect(h.session.stoppedApps).toEqual([]);
+      cancel.abort(); await running;
+      expect(h.session.stoppedApps).toHaveLength(1);
+    } finally { cancel.abort(); await running; await h.backend.stopAll(); }
+  });
+  test("a failed Service attachment stops its exact workload without stopping the shared UI", async () => {
+    const h = createHarness();
+    try {
+      const ui = await h.backend.startUi(spec("ui-sender"));
+      h.session.failNextDataStreamKind = "logs";
+      await expect(h.backend.runService(service(), new AbortController().signal, undefined, () => {})).rejects.toThrow("DATA failure");
+      expect(h.session.stoppedApps).toEqual([]);
+      (await h.backend.openUiStream(ui.instanceId)).destroy();
+      expect(h.vm.stopCalls).toBe(0);
+    } finally { await h.backend.stopAll(); }
+  });
+  test("Service-only launch has no viewer port and a zero exit is unexpected", async () => {
+    const h = createHarness(); const cancel = new AbortController();
+    const done = rejectionOf(h.backend.runService(service(), cancel.signal));
+    try {
+      await vi.waitFor(() => expect([...h.session.workloadKinds.values()]).toEqual(["service"]));
+      const [workload] = h.session.workloadKinds.keys();
+      expect(h.session.workloadPorts.get(workload)).toBeUndefined();
+      await h.backend.stopAppUi("weather"); expect(h.session.stoppedApps).toEqual([]);
+      h.session.guestEvent("workload.exited", { appHandle: h.session.workloadApps.get(workload)!, workloadHandle: workload, exitCode: 0, signal: null });
+      expect((await done).message).toContain("service exited (0)"); expect(h.session.stoppedApps).toHaveLength(1);
+    } finally { cancel.abort(); await done; await h.backend.stopAll(); }
+  });
+  test.each(["cli", "logs"] as const)("a failed %s attachment retires every already-opened stream", async kind => {
+    const h = createHarness(); h.session.failNextDataStreamKind = kind;
+    const opened: Duplex[] = []; const open = h.session.openDataStream.bind(h.session);
+    vi.spyOn(h.session, "openDataStream").mockImplementation(async (ticket, streamKind) => {
+      const result = await open(ticket, streamKind) as unknown as { stream: Duplex }; if (["sdk", "cli", "logs"].includes(streamKind)) opened.push(result.stream); return result as never;
+    });
+    try {
+      await expect(h.backend.runService(service(), new AbortController().signal, undefined, () => {})).rejects.toThrow("DATA failure");
+      expect(opened.every(stream => stream.destroyed)).toBe(true); expect(h.session.stoppedApps).toHaveLength(1);
+    } finally { await h.backend.stopAll(); }
+  });
+  test("retention failure after Service launch cleans its process and runtime reservation", async () => {
+    const h = createHarness(), capacity = enableCapacity(h); h.store.failNextRetain = true;
+    try {
+      await expect(h.backend.runService(service(), new AbortController().signal)).rejects.toThrow("retention failure");
+      expect(h.session.stoppedApps).toHaveLength(1); expect(h.store.retained.size).toBe(0);
+      expect(capacity.admission.snapshot().runtimeMemoryBytes).toBe(0);
+      expect(h.system.attachments.every(entry => entry.stream.destroyed)).toBe(true);
+    } finally { await h.backend.stopAll(); }
+  });
+  test("a replacement build failure leaves the preceding Service alive", async () => {
+    const h = createHarness({ snapshotDigest: path => path.endsWith("candidate") ? PACKAGE_B : PACKAGE_A }), first = new AbortController(), next = new AbortController();
+    const running = rejectionOf(h.backend.runService(service(), first.signal));
+    try {
+      await vi.waitFor(() => expect([...h.session.workloadKinds.values()]).toEqual(["service"]));
+      h.session.failBeforeOperation = "build.start"; const retire = vi.fn(async () => { first.abort(); await running; });
+      const different = { ...service(), packageDir: "/workspace/apps/candidate", packageDigest: PACKAGE_B as `sha256:${string}` };
+      await expect(h.backend.runService(different, next.signal, undefined, undefined, retire)).rejects.toThrow();
+      expect(retire).not.toHaveBeenCalled(); expect(h.session.stoppedApps).toEqual([]);
+    } finally { first.abort(); next.abort(); await running; await h.backend.stopAll(); }
+  });
+  test("authenticated log transport drains before completed Job teardown, independent of SDK close ordering", async () => {
+    const h = createHarness(); h.session.holdJob = true; const output: Buffer[] = [];
+    let logs: Duplex | undefined; const open = h.session.openDataStream.bind(h.session);
+    vi.spyOn(h.session, "openDataStream").mockImplementation(async (ticket, kind) => {
+      const result = await open(ticket, kind) as unknown as { stream: Duplex }; if (kind === "logs") logs = result.stream; return result as never;
+    });
+    const { serviceId: _, ...base } = service();
+    const done = h.backend.runJob({ ...base, jobId: "inbox" }, new AbortController().signal, undefined, bytes => output.push(Buffer.from(bytes)));
+    try {
+      await vi.waitFor(() => expect(h.session.operations).toContain("workload.start"));
+      const [workload] = h.session.workloadKinds.keys();
+      h.system.closeLatest();
+      h.session.guestEvent("workload.exited", { appHandle: h.session.workloadApps.get(workload)!, workloadHandle: workload, exitCode: 0, signal: null });
+      // DATA may arrive after CONTROL's terminal event.
+      logs!.write("last stderr line\n"); logs!.end();
+      await done; expect(Buffer.concat(output).toString()).toBe("last stderr line\n");
+    } finally { await h.backend.stopAll(); }
+  });
+});

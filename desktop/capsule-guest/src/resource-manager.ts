@@ -174,6 +174,7 @@ export class ArtifactMountRegistry {
 interface PreparedApp {
   appHandle: string;
   appKey: string;
+  ownerKey: string;
   artifactDigest: string;
   mappedHostUid: number;
   mappedHostGid: number;
@@ -409,6 +410,8 @@ export class AppViewerProxyRegistry {
 
 /** Owns all privileged resources beneath one Guest; no App-controlled path enters it. */
 export class GuestResourceManager {
+  private readonly networkLocks = new Map<string, Promise<unknown>>();
+  private readonly networks = new Map<string, { path: string; owners: Set<string>; ready: Promise<void> }>();
   private readonly paths: GuestFilesystemPaths;
   private readonly manageOwnership: boolean;
   private readonly mountBinary: string;
@@ -462,6 +465,7 @@ export class GuestResourceManager {
         && existing.mappedHostUid === body.mappedHostUid
         && existing.mappedHostGid === body.mappedHostGid
         && existing.scratchBytes === storage.scratchBytes
+        && existing.ownerKey === body.ownerKey
       ) return existing;
       throw new Error(`App handle ${appHandle} cannot be rebound`);
     }
@@ -476,6 +480,7 @@ export class GuestResourceManager {
     const app: PreparedApp = {
       appHandle,
       appKey,
+      ownerKey: body.ownerKey,
       artifactDigest,
       mappedHostUid: body.mappedHostUid,
       mappedHostGid: body.mappedHostGid,
@@ -525,13 +530,15 @@ export class GuestResourceManager {
         await chmod(merged, 0o755);
       }
       await mkdir(this.paths.netnsRoot, { recursive: true, mode: 0o700 });
-      await runFixedCommand(this.paths.netHelperPath, ["create", netnsPath]);
+      const network = await this.acquireAppNetwork(app);
+      await runFixedCommand(this.paths.netHelperPath, ["share", netnsPath, network]);
       await this.prepareAppCgroup(cgroupPath, app.scratchBytes);
       this.apps.set(appHandle, { app, resourceLease, artifactLease });
       return app;
     } catch (error) {
       try {
         if (appResourcesTouched) await this.cleanupPartialApp(app);
+        await this.releaseAppNetwork(app);
         await artifactLease?.release();
         resourceLease.release();
       } catch (cleanupError) {
@@ -613,6 +620,7 @@ export class GuestResourceManager {
       );
     }
     try {
+      await this.releaseAppNetwork(app);
       resourceLease!.release();
     } catch (cause) {
       throw new GuestContainmentError(
@@ -621,6 +629,43 @@ export class GuestResourceManager {
       );
     }
     this.apps.delete(appHandle);
+  }
+
+  private withNetworkOwner<T>(owner: string, operation: () => Promise<T>): Promise<T> {
+    const task = Promise.resolve(this.networkLocks.get(owner)).catch(() => {}).then(operation).finally(() => {
+      if (this.networkLocks.get(owner) === task) this.networkLocks.delete(owner);
+    });
+    this.networkLocks.set(owner, task);
+    return task;
+  }
+
+  private acquireAppNetwork(app: PreparedApp): Promise<string> {
+    return this.withNetworkOwner(app.ownerKey, async () => {
+      let network = this.networks.get(app.ownerKey);
+      if (!network) {
+        const path = `${this.paths.netnsRoot}/n-${opaqueKey(app.ownerKey)}`;
+        network = { path, owners: new Set(), ready: runFixedCommand(this.paths.netHelperPath, ["create", path]).then(() => {}) };
+        this.networks.set(app.ownerKey, network);
+      }
+      // Acquisition is published before awaiting creation, including a failed
+      // create whose exact pin still needs authoritative cleanup.
+      network.owners.add(app.appHandle);
+      await network.ready;
+      return network.path;
+    });
+  }
+
+  private releaseAppNetwork(app: PreparedApp): Promise<void> {
+    return this.withNetworkOwner(app.ownerKey, async () => {
+      const network = this.networks.get(app.ownerKey);
+      if (!network?.owners.has(app.appHandle)) return;
+      if (network.owners.size === 1) {
+        await network.ready.catch(() => {});
+        await runFixedCommand(this.paths.netHelperPath, ["delete", network.path], { allowExitCodes: [0, 2] });
+        this.networks.delete(app.ownerKey);
+      }
+      network.owners.delete(app.appHandle);
+    });
   }
 
   async waitForViewerReady(appHandle: string, port: number, timeoutMs: number, signal?: AbortSignal): Promise<void> {

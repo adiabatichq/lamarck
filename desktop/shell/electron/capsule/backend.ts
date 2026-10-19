@@ -26,14 +26,22 @@ export interface CapsuleUiSpec {
 
 /** Host-private declared job launch; completion is authenticated process exit. */
 export type CapsuleJobSpec = Omit<CapsuleUiSpec, "port"> & { jobId: string };
+export type CapsuleServiceSpec = Omit<CapsuleUiSpec, "port"> & { serviceId: string };
+export type CapsuleOutputSink = (chunk: Uint8Array) => void;
 
 export interface CapsuleUiInstance {
   instanceId: string;
 }
 
+export interface CapsuleUiPreparationOptions {
+  signal?: AbortSignal;
+  /** Called once the artifact is ready, when the single handoff deadline begins. */
+  onHandoff?(deadlineMs: number): void | Promise<void>;
+}
+
 /**
  * Host-private handle for a running candidate which has not changed the
- * last-known-good activation or retired a prior UI generation.
+ * last-known-good activation. A replacement has already retired its prior UI.
  */
 export interface CapsuleUiPreparation extends CapsuleUiInstance {
   readonly startupDeadlineMs?: number;
@@ -100,23 +108,24 @@ export interface CapsuleBackend {
   /** Reports an authenticated, unexpected terminal event for one active or prepared UI. */
   setUiLostHandler?(handler: (event: CapsuleUiLostEvent) => void): void;
   status(): Promise<CapsuleBackendStatus>;
-  runJob?(spec: CapsuleJobSpec, signal: AbortSignal, onState?: (state: "running" | "stopping") => void): Promise<void>;
-  /**
-   * Builds and starts a streamable candidate without changing activation.
-   * When previousInstanceId is present, commit atomically replaces that exact
-   * active generation; abort leaves it untouched.
-   */
+  /** Proves a current authenticated boundary or exclusive absence of an old VM. */
+  confirmCleanBoundary?(): Promise<void>;
+  runJob?(spec: CapsuleJobSpec, signal: AbortSignal, onState?: (state: "running" | "stopping") => void, output?: CapsuleOutputSink): Promise<void>;
+  /** beforeStart runs after a verified build, before any replacement process is created. */
+  runService?(spec: CapsuleServiceSpec, signal: AbortSignal, onState?: (state: "running" | "stopping") => void, output?: CapsuleOutputSink, beforeStart?: () => Promise<void>): Promise<void>;
+  /** Builds before interruption, then confirms old UI cleanup before starting its replacement. */
   prepareUi(
     spec: CapsuleUiSpec,
     previousInstanceId?: string,
+    options?: CapsuleUiPreparationOptions,
   ): Promise<CapsuleUiPreparation>;
   /** Commits exactly one prepared candidate. Commit and abort are mutually exclusive. */
   commitPreparedUi(preparationId: string): Promise<CapsuleUiInstance>;
   /** Discards exactly one prepared candidate without changing activation. */
   abortPreparedUi(preparationId: string): Promise<void>;
-  /** Compatibility wrapper which prepares and immediately commits a new UI. */
+  /** Prepares and immediately commits a new UI. */
   startUi(spec: CapsuleUiSpec): Promise<CapsuleUiInstance>;
-  /** Compatibility wrapper which prepares and immediately commits a replacement. */
+  /** Prepares and immediately commits a sequential replacement. */
   replaceUi(instanceId: string, spec: CapsuleUiSpec): Promise<CapsuleUiInstance>;
   /** Opens one active or prepared instance-bound stream to the declared Guest UI port. */
   openUiStream(instanceId: string): Promise<Duplex>;

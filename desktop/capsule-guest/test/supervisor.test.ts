@@ -50,6 +50,33 @@ afterEach(async () => {
 });
 
 describe("Capsule Guest supervisor data routing", () => {
+  test("one App owner cannot execute another UI until prior process-tree cleanup is confirmed", async () => {
+    const h = await createHarness({ blobPresent: true });
+    await prepareAndStartWorkload(h, { workloadKind: "ui", uiPort: 3000 });
+    const deleted = Promise.withResolvers<void>(), deleting = Promise.withResolvers<void>();
+    vi.spyOn(h.runc, "delete").mockImplementation(async () => { deleting.resolve(); await deleted.promise; });
+    const stop = h.request("workload.stop", { appHandle: APP, workloadHandle: WORKLOAD, graceMs: 0 });
+    await deleting.promise;
+    try {
+      await prepareAndStartWorkload(h, { workloadKind: "ui", uiPort: 3000, appHandle: "N".repeat(22), workloadHandle: "Y".repeat(22), ticketLetter: "Q", expectStart: false });
+      expect(h.runc.launches).toHaveLength(1);
+    } finally { deleted.resolve(); }
+    expect(await stop).toMatchObject({ ok: true });
+    vi.spyOn(h.runc, "start").mockImplementation(async request => {
+      h.runc.launches.push(request);
+      return { containerId: request.plan.containerId, wait: () => new Promise<WorkloadExit>(() => {}) };
+    });
+    await prepareAndStartWorkload(h, { workloadKind: "ui", uiPort: 3000, appHandle: "N".repeat(22), workloadHandle: "Z".repeat(22), ticketLetter: "T" });
+    expect(h.runc.launches).toHaveLength(2);
+  });
+
+  test("different authenticated App owners may execute UIs on the same port independently", async () => {
+    const h = await createHarness({ blobPresent: true });
+    await prepareAndStartWorkload(h, { workloadKind: "ui", uiPort: 3000 });
+    await prepareAndStartWorkload(h, { workloadKind: "ui", uiPort: 3000, appHandle: "N".repeat(22), workloadHandle: "Y".repeat(22), ownerKey: "b".repeat(64), ticketLetter: "Q" });
+    expect(h.runc.launches).toHaveLength(2);
+  });
+
   test("replacement authority resolves the live App workload in this session, never a Host credit", async () => {
     const MiB = 1024 ** 2;
     const admission = new GuestResourceAdmission({ diskBudgetBytes: 1, memoryBudgetBytes: 3556 * MiB, sharedBuildMemoryBytes: 512 * MiB });
@@ -68,6 +95,9 @@ describe("Capsule Guest supervisor data routing", () => {
     expect(await h.request("resources.launch.reserve", { ...request, launchKey: "V".repeat(22) })).toMatchObject({ ok: false });
     expect(await h.request("resources.launch.release", { launchKey: request.launchKey })).toMatchObject({ ok: true });
     expect(await h.request("workload.stop", { appHandle: APP, workloadHandle: WORKLOAD, graceMs: 0 })).toMatchObject({ ok: true });
+    expect(h.supervisor.snapshot().apps[APP]?.workloads).toEqual({});
+    expect(await h.request("workload.stop", { appHandle: APP, workloadHandle: WORKLOAD, graceMs: 0 })).toMatchObject({ ok: true });
+    expect(await h.request("workload.stop", { appHandle: "X".repeat(22), workloadHandle: WORKLOAD, graceMs: 0 })).toMatchObject({ ok: false });
     expect(await h.request("resources.launch.reserve", request)).toMatchObject({ ok: false });
     expect(admission.snapshot().reservations).toBe(0);
   });
@@ -1477,38 +1507,42 @@ describe("bounded Guest authority tombstones", () => {
 
 async function prepareAndStartWorkload(
   harness: Awaited<ReturnType<typeof createHarness>>,
-  options: { workloadKind: "ui" | "service" | "job"; uiPort?: number },
+  options: { workloadKind: "ui" | "service" | "job"; uiPort?: number; appHandle?: string; workloadHandle?: string; ownerKey?: string; ticketLetter?: string; expectStart?: boolean },
 ): Promise<void> {
+  const appHandle = options.appHandle ?? APP, workloadHandle = options.workloadHandle ?? WORKLOAD;
+  const sdkTicket = options.ticketLetter?.repeat(43) ?? SDK_TICKET;
+  const cliTicket = options.ticketLetter ? options.ticketLetter.toLowerCase().repeat(43) : CLI_TICKET;
   await harness.request("app.prepare", {
-    appHandle: APP,
+    appHandle,
     artifactDigest: DIGEST,
-    mappedHostUid: 100_000,
-    mappedHostGid: 200_000,
+    ownerKey: options.ownerKey ?? OWNER,
+    mappedHostUid: appHandle === APP ? 100_000 : 300_000,
+    mappedHostGid: appHandle === APP ? 200_000 : 400_000,
   });
   const body = {
-    appHandle: APP,
-    workloadHandle: WORKLOAD,
+    appHandle,
+    workloadHandle,
     workloadKind: options.workloadKind,
     argv: ["node", "workload.js"],
     cwd: "/app",
     environment: {},
-    sdkTicket: SDK_TICKET,
-    cliTicket: CLI_TICKET,
+    sdkTicket,
+    cliTicket,
     ...(options.uiPort === undefined ? {} : { uiPort: options.uiPort }),
   };
   const preparing = harness.request("workload.prepare", body);
   const sdk = await harness.dialer.nextHostSocket();
   const cli = await harness.dialer.nextHostSocket();
-  sdk.write(encodeJsonFrame(dataPrelude(SDK_TICKET, "sdk")));
-  cli.write(encodeJsonFrame(dataPrelude(CLI_TICKET, "cli")));
+  sdk.write(encodeJsonFrame(dataPrelude(sdkTicket, "sdk")));
+  cli.write(encodeJsonFrame(dataPrelude(cliTicket, "cli")));
   await preparing;
   await eventually(() => expect(
-    harness.supervisor.snapshot().apps[APP]?.workloads[WORKLOAD]?.status,
+    harness.supervisor.snapshot().apps[appHandle]?.workloads[workloadHandle]?.status,
   ).toBe("prepared"));
   expect(await harness.request("workload.start", {
-    appHandle: APP,
-    workloadHandle: WORKLOAD,
-  })).toMatchObject({ ok: true });
+    appHandle,
+    workloadHandle,
+  })).toMatchObject({ ok: options.expectStart ?? true });
 }
 
 async function createHarness(options: {

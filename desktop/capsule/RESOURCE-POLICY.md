@@ -116,3 +116,157 @@ The table excludes this new documentation file and ignored compilation outputs.
 | `desktop/shell/src/content/AppRuntimeView.tsx` | 5 | 2 |
 | `desktop/shell/src/main.tsx` | 1 | 0 |
 | `desktop/shell/src/vite-env.d.ts` | 2 | 1 |
+
+## App and Service enablement; background diagnostics (2026-10-19)
+
+This work follows the approved **App and Service Enablement** section of
+`202607120100-Personal App Runtime Workload Conventions.md` and the supervisor,
+management, networking and unattended-diagnostics sections of
+`202607130100-App Capsule Security and Runtime Contract.md` and
+`202607130200-Shared Linux VM Capsule Backend.md`. The existing Console details
+remain the management surface, consistent with the Desktop Use/Manage ADR.
+The 2026-10-19 approval supersedes the earlier Stop App session-suspension policy.
+
+Console App details now contain one persisted App toggle and one toggle per
+Service, including stopped Services. App disablement fences UI, Service and Job
+admission, cancels current runs through existing cancellation, and joins process
+and authority cleanup. It preserves child Service settings, Trigger settings,
+history and pending work. Re-enablement restores eligible Services; it does not
+open a viewer or create a Job invocation. Close UI and Stop job remain available;
+Stop App and separate Service restart/resume controls are not exposed.
+
+`app_runtime_settings` and `app_services` are part of the greenfield system.db V1
+baseline. Admission installs enabled defaults once; rescans and activations do
+not overwrite saved choices. App revisions fence asynchronous activation and
+channel issuance. Disabled App targets use the existing unavailable-target and
+pending-queue behavior. No Trigger scheduling, matching, input, queue or retry
+policy is added. All schema, manifest, package and protocol versions are unchanged.
+There is no migration or compatibility path and no existing user Workspace was
+reset.
+
+The existing background operation registry and Guest workload primitives own
+Services as well as Jobs. A Service has no UI port; its argv, immutable activation,
+SDK identity and managed CLI authority follow the existing Capsule path. Process
+liveness is its health signal. Unexpected exits persist exponential backoff from
+one second to sixty seconds; a run stable for sixty seconds resets crash counting.
+A replacement builds before stopping its predecessor, then waits for confirmed
+cleanup before creating the replacement process. Failed teardown or authority
+release remains owned and visible; unconfirmed VM containment retains quarantine
+and artifact pins. Confirmed Service launches retain the verified artifact for
+subsequent starts without rebuilding.
+
+Matching activation inputs share a Guest App filesystem aggregate. Exact workload
+stop preserves siblings; the last owner releases that aggregate. Guest records
+are retired only after exact cleanup, with bounded stop tombstones.
+
+An authenticated App owner has one ordinary loopback-only network namespace,
+held independently of filesystem aggregates. Each aggregate pins a reference;
+a prepared replacement holds its reference before the old UI stops. Exact final
+aggregate cleanup releases the last network lease. There are no socket programs,
+routing maps, generation-specific listener addresses, or listener publication.
+Viewer probes and streams use ordinary localhost in that App network.
+
+UI replacement builds and validates the artifact while the old UI runs. Once
+ready, it starts one 15-second handoff deadline, retires the old browser authority,
+confirms old process-tree cleanup, and only then starts the replacement. Readiness
+and viewer verification consume the same remaining deadline. At most one UI may
+execute for an App, including descendants; Host ownership and Guest admission
+both enforce this across aggregates. Service, Job and other App lifetimes remain
+independent. Build failure preserves the running UI. A failed or cancelled runtime
+handoff may leave the UI unavailable; the verified activation/artifact stays
+retained without automatically executing it again. Timeout cancels the attempt,
+but unconfirmed cleanup keeps admission fenced and visible until authoritative
+cleanup, even when it exceeds the deadline. Explicit recovery remains available.
+
+Stdout and stderr continuously drain. Congested Guest transport retains at most
+64 KiB of pending recent output and drops older output rather than blocking the
+process. The Host retains at most 128 KiB per execution, eight executions per App,
+and sixty-four globally. Completed evidence expires after one hour and all
+evidence is cleared after confirmed Host teardown. Diagnostics include exact App,
+workload, execution and activation version attribution, bounded failures, timestamps
+and discarded-byte counts. Credentials and private channel authority are redacted,
+including split/truncated output. Only trusted Shell IPC may read evidence, and
+an execution selector cannot cross App ownership. Nothing is automatically written
+to D0 or a durable log database.
+
+Authorized users and agents using Console can read retained diagnostics. The
+canonical public CLI ADR does not specify an unattended-diagnostic read command;
+a dedicated programmatic agent read surface remains a contract gap. This work
+adds no CLI grammar or SDK administration API and does not promote either Trigger
+proposal to approved status.
+
+Automated verification used Node 24.19.0 and isolated fixtures, not a physical VM:
+
+- Core lifecycle, baseline and Trigger suites: 10 files, 87 passed.
+- Real Core/Guard integration: 19 passed, including App-wide admission, a
+  Service-only App, bound SDK identity, existing CLI/event/cron Jobs and inputs.
+- Shell Capsule/viewer/Console regression set: 31 files, 602 passed, one existing
+  skip. A subsequent focused lifecycle run passed 90 tests, including the new
+  check that disabling one App preserves another App's in-flight UI admission.
+- Shared Capsule: 70 passed; Guest: 204 passed; public CLI: 71 passed;
+  System SDK: 60 passed, including unchanged jobInput V1.
+- Core, Shell, shared Capsule and Guest type checks passed. Core and Desktop
+  production builds and the Guest JavaScript build passed. Module boundaries and
+  diff whitespace checks passed; the checker still notes the existing location
+  debt for the Core/Shell integration harness.
+
+The native Linux Guest helper, signed Guest image and physical Capsule scenarios
+were not rebuilt or exercised. Use matched Desktop and Guest artifacts for those
+checks. No commit, push, packaging, publishing or release was performed.
+
+### Focused lifecycle repairs (2026-10-19)
+
+Persisted cleanup failure from an older Host can be discharged by confirmed full
+Host teardown or backend proof of a clean boundary. A cold backend obtains the
+helper's exclusive state/VM lease; availability alone is insufficient. Retained
+current-boundary workload, channel and activation cleanup obligations still block
+recovery. Enablement and HTTP acknowledgements do not clear those obligations.
+
+Authenticated Service startup clears that Service's active error and its scoped
+App failure projection. Unrelated workload failures and unresolved cleanup remain
+visible; completed execution diagnostics and restart/backoff counting are retained.
+Service observations are serialized so delayed healthy observations cannot replace
+a subsequent failed outcome.
+
+Focused regressions were integrated into the existing suites. Latest results:
+Shell 610 passed with one existing skip; Guest 205 passed; shared Capsule 70 passed;
+Core lifecycle, Trigger, version and real Core/Guard integration 106 passed. Core,
+Shell, shared Capsule and Guest type checks passed. Desktop and Core production
+builds and the Guest JavaScript build passed. The production native helper and
+native tests passed strict Linux cross-target C syntax checks.
+
+The privileged Linux runtime gate now covers the production namespace helper:
+sequential same-port UI listeners, ordinary localhost communication with unchanged
+Service and Job processes, failed replacement without automatic rollback,
+namespace-pin retirement, and cross-App same-port isolation. The former network
+BPF regression and its production routing path have been removed. The existing
+OCI/runc cgroup device BPF policy is unchanged. Live Linux/VM verification remains
+required; mock tests and cross-target C syntax checks do not establish native
+network correctness.
+
+### Sequential UI handoff verification (2026-10-19)
+
+The current reload implementation removes concurrent old/new UI execution and
+all handwritten network BPF hooks, maps, listener aliases and publication. App
+network ownership is an authenticated, reference-counted namespace lease. UI
+retirement and replacement startup are sequential; a prepared aggregate keeps
+its network lease through handoff, and sibling workloads retain their leases.
+The 15-second handoff deadline covers exact old teardown, replacement readiness
+and browser verification. Build preparation is outside the deadline. Failure
+retains the previous verified artifact without automatically executing it again.
+
+Current validation: Shell Capsule/viewer/Console set 620 passed with one existing
+skip; Guest 207 passed; shared Capsule 70 passed; Core version/Trigger suites 71
+passed; real Core/Guard integration 19 passed. Final focused backend, Manager and
+viewer lifecycle checks passed 262 tests after the renderer retirement changes.
+Shell, Guest, shared Capsule and Core type checks passed. Desktop production and
+Guest JavaScript builds passed. Module-boundary and whitespace checks passed,
+with the existing integration-harness location debt unchanged. The production
+network helper and its native regression passed strict Linux-target C syntax
+checks. Docker has no available daemon here, so the privileged Linux gate and
+matched physical Guest/VM verification could not run. No native network execution
+claim is based on these mock tests or syntax checks.
+
+Schemas remain v1 and all manifest/protocol version numbers remain unchanged.
+No migrations, compatibility routing, configuration, controls, infrastructure,
+commit, push, packaging or release were added or performed by this repair.

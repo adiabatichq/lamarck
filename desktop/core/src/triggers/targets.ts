@@ -6,12 +6,12 @@ import { AppJobDispatch } from './app-jobs';
 import type { TriggerRun } from './store';
 
 export class HostTriggerTargets implements TriggerTargets {
-  constructor(private apps: AppLifecycleService, private sources: ConnectorSupervisor, private jobs: AppJobDispatch) {}
+  constructor(private apps: AppLifecycleService, private sources: ConnectorSupervisor, private jobs: AppJobDispatch, private appEnabled: (appId: string) => boolean = () => true) {}
   async list(): Promise<TriggerTarget[]> {
     const [apps, sources] = await Promise.all([this.apps.inventory(), this.sources.listAdmitted()]);
     const targets: TriggerTarget[] = [];
     for (const app of apps) for (const jobId of Object.keys(app.runtime?.jobs ?? {})) {
-      const reason = app.manifestHealth.status !== 'valid' ? 'App manifest is invalid' : app.versionHealth.status === 'unavailable' ? 'App version authority is unavailable' : this.jobs.availability();
+      const reason = !this.appEnabled(app.id) ? 'App is disabled' : app.manifestHealth.status !== 'valid' ? 'App manifest is invalid' : app.versionHealth.status === 'unavailable' ? 'App version authority is unavailable' : this.jobs.availability();
       targets.push({ id: `app:${app.id}:job:${jobId}`, appId: app.id, name: `${app.name} / ${jobId}`, kind: 'app-job', inputs: ['event', 'schedule'], available: !reason, reason });
     }
     const packages = this.sources.listInstalledConnectors();
@@ -25,7 +25,10 @@ export class HostTriggerTargets implements TriggerTargets {
   async invoke(target: TriggerTarget, run: TriggerRun, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
     if (!target.inputs.includes(run.input.kind)) throw new Error('Target does not support this input');
-    if (target.kind === 'app-job') return this.jobs.invoke(run, signal);
+    if (target.kind === 'app-job') {
+      if (!target.appId || !this.appEnabled(target.appId)) throw new Error('App is disabled');
+      return this.jobs.invoke(run, signal);
+    }
     const sourceId = target.sourceId!;
     const source = this.sources.getSource(sourceId);
     if (!source || isSourcePaused(source)) throw new Error('Source is unavailable or paused');

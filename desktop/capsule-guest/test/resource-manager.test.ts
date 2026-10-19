@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Duplex, PassThrough } from "node:stream";
@@ -191,7 +191,7 @@ describe("artifact mount ownership", () => {
       expect(admission.snapshot().reservedDiskBytes).toBe(scratchBytes);
       allowPrepare.resolve(); const app = await prepared;
       expect(manager.getApp(APP)).toBe(app);
-      expect(Object.keys(app).sort()).toEqual(["appHandle", "appKey", "artifactDigest", "cgroupPath", "mappedHostGid", "mappedHostUid", "netnsPath", "runtimeRoot", "scratchBytes", "scratchImage"]);
+      expect(Object.keys(app).sort()).toEqual(["appHandle", "appKey", "artifactDigest", "cgroupPath", "mappedHostGid", "mappedHostUid", "netnsPath", "ownerKey", "runtimeRoot", "scratchBytes", "scratchImage"]);
       expect(await manager.prepareApp(body)).toBe(app);
       await expect(manager.prepareApp({ ...body, mappedHostUid: 300_000 })).rejects.toThrow(/cannot be rebound/);
       const stopped = manager.stopApp(APP).then(() => undefined, error => error);
@@ -217,6 +217,52 @@ describe("artifact mount ownership", () => {
       expect(admission.snapshot().reservations).toBe(0);
       await manager.drain();
     } finally { allowPrepare.resolve(); allowStop.resolve(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  test("App-private namespace leases span filesystem aggregates and retire only after their last cleaned owner", async () => {
+    const root = await mkdtemp(join(tmpdir(), "capsule-network-leases-")), paths = fixturePaths(root);
+    const log = `${root}/network-calls`, helper = `${root}/net-helper`;
+    await writeFile(helper, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n`);
+    await chmod(helper, 0o700);
+    paths.netHelperPath = helper;
+    const registry = new ArtifactMountRegistry({ mount: async () => `${paths.artifactMountRoot}/lower`, unmount: async () => {} });
+    const manager = new GuestResourceManager({ has: async () => true } as unknown as GuestBlobStore, {
+      paths, manageOwnership: false, mountBinary: "/usr/bin/true", umountBinary: "/usr/bin/true", artifactMountRegistry: registry,
+      operations: {
+        isMountPoint: async () => false,
+        createVolume: async ({ mountPath }) => {
+          const group = `${paths.cgroupRoot}/apps/${mountPath.split("/").at(-1)}`;
+          for (const path of [paths.cgroupRoot, `${paths.cgroupRoot}/apps`, group, `${group}/workloads`]) {
+            await mkdir(path, { recursive: true }); await writeFile(`${path}/cgroup.controllers`, "cpu memory pids");
+          }
+        },
+        destroyVolume: async ({ mountPath }) => {
+          const group = `${paths.cgroupRoot}/apps/${mountPath.split("/").at(-1)}`;
+          for (const path of [group, `${group}/workloads`]) for (const entry of await readdir(path, { withFileTypes: true }).catch(() => [])) if (entry.isFile()) await rm(join(path, entry.name));
+          await rm(mountPath, { recursive: true, force: true });
+        },
+      },
+    });
+    const body = { ownerKey: "a".repeat(64), appHandle: APP, artifactDigest: DIGEST_A, artifactBytes: 1, artifactBlobHandle: "L".repeat(22), mappedHostUid: 100_000, mappedHostGid: 200_000, storagePlanVersion: 1 as const, scratchBytes: 128 * 1024 ** 2 };
+    try {
+      const old = await manager.prepareApp(body);
+      const candidate = await manager.prepareApp({ ...body, appHandle: "N".repeat(22), artifactDigest: DIGEST_B, mappedHostUid: 300_000, mappedHostGid: 400_000 });
+      const other = await manager.prepareApp({ ...body, appHandle: "X".repeat(22), ownerKey: "b".repeat(64), mappedHostUid: 500_000, mappedHostGid: 600_000 });
+      const calls = () => readFile(log, "utf8").then(value => value.trim().split("\n"));
+      const network = (await calls()).find(value => value.startsWith("create "))!.slice(7);
+      expect((await calls()).filter(value => value === `create ${network}`)).toHaveLength(1);
+      expect(await calls()).toContain(`share ${old.netnsPath} ${network}`);
+      expect(await calls()).toContain(`share ${candidate.netnsPath} ${network}`);
+      await expect(manager.prepareApp({ ...body, ownerKey: "b".repeat(64) })).rejects.toThrow("cannot be rebound");
+      await manager.stopApp(APP);
+      expect(await calls()).not.toContain(`delete ${network}`);
+      expect(manager.getApp(candidate.appHandle)).toBe(candidate);
+      await manager.stopApp(candidate.appHandle);
+      expect(await calls()).toContain(`delete ${network}`);
+      expect(manager.getApp(other.appHandle)).toBe(other);
+      await manager.stopApp(other.appHandle);
+      await manager.drain();
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   test("recomputes Runtime scratch before observing the imported artifact", async () => {

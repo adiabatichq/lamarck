@@ -55,10 +55,12 @@ if (import.meta.env.DEV && !window.lamarckHost) {
     setAppViewerBounds: () => {},
     closeAppViewer: async () => ({ ok: true as const }),
     reloadAppRuntime: async () => ({ active: false }),
+    setAppServiceEnabled: async () => { throw new Error("Service management requires the Desktop Host"); },
+    getAppWorkloadDiagnostics: async () => [],
     getAppRuntimeStates: async () => [],
     stopAppJob: async () => { throw new Error("App execution management requires the Desktop Host"); },
     closeAppUi: async () => { throw new Error("App execution management requires the Desktop Host"); },
-    stopApp: async () => { throw new Error("App execution management requires the Desktop Host"); },
+    setAppEnabled: async () => { throw new Error("App execution management requires the Desktop Host"); },
     archiveApp: async (appId: string) => {
       const response = await fetch(`${base}/api/apps/${encodeURIComponent(appId)}/archive`, {
         method: "POST",

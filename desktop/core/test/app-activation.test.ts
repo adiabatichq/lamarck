@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -67,6 +67,22 @@ describe("AppActivationCoordinator", () => {
       await collectAppPackageTree(activation.immutablePackagePath),
       "example",
     ).digest).toBe(activation.packageDigest);
+  });
+
+  test("failed activation release retains its exact cleanup obligation for retry", async () => {
+    const { appDir, cacheDir } = await fixture();
+    const coordinator = new AppActivationCoordinator(new AppRepositoryService({ eventWriter: new Events() }), cacheDir);
+    const activation = await coordinator.prepare({ appId: "example", appDir, workload: "service:sync" });
+    const retained = `${activation.immutablePackagePath}.held`;
+    await chmod(activation.immutablePackagePath, 0o700);
+    await rename(activation.immutablePackagePath, retained);
+    await writeFile(activation.immutablePackagePath, "injected invalid materialization");
+    await expect(coordinator.release(activation.activationId)).rejects.toThrow();
+    expect(coordinator.require(activation.activationId, "example", "service:sync")).toBe(activation);
+    await rm(activation.immutablePackagePath);
+    await rename(retained, activation.immutablePackagePath);
+    expect(await coordinator.release(activation.activationId)).toBe(true);
+    await expect(lstat(activation.immutablePackagePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   test("rejects undeclared workloads without issuing an activation record", async () => {

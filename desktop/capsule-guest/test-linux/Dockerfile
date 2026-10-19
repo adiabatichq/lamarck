@@ -32,6 +32,9 @@ RUN printf '%s\n' \
     && rm -f /tmp/host-node.tar.xz \
     && rm -rf /var/lib/apt/lists/*
 
+COPY net-helper.c net-helper-network-test.c /tmp/
+RUN mkdir -p /usr/local/libexec && cc -std=c11 -O2 -Wall -Wextra -Werror /tmp/net-helper-network-test.c -o /usr/local/libexec/lamarck-network-regression
+
 COPY runtime-probe.c /tmp/runtime-probe.c
 COPY build-policy-probe.c /tmp/build-policy-probe.c
 RUN mkdir -p /usr/local/libexec \

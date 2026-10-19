@@ -67,6 +67,7 @@ export class AppLifecycleService {
     readonly repository: AppRepositoryService,
     readonly activations: AppActivationCoordinator,
     readonly editMaterializations: AppEditMaterializationCoordinator,
+    private readonly onRegistry?: (registry: AppRegistry) => void,
   ) {}
 
   get registry(): AppRegistry {
@@ -128,6 +129,7 @@ export class AppLifecycleService {
       try {
         const registry = await loadApps(this.appsDir, controller.signal);
         controller.signal.throwIfAborted();
+        this.onRegistry?.(registry);
         this.currentRegistry = registry;
         for (const waiter of this.activeReads) {
           if (!waiter.inventory) waiter.complete({ registry });

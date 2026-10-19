@@ -62,10 +62,13 @@ class FakeBackend implements CapsuleBackend {
   async prepareUi(
     spec: CapsuleUiSpec,
     previousInstanceId?: string,
+    options?: import("./backend").CapsuleUiPreparationOptions,
   ): Promise<CapsuleUiPreparation> {
     if (previousInstanceId) {
       this.replacements.push({ instanceId: previousInstanceId, spec });
       await this.rebuildGate;
+      options?.signal?.throwIfAborted();
+      await options?.onHandoff?.(performance.now() + 15_000);
     } else {
       this.starts.push(spec);
     }
@@ -292,13 +295,13 @@ describe("CapsuleManager", () => {
     }]);
 
     await expect(manager.reloadApp("app-a", async () => {
-      throw new Error("replacement build failed");
-    }, publishReloadedViewer)).rejects.toThrow("replacement build failed");
+      throw new Error("replacement viewer failed");
+    }, publishReloadedViewer)).rejects.toThrow("replacement viewer failed");
     expect(manager.appRuntimeStates()).toEqual([{
       appId: "app-a",
-      runningWorkloads: 1,
-      ui: "running", stopping: false, jobs: [],
-      latestFailure: "replacement build failed",
+      runningWorkloads: 0,
+      ui: "closed", stopping: false, jobs: [],
+      latestFailure: "replacement viewer failed",
     }]);
 
     const saveResponse = await fetch("http://127.0.0.1:32100/api/apps/app-a/save", {
@@ -307,18 +310,18 @@ describe("CapsuleManager", () => {
     expect(saveResponse.ok).toBe(true);
     expect(manager.appRuntimeStates()).toEqual([{
       appId: "app-a",
-      runningWorkloads: 1,
-      ui: "running", stopping: false, jobs: [],
-      latestFailure: "replacement build failed",
+      runningWorkloads: 0,
+      ui: "closed", stopping: false, jobs: [],
+      latestFailure: "replacement viewer failed",
     }]);
 
-    await manager.reloadApp("app-a", verifyPreparedViewer, publishReloadedViewer);
+    const recovered = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     expect(manager.appRuntimeStates()[0]).toMatchObject({
       runningWorkloads: 1,
       ui: "running", stopping: false, jobs: [],
       latestFailure: null,
     });
-    await manager.closeViewer(opened.viewerId, viewerOwner(7));
+    await manager.closeViewer(recovered.viewerId, viewerOwner(7));
     expect(manager.appRuntimeStates()).toEqual([]);
   });
 
@@ -539,7 +542,7 @@ describe("CapsuleManager", () => {
       await verificationGate;
       binding.assertCurrent();
     });
-    const openingFailure = expect(opening).rejects.toThrow("launch was cancelled");
+    const openingFailure = expect(opening).rejects.toThrow("App viewer owner renderer was replaced");
     await verificationStarted;
 
     const retirement = manager.closeOwner(retiredOwner);
@@ -645,7 +648,7 @@ describe("CapsuleManager", () => {
     await expect(manager.openViewer("app-a", viewerOwner(7), async (binding) => {
       candidateViewerId = binding.viewerId;
       binding.invalidate(new Error("hidden renderer exited"));
-    })).rejects.toThrow("launch was cancelled");
+    })).rejects.toThrow("hidden renderer exited");
 
     expect(manager.getViewer(candidateViewerId, viewerOwner(7))).toBeNull();
     expect(backend.committedPreparations).toEqual([]);
@@ -656,7 +659,7 @@ describe("CapsuleManager", () => {
     }
   });
 
-  test("preserves the prior viewer and capabilities when replacement verification fails", async () => {
+  test("retires the prior viewer and both generations of authority when replacement verification fails", async () => {
     const backend = new FakeBackend();
     const { fetch, calls } = createFetch();
     const manager = new CapsuleManager({
@@ -673,17 +676,98 @@ describe("CapsuleManager", () => {
       throw new Error("replacement document was incomplete");
     }, publishReloadedViewer)).rejects.toThrow("replacement document was incomplete");
 
-    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBe(opened);
+    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
     expect(backend.committedPreparations).toEqual(["preparation-1"]);
     expect(backend.abortedPreparations).toEqual(["preparation-2"]);
     for (const channel of [1, 2]) {
       expect(calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
-        .toBe(false);
+        .toBe(true);
     }
     for (const channel of [3, 4]) {
       expect(calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
         .toBe(true);
     }
+  });
+
+  test("reload excludes artifact preparation and shares one handoff deadline through viewer verification", async () => {
+    const backend = new FakeBackend(), base = createFetch();
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "secret", fetch: base.fetch, ...systemBindings() });
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
+    const build = Promise.withResolvers<void>(), built = Promise.withResolvers<void>();
+    const runtime = Promise.withResolvers<void>(), started = Promise.withResolvers<void>(), verifying = Promise.withResolvers<void>();
+    const prepare = backend.prepareUi.bind(backend);
+    backend.prepareUi = async (...args) => {
+      built.resolve(); await build.promise;
+      const result = await prepare(...args);
+      started.resolve(); await runtime.promise;
+      return result;
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const published = vi.fn();
+    const reload = rejectionOf(manager.reloadApp("app-a", async () => { verifying.resolve(); await new Promise<void>(() => {}); }, published));
+    try {
+      await built.promise;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBe(opened);
+      build.resolve(); await started.promise;
+      expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
+      await vi.advanceTimersByTimeAsync(5_000);
+      runtime.resolve(); await verifying.promise;
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(published).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await reload).message).toContain("handoff timed out");
+      expect(manager.appRuntimeStates()[0]).toMatchObject({ ui: "closed", latestFailure: expect.stringContaining("handoff timed out") });
+      expect(backend.committedPreparations).toEqual(["preparation-1"]);
+      expect(backend.abortedPreparations).toContain("preparation-2");
+    } finally { build.resolve(); runtime.resolve(); vi.useRealTimers(); await manager.stopAll(); }
+  });
+
+  test.each(["owner-close", "close-ui", "disable", "shutdown"] as const)("%s cancels reload after old UI retirement without publishing another generation", async action => {
+    const backend = new FakeBackend(), base = createFetch();
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/enablement")) return Response.json({ enabled: JSON.parse(String(init?.body)).enabled });
+      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "app-a", enabled: false }], services: [] });
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
+    const verifying = Promise.withResolvers<void>(), published = vi.fn();
+    const reload = rejectionOf(manager.reloadApp("app-a", async () => { verifying.resolve(); await new Promise<void>(() => {}); }, published));
+    try {
+      await verifying.promise;
+      expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
+      await expect(manager.openViewer("app-a", viewerOwner(8), verifyPreparedViewer)).rejects.toThrow();
+      if (action === "owner-close") await manager.closeOwner(viewerOwner(7));
+      if (action === "close-ui") await manager.closeAppUi("app-a");
+      if (action === "disable") await manager.setAppEnabled("app-a", false);
+      if (action === "shutdown") await manager.stopAll();
+      await reload;
+      expect(published).not.toHaveBeenCalled();
+      expect(backend.committedPreparations).toEqual(["preparation-1"]);
+      expect(manager.appRuntimeStates().find(value => value.appId === "app-a")?.ui ?? "closed").toBe("closed");
+    } finally { await manager.stopAll(); }
+  });
+
+  test("cancellation during adoption joins the commit and stops only the replacement UI", async () => {
+    const backend = new FakeBackend(), base = createFetch();
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "secret", fetch: base.fetch, ...systemBindings() });
+    const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
+    const other = await manager.openViewer("app-b", viewerOwner(8), verifyPreparedViewer);
+    const commit = backend.commitPreparedUi.bind(backend), entered = Promise.withResolvers<void>(), adoption = Promise.withResolvers<void>();
+    backend.commitPreparedUi = async id => { entered.resolve(); await adoption.promise; return commit(id); };
+    const published = vi.fn(), reload = rejectionOf(manager.reloadApp("app-a", verifyPreparedViewer, published));
+    try {
+      await entered.promise;
+      const close = manager.closeViewer(opened.viewerId, viewerOwner(7));
+      expect(backend.abortedPreparations).toEqual([]);
+      adoption.resolve(); await close; await reload;
+      expect(published).not.toHaveBeenCalled();
+      expect(backend.stopAllCalls).toBe(0);
+      expect(manager.getViewer(other.viewerId, viewerOwner(8))).toBe(other);
+      expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
+    } finally { adoption.resolve(); await manager.stopAll(); }
   });
 
   test("does not launch when Core cannot issue the exact manifest authority", async () => {
@@ -982,8 +1066,8 @@ describe("CapsuleManager", () => {
       "replacement exited before publication",
     );
 
-    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBe(opened);
-    expect(onUiLost).not.toHaveBeenCalled();
+    expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
+    expect(onUiLost).toHaveBeenCalledOnce();
     expect(backend.abortedPreparations).toContain("preparation-2");
     for (const channel of [3, 4]) {
       expect(base.calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
@@ -991,7 +1075,7 @@ describe("CapsuleManager", () => {
     }
     for (const channel of [1, 2]) {
       expect(base.calls.some((call) => call.url.endsWith(`/channels/channel-app-a-${channel}`)))
-        .toBe(false);
+        .toBe(true);
     }
   });
 
@@ -1035,7 +1119,7 @@ describe("CapsuleManager", () => {
     }
   });
 
-  test("detaches a prior viewer lost during candidate verification", async () => {
+  test("ignores a late terminal event from the retired previous UI during verification", async () => {
     const backend = new FakeBackend();
     const { fetch } = createFetch();
     const bindings = systemBindings();
@@ -1051,6 +1135,7 @@ describe("CapsuleManager", () => {
     });
     const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     let prepared!: PreparedViewerBinding;
+    const verification = Promise.withResolvers<void>();
     let reportVerifierStarted!: () => void;
     const verifierStarted = new Promise<void>((resolve) => {
       reportVerifierStarted = resolve;
@@ -1058,11 +1143,7 @@ describe("CapsuleManager", () => {
     const reload = manager.reloadApp("app-a", async (binding) => {
       prepared = binding;
       reportVerifierStarted();
-      await new Promise<void>((_resolve, reject) => {
-        binding.signal.addEventListener("abort", () => reject(binding.signal.reason), {
-          once: true,
-        });
-      });
+      await verification.promise;
     }, publishReloadedViewer);
     await verifierStarted;
 
@@ -1072,17 +1153,14 @@ describe("CapsuleManager", () => {
       error: new Error("prior workload exited during verification"),
     });
 
-    expect(prepared.signal.aborted).toBe(true);
+    expect(prepared.signal.aborted).toBe(false);
     expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
-    expect(onUiLost).toHaveBeenCalledWith(expect.objectContaining({
-      viewerId: opened.viewerId,
-      instanceId: opened.instanceId,
-    }));
-    await expect(reload).rejects.toThrow("prior workload exited during verification");
-    expect(backend.abortedPreparations).toContain("preparation-2");
+    expect(onUiLost).not.toHaveBeenCalled();
+    verification.resolve();
+    await expect(reload).resolves.toMatchObject({ active: true });
   });
 
-  test("does not report a replacement active if it exits while old channels are retiring", async () => {
+  test("does not publish a replacement lost while previous UI authority is retiring", async () => {
     const backend = new FakeBackend();
     const base = createFetch();
     let releaseOldChannel!: () => void;
@@ -1126,10 +1204,7 @@ describe("CapsuleManager", () => {
       },
     );
     await oldChannelRetirementStarted;
-    expect(cutoverOrder).toEqual([
-      "renderer-publication",
-      "old-channel-revocation",
-    ]);
+    expect(cutoverOrder).toEqual(["old-channel-revocation"]);
     backend.uiLostHandler?.({
       instanceId: "instance-app-a-replacement",
       appId: "app-a",
@@ -1137,7 +1212,7 @@ describe("CapsuleManager", () => {
     });
     releaseOldChannel();
 
-    await expect(reload).rejects.toThrow("stopped before Host publication completed");
+    await expect(reload).rejects.toThrow("replacement exited during Host cutover");
     expect(manager.getViewer(opened.viewerId, viewerOwner(7))).toBeNull();
     await vi.waitFor(() => {
       expect(base.calls.some((call) => call.url.endsWith("/channels/channel-app-a-3"))).toBe(true);
@@ -2027,5 +2102,102 @@ describe("declared job Host authority", () => {
     const backend = new FakeBackend(); Object.assign(backend, { runJob: vi.fn() }); const fetch = createFetch({ notes: { jobs: {} } });
     const manager = new CapsuleManager({ backend, workspacePath: () => "/unused", coreBaseUrl: () => "http://core", coreToken: "secret", fetch: fetch.fetch as typeof globalThis.fetch, bindSystemSender: vi.fn(), unbindSystemSender: vi.fn() });
     await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("declare"); expect(fetch.calls.some(c => c.url.endsWith("/api/app-runtime/channels") && c.init?.method === "POST")).toBe(false);
+  });
+});
+
+ test("completed Job output and failures remain attributable after leaving the active list", async () => {
+  const backend = new FakeBackend();
+  const runJob = vi.fn(async (_spec: unknown, _signal: AbortSignal, _state: unknown, output: (chunk: Uint8Array) => void) => {
+    output(Buffer.from("job output\n")); throw new Error("failed host-secret channel-notes-1");
+  }); Object.assign(backend, { runJob });
+  const { fetch } = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+  const manager = new CapsuleManager({ backend, workspacePath: () => "/isolated", coreBaseUrl: () => "http://core", coreToken: "host-secret", fetch, ...systemBindings() });
+  await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("failed");
+  expect(manager.appRuntimeStates()[0]?.jobs).toEqual([]);
+  const [run] = manager.workloadDiagnostics("notes", "run-a");
+  expect(run).toMatchObject({ appId: "notes", kind: "job", workloadId: "inbox", executionId: "run-a", output: "job output\n", failure: "failed [redacted] [redacted]" });
+  expect(run.endedAt).not.toBeNull(); expect(runJob).toHaveBeenCalledOnce();
+  await manager.stopAll(); expect(manager.workloadDiagnostics("notes")).toEqual([]);
+});
+
+ test("a malformed allocation reply still releases the channel and activation it allocated", async () => {
+  const backend = new FakeBackend(), runJob = vi.fn(); Object.assign(backend, { runJob });
+  const { fetch, calls } = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } }, { issuedManifestDigest: OTHER_MANIFEST_DIGEST });
+  const manager = new CapsuleManager({ backend, workspacePath: () => "/isolated", coreBaseUrl: () => "http://core", coreToken: "host-secret", fetch, ...systemBindings() });
+  await expect(manager.runJob("run-a", "notes", "inbox", new AbortController().signal)).rejects.toThrow("different App activation");
+  expect(runJob).not.toHaveBeenCalled();
+  expect(calls.some(call => call.url.endsWith("/channels/channel-notes-1") && call.init?.method === "DELETE")).toBe(true);
+  expect(calls.some(call => call.url.includes("/apps/activation/") && call.init?.method === "DELETE")).toBe(true);
+  await manager.stopAll();
+});
+
+
+describe("persisted App disablement", () => {
+  test("disabling an App leaves another App's in-flight UI admission intact", async () => {
+    const backend = new FakeBackend(), gate = Promise.withResolvers<void>(), base = createFetch(); let entered = false;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/enablement")) return Response.json({ enabled: false });
+      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "app-a", enabled: false }], services: [] });
+      if (url.endsWith("/apps/app-b/activation/prepare")) { entered = true; await gate.promise; }
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/isolated", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    const opening = manager.openViewer("app-b", viewerOwner(7), verifyPreparedViewer);
+    try {
+      await vi.waitFor(() => expect(entered).toBe(true));
+      await manager.setAppEnabled("app-a", false);
+      gate.resolve(); expect((await opening).appId).toBe("app-b");
+      expect(backend.appStops).toEqual(["app-a"]);
+    } finally { gate.resolve(); await opening; await manager.stopAll(); }
+  });
+  test.each(["activation", "channel", "preparation", "verification"] as const)("fences UI launches already in %s and joins their cleanup", async phase => {
+    const backend = new FakeBackend(), gate = Promise.withResolvers<void>();
+    const base = createFetch(), bindings = systemBindings(); let entered = false;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/enablement")) return Response.json({ enabled: JSON.parse(String(init?.body)).enabled });
+      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "app-a", enabled: false }], services: [] });
+      if ((phase === "activation" && url.endsWith("/activation/prepare")) || (phase === "channel" && url.endsWith("/channels") && init?.method === "POST")) { entered = true; await gate.promise; }
+      return base.fetch(input, init);
+    };
+    const prepare = backend.prepareUi.bind(backend);
+    backend.prepareUi = async (...args) => { if (phase === "preparation") { entered = true; await gate.promise; } return prepare(...args); };
+    const verify = async () => { if (phase === "verification") { entered = true; await gate.promise; } };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/isolated", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...bindings });
+    const opening = rejectionOf(manager.openViewer("app-a", viewerOwner(7), verify));
+    try {
+      await vi.waitFor(() => expect(entered).toBe(true));
+      let stopped = false; const disable = manager.setAppEnabled("app-a", false).then(() => { stopped = true; });
+      await Promise.resolve(); expect(stopped).toBe(false);
+      await expect(manager.openViewer("app-a", viewerOwner(8), verify)).rejects.toThrow();
+      gate.resolve(); expect((await opening).message).toContain("cancelled"); await disable;
+      expect(backend.committedPreparations).toEqual([]);
+      expect(manager.appRuntimeStates()[0]).toMatchObject({ enabled: false, ui: "closed", jobs: [], runningWorkloads: 0 });
+      expect(backend.appStops).toContain("app-a");
+    } finally { gate.resolve(); await opening; await manager.stopAll(); }
+  });
+  test.each(["activation", "execution"] as const)("App disablement cancels a Job already in %s without admitting another invocation", async phase => {
+    const backend = new FakeBackend(), gate = Promise.withResolvers<void>(); let entered = false;
+    const runJob = vi.fn(async (_spec, signal, state) => { state("running"); entered = true; await gate.promise; signal.throwIfAborted(); });
+    Object.assign(backend, { runJob });
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/enablement")) return Response.json({ enabled: JSON.parse(String(init?.body)).enabled });
+      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "notes", enabled: false }], services: [] });
+      if (phase === "activation" && url.endsWith("/activation/prepare")) { entered = true; await gate.promise; }
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/isolated", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
+    const done = rejectionOf(manager.runJob("run-a", "notes", "inbox", new AbortController().signal));
+    try {
+      await vi.waitFor(() => expect(entered).toBe(true));
+      const disable = manager.setAppEnabled("notes", false);
+      await expect(manager.runJob("run-b", "notes", "inbox", new AbortController().signal)).rejects.toThrow("disabled");
+      gate.resolve(); await done; await disable;
+      expect(runJob).toHaveBeenCalledTimes(phase === "execution" ? 1 : 0);
+      expect(manager.appRuntimeStates()[0].jobs).toEqual([]);
+    } finally { gate.resolve(); await done; await manager.stopAll(); }
   });
 });

@@ -55,8 +55,11 @@ import type {
   CapsuleUiInstance,
   CapsuleUiLostEvent,
   CapsuleUiPreparation,
+  CapsuleUiPreparationOptions,
   CapsuleUiSpec,
   CapsuleJobSpec,
+  CapsuleServiceSpec,
+  CapsuleOutputSink,
 } from "./backend";
 import {
   CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE,
@@ -141,6 +144,7 @@ const BLOB_EVENT_CONFIRM_TIMEOUT_MS = 10_000;
 const BUILD_TIMEOUT_MS = 120_000;
 const BUILD_REQUEST_TIMEOUT_MS = 10 * 60_000;
 const STOP_ALL_DEADLINE_MS = 15_000;
+const UI_HANDOFF_TIMEOUT_MS = 15_000;
 const MAX_SERIAL_OPERATIONS = 32;
 const MAX_EARLY_DATA_STREAMS = 64;
 const MAX_LIVE_UI_INSTANCES = 16;
@@ -279,6 +283,8 @@ export interface MacOsCapsuleBackendDependencies {
 }
 
 interface LaunchCapacity {
+  onHandoff?: CapsuleUiPreparationOptions["onHandoff"];
+  handoffTimer?: ReturnType<typeof setTimeout>;
   previous?: UiRecord;
   key: string;
   memoryProfile: "lightweight" | "standard";
@@ -313,13 +319,16 @@ interface UiRecord {
   readonly artifact: HostArtifact;
   readonly installDigest: string;
   readonly dependencyDigest: string;
-  readonly spec: CapsuleUiSpec | CapsuleJobSpec;
-  readonly job?: { promise: Promise<void>; resolve(): void; reject(error: unknown): void };
+  readonly spec: CapsuleUiSpec | CapsuleJobSpec | CapsuleServiceSpec;
+  readonly completion?: { promise: Promise<void>; resolve(): void; reject(error: unknown): void };
   readonly bootGeneration: number;
   readonly detachSystemStream: () => void;
   readonly viewerStreams: Set<Duplex>;
-  lifecycle: "launching" | "prepared" | "replacement" | "active" | "stopping" | "lost";
+  lifecycle: "launching" | "prepared" | "active" | "stopping" | "lost";
   terminalError?: Error;
+  terminalObserved?: boolean;
+  authorityLossTimer?: ReturnType<typeof setTimeout>;
+  logsDrained?: Promise<void>;
 }
 
 interface Candidate extends UiRecord {
@@ -347,7 +356,6 @@ interface PreparedUiRecord {
   readonly preparationId: string;
   readonly candidate: Candidate;
   readonly packageDigest: `sha256:${string}`;
-  readonly previousInstanceId?: string;
   readonly retention: HostArtifactRetention;
   state: "prepared" | "committing";
 }
@@ -411,7 +419,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   readonly #workloads = new Map<string, UiRecord>();
   readonly #latestActivationSequenceByApp = new Map<string, number>();
   readonly #namespaceBases = new Set<number>();
-  readonly #operations = new Map<string, Map<AbortController, { kind: "ui" | "job"; completion: Promise<readonly unknown[]> }>>();
+  readonly #operations = new Map<string, Map<AbortController, { kind: "ui" | "job" | "service"; completion: Promise<readonly unknown[]> }>>();
   readonly #launchCleanupFailures = new WeakMap<AbortSignal, unknown[]>();
   readonly #appStops = new Map<string, { scope: "ui" | "app"; completion: Promise<void> }>();
   readonly #uiStops = new Map<string, Promise<void>>();
@@ -515,20 +523,43 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     }
   }
 
-  runJob(spec: CapsuleJobSpec, requestSignal: AbortSignal, onState?: (state: "running" | "stopping") => void): Promise<void> {
-    try { this.#assertAcceptingWork(spec.appId, "job"); requestSignal.throwIfAborted(); }
+  confirmCleanBoundary(): Promise<void> {
+    return this.#serial.runCritical(async () => {
+      if (this.#terminalFailure) throw this.#terminalFailure;
+      if (this.#fatalCleanup) await this.#fatalCleanup;
+      if (this.#boot) { await this.#assertBoot(this.#boot); return; }
+      if (this.#bootPromise) throw new Error("Capsule boundary is still initializing");
+      // prepareState holds the helper's exclusive state/VM lease. Successful
+      // acquisition proves no previous VM can still own this boundary; a
+      // virtualization availability probe alone cannot establish that fact.
+      await this.#reconcileStateDiskResidueBeforeStorageAdmission();
+    });
+  }
+
+  runJob(spec: CapsuleJobSpec, signal: AbortSignal, onState?: (state: "running" | "stopping") => void, output?: CapsuleOutputSink): Promise<void> {
+    return this.#runBackground(spec, signal, onState, output);
+  }
+
+  runService(spec: CapsuleServiceSpec, signal: AbortSignal, onState?: (state: "running" | "stopping") => void, output?: CapsuleOutputSink, beforeStart?: () => Promise<void>): Promise<void> {
+    return this.#runBackground(spec, signal, onState, output, beforeStart);
+  }
+
+  #runBackground(spec: CapsuleJobSpec | CapsuleServiceSpec, requestSignal: AbortSignal, onState?: (state: "running" | "stopping") => void, output?: CapsuleOutputSink, beforeStart?: () => Promise<void>): Promise<void> {
+    const kind = "serviceId" in spec ? "service" : "job";
+    try { this.#assertAcceptingWork(spec.appId, kind); requestSignal.throwIfAborted(); }
     catch (error) { return Promise.reject(error); }
-    return this.#withWorkloadOperation(spec.appId, "job", async (lifetime) => {
+    return this.#withWorkloadOperation(spec.appId, kind, async (lifetime) => {
       const signal = AbortSignal.any([lifetime, requestSignal]);
       this.#launchCleanupFailures.set(signal, this.#launchCleanupFailures.get(lifetime)!);
       const ownerKey = hashAppId(spec.appId);
       const launch: LaunchCapacity = { key: this.#dependencies.opaqueId(), memoryProfile: "standard", runtimeBytes: 512 * 1024 ** 2, buildBytes: 0 };
       let candidate: Candidate | undefined;
       let retention: HostArtifactRetention | undefined;
+      let buildRetention: HostArtifactRetention | undefined;
       try {
         // The package/build queue covers launch, never a job's execution time.
         await this.#appLaunchQueue(spec.appId).run(() => this.#withTransientStorage(ownerKey, async () => {
-          throwIfAborted(signal); this.#assertAcceptingWork(spec.appId, "job");
+          throwIfAborted(signal); this.#assertAcceptingWork(spec.appId, kind);
           if (this.#workloads.size >= MAX_LIVE_UI_INSTANCES) throw new Error("Capsule workload capacity is full");
           const release = await this.#loadRelease();
           const snapshot = await this.#dependencies.snapshot({ packageDir: spec.packageDir, cacheDir: join(this.#options.cacheDirectory, "packages", ownerKey), ownerKey, storageBudget: this.#storageBudget });
@@ -536,13 +567,21 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           launch.memoryProfile = await selectRuntimeMemoryProfile(snapshot, spec.command);
           launch.runtimeBytes = (launch.memoryProfile === "lightweight" ? 256 : 512) * 1024 ** 2;
           const resolved = await this.#resolveArtifact(release, spec, snapshot, signal, launch);
+          // Keep a verified replacement pinned while its predecessor drains.
+          if (beforeStart) buildRetention = this.#artifacts.retain(resolved.artifact);
+          await beforeStart?.();
+          signal.throwIfAborted(); this.#assertAcceptingWork(spec.appId, kind);
           const capacity = createCapsuleRuntimeStateCapacityPlan({ artifact: retainedArtifact(resolved.artifact), liveRuntimeLeases: this.#liveRuntimeStorageLeases() });
           const boot = await this.#ensureBoot(capacity.stateDiskBytes, release, signal);
-          const record = await this.#launchCandidate(boot, spec, resolved, capacity.runtimePlan, signal, launch);
+          const record = await this.#launchCandidate(boot, spec, resolved, capacity.runtimePlan, signal, launch, output);
           // Own teardown before retention, publication, or queue settlement can
           // fail. The operation barrier keeps App stop joined to this cleanup.
           candidate = record;
           retention = this.#artifacts.retain(record.artifact);
+          if (kind === "service") {
+            await this.#activateCandidate(record, spec.packageDigest, boot, signal);
+            this.#latestActivationSequenceByApp.set(spec.appId, spec.activationSequence);
+          }
           record.lifecycle = "active"; this.#instances.set(record.instanceId, record);
           return record;
         }));
@@ -552,10 +591,17 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         await this.#releaseLaunchCapacity(launch, lifetime);
         signal.throwIfAborted();
         onState?.("running");
-        const abort = () => record.job!.reject(signal.reason ?? new Error("Job canceled"));
+        const abort = () => record.completion!.reject(signal.reason ?? new Error("Job canceled"));
         signal.addEventListener("abort", abort, { once: true });
-        try { if (signal.aborted) abort(); await record.job!.promise; signal.throwIfAborted(); }
-        finally { signal.removeEventListener("abort", abort); }
+        try { if (signal.aborted) abort(); await record.completion!.promise; signal.throwIfAborted(); }
+        finally {
+          signal.removeEventListener("abort", abort);
+          if (!signal.aborted && record.logsDrained) {
+            await withTimeout(record.logsDrained, 2000, "Diagnostic transport did not drain").catch(() => {
+              try { output?.(Buffer.from("\n[Capsule diagnostic transport ended before all output drained]\n")); } catch {}
+            });
+          }
+        }
       } finally {
         let teardownConfirmed = candidate === undefined;
         try {
@@ -582,7 +628,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         } finally {
           // An unconfirmed VM stop stays quarantined and keeps its artifact
           // pinned. Never evict bytes still potentially in use by the Guest.
-          try { if (teardownConfirmed) retention?.release(); }
+          try { if (teardownConfirmed) { retention?.release(); buildRetention?.release(); } }
           finally { await this.#releaseLaunchCapacity(launch, lifetime); }
         }
       }
@@ -592,13 +638,16 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   prepareUi(
     spec: CapsuleUiSpec,
     previousInstanceId?: string,
+    options?: CapsuleUiPreparationOptions,
   ): Promise<CapsuleUiPreparation> {
     try {
       this.#assertAcceptingWork(spec.appId);
     } catch (error) {
       return Promise.reject(error);
     }
-    return this.#withWorkloadOperation(spec.appId, "ui", (signal) => this.#appLaunchQueue(spec.appId).run(async () => {
+    return this.#withWorkloadOperation(spec.appId, "ui", (lifetime) => this.#appLaunchQueue(spec.appId).run(async () => {
+      const signal = options?.signal ? AbortSignal.any([lifetime, options.signal]) : lifetime;
+      this.#launchCleanupFailures.set(signal, this.#launchCleanupFailures.get(lifetime)!);
       throwIfAborted(signal);
       this.#assertAcceptingWork(spec.appId);
       const ownerKey = hashAppId(spec.appId);
@@ -623,6 +672,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           }
 
           launch.previous = previous;
+          launch.onHandoff = options?.onHandoff;
           const release = await this.#loadRelease();
           if (previous && !release.handshake.expectedFeatures.includes("replacement-admission-v1")) {
             throw new Error("App updates require a Guest rebuild with replacement-admission-v1");
@@ -666,7 +716,6 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
             candidate,
             launch,
             packageDigest: snapshot.packageDigest,
-            ...(previousInstanceId === undefined ? {} : { previousInstanceId }),
             retention: this.#artifacts.retain(candidate.artifact),
             state: "prepared",
           };
@@ -756,12 +805,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   async startUi(spec: CapsuleUiSpec): Promise<CapsuleUiInstance> {
     const prepared = await this.prepareUi(spec);
-    return await this.#commitCompatibilityPreparation(prepared);
+    return await this.#adoptPreparedUi(prepared);
   }
 
   async replaceUi(instanceId: string, spec: CapsuleUiSpec): Promise<CapsuleUiInstance> {
     const prepared = await this.prepareUi(spec, instanceId);
-    return await this.#commitCompatibilityPreparation(prepared);
+    return await this.#adoptPreparedUi(prepared);
   }
 
   openUiStream(instanceId: string): Promise<Duplex> {
@@ -775,7 +824,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       const instance = this.#instances.get(instanceId)
         ?? this.#preparedInstances.get(instanceId)?.candidate;
       if (!instance) throw new Error("App Capsule UI instance is no longer active or prepared");
-      if (!("port" in instance.spec)) throw new Error("Job workloads have no viewer");
+      if (!("port" in instance.spec)) throw new Error("Background workloads have no viewer");
       if (instance.terminalError) throw instance.terminalError;
       if (instance.viewerStreams.size >= CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE) {
         throw new CapsuleViewerCapacityError("App viewer connection limit reached");
@@ -844,7 +893,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     const preparations = [...this.#preparedUi.values()]
       .filter((prepared) => prepared.candidate.appId === appId);
     for (const prepared of preparations) await this.#abortPreparation(prepared);
-    const records = [...this.#instances.values()].filter((record) => record.appId === appId && (!uiOnly || !record.job));
+    const records = [...this.#instances.values()].filter((record) => record.appId === appId && (!uiOnly || !record.completion));
     if (records.length > 0) {
       const boot = await this.#requireCurrentBoot(records[0]!.bootGeneration);
       for (const record of records) {
@@ -1341,7 +1390,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   async #resolveArtifact(
     release: LoadedCapsuleGuestRelease,
-    spec: CapsuleUiSpec | CapsuleJobSpec,
+    spec: CapsuleUiSpec | CapsuleJobSpec | CapsuleServiceSpec,
     snapshot: CapsuleTreeSnapshot,
     signal: AbortSignal,
     launch: LaunchCapacity,
@@ -1430,7 +1479,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   async #assertSnapshotManifestAuthority(
     snapshot: CapsulePackageSnapshot,
-    spec: CapsuleUiSpec | CapsuleJobSpec,
+    spec: CapsuleUiSpec | CapsuleJobSpec | CapsuleServiceSpec,
   ): Promise<void> {
     if (
       !/^activation_[A-Za-z0-9_-]{32}$/.test(spec.activationId)
@@ -1455,7 +1504,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   async #buildArtifact(
     boot: BootBoundary,
-    spec: CapsuleUiSpec | CapsuleJobSpec,
+    spec: CapsuleUiSpec | CapsuleJobSpec | CapsuleServiceSpec,
     snapshot: CapsuleTreeSnapshot,
     installDigest: `sha256:${string}`,
     input: ArtifactBuildInput,
@@ -1948,11 +1997,12 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   async #launchCandidate(
     boot: BootBoundary,
-    spec: CapsuleUiSpec | CapsuleJobSpec,
+    spec: CapsuleUiSpec | CapsuleJobSpec | CapsuleServiceSpec,
     resolved: ResolvedArtifact,
     storagePlan: CapsuleRuntimeStoragePlan,
     signal: AbortSignal,
     launch: LaunchCapacity,
+    output?: CapsuleOutputSink,
   ): Promise<Candidate> {
     throwIfAborted(signal);
     if (boot.capacity && !launch.boot) {
@@ -1966,12 +2016,23 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     const { artifact } = resolved;
     throwIfAborted(signal);
     const ownerKey = hashAppId(spec.appId);
-    const appHandle = this.#dependencies.opaqueId();
+    // Workloads of an exact package activation share the Guest's App root and
+    // private loopback. A sequential replacement prepares its own filesystem
+    // aggregate before retiring the previous UI.
+    const shared = !launch.previous ? [...this.#workloads.values()].reverse().find(record =>
+      record.appId === spec.appId && record.bootGeneration === boot.generation &&
+      record.lifecycle === "active" && !record.terminalError &&
+      record.spec.version === spec.version && record.spec.packageDigest === spec.packageDigest &&
+      record.spec.manifestDigest === spec.manifestDigest && record.artifact.digest === artifact.digest &&
+      ("serviceId" in spec || [...this.#workloads.values()].some(peer => peer.appHandle === record.appHandle && "serviceId" in peer.spec)))
+      : undefined;
+    const appHandle = shared?.appHandle ?? this.#dependencies.opaqueId();
     const workloadHandle = this.#dependencies.opaqueId();
     const instanceId = this.#dependencies.opaqueId();
-    const namespaceBase = this.#allocateNamespace();
+    const namespaceBase = shared?.userNamespaceBase ?? this.#allocateNamespace();
     let detachSystemStream: (() => void) | undefined;
     let detachAppCliStream: (() => void) | undefined;
+    let logsStream: Duplex | undefined;
     const candidate: Candidate = {
       instanceId,
       appId: spec.appId,
@@ -1986,16 +2047,18 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       detachSystemStream: () => {
         detachSystemStream?.();
         detachAppCliStream?.();
+        clearTimeout(candidate.authorityLossTimer);
+        logsStream?.destroy();
       },
       viewerStreams: new Set(),
       lifecycle: "launching",
       activated: false,
-      ...("jobId" in spec ? { job: Promise.withResolvers<void>() } : {}),
+      ...(!("port" in spec) ? { completion: Promise.withResolvers<void>() } : {}),
     };
-    void candidate.job?.promise.catch(() => {});
-    let artifactBlobHandle: string;
+    void candidate.completion?.promise.catch(() => {});
+    let artifactBlobHandle: string | undefined;
     try {
-      artifactBlobHandle = await this.#importBlob(
+      if (!shared) artifactBlobHandle = await this.#importBlob(
         boot,
         ownerKey,
         "artifact",
@@ -2006,28 +2069,30 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     } catch (error) {
       // No Guest resource has observed this userns range yet. Unlike a Build
       // range, it is safe to reuse after the exact import cleanup completes.
-      this.#releaseNamespace(namespaceBase);
+      if (!shared) this.#releaseNamespace(namespaceBase);
       throw error;
     }
     this.#workloads.set(workloadHandle, candidate);
-    let appPrepared = false;
+    let appPrepared = !!shared;
     try {
-      const reserveApp = () => boot.session.request("app.prepare", {
-        ownerKey,
-        appHandle,
-        artifactDigest: artifact.digest,
-        artifactBytes: artifact.bytes,
-        artifactBlobHandle,
-        mappedHostUid: namespaceBase,
-        mappedHostGid: namespaceBase,
-        storagePlanVersion: storagePlan.version,
-        scratchBytes: storagePlan.scratchBytes,
-      });
-      const appResult = boot.capacity
-        ? await boot.capacity.withDiskAdmission(storagePlan.scratchBytes, reserveApp)
-        : await reserveApp();
-      this.#parseGuestResult(boot, parseAppPrepareResult, appResult);
-      appPrepared = true;
+      if (!shared) {
+        const reserveApp = () => boot.session.request("app.prepare", {
+          ownerKey,
+          appHandle,
+          artifactDigest: artifact.digest,
+          artifactBytes: artifact.bytes,
+          artifactBlobHandle: artifactBlobHandle!,
+          mappedHostUid: namespaceBase,
+          mappedHostGid: namespaceBase,
+          storagePlanVersion: storagePlan.version,
+          scratchBytes: storagePlan.scratchBytes,
+        });
+        const appResult = boot.capacity
+          ? await boot.capacity.withDiskAdmission(storagePlan.scratchBytes, reserveApp)
+          : await reserveApp();
+        this.#parseGuestResult(boot, parseAppPrepareResult, appResult);
+        appPrepared = true;
+      }
 
       const sdkTicket = boot.session.issueTicket({
         kind: "sdk",
@@ -2041,23 +2106,27 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         subjectHandle: workloadHandle,
         ttlMs: TICKET_TTL_MS,
       });
+      const logsTicket = output ? boot.session.issueTicket({
+        kind: "logs", appHandle, subjectHandle: workloadHandle, ttlMs: TICKET_TTL_MS,
+      }) : undefined;
       const workloadPrepareBody: RequestBodyFor<"workload.prepare"> = {
         memoryProfile: launch.memoryProfile,
         ...(boot.capacity ? { launchKey: launch.key } : {}),
         appHandle,
         workloadHandle,
-        workloadKind: "jobId" in spec ? "job" : "ui",
+        workloadKind: "jobId" in spec ? "job" : "serviceId" in spec ? "service" : "ui",
         argv: [...spec.command],
         cwd: "/app",
         environment: {},
         sdkTicket: sdkTicket.ticket,
         cliTicket: cliTicket.ticket,
+        ...(logsTicket ? { logsTicket: logsTicket.ticket } : {}),
         ...("port" in spec ? { uiPort: spec.port } : {}),
       };
       const workloadResult = await boot.session.request(
         "workload.prepare",
         workloadPrepareBody,
-        { revokeTicketsOnFailure: [sdkTicket.ticket, cliTicket.ticket] },
+        { revokeTicketsOnFailure: [sdkTicket.ticket, cliTicket.ticket, ...(logsTicket ? [logsTicket.ticket] : [])] },
       );
       const initialPrepare = this.#parseGuestResult(
         boot,
@@ -2070,11 +2139,25 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         throw error;
       }
       const sdk = await boot.session.openDataStream(sdkTicket.ticket, "sdk");
+      // Capture ownership before the next attachment can fail.
+      detachSystemStream = () => sdk.stream.destroy();
       const cli = await boot.session.openDataStream(cliTicket.ticket, "cli");
+      detachAppCliStream = () => cli.stream.destroy();
+      if (logsTicket) {
+        logsStream = (await boot.session.openDataStream(logsTicket.ticket, "logs")).stream;
+        candidate.logsDrained = new Promise<void>(resolve => {
+          logsStream!.once("end", resolve);
+          logsStream!.once("close", resolve);
+          logsStream!.once("error", () => resolve());
+        });
+        logsStream.on("data", (chunk: Buffer) => { try { output?.(chunk); } catch {} });
+        logsStream.on("error", () => {});
+        logsStream.resume();
+      }
       detachAppCliStream = this.#options.appCliStreamServer.attach({
         kind: "app",
         appId: spec.appId,
-        workload: "jobId" in spec ? `job:${spec.jobId}` : "ui",
+        workload: "jobId" in spec ? `job:${spec.jobId}` : "serviceId" in spec ? `service:${spec.serviceId}` : "ui",
         appCommit: spec.version,
         writeTables: [...spec.writeTables],
         fileGrants: [...spec.fileGrants],
@@ -2088,6 +2171,11 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           { onClose: (error) => {
             sdkClosed = error ?? new Error("System SDK stream closed before UI readiness");
             reject(sdkClosed);
+            // Guest closes SDK before publishing authenticated exit. Allow
+            // that cross-stream ordering, then treat missing outcome as loss.
+            if (candidate.completion && !candidate.terminalObserved && candidate.lifecycle !== "stopping" && candidate.lifecycle !== "lost") {
+              candidate.authorityLossTimer = setTimeout(() => candidate.completion!.reject(sdkClosed!), 2000);
+            }
           } },
         );
       });
@@ -2105,13 +2193,42 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       );
 
       candidate.startupDeadlineMs = performance.now() + RUNTIME_STARTUP_TIMEOUT_MS;
+      throwIfAborted(signal);
+      if ("port" in spec) {
+        const previous = launch.previous;
+        if (previous) {
+          candidate.startupDeadlineMs = performance.now() + UI_HANDOFF_TIMEOUT_MS;
+          const timeout = new AbortController();
+          launch.handoffTimer = setTimeout(() => timeout.abort(new Error("UI handoff timed out after 15 seconds")), UI_HANDOFF_TIMEOUT_MS);
+          launch.handoffTimer.unref();
+          const handoffSignal = AbortSignal.any([signal, timeout.signal]);
+          this.#launchCleanupFailures.set(handoffSignal, this.#launchCleanupFailures.get(signal)!);
+          signal = handoffSignal;
+          const retireViewer = Promise.resolve().then(() => launch.onHandoff?.(candidate.startupDeadlineMs!));
+          void retireViewer.catch(() => {});
+          // Even after cancellation, join exact process-tree cleanup. No next UI
+          // may start until this obligation is confirmed.
+          try { await this.#stopRecord(previous, boot); }
+          catch (error) {
+            this.#recordLaunchCleanupFailure(signal, error);
+            await this.#loseBoundary(error, boot);
+            throw error;
+          }
+          this.#instances.delete(previous.instanceId);
+          await raceAbort(retireViewer, signal);
+          throwIfAborted(signal);
+        }
+        if ([...this.#workloads.values()].some(record => record !== candidate && record.appId === spec.appId && "port" in record.spec)) {
+          throw new Error("App already owns a UI workload or pending cleanup");
+        }
+      }
       if (sdkClosed) throw sdkClosed;
       if ("port" in spec) {
         const ready = this.#waitForWorkloadReady(boot, appHandle, workloadHandle, spec.port, signal,
           Math.max(1, Math.floor(candidate.startupDeadlineMs - performance.now())));
         try {
-          const started = await boot.session.request("workload.start", { appHandle, workloadHandle,
-            startupTimeoutMs: Math.max(1, Math.floor(candidate.startupDeadlineMs - performance.now())) });
+          const started = await raceAbort(boot.session.request("workload.start", { appHandle, workloadHandle,
+            startupTimeoutMs: Math.max(1, Math.floor(candidate.startupDeadlineMs - performance.now())) }), signal);
           this.#parseGuestResult(boot, parseWorkloadStartResult, started);
           await Promise.race([ready.promise, sdkClosure]);
         } catch (error) { ready.cancel(asError(error)); throw error; }
@@ -2126,8 +2243,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       throwIfAborted(signal);
       return candidate;
     } catch (error) {
-      detachSystemStream?.();
-      detachAppCliStream?.();
+      candidate.detachSystemStream();
       candidate.lifecycle = "stopping";
       if (!appPrepared) {
         let releasedBeforePrepare = false;
@@ -2135,7 +2251,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
           releasedBeforePrepare = await this.#releaseImportedBlob(
             boot,
             ownerKey,
-            artifactBlobHandle,
+            artifactBlobHandle!,
             "artifact",
             artifact,
           );
@@ -2156,10 +2272,13 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         // response failed. Fall through to authoritative aggregate teardown.
       }
       try {
-        const stopped = await boot.session.request("app.stop", { appHandle });
-        this.#parseGuestResult(boot, parseAppStopResult, stopped);
-        this.#releaseNamespace(namespaceBase);
-        this.#workloads.delete(workloadHandle);
+        if (shared) await this.#stopRecord(candidate, boot);
+        else {
+          const stopped = await boot.session.request("app.stop", { appHandle });
+          this.#parseGuestResult(boot, parseAppStopResult, stopped);
+          this.#releaseNamespace(namespaceBase);
+          this.#workloads.delete(workloadHandle);
+        }
       } catch (cleanupError) {
         this.#recordLaunchCleanupFailure(signal, cleanupError);
         await this.#loseBoundary(cleanupError, boot);
@@ -2190,138 +2309,21 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       throw error;
     }
 
-    const previous = prepared.previousInstanceId === undefined
-      ? undefined
-      : this.#instances.get(prepared.previousInstanceId);
-    if (prepared.previousInstanceId !== undefined && !previous) {
-      await this.#abortPreparation(prepared, undefined, signal);
-      throw new Error("Prepared replacement no longer owns its previous UI generation");
-    }
-    if (previous && (
-      previous.appId !== candidate.appId
-      || previous.bootGeneration !== candidate.bootGeneration
-    )) {
-      await this.#abortPreparation(prepared, undefined, signal);
-      throw new Error("Prepared replacement previous UI authority changed");
-    }
-
     let activation: ActivationCheckpoint | undefined;
     try {
       activation = await this.#activateCandidate(candidate, prepared.packageDigest, boot, signal);
       throwIfAborted(signal);
+      if (performance.now() >= candidate.startupDeadlineMs!) throw new Error("Runtime startup budget exhausted");
+      this.#publishCandidate(candidate);
+      this.#latestActivationSequenceByApp.set(candidate.appId, candidate.spec.activationSequence);
+      await this.#finishPreparation(prepared, { decision: "committed", instanceId: candidate.instanceId });
+      return { instanceId: candidate.instanceId };
     } catch (error) {
       return await this.#failPreparedCommit(prepared, boot, error, activation, signal);
     }
-
-    if (!previous) {
-      try {
-        this.#publishCandidate(candidate);
-        this.#latestActivationSequenceByApp.set(
-          candidate.appId,
-          candidate.spec.activationSequence,
-        );
-        await this.#finishPreparation(prepared, {
-          decision: "committed",
-          instanceId: candidate.instanceId,
-        });
-        return { instanceId: candidate.instanceId };
-      } catch (error) {
-        return await this.#failPreparedCommit(prepared, boot, error, activation, signal);
-      }
-    }
-
-    if (
-      this.#instances.get(previous.instanceId) !== previous
-      || previous.lifecycle !== "active"
-      || previous.terminalError
-    ) {
-      return await this.#failPreparedCommit(
-        prepared,
-        boot,
-        previous.terminalError
-          ?? new Error("Prepared replacement lost its previous UI generation during commit"),
-        activation,
-        signal,
-      );
-    }
-
-    candidate.lifecycle = "replacement";
-    try {
-      await this.#stopRecord(previous, boot);
-    } catch (error) {
-      this.#recordLaunchCleanupFailure(signal, error);
-      let rollbackError: unknown;
-      try {
-        await this.#rollbackCandidateActivation(candidate, activation, signal);
-      } catch (failure) {
-        rollbackError = failure;
-      }
-      try {
-        await this.#loseBoundary(error, boot);
-      } finally {
-        await this.#finishPreparation(prepared, { decision: "aborted" });
-      }
-      if (rollbackError !== undefined) {
-        throw new AggregateError(
-          [error, rollbackError],
-          "Previous UI retirement and activation rollback both failed",
-        );
-      }
-      throw error;
-    }
-
-    this.#instances.delete(previous.instanceId);
-    // A stop during the confirmed previous-UI teardown only discards this
-    // candidate; it does not invalidate the shared VM or unrelated Apps.
-    if (signal?.aborted) {
-      return await this.#failPreparedCommit(prepared, boot, abortError(signal), activation, signal);
-    }
-    if (candidate.terminalError) {
-      // The prior Runtime is already gone. Reuse the existing loss notification
-      // so Manager/Main retire its browser authority instead of retaining a
-      // viewer for a dead generation when this candidate is discarded.
-      try {
-        this.#uiLostHandler?.({ instanceId: previous.instanceId, appId: previous.appId, error: candidate.terminalError });
-      } catch (error) {
-        await this.#loseBoundary(error, boot);
-        throw error;
-      }
-      return await this.#failPreparedCommit(prepared, boot, candidate.terminalError, activation, signal);
-    }
-    try {
-      this.#publishCandidate(candidate);
-      this.#latestActivationSequenceByApp.set(
-        candidate.appId,
-        candidate.spec.activationSequence,
-      );
-      await this.#finishPreparation(prepared, {
-        decision: "committed",
-        instanceId: candidate.instanceId,
-      });
-      return { instanceId: candidate.instanceId };
-    } catch (error) {
-      let rollbackError: unknown;
-      try {
-        await this.#rollbackCandidateActivation(candidate, activation, signal);
-      } catch (failure) {
-        rollbackError = failure;
-      }
-      try {
-        await this.#loseBoundary(error, boot);
-      } finally {
-        await this.#finishPreparation(prepared, { decision: "aborted" });
-      }
-      if (rollbackError !== undefined) {
-        throw new AggregateError(
-          [error, rollbackError],
-          "Replacement publication and activation rollback both failed",
-        );
-      }
-      throw error;
-    }
   }
 
-  async #commitCompatibilityPreparation(
+  async #adoptPreparedUi(
     prepared: CapsuleUiPreparation,
   ): Promise<CapsuleUiInstance> {
     try {
@@ -2415,6 +2417,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   async #releaseLaunchCapacity(launch: LaunchCapacity, signal?: AbortSignal): Promise<void> {
+    if (launch.handoffTimer) clearTimeout(launch.handoffTimer);
     try {
       if (launch.boot?.capacity && !launch.boot.intentional) await launch.boot.capacity.releaseLaunch(launch.key);
       launch.boot = undefined;
@@ -2434,6 +2437,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   #completePreparation(prepared: PreparedUiRecord, outcome: PreparedUiOutcome): void {
+    if (prepared.launch.handoffTimer) clearTimeout(prepared.launch.handoffTimer);
     if (prepared.expires) clearTimeout(prepared.expires);
     prepared.launch.releaseBuild?.();
     prepared.launch.releaseBuild = undefined;
@@ -2556,6 +2560,10 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   async #discardCandidate(candidate: Candidate, boot: BootBoundary): Promise<void> {
+    if ([...this.#workloads.values()].some(peer => peer !== candidate && peer.appHandle === candidate.appHandle)) {
+      await this.#stopRecord(candidate, boot);
+      return;
+    }
     candidate.lifecycle = "stopping";
     for (const stream of candidate.viewerStreams) stream.destroy();
     candidate.viewerStreams.clear();
@@ -2568,7 +2576,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
 
   async #stopRecord(record: UiRecord, boot: BootBoundary): Promise<void> {
     record.lifecycle = "stopping";
-    record.job?.reject(new Error("Job stopped"));
+    record.completion?.reject(new Error("Workload stopped"));
     const failures: unknown[] = [];
     for (const stream of record.viewerStreams) stream.destroy();
     record.viewerStreams.clear();
@@ -2581,6 +2589,14 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       this.#parseGuestResult(boot, parseWorkloadStopResult, result);
     } catch (error) {
       failures.push(error);
+    }
+    // The exact workload stop must finish before another owner can release
+    // the aggregate. Keep this reference on failed cleanup.
+    if ([...this.#workloads.values()].some(peer => peer !== record && peer.appHandle === record.appHandle)) {
+      record.detachSystemStream();
+      if (failures.length) throw new AggregateError(failures, `Could not stop workload ${record.instanceId}`);
+      this.#workloads.delete(record.workloadHandle);
+      return;
     }
     try {
       const result = await boot.session.request("app.stop", { appHandle: record.appHandle });
@@ -2621,15 +2637,17 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     if (record.bootGeneration !== boot.generation) {
       this.#loseBoundaryInBackground(new Error("Job terminal event crossed VM generations"), boot); return;
     }
-    if (record.job) {
+    if (record.completion) {
+      record.terminalObserved = true;
+      clearTimeout(record.authorityLossTimer);
       try {
         if (event.type === "workload.faulted") {
           const fault = correlateWorkloadFaultedEvent(event, record);
-          record.job.reject(new GuestOperationError(`Guest job faulted: ${fault.message}`));
+          record.completion.reject(new GuestOperationError(`Guest job faulted: ${fault.message}`));
         } else {
           const exit = correlateWorkloadExitedEvent(event, record);
-          if (exit.exitCode === 0 && !exit.signal) record.job.resolve();
-          else record.job.reject(new GuestOperationError(`Guest job exited (${exit.exitCode ?? exit.signal ?? "unknown"})`));
+          if (exit.exitCode === 0 && !exit.signal && !("serviceId" in record.spec)) record.completion.resolve();
+          else record.completion.reject(new GuestOperationError(`Guest ${"serviceId" in record.spec ? "service" : "job"} exited (${exit.exitCode ?? exit.signal ?? "unknown"})`));
         }
       } catch (error) { this.#loseBoundaryInBackground(asError(error), boot); }
       return;
@@ -2659,7 +2677,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       return;
     }
     if (record.lifecycle === "stopping" || record.lifecycle === "lost") return;
-    if (record.job) { record.job.reject(terminalError); return; }
+    if (record.completion) { record.completion.reject(terminalError); return; }
     record.terminalError = terminalError;
     if (record.lifecycle === "launching") return;
     if (record.lifecycle === "prepared") {
@@ -2694,10 +2712,6 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
       }).catch((error) => this.#loseBoundaryInBackground(error, boot));
       return;
     }
-    // Commit already owns the previous-UI retirement. Its next authority check
-    // observes terminalError and discards this candidate after verified cleanup.
-    if (record.lifecycle === "replacement") return;
-
     record.lifecycle = "lost";
     this.#instances.delete(record.instanceId);
     let notificationError: unknown;
@@ -2722,10 +2736,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     }
     void this.#serial.runCritical(async () => {
       try {
-        const result = await boot.session.request("app.stop", { appHandle: record.appHandle });
-        this.#parseGuestResult(boot, parseAppStopResult, result);
-        this.#releaseNamespace(record.userNamespaceBase);
-        this.#workloads.delete(record.workloadHandle);
+        await this.#stopRecord(record, boot);
       } catch (error) {
         await this.#loseBoundary(error, boot);
       }
@@ -3076,7 +3087,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     const boot = expected ?? this.#boot;
     if (boot) boot.intentional = true;
     for (const instance of new Set([...this.#instances.values(), ...this.#workloads.values()])) {
-      instance.job?.reject(failure);
+      instance.completion?.reject(failure);
       instance.detachSystemStream();
       for (const stream of instance.viewerStreams) stream.destroy();
       instance.viewerStreams.clear();
@@ -3149,7 +3160,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
   }
 
   #liveRuntimeStorageLeases(): CapsuleLiveRuntimeStorageLease[] {
-    return [...new Set(this.#workloads.values())].map((record) => ({
+    return [...new Map([...this.#workloads.values()].map(record => [record.appHandle, record])).values()].map((record) => ({
       artifact: retainedArtifact(record.artifact),
       scratchBytes: createCapsuleRuntimeStoragePlan(record.artifact.bytes).scratchBytes,
     }));
@@ -3219,7 +3230,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     return queue;
   }
 
-  #withWorkloadOperation<T>(appId: string, kind: "ui" | "job", operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  #withWorkloadOperation<T>(appId: string, kind: "ui" | "job" | "service", operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const controller = new AbortController();
     const cleanupFailures: unknown[] = [];
     this.#launchCleanupFailures.set(controller.signal, cleanupFailures);
@@ -3259,7 +3270,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     return (await Promise.all(operations)).flat();
   }
 
-  #stopAppWork(appId: string, reason: string, operation: () => Promise<void>, kind?: "ui" | "job"): Promise<void> {
+  #stopAppWork(appId: string, reason: string, operation: () => Promise<void>, kind?: "ui" | "job" | "service"): Promise<void> {
     const previous = this.#appStops.get(appId);
     const pendingWork = [...this.#operations.get(appId)?.values() ?? []]
       .filter(entry => kind === undefined || entry.kind === kind).map(entry => entry.completion);
@@ -3282,7 +3293,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     return stopping;
   }
 
-  #abortOperations(appId: string, reason: string | Error, kind?: "ui" | "job"): void {
+  #abortOperations(appId: string, reason: string | Error, kind?: "ui" | "job" | "service"): void {
     for (const [controller, entry] of this.#operations.get(appId) ?? []) {
       if (kind === undefined || entry.kind === kind) controller.abort(typeof reason === "string" ? new Error(reason) : reason);
     }
@@ -3292,7 +3303,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
     for (const appId of this.#operations.keys()) this.#abortOperations(appId, reason);
   }
 
-  #assertAcceptingWork(appId?: string, kind: "ui" | "job" = "ui"): void {
+  #assertAcceptingWork(appId?: string, kind: "ui" | "job" | "service" = "ui"): void {
     if (this.#terminalFailure) throw this.#terminalFailure;
     if (this.#stoppingAll) throw new Error("Capsule backend is stopping");
     if (this.#fatalCleanup) throw new Error("Capsule boundary recovery is still in progress");

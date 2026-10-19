@@ -79,6 +79,7 @@ export type SupervisorEvent =
   | { type: "workload.started"; appHandle: string; workloadHandle: string }
   | { type: "workload.ready"; appHandle: string; workloadHandle: string }
   | { type: "workload.stop"; appHandle: string; workloadHandle: string }
+  | { type: "workload.cleaned"; appHandle: string; workloadHandle: string }
   | {
     type: "workload.exited";
     appHandle: string;
@@ -219,6 +220,14 @@ export function transitionSupervisor(
       const { app, workload } = requireWorkload(state, event, event.appHandle, event.workloadHandle);
       if (workload.status === "stopping" || isTerminalWorkload(workload.status)) return state;
       return withWorkload(state, app, { ...workload, status: "stopping" });
+    }
+
+    case "workload.cleaned": {
+      const { app, workload } = requireWorkload(state, event, event.appHandle, event.workloadHandle);
+      requireWorkloadStatus(workload, event, ["exited", "faulted"]);
+      const workloads = { ...app.workloads };
+      delete workloads[event.workloadHandle];
+      return withApp(state, { ...app, workloads });
     }
 
     case "workload.exited": {

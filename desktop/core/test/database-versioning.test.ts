@@ -64,7 +64,7 @@ describe("greenfield data.db and system.db V1 schemas", () => {
     expect(sha256(DATA_SCHEMA_V1))
       .toBe("0dad836ef5969c2dc2eb71202881ca802281de079ec73866a62dfa19c5ed0979");
     expect(sha256(SYSTEM_SCHEMA_V1))
-      .toBe("7e1403f55c2dcd25c55481d45a8f746350b72419c766a3d3e194d3bfd1ae09c4");
+      .toBe("6f4e31067ec77f6f7e4ff186751e7dbafb5d172a91d653afdec1a665dc2aee35");
   });
 
   test("persists current Marketplace Connector release metadata across restart", () => {

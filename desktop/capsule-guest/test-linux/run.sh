@@ -95,6 +95,7 @@ enable_controllers "$workload_cgroup_parent_b"
 # The App joins one pinned, loopback-only network namespace. There is no veth,
 # host namespace, or raw network fallback available to the workload.
 mkdir -p /run/netns /run/lamarck/netns
+/usr/local/libexec/lamarck-network-regression
 ip netns add "$app_key"
 named_network_namespace=1
 ip -n "$app_key" link set lo up

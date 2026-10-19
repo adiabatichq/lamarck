@@ -37,11 +37,21 @@ static int valid_netns_path(const char *path) {
   size_t prefix = strlen(NETNS_PREFIX);
   if (strncmp(path, NETNS_PREFIX, prefix) != 0 || strlen(path) != prefix + 34) return 0;
   const char *key = path + prefix;
-  if (!((key[0] == 'a' || key[0] == 'b') && key[1] == '-')) return 0;
+  if (!((key[0] == 'a' || key[0] == 'b' || key[0] == 'n') && key[1] == '-')) return 0;
   for (const char *cursor = key + 2; *cursor; cursor++) {
     if (!((*cursor >= '0' && *cursor <= '9') || (*cursor >= 'a' && *cursor <= 'f'))) return 0;
   }
   return 1;
+}
+
+/* Pin another reference to an App-private network. No workload or filesystem
+ * aggregate owns the namespace exclusively. Only the supervisor calls this. */
+static int share_namespace(const char *path, const char *source) {
+  if (!valid_netns_path(path) || !valid_netns_path(source)) return 1;
+  int fd = open(path, O_CREAT | O_EXCL | O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (fd < 0) return 1;
+  close(fd);
+  return mount(source, path, NULL, MS_BIND, NULL) == 0 ? 0 : 1;
 }
 
 static int parse_port(const char *value) {
@@ -386,6 +396,7 @@ static int probe_namespace(const char *path, const char *port_value, const char 
 
 int main(int argc, char **argv) {
   if (geteuid() != 0) return 1;
+  if (argc == 4 && strcmp(argv[1], "share") == 0) return share_namespace(argv[2], argv[3]);
   if (argc == 3 && strcmp(argv[1], "create") == 0) return create_namespace(argv[2]);
   if (argc == 3 && strcmp(argv[1], "delete") == 0) return delete_namespace(argv[2]);
   if (argc == 4 && strcmp(argv[1], "proxy") == 0) return proxy_namespace(argv[2], argv[3]);
