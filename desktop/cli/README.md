@@ -12,6 +12,48 @@ Core token, gateway token, Workspace selector, or managed socket path.
 
 Use `lamarck --help` for the complete local command surface.
 
+## App runtime management
+
+Host CLI and Console use the same App/Service enablement and workload cleanup:
+
+```sh
+lamarck app inspect <app-id> --json
+lamarck app enable <app-id> --json
+lamarck app disable <app-id> --json
+lamarck app service enable <app-id> <service-id> --json
+lamarck app service disable <app-id> <service-id> --json
+lamarck app activity <app-id> --json
+```
+
+Discover App and Service IDs with `app list` and `app inspect`. Host inspection
+adds `runtime.enabled`, UI state, per-Service policy/state, active Job run IDs,
+and failure/cleanup information. Unknown enablement is null. Enablement is a
+setting; it does not prove a process is ready or running.
+
+Disabling an App fences new UI/Service/Job launches and waits for existing
+workload and viewer cleanup. Individual Service settings and Trigger history
+are preserved. Enabling restores individually enabled Services while the Host
+is active; it does not open UI, create a Job invocation or replay missed work.
+A Service toggle affects only that Service and never enables its parent App.
+A failed command may have persisted its setting without confirming cleanup;
+inspect before retrying. Runtime mutations allow up to 60 seconds for the
+existing lifecycle operation; a timeout does not cancel or roll it back.
+
+`app activity` returns existing sanitized temporary Service/Job diagnostics,
+with at most eight retained records per App, retained for up to an hour after
+completion and lost on Host restart. Each CLI record keeps a UTF-8 output tail
+of at most 64 KiB; `droppedBytes` includes omitted output. Empty activity is not
+proof that no execution occurred. Persistent Job history belongs to
+`trigger runs`; cancel a pending or running Job with `trigger cancel <run-id>`.
+There is no additional Job launch/retry/replay command.
+
+These controls and diagnostics are Host-only. Managed workloads retain their
+existing App editing commands and aggregate running read. CLI help labels
+commands `[read]`, `[write]`, or `[read/write]`; the last applies to the mixed
+file command family. Labels describe effects and do not grant permissions.
+Both the CLI package and running Desktop must support a new command; upgrading
+only the npm package cannot add Host behavior. Protocol and schema remain v1.
+
 ## Triggers
 
 Host CLI and Console share validation, storage, scheduling, and execution history.

@@ -93,6 +93,15 @@ describe("public CLI shape projectors", () => {
     expect(JSON.stringify(invalid)).not.toContain("parse failure");
   });
 
+  test("projects explicit Host enablement without assuming a stopped App is disabled", () => {
+    const disabled = projectAppShape(appInventory({}), false, "/host/apps/example", false);
+    expect(disabled.runtime).toEqual({ running: false, enabled: false });
+    expect(projectAppSummary(disabled).runtime).toEqual(disabled.runtime);
+    const enabled = projectAppShape(appInventory({}), false, "/host/apps/example", true);
+    expect(enabled.runtime).toEqual({ running: false, enabled: true });
+    expect(projectAppShape(appInventory({}), false, "/mnt/lamarck-apps/example").runtime).toEqual({ running: false });
+  });
+
   test("publishes releaseId only for the exact current Official package", () => {
     const base = {
       connectorId: "lamarck.calendar", name: "Calendar", description: "Calendar events",

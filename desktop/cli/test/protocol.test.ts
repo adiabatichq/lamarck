@@ -100,3 +100,22 @@ test("Trigger wire requests reject operational state and invalid preview/revisio
   for (const [operation, input] of [["trigger.list", { source: "forged" }], ["trigger.update", { triggerId: "t", config: {}, revision: 0 }], ["trigger.preview", { triggerId: "t", config: {} }], ["trigger.preview", { config: {}, limit: 21 }], ["trigger.runs", { triggerId: "t", limit: 501 }], ["trigger.cancel", { runId: "r", appId: "forged" }]]) expect(() => parseCliRequest({ requestId: "test", operation, input })).toThrow();
   expect(parseCliRequest({ requestId: "test", operation: "trigger.create", input: { config: { condition: { kind: "schedule", cron: "* * * * *", timezone: "UTC" } } } }).operation).toBe("trigger.create");
 });
+
+
+test("App runtime V1 inputs accept selectors only and never grant managed administration", () => {
+  for (const operation of ["app.enable", "app.disable", "app.service.enable", "app.service.disable", "app.activity"] as const) {
+    const input = operation.startsWith("app.service.") ? { appId: "notes.app-", serviceId: "sync-" } : { appId: "notes.app-" };
+    expect(parseCliRequest({ requestId: "runtime", operation, input })).toMatchObject({ operation, input });
+    expect(HOST_CLI_OPERATIONS).toContain(operation);
+    expect(MANAGED_CLI_OPERATIONS).not.toContain(operation);
+    for (const extra of [{ enabled: true }, { principal: "system" }, { executionId: "other-app" }]) {
+      expect(() => parseCliRequest({ requestId: "runtime", operation, input: { ...input, ...extra } })).toThrow();
+    }
+    for (const appId of ["../notes", "a/b", "--json", "", "UPPER"]) {
+      expect(() => parseCliRequest({ requestId: "runtime", operation, input: { ...input, appId } })).toThrow();
+    }
+  }
+  for (const serviceId of ["sync.good", "../sync", null]) {
+    expect(() => parseCliRequest({ requestId: "runtime", operation: "app.service.enable", input: { appId: "notes", serviceId } })).toThrow();
+  }
+});

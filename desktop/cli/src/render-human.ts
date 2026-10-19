@@ -15,6 +15,10 @@ export function renderHuman(operation: CliOperation, value: unknown): string {
     case "connector.install": case "connector.update":
       return `${result.changed ? (operation === "connector.update" ? "Updated" : "Installed") : "Already current"} ${result.id} (${result.releaseId}).\n`;
     case "connector.remove": return `Removed Connector ${result.id}.\n`;
+    case "app.enable": return `Enabled App ${result.appId}.\n`;
+    case "app.disable": return `Disabled App ${result.appId}.\n`;
+    case "app.service.enable": return `Enabled Service ${result.appId}/${result.serviceId}.\n`;
+    case "app.service.disable": return `Disabled Service ${result.appId}/${result.serviceId}.\n`;
     case "app.create": return `Created App ${result.id}.\n`;
     case "app.save": return `${result.created ? "Saved" : "Unchanged at"} ${short(result.version)}.\n`;
     case "app.restore": return `${result.created ? "Restored as" : "Unchanged at"} ${short(result.version)}.\n`;
@@ -33,6 +37,7 @@ function summaryLine(operation: CliOperation, value: unknown): string {
   if (operation === "marketplace.list") return `${item.kind}\t${item.packageId}\t${item.displayName}\t${item.description}`;
   if (operation === "connector.list") return `${item.id}\t${item.name}\t${item.trust}\t${item.sourceCount} source(s)`;
   if (operation === "app.list") return `${item.id}\t${item.name ?? ""}\t${short((item.lifecycle as Record<string, unknown>)?.version)}`;
+  if (operation === "app.activity") return `${item.kind}:${item.workloadId}\t${item.executionId}\t${item.endedAt === null ? "active" : "ended"}${item.failure ? `\t${item.failure}` : ""}${item.droppedBytes ? `\t${item.droppedBytes} output bytes omitted` : ""}${item.output ? `\n${item.output}` : ""}`;
   if (operation === "app.versions") return `${short(item.version)}\t${item.trigger}\t${new Date(Number(item.createdAt)).toISOString()}${item.message ? `\t${item.message}` : ""}`;
   return JSON.stringify(value);
 }
@@ -41,6 +46,7 @@ function emptyMessage(operation: CliOperation): string {
   if (operation === "connector.list") return "No Connectors installed.\n";
   if (operation === "app.list") return "No Apps.\n";
   if (operation === "app.versions") return "No App versions.\n";
+  if (operation === "app.activity") return "No retained App activity.\n";
   return "[]\n";
 }
 function short(value: unknown): string { return typeof value === "string" ? value.slice(0, 12) : "unversioned"; }

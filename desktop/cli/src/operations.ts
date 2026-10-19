@@ -33,6 +33,11 @@ export const CLI_OPERATIONS = [
   "connector.remove",
   "app.list",
   "app.inspect",
+  "app.enable",
+  "app.disable",
+  "app.service.enable",
+  "app.service.disable",
+  "app.activity",
   "app.create",
   "app.save",
   "app.versions",
@@ -42,11 +47,14 @@ export const CLI_OPERATIONS = [
 ] as const;
 
 export type CliOperation = typeof CLI_OPERATIONS[number];
+export const HOST_APP_RUNTIME_OPERATIONS: readonly CliOperation[] = Object.freeze([
+  "app.enable", "app.disable", "app.service.enable", "app.service.disable", "app.activity",
+]);
 export const HOST_CLI_OPERATIONS: readonly CliOperation[] = Object.freeze(
   CLI_OPERATIONS.filter((operation) => operation !== "app.refresh"),
 );
 export const MANAGED_CLI_OPERATIONS: readonly CliOperation[] = Object.freeze(
-  CLI_OPERATIONS.filter((operation) => operation !== "file.import" && operation !== "file.export" && !operation.startsWith("trigger.")),
+  CLI_OPERATIONS.filter((operation) => operation !== "file.import" && operation !== "file.export" && !operation.startsWith("trigger.") && !HOST_APP_RUNTIME_OPERATIONS.includes(operation)),
 );
 export type JsonObject = { readonly [key: string]: unknown };
 
@@ -153,11 +161,62 @@ export interface AppShape {
     readonly manifestHealth: "valid" | "invalid";
     readonly versionHealth: "healthy" | "unversioned" | "unavailable";
   };
-  readonly runtime: { readonly running: boolean };
+  readonly runtime: {
+    readonly running: boolean;
+    /** Host inspection only. Null means the policy has not been observed. */
+    readonly enabled?: boolean | null;
+    readonly ui?: AppRuntimeState["ui"];
+    readonly stopping?: boolean;
+    readonly latestFailure?: string | null;
+    readonly services?: readonly AppServiceState[];
+    readonly jobs?: readonly AppActiveJob[];
+  };
   readonly path: string;
 }
 
 export type AppSummary = Pick<AppShape, "id" | "name" | "description" | "lifecycle" | "runtime" | "path">;
+
+/** Trusted Host management data, unavailable to managed workloads. */
+export interface AppActiveJob {
+  readonly runId: string;
+  readonly jobId: string;
+  readonly triggerId: string | null;
+  readonly state: "starting" | "running" | "stopping" | "cleanup-failed";
+  readonly cleanupError: string | null;
+}
+
+export interface AppServiceState {
+  readonly serviceId: string;
+  readonly enabled: boolean | null;
+  readonly state: "unconfigured" | "disabled" | "starting" | "running" | "stopping" | "backoff" | "cleanup-failed" | "stopped";
+  readonly executionId: string | null;
+  readonly restartAt: number | null;
+  readonly failure: string | null;
+}
+
+export interface AppRuntimeState {
+  readonly appId: string;
+  readonly enabled?: boolean;
+  readonly runningWorkloads: number;
+  readonly latestFailure: string | null;
+  readonly ui: "closed" | "starting" | "running" | "stopping";
+  readonly stopping: boolean;
+  readonly jobs: readonly AppActiveJob[];
+  readonly services?: readonly AppServiceState[];
+}
+
+export interface AppWorkloadDiagnostic {
+  readonly appId: string;
+  readonly kind: "service" | "job";
+  readonly workloadId: string;
+  readonly executionId: string;
+  readonly version: string | null;
+  readonly startedAt: number;
+  readonly endedAt: number | null;
+  readonly failure: string | null;
+  readonly output: string;
+  readonly droppedBytes: number;
+}
 
 export interface AppVersionRecord {
   readonly appId: string;
@@ -202,6 +261,11 @@ export interface CliOperationInputMap {
   "connector.remove": { readonly connectorId: string };
   "app.list": Record<string, never>;
   "app.inspect": { readonly appId: string };
+  "app.enable": { readonly appId: string };
+  "app.disable": { readonly appId: string };
+  "app.service.enable": { readonly appId: string; readonly serviceId: string };
+  "app.service.disable": { readonly appId: string; readonly serviceId: string };
+  "app.activity": { readonly appId: string };
   "app.create":
     | { readonly appId: string; readonly name: string; readonly description: string }
     | { readonly fromPackageId: string; readonly localId?: string };
@@ -269,6 +333,11 @@ export interface CliOperationResultMap {
   "connector.remove": { readonly id: string; readonly removed: true };
   "app.list": readonly AppSummary[];
   "app.inspect": AppShape;
+  "app.enable": { readonly appId: string; readonly enabled: true };
+  "app.disable": { readonly appId: string; readonly enabled: false };
+  "app.service.enable": { readonly appId: string; readonly serviceId: string; readonly enabled: true };
+  "app.service.disable": { readonly appId: string; readonly serviceId: string; readonly enabled: false };
+  "app.activity": readonly AppWorkloadDiagnostic[];
   "app.create": { readonly id: string; readonly created: true };
   "app.save": { readonly version: string; readonly created: boolean };
   "app.versions": readonly AppVersionRecord[];

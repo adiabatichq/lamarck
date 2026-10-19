@@ -1,6 +1,7 @@
 import { COMMAND_REGISTRY, helpText, operationAvailable } from "./command-registry.js";
 import { CliError } from "./errors.js";
 import type { CliEnvironment, CliOperation, CliOperationInput } from "./operations.js";
+import { HOST_APP_RUNTIME_OPERATIONS } from "./operations.js";
 
 export type ParsedCliCommand =
   | { readonly kind: "help"; readonly text: string }
@@ -87,8 +88,15 @@ export function parseCliArgs(argv: readonly string[], environment: CliEnvironmen
     const verb = args.shift();
     if (verb === "list") {
       noArgs(args, "app list"); operation = "app.list"; input = {};
-    } else if (verb === "inspect" || verb === "versions") {
+    } else if (verb === "inspect" || verb === "versions" || verb === "enable" || verb === "disable" || verb === "activity") {
+      requireNoOptions(args, `app ${verb}`);
       operation = `app.${verb}` as CliOperation; input = { appId: oneArg(args, `app ${verb}`) };
+    } else if (verb === "service") {
+      const action = args.shift();
+      if (action !== "enable" && action !== "disable") usage("app service requires enable or disable");
+      requireNoOptions(args, `app service ${action}`);
+      if (args.length !== 2 || args.some(value => !value)) usage(`app service ${action} requires an App id and Service id`);
+      operation = `app.service.${action}`; input = { appId: args[0], serviceId: args[1] };
     } else if (verb === "create" && args.includes("--from")) {
       const fromPackageId = removeValueFlag(args, "--from")!;
       const localId = removeValueFlag(args, "--as");
@@ -113,9 +121,13 @@ export function parseCliArgs(argv: readonly string[], environment: CliEnvironmen
     } else if (verb === "refresh" || verb === "archive") {
       confirmed = removeBooleanFlag(args, "--yes");
       operation = `app.${verb}` as CliOperation; input = { appId: oneArg(args, `app ${verb}`) };
-    } else usage("app requires list, inspect, create, save, versions, restore, refresh, or archive");
+    } else usage("app requires list, inspect, enable, disable, service, activity, create, save, versions, restore, refresh, or archive");
   } else usage(`unknown command: ${top}`);
 
+  if (HOST_APP_RUNTIME_OPERATIONS.includes(operation)) {
+    if (!/^[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*$/.test(String(input.appId))) usage("app requires a valid App id");
+    if (operation.startsWith("app.service.") && !/^[a-z0-9][a-z0-9-]*$/.test(String(input.serviceId))) usage("app service requires a valid Service id");
+  }
   if (!operationAvailable(operation, environment)) {
     throw new CliError("CLI_UNSUPPORTED_COMMAND", `lamarck ${operation.replaceAll(".", " ")} is not available in the ${environment} CLI.`);
   }
@@ -128,7 +140,7 @@ function scopedHelp(args: readonly string[], environment: CliEnvironment): strin
   if (!path.length) return helpText(environment);
   const entries = COMMAND_REGISTRY.filter((entry) => entry.environments.includes(environment)
     && path.every((part, index) => entry.path[index] === part));
-  return entries.length ? `Usage:\n${entries.map((entry) => `  lamarck ${entry.usage}\n      ${entry.description}`).join("\n")}` : helpText(environment);
+  return entries.length ? `Usage:\n${entries.map((entry) => `  lamarck ${entry.usage}\n      [${entry.effect}] ${entry.description}`).join("\n")}` : helpText(environment);
 }
 
 function versionMetadata(args: string[]): { message?: string; author?: string } {

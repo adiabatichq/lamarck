@@ -3,7 +3,7 @@ import { lstat, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CliError, notRunning } from "./errors.js";
-import { type CliHostCapabilities, type CliOperation, type CliRequest, type CliResponse, type CliTransport } from "./operations.js";
+import { HOST_APP_RUNTIME_OPERATIONS, type CliHostCapabilities, type CliOperation, type CliRequest, type CliResponse, type CliTransport } from "./operations.js";
 import { encodeCliFrame, parseCliCapabilities, parseCliRequest } from "./protocol.js";
 import { decodeCliHttpResponse } from "./wire.js";
 
@@ -50,22 +50,25 @@ export class HostCliTransport implements CliTransport {
       encodeCliFrame(request),
       ...(uploadBytes === undefined ? [] : [Buffer.from(uploadBytes)]),
     ]);
+    const runtimeChange = HOST_APP_RUNTIME_OPERATIONS.includes(request.operation) && request.operation !== "app.activity";
     const response = await this.#request(descriptor, "/cli/v1/execute", {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream", "Content-Length": String(body.byteLength) },
       body,
-    });
+    }, runtimeChange);
     if (!response.ok && response.status === 401) throw notRunning();
     if (!response.ok) throw notRunning();
     return await decodeCliHttpResponse(new Uint8Array(await response.arrayBuffer()), request.operation, request.requestId) as CliResponse<T>;
   }
 
-  async #request(descriptor: CliRuntimeDescriptor, path: string, init: RequestInit): Promise<Response> {
+  async #request(descriptor: CliRuntimeDescriptor, path: string, init: RequestInit, runtimeChange = false): Promise<Response> {
+    // Workload cleanup may outlast the short discovery/read deadline.
+    const signal = AbortSignal.timeout(runtimeChange ? 60_000 : 5_000);
     try {
       return await (this.options.fetch ?? fetch)(`http://127.0.0.1:${descriptor.port}${path}`, {
         ...init,
         redirect: "error",
-        signal: AbortSignal.timeout(5_000),
+        signal,
         headers: {
           ...Object.fromEntries(new Headers(init.headers)),
           Authorization: `Bearer ${descriptor.token}`,
@@ -73,6 +76,7 @@ export class HostCliTransport implements CliTransport {
       });
     } catch (error) {
       if (error instanceof CliError) throw error;
+      if (runtimeChange && signal.aborted) throw new CliError("APP_RUNTIME_FAILED", "The App runtime operation timed out and may still complete. Inspect the App and its activity before retrying.");
       throw notRunning();
     }
   }

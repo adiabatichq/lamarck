@@ -62,7 +62,7 @@ describe("App viewer IPC contract", () => {
   test.each(["stop-job", "close-ui", "app-enablement", "service-enablement", "diagnostics"])("App execution %s is fenced behind trusted Shell IPC", operation => {
     const handler = mainSource.slice(mainSource.indexOf(`  ipcMain.handle("app-runtime:${operation}"`)).split("\n  });")[0];
     expect(handler).toContain("requireShellIpc(event)");
-    const action = operation === "stop-job" ? "capsuleManager.stopJob" : operation === "close-ui" ? "capsuleManager.closeAppUi" : operation === "service-enablement" ? "capsuleManager.setServiceEnabled" : operation === "diagnostics" ? "capsuleManager.workloadDiagnostics" : "capsuleManager.setAppEnabled";
+    const action = operation === "stop-job" ? "capsuleManager.stopJob" : operation === "close-ui" ? "capsuleManager.closeAppUi" : operation === "service-enablement" ? "capsuleManager.setServiceEnabled" : operation === "diagnostics" ? "capsuleManager.workloadDiagnostics" : "setAppEnabledFromHost";
     expect(handler.indexOf("requireShellIpc(event)")).toBeLessThan(handler.indexOf(action));
     expect(handler).toContain(action);
   });

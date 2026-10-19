@@ -402,11 +402,27 @@ const capsuleManager = new CapsuleManager({
     });
   },
 });
+async function setAppEnabledFromHost(appId: string, enabled: boolean) {
+  const setting = capsuleManager.setAppEnabled(appId, enabled);
+  const cleanup: Promise<unknown>[] = [setting];
+  if (!enabled) {
+    for (const opening of appOpenings.values()) if (opening.appId === appId) opening.controller.abort(new Error("App disabled"));
+    cleanup.push(stopAppViewers(appId));
+  }
+  const results = await Promise.allSettled(cleanup);
+  const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length) throw new AggregateError(failures, "App enablement or cleanup was not confirmed");
+  return { ok: true };
+}
+
 const capsuleJobWorker = new CapsuleJobWorker(capsuleManager, CORE_TOKEN);
 cliDispatcher = new CliOperationDispatcher({
   coreBaseUrl: () => coreBaseUrl(),
   coreToken: CORE_TOKEN,
   runtimeStates: () => capsuleManager.appRuntimeStates(),
+  setAppEnabled: setAppEnabledFromHost,
+  setServiceEnabled: (appId, serviceId, enabled) => capsuleManager.setServiceEnabled(appId, serviceId, enabled),
+  workloadDiagnostics: appId => capsuleManager.workloadDiagnostics(appId),
   archive: coordinateCliArchive,
   onAppCanonicalChange: (appId, editBase) =>
     appCliStreamServer.reconcileAppWorkspaces(appId, editBase),
@@ -3093,16 +3109,7 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle("app-runtime:app-enablement", async (event, appId: string, enabled: boolean) => {
     requireShellIpc(event);
-    const setting = capsuleManager.setAppEnabled(appId, enabled);
-    const cleanup: Promise<unknown>[] = [setting];
-    if (!enabled) {
-      for (const opening of appOpenings.values()) if (opening.appId === appId) opening.controller.abort(new Error("App disabled"));
-      cleanup.push(stopAppViewers(appId));
-    }
-    const results = await Promise.allSettled(cleanup);
-    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
-    if (failures.length) throw new AggregateError(failures, "App enablement or cleanup was not confirmed");
-    return { ok: true };
+    return setAppEnabledFromHost(appId, enabled);
   });
   ipcMain.handle("app-runtime:archive", async (event, appId: string) => {
     requireShellIpc(event);

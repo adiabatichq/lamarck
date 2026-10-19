@@ -32,6 +32,11 @@ describe("shared CLI parser", () => {
     [["connector", "remove", "lamarck.oura", "--yes"], "connector.remove", { connectorId: "lamarck.oura" }],
     [["app", "list"], "app.list", {}],
     [["app", "inspect", "focus"], "app.inspect", { appId: "focus" }],
+    [["app", "enable", "focus"], "app.enable", { appId: "focus" }],
+    [["app", "disable", "focus"], "app.disable", { appId: "focus" }],
+    [["app", "service", "enable", "focus", "sync"], "app.service.enable", { appId: "focus", serviceId: "sync" }],
+    [["app", "service", "disable", "focus", "sync"], "app.service.disable", { appId: "focus", serviceId: "sync" }],
+    [["app", "activity", "focus"], "app.activity", { appId: "focus" }],
     [["app", "create", "focus", "--description", "Focus", "--name", "Focus App"], "app.create", { appId: "focus", name: "Focus App", description: "Focus" }],
     [["app", "create", "--from", "lamarck.focus", "--as", "my-focus"], "app.create", { fromPackageId: "lamarck.focus", localId: "my-focus" }],
     [["app", "save", "focus", "--author", "Ada", "-m", "First"], "app.save", { appId: "focus", message: "First", author: "Ada" }],
@@ -109,4 +114,32 @@ test("Trigger configuration modes stay exclusive and Host-only", () => {
   for (const args of [["preview", "t1", "--sql", "SELECT id FROM events"], ["create", "--file", "a.json", "--name", "A"], ["create", "--sql", "SELECT id FROM events", "--cron", "* * * * *"], ["preview", "--cron", "* * * * *"], ["preview", "t1", "--limit", "21"], ["update", "t1", "--name", "a", "--revision", "0"]]) expect(() => parseCliArgs(["trigger", ...args], "host")).toThrow();
   expect(() => parseCliArgs(["trigger", "list"], "managed")).toThrowError(expect.objectContaining({ code: "CLI_UNSUPPORTED_COMMAND" }));
   expect(helpText("managed")).not.toContain("lamarck trigger");
+});
+
+
+test("App runtime commands are explicit and Host-only", () => {
+  const commands = [
+    [["app", "enable", "notes"], "app.enable", { appId: "notes" }],
+    [["app", "disable", "notes"], "app.disable", { appId: "notes" }],
+    [["app", "service", "enable", "notes", "sync"], "app.service.enable", { appId: "notes", serviceId: "sync" }],
+    [["app", "service", "disable", "notes", "sync"], "app.service.disable", { appId: "notes", serviceId: "sync" }],
+    [["app", "activity", "notes"], "app.activity", { appId: "notes" }],
+  ] as const;
+  for (const [args, operation, input] of commands) {
+    expect(parseCliArgs([...args, "--json"], "host")).toMatchObject({ operation, input, json: true });
+    expect(() => parseCliArgs(args, "managed")).toThrowError(expect.objectContaining({ code: "CLI_UNSUPPORTED_COMMAND" }));
+  }
+  for (const args of [
+    ["enable"], ["disable", "notes", "extra"], ["activity", "notes", "--execution", "run"],
+    ["enable", "--unknown"], ["enable", "../notes"], ["activity", "NOTES"],
+    ["service", "enable", "notes", "bad.service"], ["service", "restart", "notes", "sync"],
+    ["service", "enable", "notes"], ["service", "disable", "notes", "sync", "extra"],
+    ["service", "enable", "notes", "--enabled"],
+  ]) expect(() => parseCliArgs(["app", ...args], "host")).toThrowError(expect.objectContaining({ code: "CLI_USAGE" }));
+  expect(helpText("host")).toContain("[read] Read recent retained Service and Job diagnostics.");
+  expect(helpText("host")).toContain("[write] Disable an App and stop its workloads.");
+  expect(helpText("host")).toContain("[read/write] Use the Workspace file authority.");
+  expect(helpText("managed")).not.toContain("app service");
+  expect(helpText("managed")).not.toContain("app activity");
+  expect(parseCliArgs(["app", "service", "--help"], "host")).toMatchObject({ kind: "help", text: expect.stringContaining("[write]") });
 });

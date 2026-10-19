@@ -161,6 +161,7 @@ export function projectAppShape(
   value: AppInventoryItemV1,
   running: boolean,
   path: string,
+  enabled?: boolean,
 ): AppShape {
   const manifestUsable = value.manifestHealth.status === "valid"
     || (value.version !== null && value.versionHealth.status === "healthy");
@@ -186,7 +187,7 @@ export function projectAppShape(
       manifestHealth: value.manifestHealth.status,
       versionHealth: value.versionHealth.status,
     }),
-    runtime: Object.freeze({ running }),
+    runtime: Object.freeze({ running, ...(enabled === undefined ? {} : { enabled }) }),
     path,
   });
 }

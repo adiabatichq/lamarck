@@ -1,10 +1,13 @@
 import {
   HOST_CLI_OPERATIONS,
+  HOST_APP_RUNTIME_OPERATIONS,
   MANAGED_CLI_OPERATIONS,
   parseCliRequest,
   parseCliResponse,
   type AppShape,
   type AppSummary,
+  type AppRuntimeState,
+  type AppWorkloadDiagnostic,
   type CliEnvironment,
   type CliHostCapabilities,
   type CliOperation,
@@ -44,7 +47,10 @@ export class CliOperationDispatcher {
     readonly coreBaseUrl: string | (() => string);
     readonly coreToken: string;
     readonly fetch?: typeof fetch;
-    readonly runtimeStates: () => readonly { appId: string; runningWorkloads: number }[];
+    readonly runtimeStates: () => readonly AppRuntimeState[];
+    readonly setAppEnabled?: (appId: string, enabled: boolean) => Promise<unknown>;
+    readonly setServiceEnabled?: (appId: string, serviceId: string, enabled: boolean) => Promise<unknown>;
+    readonly workloadDiagnostics?: (appId: string) => readonly AppWorkloadDiagnostic[];
     readonly archive?: (
       request: CliRequest<"app.archive">,
       context: CliDispatchContext,
@@ -78,6 +84,9 @@ export class CliOperationDispatcher {
     if (!supported.includes(request.operation)) {
       return failure(request.requestId, "CLI_UNSUPPORTED_COMMAND", `${request.operation} is not available in the ${context.environment} CLI.`);
     }
+    if (HOST_APP_RUNTIME_OPERATIONS.includes(request.operation)) {
+      return this.#dispatchAppRuntime(request, context);
+    }
     if (request.operation === "app.archive" && this.options.archive) {
       const result = await this.options.archive(
         request as CliRequest<"app.archive">,
@@ -94,7 +103,36 @@ export class CliOperationDispatcher {
         : undefined;
       await this.options.onAppCanonicalChange?.(appId);
     }
-    return { response: response.ok ? joinRuntime(response, request.operation, this.options.runtimeStates()) : response };
+    return { response: response.ok ? joinRuntime(response, request.operation, this.options.runtimeStates(), context.environment) : response };
+  }
+
+  async #dispatchAppRuntime(request: CliRequest, context: CliDispatchContext): Promise<CliDispatchResult> {
+    const { appId, serviceId } = request.input as { appId: string; serviceId?: string };
+    // Core remains authoritative for installed Apps and declared workloads.
+    const inspected = await this.#executeCore({ requestId: request.requestId, operation: "app.inspect", input: { appId } }, context);
+    if (!inspected.ok) return { response: inspected };
+    const app = inspected.result as AppShape;
+    if (serviceId && !Object.hasOwn(app.workloads?.services ?? {}, serviceId)) {
+      return failure(request.requestId, "APP_SERVICE_NOT_FOUND", `Service ${serviceId} is not declared by App ${appId}.`);
+    }
+    try {
+      if (request.operation === "app.activity") {
+        if (!this.options.workloadDiagnostics) throw new Error("App diagnostics are unavailable.");
+        const result = this.options.workloadDiagnostics(appId).map(boundActivityOutput);
+        return { response: { requestId: request.requestId, ok: true, result } };
+      }
+      const enabled = request.operation === "app.enable" || request.operation === "app.service.enable";
+      if (serviceId) {
+        if (!this.options.setServiceEnabled) throw new Error("Service management is unavailable.");
+        await this.options.setServiceEnabled(appId, serviceId, enabled);
+      } else {
+        if (!this.options.setAppEnabled) throw new Error("App management is unavailable.");
+        await this.options.setAppEnabled(appId, enabled);
+      }
+      return { response: { requestId: request.requestId, ok: true, result: { appId, ...(serviceId ? { serviceId } : {}), enabled } } as CliResponse };
+    } catch {
+      return failure(request.requestId, "APP_RUNTIME_FAILED", "Lamarck could not confirm the App runtime operation. Inspect the App and its activity before retrying.");
+    }
   }
 
   async dispatchManagedAppSave(
@@ -242,7 +280,8 @@ export class CliOperationDispatcher {
 function joinRuntime(
   response: Extract<CliResponse, { ok: true }>,
   operation: CliOperation,
-  states: readonly { appId: string; runningWorkloads: number }[],
+  states: readonly AppRuntimeState[],
+  environment: CliEnvironment,
 ): CliResponse {
   if (operation !== "app.list" && operation !== "app.inspect") return response;
   const running = new Set(states.filter((state) => state.runningWorkloads > 0).map((state) => state.appId));
@@ -250,7 +289,7 @@ function joinRuntime(
     if (!Array.isArray(response.result)) return failure(response.requestId, "CLI_INTERNAL", "Lamarck returned an invalid App list.").response;
     const result = response.result.map((raw) => {
       const app = raw as AppSummary;
-      return { ...app, runtime: { running: running.has(app.id) } };
+      return { ...app, runtime: { ...app.runtime, running: running.has(app.id) } };
     });
     return { ...response, result } as CliResponse;
   }
@@ -258,7 +297,29 @@ function joinRuntime(
   if (!app || typeof app !== "object" || typeof app.id !== "string") {
     return failure(response.requestId, "CLI_INTERNAL", "Lamarck returned an invalid App record.").response;
   }
-  return { ...response, result: { ...app, runtime: { running: running.has(app.id) } } } as CliResponse;
+  const state = states.find(state => state.appId === app.id);
+  const serviceIds = new Set([...Object.keys(app.workloads?.services ?? {}), ...(state?.services ?? []).map(service => service.serviceId)]);
+  const runtime: AppShape["runtime"] = environment === "managed" ? { running: running.has(app.id) } : {
+    running: running.has(app.id),
+    enabled: app.runtime.enabled ?? state?.enabled ?? null,
+    ui: state?.ui ?? "closed",
+    stopping: state?.stopping ?? false,
+    latestFailure: state?.latestFailure ?? null,
+    jobs: state?.jobs ?? [],
+    services: [...serviceIds].map(serviceId => state?.services?.find(service => service.serviceId === serviceId) ?? {
+      serviceId, enabled: null, state: "unconfigured", executionId: null, restartAt: null, failure: null,
+    }),
+  };
+  return { ...response, result: { ...app, runtime } } as CliResponse;
+}
+
+function boundActivityOutput(value: AppWorkloadDiagnostic): AppWorkloadDiagnostic {
+  // Eight retained records must fit the existing 2 MiB control frame even
+  // after JSON escaping. Keep a UTF-8 tail and account for discarded bytes.
+  const bytes = Buffer.from(value.output, "utf8");
+  let start = Math.max(0, bytes.length - 64 * 1024);
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++;
+  return { ...value, output: bytes.subarray(start).toString("utf8"), droppedBytes: value.droppedBytes + start };
 }
 
 function failure(requestId: string, code: string, message: string): CliDispatchResult {

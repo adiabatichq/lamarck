@@ -69,6 +69,13 @@ function validateInput(
       exactKeys(input, ["runId", "sourceId"], `CLI ${operation} input`); text(input.sourceId, "sourceId"); text(input.runId, "runId"); break;
     case "connector.install": id("packageId"); break;
     case "connector.inspect": case "connector.update": case "connector.remove": id("connectorId"); break;
+    case "app.enable": case "app.disable": case "app.activity":
+      id("appId"); appIdentity(input.appId); break;
+    case "app.service.enable": case "app.service.disable":
+      exactKeys(input, ["appId", "serviceId"], `CLI ${operation} input`);
+      appIdentity(input.appId);
+      if (typeof input.serviceId !== "string" || !/^[a-z0-9][a-z0-9-]*$/.test(input.serviceId)) throw new Error("CLI serviceId is invalid");
+      break;
     case "app.inspect": case "app.versions": case "app.refresh": case "app.archive": id("appId"); break;
     case "schema.change":
       exactOptionalKeys(input, ["ddl"], ["author", "context"], `CLI ${operation} input`);
@@ -129,3 +136,7 @@ function exactOptionalKeys(value: Record<string, unknown>, required: readonly st
 
 function triggerConfig(value: unknown): void { record(value, "Trigger configuration"); if (Buffer.byteLength(JSON.stringify(value)) > 16 * 1024) throw new Error("Trigger configuration exceeds 16 KiB"); }
 function integer(value: unknown, field: string, max = Number.MAX_SAFE_INTEGER): void { if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > max)) throw new Error(`CLI ${field} is invalid`); }
+
+function appIdentity(value: unknown): void {
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*$/.test(value)) throw new Error("CLI appId is invalid");
+}

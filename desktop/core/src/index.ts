@@ -99,6 +99,7 @@ import { loadMarketplaceTrustRootsFile } from "./marketplace/client";
 import { ConnectorMarketplaceError, MarketplaceService } from "./marketplace/service";
 import {
   MANAGED_APP_EDIT_ROOT,
+  HOST_APP_RUNTIME_OPERATIONS,
   parseCliRequest,
   type CliRequest,
   type CliResponse,
@@ -910,6 +911,7 @@ async function cliAppShapes(principal: CliCorePrincipal, signal: AbortSignal) {
     item,
     false,
     principal.kind === "system" ? item.path : `${MANAGED_APP_EDIT_ROOT}/${item.id}`,
+    principal.kind === "system" ? appServices.appEnabled(item.id) : undefined,
   ));
 }
 
@@ -919,6 +921,9 @@ async function executeCoreCliOperation(
   signal: AbortSignal,
 ): Promise<unknown> {
   const input = request.input as Record<string, unknown>;
+  if (HOST_APP_RUNTIME_OPERATIONS.includes(request.operation)) {
+    throw cliCoded("CLI_UNSUPPORTED_COMMAND", "App runtime management requires the Desktop Host.");
+  }
   if (request.operation.startsWith("trigger.")) {
     if (principal.kind !== "system") throw cliCoded("CLI_UNSUPPORTED_COMMAND", "Trigger management requires Host authority");
     try { return await manageTriggers(triggerCoordinator, request.operation, input, true); }

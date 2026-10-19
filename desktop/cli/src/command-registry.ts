@@ -1,6 +1,7 @@
 import type { CliEnvironment, CliOperation } from "./operations.js";
 
 export interface CommandDefinition {
+  readonly effect: "read" | "write" | "read/write";
   readonly path: readonly string[];
   readonly operation: CliOperation;
   readonly usage: string;
@@ -39,6 +40,11 @@ export const COMMAND_REGISTRY: readonly CommandDefinition[] = Object.freeze([
   command(["connector", "remove"], "connector.remove", "connector remove <connector-id> [--yes] [--json]", "Retire an installed Connector package.", both),
   command(["app", "list"], "app.list", "app list [--json]", "List current Apps.", both),
   command(["app", "inspect"], "app.inspect", "app inspect <app-id> [--json]", "Inspect one App.", both),
+  command(["app", "enable"], "app.enable", "app enable <app-id> [--json]", "Enable an App; preserve individual Service settings.", ["host"]),
+  command(["app", "disable"], "app.disable", "app disable <app-id> [--json]", "Disable an App and stop its workloads.", ["host"]),
+  command(["app", "service", "enable"], "app.service.enable", "app service enable <app-id> <service-id> [--json]", "Enable one declared Service.", ["host"]),
+  command(["app", "service", "disable"], "app.service.disable", "app service disable <app-id> <service-id> [--json]", "Disable and stop one declared Service.", ["host"]),
+  command(["app", "activity"], "app.activity", "app activity <app-id> [--json]", "Read recent retained Service and Job diagnostics.", ["host"]),
   command(["app", "create"], "app.create", "app create <app-id> --description <text> [--name <name>] [--json]", "Create a blank App package.", both),
   command(["app", "create"], "app.create", "app create --from <package-id> [--as <local-app-id>] [--json]", "Create an editable App from a Marketplace template.", both),
   command(["app", "save"], "app.save", "app save <app-id> [-m <message>] [--author <author>] [--json]", "Record the current App package.", both),
@@ -49,12 +55,16 @@ export const COMMAND_REGISTRY: readonly CommandDefinition[] = Object.freeze([
 ]);
 
 function command(path: readonly string[], operation: CliOperation, usage: string, description: string, environments: readonly CliEnvironment[]): CommandDefinition {
-  return Object.freeze({ path, operation, usage, description, environments });
+  const effect = operation === "file.command" ? "read/write"
+    : ["query", "trigger.targets", "trigger.list", "trigger.inspect", "trigger.preview", "trigger.runs",
+      "source.list", "source.inspect", "source.run.status", "marketplace.list", "connector.list", "connector.inspect",
+      "app.list", "app.inspect", "app.versions", "app.activity"].includes(operation) ? "read" : "write";
+  return Object.freeze({ path, operation, usage, description, environments, effect });
 }
 
 export function helpText(environment: CliEnvironment): string {
   const lines = COMMAND_REGISTRY.filter((entry) => entry.environments.includes(environment))
-    .map((entry) => `  lamarck ${entry.usage}\n      ${entry.description}`);
+    .map((entry) => `  lamarck ${entry.usage}\n      [${entry.effect}] ${entry.description}`);
   return `Usage:\n${lines.join("\n")}`;
 }
 

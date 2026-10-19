@@ -1,7 +1,7 @@
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { HOST_CLI_OPERATIONS, HostCliTransport, readRuntimeDescriptor } from "../src/index";
+import { HOST_CLI_OPERATIONS, HostCliTransport, readRuntimeDescriptor, encodeCliHttpResponse } from "../src/index";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
@@ -74,3 +74,34 @@ function value(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+
+test("App disable waits beyond the short read deadline for confirmed cleanup", async () => {
+  const { path } = await fixture();
+  const client = new HostCliTransport({ descriptorPath: path, fetch: async (url, init) => {
+    if (String(url).endsWith("/hello")) return Response.json({ protocolVersion: 1, environment: "host", supportedOperations: HOST_CLI_OPERATIONS });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, 5_100);
+      init?.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(init.signal?.reason); }, { once: true });
+    });
+    return new Response(new Uint8Array(encodeCliHttpResponse("app.disable", { requestId: "cleanup", ok: true, result: { appId: "notes", enabled: false } })));
+  } });
+  await expect(client.execute({ requestId: "cleanup", operation: "app.disable", input: { appId: "notes" } }))
+    .resolves.toMatchObject({ ok: true, result: { enabled: false } });
+}, 10_000);
+
+
+test("runtime timeout reports an unconfirmed operation rather than a stopped Desktop", async () => {
+  const { path } = await fixture();
+  const timeout = vi.spyOn(AbortSignal, "timeout")
+    .mockReturnValueOnce(new AbortController().signal)
+    .mockReturnValueOnce(AbortSignal.abort(new Error("Timed out")));
+  try {
+    const client = new HostCliTransport({ descriptorPath: path, fetch: async (url, init) => {
+      if (String(url).endsWith("/hello")) return Response.json({ protocolVersion: 1, environment: "host", supportedOperations: HOST_CLI_OPERATIONS });
+      throw init?.signal?.reason;
+    } });
+    await expect(client.execute({ requestId: "timeout", operation: "app.disable", input: { appId: "notes" } }))
+      .rejects.toMatchObject({ code: "APP_RUNTIME_FAILED", message: expect.stringContaining("may still complete") });
+  } finally { timeout.mockRestore(); }
+});
