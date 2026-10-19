@@ -2,8 +2,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { Children, isValidElement, type ReactNode, type ReactElement } from "react";
 import { describe, expect, test, vi } from "vitest";
 import type { AppHistoryView, AppRuntimeView } from "../hooks/useAppsManager";
-import type { AppInfo, AppVersionRecordV1 } from "../lib/api";
-import { AppWorkloadManagement } from "./AppWorkloadManagement";
+import type { AppInfo, AppVersionRecordV1, TriggerSummary } from "../lib/api";
+import { AppActivityView, AppEnablementSwitch, AppServices } from "./AppWorkloadManagement";
+import { AppVersions } from "./AppManagementDetails";
 import { AppExecutionView, AppsManagerView, deriveAppPrimaryStatus } from "./AppsManager";
 
 const latest: AppVersionRecordV1 = {
@@ -39,13 +40,13 @@ describe("Apps Manager", () => {
     runtime: { ...runtime("notes", 3), ui: "running", jobs: [
       { runId: "run-a", jobId: "inbox", triggerId: "trigger-a", state: "starting", cleanupError: null },
       { runId: "run-b", jobId: "inbox", triggerId: null, state: "running", cleanupError: null },
-    ] }, onStopJob: vi.fn(), onCloseUi: vi.fn(), onManageTriggers: vi.fn(), ...overrides,
+    ] }, onStopJob: vi.fn(), onManageTriggers: vi.fn(), ...overrides,
   });
   test("App and declared Service toggles show independent persisted choices without Stop App or restart controls", () => {
-    const html = renderToStaticMarkup(<AppWorkloadManagement appId="notes" appEnabled={false} services={[
+    const html = renderToStaticMarkup(<><AppEnablementSwitch enabled={false} label="App enabled" disabled={false} onChange={vi.fn()} /><AppServices appEnabled={false} pending={null} onChange={vi.fn()} services={[
       { serviceId: "indexer", enabled: true, state: "stopped", executionId: null, restartAt: null, failure: null },
       { serviceId: "sync", enabled: false, state: "disabled", executionId: null, restartAt: null, failure: null },
-    ]} />);
+    ]} /></>);
     expect(html).toContain('aria-label="App enabled" aria-checked="false"');
     expect(html).toContain('aria-label="Service indexer enabled" aria-checked="true"');
     expect(html).toContain('aria-label="Service sync enabled" aria-checked="false"');
@@ -53,16 +54,15 @@ describe("Apps Manager", () => {
   });
   test("shows starting and running invocations by declared job/run and available Trigger association", () => {
     const html = renderToStaticMarkup(execution());
-    for (const text of ["inbox", "run-a", "run-b", "Starting", "Running", "Trigger trigger-a", "Close UI", "keeps jobs and Services running"]) expect(html).toContain(text);
+    for (const text of ["Inbox", "run-a", "run-b", "Starting", "Running", "View trigger", "Run details"]) expect(html).toContain(text);
     expect(html).not.toContain("Launch job"); expect(html).not.toContain("Retry");
   });
-  test("job, UI, App and Trigger actions carry only the selected execution identity", () => {
-    const onStopJob = vi.fn(), onCloseUi = vi.fn(), onManageTriggers = vi.fn();
-    const buttons = elements(execution({ onStopJob, onCloseUi, onManageTriggers })).filter(node => node.type === "button");
+  test("job and Trigger actions carry only the selected execution identity", () => {
+    const onStopJob = vi.fn(), onManageTriggers = vi.fn();
+    const buttons = elements(execution({ onStopJob, onManageTriggers })).filter(node => node.type === "button");
     buttons.find(node => node.props["aria-label"] === "Stop job inbox, run run-a")!.props.onClick();
     expect(onStopJob.mock.calls).toEqual([["notes", "run-a"]]);
-    buttons.find(node => node.props.children === "Close UI")!.props.onClick(); expect(onCloseUi.mock.calls).toEqual([["notes"]]);
-    buttons.find(node => renderToStaticMarkup(node).includes("Trigger trigger-a"))!.props.onClick(); expect(onManageTriggers.mock.calls).toEqual([["notes", "trigger-a"]]);
+    buttons.find(node => node.props.children === "View trigger")!.props.onClick(); expect(onManageTriggers.mock.calls).toEqual([["notes", "trigger-a"]]);
   });
   test("pending and failed cleanup remain visible with stop actions disabled instead of reporting completion", () => {
     const tree = execution({ pending: new Set(["job:run-a", "ui:notes"]), runtime: { ...runtime("notes", 2), ui: "running", jobs: [
@@ -70,7 +70,7 @@ describe("Apps Manager", () => {
       { jobId: "inbox", runId: "run-b", triggerId: "trigger-b", state: "cleanup-failed", cleanupError: "VM stop unconfirmed; restart required" },
     ] }, error: "App stop could not be confirmed" });
     const html = renderToStaticMarkup(tree);
-    for (const text of ["waiting for cleanup", "Cleanup failed", "stop unconfirmed", "restart required", "App stop could not be confirmed", "Closing UI"]) expect(html).toContain(text);
+    for (const text of ["waiting for cleanup", "Cleanup failed", "stop unconfirmed", "restart required"]) expect(html).toContain(text);
     const stops = elements(tree).filter(node => node.type === "button" && node.props["aria-label"]?.startsWith("Stop job"));
     expect(stops.every(node => node.props.disabled)).toBe(true);
     expect(html).not.toContain("No active jobs");
@@ -96,10 +96,11 @@ describe("Apps Manager", () => {
   });
   test("links declared job Apps to Trigger management", () => {
     const notes = app("notes"); notes.runtime!.jobs = { inbox: { command: ["node", "inbox.js"] } };
-    expect(render(notes, history)).toContain("Manage Triggers");
-    expect(render(app("ui-only"), history)).not.toContain("Manage Triggers");
+    expect(render(notes, history)).toContain("Manage triggers");
+    expect(render(app("ui-only"), history)).not.toContain("Manage triggers");
   });
-  test("derives only Running, Ready, and Failed from runtime and health", () => {
+  test("derives runtime health and represents a disabled App without claiming it is Ready", () => {
+    expect(deriveAppPrimaryStatus(app("disabled"), { ...runtime("disabled"), enabled: false })).toEqual({ status: "Disabled", detail: null });
     expect(deriveAppPrimaryStatus(app("ready"))).toEqual({ status: "Ready", detail: null });
     expect(deriveAppPrimaryStatus(app("running"), runtime("running", 2))).toEqual({
       status: "Running",
@@ -126,18 +127,14 @@ describe("Apps Manager", () => {
     });
   });
 
-  test("renders actual grants, paginated history, and no editor or ordinary Save action", () => {
+  test("prioritizes management and keeps history, grants, and diagnostics out of the default view", () => {
     const notes = app("notes");
     const markup = render(notes, history);
 
-    expect(markup).toContain("Running");
-    expect(markup).toContain("apps/notes/");
-    expect(markup).toContain("shared/notes/");
-    expect(markup).toContain("note_index");
-    expect(markup).toContain("aaaaaaaaa");
-    expect(markup).toContain("Latest");
-    expect(markup).toContain("Restore version bbbbbbbbb");
-    expect(markup).toContain("Load earlier versions");
+    expect(markup).toContain('role="tablist"');
+    expect(markup).toMatch(/role="tab"[^>]*aria-selected="true"[^>]*>Manage/);
+    expect(markup).toContain("Open app");
+    for (const text of ["apps/notes/", "shared/notes/", "note_index", latest.version, "Recent activity", "process output", "Restore this version"]) expect(markup).not.toContain(text);
     expect(markup).not.toContain(">Save<");
     expect(markup).not.toContain("source editor");
   });
@@ -147,8 +144,8 @@ describe("Apps Manager", () => {
     const markup = render(notes, history, { kind: "restore", app: notes, version: older });
 
     expect(markup).toContain('role="dialog"');
-    expect(markup).toContain("Restore bbbbbbbbb?");
-    expect(markup).toContain("creates a new forward version");
+    expect(markup).toContain("Restore Notes?");
+    expect(markup).toContain("creates a new version");
     expect(markup).toContain("It does not launch the App");
     expect(markup).toContain("Restore version");
   });
@@ -161,6 +158,57 @@ describe("Apps Manager", () => {
     expect(markup).toContain("Rebuild version history");
     expect(markup).toContain("Unrecoverable versions will disappear");
     expect(markup).toContain("historical D0 evidence is not changed");
+  });
+
+  test("retains history pagination and restores with the exact selected version", () => {
+    const notes = app("notes"), restore = vi.fn(), more = vi.fn();
+    const tree = AppVersions({ app: notes, history, busy: null, onLoadMore: more, onRequestRestore: restore, onRequestRebuild: vi.fn() });
+    const html = renderToStaticMarkup(tree);
+    expect(html).toContain("Current version");
+    expect(html).toContain("Load earlier versions");
+    const buttons = elements(tree).filter(node => node.type === "button");
+    buttons.find(node => node.props.children === "Restore this version")!.props.onClick();
+    expect(restore.mock.calls).toEqual([[notes, older]]);
+    buttons.find(node => node.props.onClick === more)!.props.onClick();
+    expect(more).toHaveBeenCalledOnce();
+  });
+
+  test("puts execution IDs and bounded output inside technical details in Activity", () => {
+    const html = renderToStaticMarkup(<AppActivityView loading={false} error={null} diagnostics={[{
+      appId: "notes", kind: "job", workloadId: "inbox", executionId: "run-a", version: latest.version,
+      startedAt: 1_700_000_000_000, endedAt: 1_700_000_001_000, failure: null, output: "Private process output", droppedBytes: 64,
+    }]} />);
+    expect(html).toContain("Finished");
+    expect(html).toMatch(/<summary>Technical details<\/summary>[\s\S]*run-a[\s\S]*Private process output/);
+    expect(html).not.toMatch(/<details[^>]*\sopen[\s=>]/);
+    expect(html).toContain("64 bytes");
+    expect(renderToStaticMarkup(<AppActivityView diagnostics={[]} loading={false} error="Host unavailable" />)).toContain("could not be loaded");
+  });
+
+  test("declared idle jobs retain their last result and hide Next for a disabled schedule or App", () => {
+    const trigger: TriggerSummary = { id: "schedule-a", revision: 1, name: "Evening review", target: "app:notes:job:evening-review", kind: "schedule",
+      enabled: false, available: true, unavailableReason: null, error: null, nextRunAt: 1_700_000_999_000,
+      lastRun: { id: "finished", triggerId: "schedule-a", revision: 1, name: "Evening review", target: "app:notes:job:evening-review", status: "success",
+        createdAt: 1_700_000_000_000, startedAt: 1_700_000_000_000, endedAt: 1_700_000_001_000, error: null, input: { kind: "schedule", scheduledAt: 1_700_000_000_000 } } };
+    const view = (enabled: boolean, appEnabled: boolean) => renderToStaticMarkup(execution({ runtime: { ...runtime("notes"), enabled: appEnabled }, jobIds: ["evening-review"], triggers: [{ ...trigger, enabled }] }));
+    expect(view(false, true)).toContain("Evening review");
+    expect(view(false, true)).toContain("Last run: Completed");
+    expect(view(false, true)).not.toContain("Next ");
+    expect(view(true, false)).not.toContain("Next ");
+    expect(view(true, true)).toContain("Next ");
+    expect(view(false, true)).not.toContain("Launch job");
+  });
+
+  test("unknown enablement cannot be toggled and Service cleanup failures remain visible when App is disabled", () => {
+    const unknown = renderToStaticMarkup(<AppEnablementSwitch enabled={undefined} label="App enabled" disabled={false} onChange={vi.fn()} />);
+    expect(unknown).toContain("Checking");
+    expect(unknown).toContain("disabled");
+    const html = renderToStaticMarkup(<AppServices appEnabled={false} pending={null} onChange={vi.fn()} services={[
+      { serviceId: "indexer", enabled: true, state: "cleanup-failed", executionId: "service-a", restartAt: null, failure: "Stop unconfirmed" },
+    ]} />);
+    expect(html).toContain("Cleanup failed · stop unconfirmed");
+    expect(html).toContain("Stop unconfirmed");
+    expect(html).toContain('aria-checked="true"');
   });
 });
 
@@ -229,5 +277,5 @@ function runtime(
   runningWorkloads = 0,
   latestFailure: string | null = null,
 ): AppRuntimeView {
-  return { appId, runningWorkloads, latestFailure };
+  return { appId, enabled: true, runningWorkloads, latestFailure };
 }

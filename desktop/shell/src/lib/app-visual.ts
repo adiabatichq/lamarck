@@ -31,6 +31,11 @@ export function appInitials(name: string): string {
   return `${words[0][0]}${words[words.length - 1][0]}`.toUpperCase();
 }
 
+export function workloadName(id: string): string {
+  const name = id.replace(/[-_]+/g, " ");
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
 export function appWorkloads(app: AppInfo): string[] {
   const workloads: string[] = [];
   if (app.runtime?.ui) workloads.push("UI");

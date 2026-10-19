@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 
-const css = readFileSync(new URL("./SystemRoom.module.css", import.meta.url), "utf8");
+const css = readFileSync(new URL("./AppsManager.module.css", import.meta.url), "utf8");
 
 function declarationsFor(selector: string): string {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -17,11 +17,11 @@ describe("Apps Manager layout contract", () => {
     expect(declarationsFor(".appsManager")).toMatch(/overflow:\s*hidden/);
   });
 
-  test("keeps version history as the stable-gutter scroll owner", () => {
-    expect(declarationsFor(".versionScroll")).toMatch(/min-height:\s*0/);
-    expect(declarationsFor(".versionScroll")).toMatch(/overflow-y:\s*auto/);
-    expect(declarationsFor(".versionScroll")).toMatch(/scrollbar-gutter:\s*stable/);
-    expect(css).toMatch(/\.versionPane\s*\{[^}]*display:\s*flex[^}]*overflow:\s*hidden/);
+  test("gives the selected App one stable scroll area for management and secondary tabs", () => {
+    expect(declarationsFor(".appDetails")).toMatch(/min-height:\s*0/);
+    expect(declarationsFor(".appDetails")).toMatch(/overflow-y:\s*auto/);
+    expect(declarationsFor(".appDetails")).toMatch(/scrollbar-gutter:\s*stable/);
+    expect(css).not.toContain(".versionPane");
   });
 
   test("switches to a stacked selected-App drill-in at narrow widths", () => {
