@@ -4871,7 +4871,7 @@ auth:
         {
           timestamp: "2026-05-01T00:00:02.000Z",
           type: "event_msg",
-          payload: { type: "user_message", client_id: "old-human", message: "Old human." },
+          payload: { type: "item_completed", turn_id: "old-turn", item: { type: "UserMessage", id: "old-human", client_id: "old-human", content: [{ type: "text", text: "Old human." }] } },
         },
         {
           timestamp: "2026-05-01T00:00:03.000Z",
@@ -4882,7 +4882,7 @@ auth:
         {
           timestamp: "2026-05-31T00:00:01.000Z",
           type: "event_msg",
-          payload: { type: "user_message", client_id: "cross-human", message: "Cross-boundary human." },
+          payload: { type: "item_completed", turn_id: "cross-turn", item: { type: "UserMessage", id: "cross-human", client_id: "cross-human", content: [{ type: "text", text: "Cross-boundary human." }] } },
         },
         {
           timestamp: "2026-06-02T00:00:00.000Z",
@@ -4893,7 +4893,7 @@ auth:
         {
           timestamp: "2026-06-30T00:00:01.000Z",
           type: "event_msg",
-          payload: { type: "user_message", client_id: "new-human", message: "New human." },
+          payload: { type: "item_completed", turn_id: "new-turn", item: { type: "UserMessage", id: "new-human", client_id: "new-human", content: [{ type: "text", text: "New human." }] } },
         },
         {
           timestamp: "2026-06-30T00:00:02.000Z",
@@ -4953,6 +4953,155 @@ auth:
     ]));
   });
 
+  test("code-agent-transcripts captures paginated Codex human items without context or response mirrors", async () => {
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl);
+    const codexRoot = join(workspace, "codex-paginated-sessions");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const turnId = "paginated-turn";
+    const records = [
+      { type: "session_meta", payload: { id: "paginated-session", history_mode: "paginated" } },
+      { type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+      {
+        type: "response_item",
+        payload: {
+          type: "message", role: "user", content: [{ type: "input_text", text: "Injected environment." }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ["environments.environment_context"] },
+        },
+      },
+      {
+        type: "response_item",
+        payload: {
+          type: "message", role: "user", content: [{ type: "input_text", text: "Check this." }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ["user.text"] },
+        },
+      },
+      {
+        type: "event_msg",
+        payload: { type: "item_started", turn_id: turnId, item: { type: "UserMessage", id: "human-item-1", client_id: "human-client-1", content: [{ type: "text", text: "Check this." }] } },
+      },
+      {
+        type: "event_msg",
+        payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: "human-item-1", client_id: "human-client-1", content: [{ type: "text", text: "Check this." }] } },
+      },
+      {
+        type: "event_msg",
+        payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: "human-item-2", content: [{ type: "text", text: "Check this." }, { type: "image", image_url: "data:image/png;base64,aGVsbG8=" }, { type: "text", text: "And the screenshot." }] } },
+      },
+      { type: "event_msg", payload: { type: "item_completed", turn_id: turnId, item: { type: "AgentMessage", id: "agent-mirror", text: "Finished." } } },
+      {
+        type: "response_item",
+        payload: { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "Finished." }] },
+      },
+      { type: "event_msg", payload: { type: "task_complete", turn_id: turnId } },
+    ].map((record, index) => ({ ...record, timestamp: new Date(Date.UTC(2026, 6, 1, 2) + index * 1000).toISOString() }));
+    writeFileSync(join(dayDir, "root.jsonl"), records.map((record) => JSON.stringify(record)).join("\n") + "\n");
+    const childRecords = [
+      { ...records[0], payload: { id: "child-session", history_mode: "paginated", source: { subagent: {} } } },
+      ...records.slice(1),
+    ];
+    writeFileSync(join(dayDir, "child.jsonl"), childRecords.map((record) => JSON.stringify(record)).join("\n") + "\n");
+
+    const run = makeCodeAgentContext({ "include-claude": false, "codex-root": codexRoot });
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+
+    expect(run.events.map((event) => event.type)).toEqual([
+      "code_agent.human_message", "code_agent.human_message", "code_agent.agent_turn",
+    ]);
+    expect(run.events[0]).toMatchObject({
+      externalId: expect.stringMatching(/:human-client-1$/),
+      startedAt: Date.parse(records[5].timestamp),
+      payload: {
+        content: { text: "Check this." },
+        raw: { ids: { sessionId: "paginated-session", turnId, clientId: "human-client-1", messageId: "human-item-1" } },
+      },
+    });
+    expect(run.events[1]).toMatchObject({
+      externalId: expect.stringMatching(/:human-item-2$/),
+      payload: { content: { text: "Check this.\n\nAnd the screenshot." } },
+    });
+    expect(run.events[1].payload.raw.ids.clientId).toBeUndefined();
+    expect(new Set(run.events.map((event) => event.payload.interactionId)).size).toBe(1);
+    expect(run.events[2].payload.content.text).toBe("Finished.");
+    expect(run.blobWrites[0].text).not.toContain("Check this.");
+    expect(run.getWarnings().size).toBe(0);
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    expect(run.events).toHaveLength(3);
+  });
+
+  test("code-agent-transcripts keeps Codex human identity stable when a write acknowledgment fails", async () => {
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl);
+    const codexRoot = join(workspace, "codex-human-retry");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const transcriptPath = join(dayDir, "root.jsonl");
+    const completed = { type: "item_completed", turn_id: "retry-turn", item: { type: "UserMessage", id: "item-1", client_id: "retry-client", content: [{ type: "text", text: "Same message." }] } };
+    const encode = (record: unknown) => JSON.stringify({ timestamp: "2026-07-01T02:00:00.000Z", ...record as object }) + "\n";
+    writeFileSync(transcriptPath, [
+      { type: "session_meta", payload: { id: "retry-session" } },
+      { type: "event_msg", payload: { type: "task_started", turn_id: "retry-turn" } },
+      { type: "event_msg", payload: completed },
+    ].map(encode).join(""));
+    const run = makeCodeAgentContext({ "include-claude": false, "codex-root": codexRoot });
+    const attemptedIds: string[] = [];
+    // Guard's (source, externalId) contract makes a repeated write a no-op.
+    const writeEvents = run.context.guard.writeEvents;
+    run.context.guard.writeEvents = async (batch: any[]) => {
+      const unseen = batch.filter((event) => {
+        const seen = attemptedIds.includes(event.externalId);
+        attemptedIds.push(event.externalId);
+        return !seen;
+      });
+      const result = await writeEvents(unseen);
+      if (attemptedIds.length === 1) throw new Error("Write acknowledgment lost.");
+      return result;
+    };
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    expect(run.getWarnings().size).toBe(1);
+    await syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    expect(attemptedIds).toHaveLength(2);
+    expect(new Set(attemptedIds).size).toBe(1);
+    expect(run.events).toHaveLength(1);
+    expect(run.events[0].payload.content.text).toBe("Same message.");
+    expect(run.getWarnings().size).toBe(0);
+  });
+
+  test("code-agent-transcripts waits for a complete Codex human item across polls and honors its explicit turn", async () => {
+    const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
+    const { syncOnce } = await import(agentUrl);
+    const codexRoot = join(workspace, "codex-streamed-human");
+    const dayDir = join(codexRoot, "2026", "07", "01");
+    mkdirSync(dayDir, { recursive: true });
+    const transcriptPath = join(dayDir, "root.jsonl");
+    const encode = (record: unknown) => JSON.stringify({ timestamp: "2026-07-01T02:00:00.000Z", ...record as object }) + "\n";
+    writeFileSync(transcriptPath, [
+      { type: "session_meta", payload: { id: "streamed-session", history_mode: "paginated" } },
+      { type: "event_msg", payload: { type: "task_started", turn_id: "human-turn" } },
+      { type: "event_msg", payload: { type: "task_started", turn_id: "other-turn" } },
+    ].map(encode).join(""));
+    const run = makeCodeAgentContext({ "include-claude": false, "codex-root": codexRoot });
+    const sync = () => syncOnce(run.context, { now: Date.UTC(2026, 6, 1, 3) });
+    await sync();
+    const human = encode({ type: "event_msg", payload: { type: "item_completed", turn_id: "human-turn", item: { type: "UserMessage", id: "streamed-human", content: [{ type: "text", text: "A streamed prompt." }] } } });
+    const split = Math.floor(human.length / 2);
+    appendFileSync(transcriptPath, human.slice(0, split));
+    await sync();
+    expect(run.events).toHaveLength(0);
+    appendFileSync(transcriptPath, human.slice(split));
+    await sync();
+    expect(run.events).toHaveLength(1);
+    expect(run.events[0].payload.interactionId).toBe("codex:streamed-session:human-turn");
+    expect(run.events[0].payload.content.text).toBe("A streamed prompt.");
+    appendFileSync(transcriptPath, encode({ type: "event_msg", payload: { type: "task_complete", turn_id: "human-turn", last_agent_message: "Done." } }));
+    await sync();
+    expect(run.events).toHaveLength(2);
+    expect(run.events[1].payload.interactionId).toBe(run.events[0].payload.interactionId);
+    await sync();
+    expect(run.events).toHaveLength(2);
+  });
+
   test("code-agent-transcripts packs one Codex interaction into human and agent events", async () => {
     const agentUrl = new URL("../../../connectors/code-agent-transcripts/index.mjs", import.meta.url).href;
     const { syncOnce } = await import(agentUrl) as {
@@ -4989,7 +5138,7 @@ auth:
         {
           timestamp: "2026-07-01T02:00:01.100Z",
           type: "event_msg",
-          payload: { type: "user_message", client_id: "client-1", message: "Run the focused tests." },
+          payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: "client-1", client_id: "client-1", content: [{ type: "text", text: "Run the focused tests." }] } },
         },
         {
           timestamp: "2026-07-01T02:00:02.000Z",
@@ -5116,7 +5265,7 @@ auth:
     expect(run.blobWrites[0].text).toContain('"type":"function_call_output"');
     expect(run.blobWrites[0].text).toContain('"phase":"final_answer"');
     expect(run.blobWrites[0].text).not.toContain("Private reasoning.");
-    expect(run.blobWrites[0].text).not.toContain('"type":"user_message"');
+    expect(run.blobWrites[0].text).not.toContain('"type":"UserMessage"');
   });
 
   test("code-agent-transcripts preserves current Codex tool calls and outputs in selected raw", async () => {
@@ -5406,7 +5555,7 @@ auth:
         type: "event_msg",
         payload: { type: "task_started", turn_id: parentTurnId, started_at: parentStartedAt / 1_000 },
       },
-      { timestamp: "2026-06-25T09:18:31.924Z", type: "event_msg", payload: { type: "user_message", client_id: "parent-client", message: "Parent prompt." } },
+      { timestamp: "2026-06-25T09:18:31.924Z", type: "event_msg", payload: { type: "item_completed", turn_id: parentTurnId, item: { type: "UserMessage", id: "parent-client", client_id: "parent-client", content: [{ type: "text", text: "Parent prompt." }] } } },
       {
         timestamp: "2026-06-25T09:18:31.924Z",
         type: "response_item",
@@ -5435,7 +5584,7 @@ auth:
         type: "event_msg",
         payload: { type: "task_started", turn_id: forkTurnId, started_at: forkStartedAt / 1_000 },
       },
-      { timestamp: "2026-06-25T09:18:34.688Z", type: "event_msg", payload: { type: "user_message", client_id: "fork-client", message: "Fork prompt." } },
+      { timestamp: "2026-06-25T09:18:34.688Z", type: "event_msg", payload: { type: "item_completed", turn_id: forkTurnId, item: { type: "UserMessage", id: "fork-client", client_id: "fork-client", content: [{ type: "text", text: "Fork prompt." }] } } },
       {
         timestamp: "2026-06-25T09:18:35.000Z",
         type: "response_item",
@@ -5553,7 +5702,7 @@ auth:
         {
           timestamp: `2026-07-01T02:00:0${second}.020Z`,
           type: "event_msg",
-          payload: { type: "user_message", client_id: `${turn.id}-client`, message: turn.prompt },
+          payload: { type: "item_completed", turn_id: turn.id, item: { type: "UserMessage", id: `${turn.id}-client`, client_id: `${turn.id}-client`, content: [{ type: "text", text: turn.prompt }] } },
         },
         {
           timestamp: `2026-07-01T02:00:0${second}.030Z`,
@@ -5625,7 +5774,7 @@ auth:
         {
           timestamp: "2026-07-01T02:00:01.100Z",
           type: "event_msg",
-          payload: { type: "user_message", client_id: "memory-client", message: "Consolidate memory." },
+          payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: "memory-client", client_id: "memory-client", content: [{ type: "text", text: "Consolidate memory." }] } },
         },
         {
           timestamp: "2026-07-01T02:00:02.000Z",
@@ -5687,7 +5836,7 @@ auth:
         {
           timestamp: "2026-07-01T02:00:01.100Z",
           type: "event_msg",
-          payload: { type: "user_message", client_id: "failed-client", message: "Finish the task." },
+          payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: "failed-client", client_id: "failed-client", content: [{ type: "text", text: "Finish the task." }] } },
         },
         {
           timestamp: "2026-07-01T02:00:02.100Z",
@@ -5755,7 +5904,7 @@ auth:
         {
           timestamp: "2026-07-01T02:00:01.100Z",
           type: "event_msg",
-          payload: { type: "user_message", client_id: "root-client", message: "Inspect the build." },
+          payload: { type: "item_completed", turn_id: rootTurnId, item: { type: "UserMessage", id: "root-client", client_id: "root-client", content: [{ type: "text", text: "Inspect the build." }] } },
         },
       ].map((record) => JSON.stringify(record)).join("\n") + "\n",
     );
@@ -5790,7 +5939,7 @@ auth:
         {
           timestamp: "2026-07-01T02:00:01.400Z",
           type: "event_msg",
-          payload: { type: "user_message", message: "Assess this approval request." },
+          payload: { type: "item_completed", turn_id: childTurnId, item: { type: "UserMessage", id: "approval-message", content: [{ type: "text", text: "Assess this approval request." }] } },
         },
       ].map((record) => JSON.stringify(record)).join("\n") + "\n",
     );
@@ -5970,7 +6119,7 @@ auth:
       [
         { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "root-session", thread_source: "cli" } },
         { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "root-turn" } },
-        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "root-client", message: "Capture the root." } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "item_completed", turn_id: "root-turn", item: { type: "UserMessage", id: "root-client", client_id: "root-client", content: [{ type: "text", text: "Capture the root." }] } } },
         {
           timestamp: "2026-07-01T02:00:02.000Z",
           type: "response_item",
@@ -6136,7 +6285,7 @@ auth:
       [
         { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "session-open" } },
         { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
-        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "client-open", message: "Start." } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: "client-open", client_id: "client-open", content: [{ type: "text", text: "Start." }] } } },
       ].map((record) => JSON.stringify(record)).join("\n") + "\n",
     );
     const run = makeCodeAgentContext({
@@ -6207,7 +6356,7 @@ auth:
     const turnId = "turn-partial";
     const completePrefix = [
       { timestamp: "2026-07-01T02:00:00.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
-      { timestamp: "2026-07-01T02:00:00.100Z", type: "event_msg", payload: { type: "user_message", client_id: "client-partial", message: "Wait for closure." } },
+      { timestamp: "2026-07-01T02:00:00.100Z", type: "event_msg", payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: "client-partial", client_id: "client-partial", content: [{ type: "text", text: "Wait for closure." }] } } },
       {
         timestamp: "2026-07-01T02:00:01.000Z",
         type: "response_item",
@@ -6264,7 +6413,7 @@ auth:
       [
         { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "session-aborted-materialization" } },
         { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
-        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "client-aborted-materialization", message: "Finish safely." } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: "client-aborted-materialization", client_id: "client-aborted-materialization", content: [{ type: "text", text: "Finish safely." }] } } },
       ].map((record) => JSON.stringify(record)).join("\n") + "\n",
     );
     const run = makeCodeAgentContext({
@@ -6338,7 +6487,7 @@ auth:
       [
         { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "initial-materialization-session", thread_source: "cli" } },
         { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
-        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "initial-materialization-client", message: "Capture this root." } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "item_completed", turn_id: turnId, item: { type: "UserMessage", id: "initial-materialization-client", client_id: "initial-materialization-client", content: [{ type: "text", text: "Capture this root." }] } } },
         {
           timestamp: "2026-07-01T02:00:02.000Z",
           type: "response_item",
@@ -6410,7 +6559,7 @@ auth:
       [
         { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "watch-session" } },
         { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "watch-turn" } },
-        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "watch-client", message: "Retry this root." } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "item_completed", turn_id: "watch-turn", item: { type: "UserMessage", id: "watch-client", client_id: "watch-client", content: [{ type: "text", text: "Retry this root." }] } } },
         {
           timestamp: "2026-07-01T02:00:02.000Z",
           type: "response_item",
@@ -6584,7 +6733,7 @@ auth:
       [
         { timestamp: "2026-07-01T02:00:00.000Z", type: "session_meta", payload: { id: "session-limit" } },
         { timestamp: "2026-07-01T02:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "turn-limit" } },
-        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "user_message", client_id: "client-limit", message: longMessage } },
+        { timestamp: "2026-07-01T02:00:01.100Z", type: "event_msg", payload: { type: "item_completed", turn_id: "turn-limit", item: { type: "UserMessage", id: "client-limit", client_id: "client-limit", content: [{ type: "text", text: longMessage }] } } },
       ].map((record) => JSON.stringify(record)).join("\n") + "\n",
     );
     const run = makeCodeAgentContext({

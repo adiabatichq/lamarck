@@ -19,6 +19,8 @@ All text and raw records pass through best-effort redaction before hashing, byte
 
 A point event for one provider-authored human message. It has `startedAt` and no `endedAt`.
 
+Codex captures `event_msg.item_completed` records with a `UserMessage` item. The event's `turn_id` identifies the interaction; the item's `client_id`, then `id`, identifies the message.
+
 ```json
 {
   "type": "code_agent.human_message",
@@ -45,7 +47,8 @@ A point event for one provider-authored human message. It has `startedAt` and no
       "ids": {
         "sessionId": "<provider-session-id>",
         "turnId": "<codex-turn-id>",
-        "clientId": "<codex-client-id>"
+        "clientId": "<codex-client-id>",
+        "messageId": "<codex-item-id>"
       },
       "records": [
         {

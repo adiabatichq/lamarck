@@ -73,27 +73,32 @@ function scanCodexRecord(record, ctx, scan, session) {
     return;
   }
 
-  if (payload.type === "user_message") {
+  if (payload.type === "item_completed" && payload.item?.type === "UserMessage") {
     if (isCodexNonRootSession(session)) return;
-    const open = scan.activeInteractionId
-      ? scan.openInteractions[scan.activeInteractionId]
+    const humanItem = payload.item;
+    const turnId = stringFrom(payload.turn_id) ?? scan.activeInteractionId;
+    const open = turnId
+      ? scan.openInteractions[turnId]
       : undefined;
     const interactionSession = sessionForInteraction(session, open);
-    const rawId = stringFrom(payload.client_id) ?? fallbackRecordId(interactionSession, ctx);
-    const providerInteractionId = scan.activeInteractionId ?? rawId;
+    const clientId = stringFrom(humanItem.client_id);
+    const messageId = stringFrom(humanItem.id);
+    const rawId = clientId ?? messageId ?? fallbackRecordId(interactionSession, ctx);
+    const providerInteractionId = turnId ?? rawId;
     scan.events.push(buildHumanMessageEvent({
       provider: "codex",
       providerInteractionId,
       rawId,
-      text: typeof payload.message === "string" ? payload.message : "",
+      text: extractContentParts(humanItem.content).text.join("\n\n"),
       record,
       startedAt: open?.replayed === true ? open.startedAt : undefined,
       lineIndex: ctx.lineIndex,
       session: interactionSession,
       ids: compactObject({
         sessionId: interactionSession.id,
-        turnId: scan.activeInteractionId,
-        clientId: stringFrom(payload.client_id),
+        turnId,
+        clientId,
+        messageId,
       }),
     }));
     return;
