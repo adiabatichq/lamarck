@@ -98,6 +98,12 @@ export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationCo
     let usage = unknownUsage();
     const started = new Set<string>();
     const reasoning = new Set<string>();
+    const structured = options.responseFormat?.type === 'json';
+    let finalMessage: { id: string; text: string; streaming: boolean; completed: boolean } | undefined;
+    const selectFinal = (id: string) => {
+      if (finalMessage && finalMessage.id !== id) throw new AiError('subscription_failed', 'Codex returned multiple final answers for structured output');
+      return finalMessage ??= { id, text: '', streaming: false, completed: false };
+    };
     let resolveDone!: () => void;
     let rejectDone!: (error: unknown) => void;
     const done = new Promise<void>((resolve, reject) => { resolveDone = resolve; rejectDone = reject; });
@@ -111,12 +117,17 @@ export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationCo
         output.enqueue(part);
       } catch (error) { rejectDone(error); void rpc.close(); }
     };
+    const text = (id: string, delta: string) => {
+      if (!started.has(id)) { started.add(id); emit({ type: 'text-start', id }); }
+      emit({ type: 'text-delta', id, delta });
+    };
     const abort = () => { rejectDone(new DOMException('Cancelled', 'AbortError')); void rpc.close(); };
     context.signal.addEventListener('abort', abort, { once: true });
     rpc.onClose = () => rejectDone(new AiError('runtime_closed', 'Codex runtime closed'));
     rpc.onRequest = async (method, params) => {
       if (method !== 'item/tool/call' || params.threadId !== thread.id || params.namespace != null || !declared.has(params.tool)) return { decision: 'decline' };
       try {
+        if (structured && finalMessage) throw new AiError('subscription_failed', 'Codex requested a tool after its final answer');
         const result = await context.tool(params.tool, params.arguments, params.callId);
         const response = toCodexToolResult(result.modelOutput);
         emit({ type: 'tool-call', toolCallId: params.callId, toolName: params.tool, input: JSON.stringify(params.arguments), providerExecuted: true });
@@ -126,25 +137,49 @@ export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationCo
     };
     rpc.onEvent = (method, params) => {
       if (params.threadId !== thread.id) return;
-      if (method === 'item/agentMessage/delta') {
-        const id = params.itemId;
-        if (!started.has(id)) { started.add(id); emit({ type: 'text-start', id }); }
-        emit({ type: 'text-delta', id, delta: params.delta });
-      }
-      if (method === 'item/reasoning/summaryTextDelta') {
-        const id = `${params.itemId}:${params.summaryIndex ?? 0}`;
-        if (!reasoning.has(id)) { reasoning.add(id); emit({ type: 'reasoning-start', id }); }
-        emit({ type: 'reasoning-delta', id, delta: params.delta });
-      }
-      if (method === 'thread/tokenUsage/updated') {
-        const reported = params.tokenUsage?.last;
-        if (reported) usage = { inputTokens: { total: reported.inputTokens, noCache: undefined, cacheRead: reported.cachedInputTokens, cacheWrite: undefined }, outputTokens: { total: reported.outputTokens, text: undefined, reasoning: reported.reasoningOutputTokens } };
-      }
-      if (method === 'turn/completed') {
-        if (params.turn.status !== 'completed') rejectDone(new AiError('subscription_failed', 'Codex generation failed or was interrupted'));
-        else resolveDone();
-      }
-      if (method === 'error') rejectDone(new AiError('subscription_failed', 'Codex generation failed'));
+      try {
+        // Only the native final_answer belongs to structured output. Commentary
+        // is another assistant message in the same Vercel step, not another step.
+        if (structured && method === 'item/started' && params.item.type === 'agentMessage' && params.item.phase === 'final_answer') {
+          selectFinal(params.item.id).streaming = true;
+        }
+        if (method === 'item/agentMessage/delta') {
+          const id = params.itemId;
+          if (structured) {
+            if (!finalMessage || finalMessage.id !== id || !finalMessage.streaming) return;
+            if (finalMessage.completed) throw new AiError('subscription_failed', 'Codex returned text after completing its final answer');
+            finalMessage.text += params.delta;
+          }
+          text(id, params.delta);
+        }
+        if (structured && method === 'item/completed' && params.item.type === 'agentMessage') {
+          const item = params.item;
+          if (finalMessage?.id === item.id && item.phase !== 'final_answer') throw new AiError('subscription_failed', 'Codex changed the final answer phase');
+          if (item.phase === 'final_answer') {
+            const selected = selectFinal(item.id);
+            if (selected.completed || (selected.streaming && selected.text !== item.text)) throw new AiError('subscription_failed', 'Codex final answer did not match its stream');
+            // If classification arrives only at completion, use that native
+            // item's exact text; never extract or repair JSON.
+            if (!selected.streaming) { selected.text = item.text; text(item.id, item.text); }
+            selected.completed = true;
+          }
+        }
+        if (method === 'item/reasoning/summaryTextDelta') {
+          const id = `${params.itemId}:${params.summaryIndex ?? 0}`;
+          if (!reasoning.has(id)) { reasoning.add(id); emit({ type: 'reasoning-start', id }); }
+          emit({ type: 'reasoning-delta', id, delta: params.delta });
+        }
+        if (method === 'thread/tokenUsage/updated') {
+          const reported = params.tokenUsage?.last;
+          if (reported) usage = { inputTokens: { total: reported.inputTokens, noCache: undefined, cacheRead: reported.cachedInputTokens, cacheWrite: undefined }, outputTokens: { total: reported.outputTokens, text: undefined, reasoning: reported.reasoningOutputTokens } };
+        }
+        if (method === 'turn/completed') {
+          if (params.turn.status !== 'completed') rejectDone(new AiError('subscription_failed', 'Codex generation failed or was interrupted'));
+          else if (structured && !finalMessage?.completed) rejectDone(new AiError('subscription_failed', 'Codex did not identify a completed final answer for structured output'));
+          else resolveDone();
+        }
+        if (method === 'error') rejectDone(new AiError('subscription_failed', 'Codex generation failed'));
+      } catch (error) { rejectDone(error); }
     };
     emit({ type: 'stream-start', warnings });
     await rpc.request('turn/start', {
@@ -158,7 +193,7 @@ export function codexModel(modelId: string, rpc: CodexRpc, context: InvocationCo
       for (const id of started) emit({ type: 'text-end', id });
       emit({ type: 'finish', finishReason: { unified: 'stop', raw: 'completed' }, usage });
       output.close();
-    }, error => { output.error(error); }).finally(() => context.signal.removeEventListener('abort', abort));
+    }, error => { output.error(error); void rpc.close(); }).finally(() => context.signal.removeEventListener('abort', abort));
     return { stream };
   };
   return {

@@ -83,7 +83,9 @@ createInterface({input:process.stdin}).on('line', line=>{
  }
  if(m.method==='turn/start') { send({id:m.id,result:{turn:{id:'turn'}}}); send({id:99,method:'item/tool/call',params:{threadId:'thread',tool:'lookup',callId:'tool',arguments:{value:'yes'}}}); }
  if(m.id===99 && m.result) {
+   send({method:'item/started',params:{threadId:'thread',item:{type:'agentMessage',id:'text',phase:'final_answer',text:''}}});
    send({method:'item/agentMessage/delta',params:{threadId:'thread',itemId:'text',delta:'hello'}});
+   send({method:'item/completed',params:{threadId:'thread',item:{type:'agentMessage',id:'text',phase:'final_answer',text:'hello'}}});
    send({method:'turn/completed',params:{threadId:'thread',turn:{status:'completed'}}});
  }
 });

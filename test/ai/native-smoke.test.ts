@@ -58,7 +58,8 @@ test.runIf(native).each([
   ...['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'].flatMap(id => [false, true].map(streaming => ({ id, codeMode: true, streaming, cancelled: false }))),
   ...[{ id: 'gpt-6-astra', codeMode: true }, { id: 'gpt-5.5', codeMode: false }].map(row => ({ ...row, streaming: true, cancelled: true })),
   ...[false, true].map(streaming => ({ id: 'gpt-5.5', codeMode: false, streaming, cancelled: false, toolFailed: true })),
-])('native Codex $id codeMode=$codeMode streaming=$streaming cancelled=$cancelled toolFailed=$toolFailed through Host', async ({ id, codeMode, streaming, cancelled, toolFailed }: { id: string; codeMode: boolean; streaming: boolean; cancelled: boolean; toolFailed?: boolean }) => {
+  ...[{ id: 'gpt-5.5', codeMode: false }, { id: 'gpt-5.6-luna', codeMode: true }].flatMap(row => [false, true].map(streaming => ({ ...row, streaming, cancelled: false, structured: true, commentary: true }))),
+])('native Codex $id codeMode=$codeMode streaming=$streaming cancelled=$cancelled toolFailed=$toolFailed commentary=$commentary through Host', async ({ id, codeMode, streaming, cancelled, toolFailed, structured = streaming, commentary }: { id: string; codeMode: boolean; streaming: boolean; cancelled: boolean; toolFailed?: boolean; structured?: boolean; commentary?: boolean }) => {
   const root = await mkdtemp(join(tmpdir(), 'ai-native-model-'));
   const requests: any[] = [], children: number[] = [];
   const controller = new AbortController();
@@ -81,10 +82,11 @@ test.runIf(native).each([
       { type: 'function_call', id: 'denied-namespace', call_id: 'denied-namespace', name: 'lookup', namespace: 'foreign', arguments: '{"value":"wrong namespace"}', status: 'completed' },
     ]);
     const toolTurn = requests.length === (denialProbe ? 2 : 1);
-    const output = toolTurn ? [codeMode
+    const output = toolTurn ? [
+      ...(commentary ? [{ type: 'message', id: 'commentary', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: '{"answer":"intermediate"}', annotations: [] }], status: 'completed' }] : []), codeMode
       ? { type: 'custom_tool_call', id: 'fc', call_id: 'native-call', name: 'exec', input: probe ? source : 'text(await tools.lookup({value: "native"}));', status: 'completed' }
       : { type: 'function_call', id: 'fc', call_id: 'native-call', name: 'lookup', arguments: '{"value":"native"}', status: 'completed' }]
-      : [{ type: 'reasoning', id: 'reason', summary: [{ type: 'summary_text', text: 'fixture reasoning' }] }, { type: 'message', id: 'msg', role: 'assistant', content: [{ type: 'output_text', text: streaming ? '{"answer":"contained"}' : 'contained', annotations: [] }], status: 'completed' }];
+      : [{ type: 'reasoning', id: 'reason', summary: [{ type: 'summary_text', text: 'fixture reasoning' }] }, { type: 'message', id: 'msg', role: 'assistant', phase: 'final_answer', content: [{ type: 'output_text', text: structured ? '{"answer":"contained"}' : 'contained', annotations: [] }], status: 'completed' }];
     return codexResponse(output);
   } });
   const rpc = new CodexRpc(root, process.env.LAMARCK_AI_CODEX_TEST_EXECUTABLE);
@@ -122,7 +124,7 @@ test.runIf(native).each([
       return appToolOutput;
     });
     const generated = host.system.ai.withTools({ model: `openai:${id}`, accessSource: access.id, tools: { lookup: tool({ inputSchema: jsonSchema({ type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false }), execute, toModelOutput: imageToolOutput }) } }, async ({ model, tools }) => {
-      const options = { model, tools, reasoning: 'minimal' as const, messages: imageHistory, abortSignal: controller.signal, maxRetries: 0, ...(streaming ? { output: Output.object({ schema: jsonSchema<{ answer: string }>({ type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false }) }) } : {}) };
+      const options = { model, tools, reasoning: 'minimal' as const, messages: imageHistory, abortSignal: controller.signal, maxRetries: 0, ...(structured ? { output: Output.object({ schema: jsonSchema<{ answer: string }>({ type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false }) }) } : {}) };
       if (!streaming) return generateText(options);
       const result = streamText(options);
       const deltas: string[] = []; for await (const text of result.textStream) deltas.push(text);
@@ -132,13 +134,13 @@ test.runIf(native).each([
     if (cancelled) await expect(generated).rejects.toThrow();
     else {
       const result = await generated;
-      expect(result.text).toContain('contained');
+      expect(result.text).toBe(structured ? '{"answer":"contained"}' : 'contained');
       expect(result.reasoningText).toBe('fixture reasoning');
       expect(result.toolCalls).toHaveLength(1); expect(result.toolCalls[0]).toMatchObject({ toolName: 'lookup', providerExecuted: true });
       const content = result.steps.flatMap(step => step.content);
       if (toolFailed) expect(content.find(part => part.type === 'tool-error')).toMatchObject({ toolName: 'lookup', error: 'Error: lookup failed' });
       else expect(content.find(part => part.type === 'tool-result')).toMatchObject({ toolName: 'lookup', output: appToolOutput });
-      if (streaming) expect(result.output).toEqual({ answer: 'contained' });
+      if (structured) expect(result.output).toEqual({ answer: 'contained' });
     }
     expect(execute).toHaveBeenCalledTimes(1);
     expect(execute.mock.calls[0][0]).toEqual({ value: 'native' });
@@ -152,7 +154,7 @@ test.runIf(native).each([
     }
     for (const request of requests) {
       expect(request.model).toBe(id); expect(request.reasoning.effort).toBe('low');
-      if (streaming) expect(request.text.format.type).toBe('json_schema');
+      if (structured) expect(request.text.format.type).toBe('json_schema');
       if (!codeMode) { expect(request.tools.map((tool: any) => tool.name ?? tool.type)).toEqual(['lookup']); expect(request.input.some((item: any) => item.type === 'additional_tools')).toBe(false); }
     }
     if (probe) {
