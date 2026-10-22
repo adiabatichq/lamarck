@@ -192,7 +192,7 @@ function codexResponse(output: any[]): Response {
 async function fixtureHost(root: string, adapter: AiAdapter) {
   const db = new DatabaseSync(':memory:'); db.exec(SYSTEM_SCHEMA_V1);
   const service = new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter);
-  const caller = { kind: 'app', appId: 'fixture', channelId: 'native-fixture', workload: 'ui', authorization: {} } as any;
+  const caller = { kind: 'app', appId: 'fixture', channelId: 'native-fixture', workload: 'ui', authorization: { mode: 'normal' } } as any;
   const system = createSystem(async (operation, input: any): Promise<any> => {
     if (operation === 'ai.listOptions') return service.options(caller);
     if (operation === 'ai.capabilities') return service.capabilities(caller, input, input.operation);

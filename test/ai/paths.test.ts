@@ -153,9 +153,9 @@ afterEach(async () => {
   } finally { db.close(); guard.close(); await rm(root, { recursive: true, force: true }); }
 });
 function bind(id: string, workload: AppAuthContext['workload'] = 'ui') {
-  const caller = { kind: 'app', appId: id, workload, channelId: `ch-${id}`, authorization: { aiAccessSources: structuredClone(manifests.get(id)?.ai?.accessSources ?? {}) } } as AppAuthContext;
+  const caller = { kind: 'app', appId: id, workload, channelId: `ch-${id}`, authorization: { mode: 'normal', aiAccessSources: structuredClone(manifests.get(id)?.ai?.accessSources ?? {}) } } as AppAuthContext;
   callers.set(id, caller); signals.set(id, new AbortController());
-  broker.bindSender(id, { capability: id, channelId: caller.channelId });
+  broker.bindSender(id, { mode: 'normal', capability: id, channelId: caller.channelId });
 }
 async function systemFor(path: 'browser' | 'node', id = 'app-a', workload: AppAuthContext['workload'] = 'ui') {
   bind(id, workload);

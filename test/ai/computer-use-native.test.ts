@@ -10,7 +10,7 @@ test.runIf(process.env.LAMARCK_COMPUTER_USE_NATIVE_SMOKE === '1')('bundled drive
   const authorize = vi.fn(async () => {});
   const service = new ComputerUseService({ executable: resolve('desktop/shell/dist-electron/computer-use/cua-driver'), bundleId: 'ai.lamarck.desktop', authorize });
   const broker = new SystemBroker({ coreBaseUrl: 'http://unused.invalid', revokeCapability() {}, computer: service });
-  broker.bindSender('native-computer', { appId: 'native-fixture', channelId: 'private-channel', capability: 'unused' });
+  broker.bindSender('native-computer', { mode: 'normal', appId: 'native-fixture', channelId: 'private-channel', capability: 'unused' });
   const system = createSystem((operation, input) => broker.invoke('native-computer', operation, input));
   let pid: number | undefined;
   // Upstream's Rust uint formats are annotations; its default MCP validator
