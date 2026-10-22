@@ -5,7 +5,8 @@ export const APP_SERVICE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS app_runtime_settings (
   app_id TEXT PRIMARY KEY,
   enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
-  revision INTEGER NOT NULL CHECK (revision > 0)
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  mode TEXT NOT NULL DEFAULT 'normal' CHECK (mode IN ('normal', 'exp'))
 );
 CREATE TABLE IF NOT EXISTS app_services (
   app_id TEXT NOT NULL REFERENCES app_runtime_settings(app_id) ON DELETE CASCADE,
@@ -45,7 +46,7 @@ export class AppServiceStore {
         // A package in a download/staging directory is never in this registry.
         // Admission chooses the approved enabled default once for each setting.
         // Rescans and new activations never overwrite an explicit user choice.
-        this.db.prepare("INSERT OR IGNORE INTO app_runtime_settings VALUES (?, 1, 1)").run(appId);
+        this.db.prepare("INSERT OR IGNORE INTO app_runtime_settings (app_id, enabled, revision) VALUES (?, 1, 1)").run(appId);
         for (const serviceId of Object.keys(app.manifest.runtime.services ?? {})) {
           if (!this.get(appId, serviceId)) this.setEnabled(appId, serviceId, true);
         }
@@ -57,9 +58,20 @@ export class AppServiceStore {
     }
   }
 
-  appSetting(appId: string): { enabled: boolean; revision: number } | null {
-    const row = this.db.prepare("SELECT enabled, revision FROM app_runtime_settings WHERE app_id = ?").get(appId);
-    return row ? { enabled: row.enabled === 1, revision: Number(row.revision) } : null;
+  appSetting(appId: string): { enabled: boolean; revision: number; mode: "normal" | "exp" } | null {
+    const row = this.db.prepare("SELECT enabled, revision, mode FROM app_runtime_settings WHERE app_id = ?").get(appId);
+    if (row && row.mode !== "normal" && row.mode !== "exp") throw new Error("App execution policy is unavailable");
+    return row ? { enabled: row.enabled === 1, revision: Number(row.revision), mode: row.mode as "normal" | "exp" } : null;
+  }
+  mode(appId: string): "normal" | "exp" {
+    const setting = this.appSetting(appId);
+    if (!setting) throw new Error("App execution policy is unavailable");
+    return setting.mode;
+  }
+  setMode(appId: string, mode: "normal" | "exp"): void {
+    if (mode !== "normal" && mode !== "exp") throw new Error("Invalid App execution mode");
+    if (this.db.prepare("SELECT 1 FROM app_services WHERE app_id = ? AND cleanup_failed = 1").get(appId)) throw new Error("Stop the App and resolve workload cleanup before changing Experiment mode.");
+    if (this.db.prepare("UPDATE app_runtime_settings SET mode = ?, revision = revision + 1 WHERE app_id = ?").run(mode, appId).changes !== 1) throw new Error("App execution policy is unavailable");
   }
   appEnabled(appId: string): boolean { return this.appSetting(appId)?.enabled === true; }
   setAppEnabled(appId: string, enabled: boolean): void {

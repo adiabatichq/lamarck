@@ -1438,3 +1438,22 @@ async function waitForProcessToExit(pid, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (processExists(pid) && Date.now() < deadline) await delay(25);
 }
+
+
+test("exp preserves live reads and read transactions but rejects every durable write atomically", async () => {
+  const exp = { ...principal("app:experiment:job:inbox", ["parents"]), readOnly: true };
+  const before = await queryRows("SELECT count(*) AS n FROM events");
+  const results = await rpc("transaction", { principal: exp, statements: [{ sql: "SELECT count(*) AS n FROM parents" }, { sql: "SELECT 7 AS value" }] });
+  assert.equal(results[1].rows[0].value, 7);
+  for (const statements of [
+    [{ sql: "SELECT 1" }, { sql: "INSERT INTO parents (id, label) VALUES ('exp-denied', 'x')" }],
+    [{ sql: "INSERT INTO parents (id, label) VALUES ('exp-denied', 'x')" }, { sql: "SELECT 1" }],
+    [{ sql: "WITH x AS (SELECT 1) DELETE FROM parents WHERE id = 'absent' RETURNING id" }],
+  ]) await assertRpcRejects("transaction", { principal: exp, statements }, /Experiment mode/);
+  await assertRpcRejects("mutate", { principal: exp, sql: "INSERT INTO parents (id, label) VALUES ('exp-denied', 'x')" }, /Experiment mode/);
+  for (const method of ["writeEvent", "writeLifecycleEvent", "writeWorkspaceEvent"]) {
+    await assertRpcRejects(method, { principal: exp, event: { type: "exp.denied", startedAt: 1, payload: {} } }, /Experiment mode/);
+  }
+  assert.deepEqual(await queryRows("SELECT id FROM parents WHERE id = 'exp-denied'"), []);
+  assert.deepEqual(await queryRows("SELECT count(*) AS n FROM events"), before);
+});

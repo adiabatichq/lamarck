@@ -1,7 +1,7 @@
 import { useCallback, useId, useState, type KeyboardEvent, type ReactElement } from "react";
 import type { AppHistoryView, AppRuntimeView } from "../hooks/useAppsManager";
 import { useCorePolling } from "../hooks/useCorePolling";
-import { manageTrigger, type AppInfo, type AppVersionRecordV1, type TriggerSummary } from "../lib/api";
+import { setAppMode, manageTrigger, type AppInfo, type AppVersionRecordV1, type TriggerSummary } from "../lib/api";
 import { AppMark } from "../components/AppMark";
 import { workloadName } from "../lib/app-visual";
 import { AppActivity, AppEnablementSwitch, AppServices, useAppEnablement } from "./AppWorkloadManagement";
@@ -35,6 +35,8 @@ export function AppManagementDetails({ app, runtime, history, loading, busy, err
   onLoadMore, onRequestRestore, onRequestRebuild }: AppManagementDetailsProps) {
   const [tab, setTab] = useState<Tab>("Manage");
   const tabId = useId();
+  const [modePending, setModePending] = useState(false);
+  const [modeError, setModeError] = useState<string | null>(null);
   const policy = useAppEnablement(app.id, onPolicyChanged, onAppDisabled);
   const [triggers, setTriggers] = useState<readonly TriggerSummary[]>([]);
   const [triggerError, setTriggerError] = useState<string | null>(null);
@@ -56,7 +58,7 @@ export function AppManagementDetails({ app, runtime, history, loading, busy, err
   const uiPending = executionPending.has(`ui:${app.id}`);
   const failure = app.manifestHealth.status === "invalid" ? app.manifestHealth.message
     : app.versionHealth.status === "unavailable" ? app.versionHealth.message : runtime?.latestFailure;
-  const errors = [...new Set([error, executionError, policy.error, failure].filter(Boolean))];
+  const errors = [...new Set([error, executionError, policy.error, modeError, failure].filter(Boolean))];
   const grants = [...new Set([`apps/${app.id}/`, ...(app.permissions?.writes.files ?? [])])];
   const navigateTab = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     const next = event.key === "ArrowRight" ? (index + 1) % TABS.length : event.key === "ArrowLeft" ? (index + TABS.length - 1) % TABS.length
@@ -89,6 +91,18 @@ export function AppManagementDetails({ app, runtime, history, loading, busy, err
     </div>
     <div className={styles.tabPanel} role="tabpanel" id={`${tabId}-panel`} aria-labelledby={`${tabId}-${tab}`}>
       {tab === "Manage" && <>
+        <section className={styles.workloadSection} aria-label="Experiment mode">
+          <AppEnablementSwitch label="Experiment mode" enabled={runtime?.mode === undefined ? undefined : runtime.mode === "exp"}
+            disabled={modePending || runtime?.mode === undefined || runtime?.modeChangeAllowed !== true || policy.pending !== null}
+            onChange={enabled => {
+              setModePending(true); setModeError(null);
+              void setAppMode(app.id, enabled ? "exp" : "normal").then(() => onPolicyChanged?.())
+                .catch(cause => setModeError(cause instanceof Error ? cause.message : String(cause)))
+                .finally(() => setModePending(false));
+            }} />
+          <p className={styles.hint}>Read-only access to Workspace data. AI calls may incur costs.</p>
+          {runtime?.modeChangeAllowed !== true && <p className={styles.hint}>Stop the App and resolve workload cleanup before changing Experiment mode.</p>}
+        </section>
         <AppServices services={services} appEnabled={runtime?.enabled} pending={policy.pending} onChange={(id, enabled) => void policy.changeService(id, enabled)} />
         {(jobIds.length > 0 || (runtime?.jobs?.length ?? 0) > 0) && <AppExecutionView appId={app.id} runtime={runtime} jobIds={jobIds} loading={loading}
           pending={executionPending} error={executionError ?? null} onStopJob={onStopJob} onManageTriggers={onManageTriggers}

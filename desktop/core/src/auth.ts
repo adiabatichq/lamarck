@@ -16,6 +16,7 @@ export type AppWorkload =
 export type HostAuthContext = Readonly<{ kind: "host" }>;
 
 export type AppAuthorizationSnapshot = Readonly<{
+  mode: "normal" | "exp";
   activationId: string;
   manifestDigest: AppManifestDigest;
   packageDigest: `sha256:${string}`;
@@ -42,6 +43,7 @@ export interface AuthSecrets {
 }
 
 export type IssuedAppCapability = Readonly<{
+  mode: "normal" | "exp";
   capability: string;
   channelId: string;
   activationId: string;
@@ -98,6 +100,10 @@ export class AppCapabilityRegistry {
     return this.#channelsById.get(channelId)?.open === true;
   }
 
+  hasAuthority(appId: string): boolean {
+    return [...this.#channelsById.values()].some(channel => channel.context.appId === appId);
+  }
+
   onChannelDeleted(listener: (channelId: string) => void): () => void {
     this.#channelDeletedListeners.add(listener);
     return () => this.#channelDeletedListeners.delete(listener);
@@ -144,6 +150,7 @@ export class AppCapabilityRegistry {
 
     return Object.freeze({
       capability,
+      mode: frozenAuthorization.mode,
       channelId,
       activationId: frozenAuthorization.activationId,
       appCommit: frozenAuthorization.appCommit,
@@ -295,6 +302,7 @@ function freezeAuthorizationSnapshot(
   ) {
     throw new Error("App authorization grants must be string arrays");
   }
+  if (authorization.mode !== "normal" && authorization.mode !== "exp") throw new Error("App execution policy is unavailable");
   const declarations = authorization.aiAccessSources;
   if (!declarations || typeof declarations !== "object" || Array.isArray(declarations)) {
     throw new Error("App authorization AI sources must be an object");
@@ -308,6 +316,7 @@ function freezeAuthorizationSnapshot(
     return [reference, Object.freeze({ name: definition.name, provider: definition.provider })];
   }));
   return Object.freeze({
+    mode: authorization.mode,
     activationId: authorization.activationId,
     manifestDigest: authorization.manifestDigest,
     packageDigest: authorization.packageDigest,

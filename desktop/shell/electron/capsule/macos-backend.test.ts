@@ -2434,6 +2434,7 @@ describe("declared Capsule jobs", () => {
 
 function spec(sender: string, packageDigest: string = PACKAGE_A, activationSequence = 1) {
   return {
+    mode: "normal" as const,
     appId: "weather",
     activationId: `activation_${"e".repeat(32)}`,
     activationSequence,

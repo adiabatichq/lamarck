@@ -40,6 +40,7 @@ let coreOrigin = "";
 let coreProcess: ChildProcess | undefined;
 let guardProcess: ChildProcess | undefined;
 let cliGateway: DesktopCliGateway | undefined;
+let managementManager: CapsuleManager;
 let coreOutput = "";
 let guardOutput = "";
 
@@ -54,6 +55,7 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
       mkdir(join(workspace, ".lamarck"), { recursive: true }),
       writeAppManifest("app-a", ["app_a_items"]),
       writeAppManifest("app-b", ["app_b_items"]),
+      writeAppManifest("exp-app", ["app_a_items"]),
       writeAppManifest("history-app", []),
       writeAppManifest("archive-app", []),
       writeAppManifest("trigger-app", []),
@@ -103,11 +105,14 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     await waitForCore();
     const cliRuntimeDirectory = join(testRoot, "cli");
     cliDescriptor = join(cliRuntimeDirectory, "runtime.json");
+    managementManager = new CapsuleManager({ backend: new UnavailableCapsuleBackend(), workspacePath: () => workspace,
+      coreBaseUrl: () => coreOrigin, coreToken: CORE_TOKEN, bindSystemSender() {}, unbindSystemSender() {} });
     cliGateway = new DesktopCliGateway({
       dispatcher: new CliOperationDispatcher({
         coreBaseUrl: () => coreOrigin,
         coreToken: CORE_TOKEN,
-        runtimeStates: () => [],
+        runtimeStates: () => managementManager.appRuntimeStates(),
+        setAppMode: (appId, mode) => managementManager.setAppMode(appId, mode),
       }),
       runtimeDirectory: cliRuntimeDirectory,
     });
@@ -120,6 +125,70 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     await stopProcess(guardProcess);
     if (testRoot) await rm(testRoot, { recursive: true, force: true });
   });
+
+  test("exp mode rejects SDK and forged managed mutations while Host schema and App versions retain evidence", async () => {
+    expect(JSON.parse(await runCli("app", "inspect", "exp-app", "--json")).runtime.mode).toBe("normal");
+    expect(JSON.parse(await runCli("app", "mode", "exp-app", "exp", "--json"))).toEqual({ appId: "exp-app", mode: "exp" });
+    const issued = await issueCapability("exp-app"); expect(issued.mode).toBe("exp");
+    const broker = new SystemBroker({ coreBaseUrl: coreOrigin, revokeCapability: async () => {} });
+    broker.bindSender("exp", { ...issued, appId: "exp-app" });
+    const system = createSystem((operation, input) => broker.invoke("exp", operation, input));
+    const snapshot = async () => hostRequest("/api/query", { method: "POST", body: JSON.stringify({ sql: "SELECT count(*) AS n FROM events" }) });
+    const before = await snapshot();
+    try {
+      expect((await system.query("SELECT 1 AS value")).rows).toEqual([{ value: 1 }]);
+      expect(await system.transaction([{ sql: "SELECT 2 AS value" }])).toMatchObject([{ kind: "query", rows: [{ value: 2 }] }]);
+      await expect(system.writeEvent({ type: "exp.denied", startedAt: 1, payload: {} })).rejects.toThrow(/Experiment mode/);
+      await expect(system.mutate("INSERT INTO app_a_items VALUES ('exp-denied', 'x')")).rejects.toThrow(/Experiment mode/);
+      await expect(system.transaction([{ sql: "SELECT 1" }, { sql: "INSERT INTO app_a_items VALUES ('exp-denied', 'x')" }])).rejects.toThrow(/Experiment mode/);
+      const write = await system.vfs.command("mkdir -p apps/exp-app/denied");
+      expect(write.success).toBe(false); expect(new TextDecoder().decode(write.stderr)).toMatch(/Experiment mode/);
+      expect(existsSync(join(workspace, "files", "apps", "exp-app", "denied"))).toBe(false);
+      const file = await system.vfs.command("tee apps/exp-app/denied.txt", { stdin: "must not persist" });
+      expect(file.success).toBe(false); expect(existsSync(join(workspace, "files", "apps", "exp-app", "denied.txt"))).toBe(false);
+      const read = await system.vfs.command("ls"); expect(read.success).toBe(true);
+      const subscription = await system.subscribe({ sql: "SELECT id FROM events WHERE type='exp.subscription'" }, async () => {});
+      await subscription.cancel(); await subscription.done;
+      const principal = { kind: "app", appId: "exp-app", workload: "ui", appCommit: issued.appCommit, writeTables: ["app_a_items"], fileGrants: ["apps/exp-app/"], workloadHandle: "bound-workload" };
+      const modeSpoof = await fetch(`${coreOrigin}/api/app-runtime/apps/exp-app/mode`, { method: "POST", headers: { "x-lamarck-app-capability": issued.capability }, body: JSON.stringify({ mode: "normal" }) });
+      expect(modeSpoof.status).toBe(403);
+      const upload = await fetch(`${coreOrigin}/api/apps/exp-app/edit-package`, { method: "POST", headers: {
+        Authorization: `Bearer ${CORE_TOKEN}`, "X-Lamarck-CLI-Principal": Buffer.from(JSON.stringify(principal)).toString("base64url"),
+      }, body: "denied before archive staging" });
+      expect(upload.status).toBe(403); expect(await upload.json()).toMatchObject({ error: { code: "APP_EXPERIMENT_READ_ONLY" } });
+      const pendingBefore = await hostRequest("/api/schema/requests");
+      const sourcesBefore = JSON.parse(await runCli("source", "list", "--json"));
+      const changes = [
+        ["schema.change", { ddl: "CREATE TABLE exp_denied (id TEXT PRIMARY KEY NOT NULL)" }],
+        ["source.run", { sourceId: "source" }], ["source.pause", { sourceId: "source" }], ["source.resume", { sourceId: "source" }],
+        ["connector.install", { packageId: "package" }], ["connector.update", { connectorId: "lamarck.cli-fixture" }], ["connector.remove", { connectorId: "lamarck.cli-fixture" }],
+        ["app.create", { appId: "denied-app", name: "Denied", description: "Denied" }], ["app.save", { appId: "exp-app" }],
+        ["app.restore", { appId: "exp-app", version: issued.appCommit }], ["app.archive", { appId: "exp-app" }], ["app.refresh", { appId: "exp-app" }],
+        ["file.command", { argv: ["mkdir", "apps/exp-app/denied"] }],
+      ];
+      for (const [operation, input] of changes) expect(await hostRequest("/api/cli/execute", { method: "POST", body: JSON.stringify({ principal, request: { requestId: "exp", operation, input } }) }))
+        .toMatchObject({ ok: false, error: { code: "APP_EXPERIMENT_READ_ONLY" } });
+      expect(await hostRequest("/api/schema/requests")).toEqual(pendingBefore);
+      expect(JSON.parse(await runCli("source", "list", "--json"))).toEqual(sourcesBefore);
+      expect(existsSync(join(workspace, "apps", "denied-app"))).toBe(false);
+      expect(await snapshot()).toEqual(before);
+      const spoof = await fetch(`${coreOrigin}/api/events`, { method: "POST", headers: { "x-lamarck-app-capability": issued.capability }, body: JSON.stringify({ mode: "normal", source: "system:host", readOnly: false, type: "exp.denied", startedAt: 1, payload: {} }) });
+      expect(spoof.ok).toBe(false); expect(await snapshot()).toEqual(before);
+      expect(await runCliFailure("app", "mode", "exp-app", "normal", "--json")).toMatchObject({ error: { code: "APP_MODE_REQUIRES_STOP" } });
+      // Independent Host authoring and schema management keep their ordinary evidence.
+      await writeFile(join(workspace, "apps", "exp-app", "note.txt"), "Host edit");
+      expect(JSON.parse(await runCli("app", "save", "exp-app", "--json"))).toMatchObject({ created: true });
+      const pending = await hostRequest("/api/schema/change/request", { method: "POST", body: JSON.stringify({ ddl: "CREATE TABLE exp_host_schema (id TEXT PRIMARY KEY NOT NULL)", author: "Host test" }) }) as { request: { id: string } };
+      expect(await hostRequest(`/api/schema/requests/${pending.request.id}/approve`, { method: "POST", body: "{}" })).toMatchObject({ request: { status: "applied" } });
+      const evidence = await hostRequest("/api/query", { method: "POST", body: JSON.stringify({ sql: "SELECT type, source FROM events WHERE type IN ('workspace.schema.changed', 'app.version.created') ORDER BY rowid DESC LIMIT 2" }) }) as { rows: { type: string; source: string }[] };
+      expect(evidence.rows.map(row => row.type)).toEqual(["workspace.schema.changed", "app.version.created"]);
+      expect(evidence.rows.every(row => row.source.startsWith("system:"))).toBe(true);
+      expect(JSON.parse(await runCli("app", "inspect", "exp-app", "--json")).runtime.mode).toBe("exp");
+    } finally {
+      broker.unbindAll(); await hostRequest(`/api/app-runtime/channels/${issued.channelId}`, { method: "DELETE" });
+    }
+    expect(JSON.parse(await runCli("app", "mode", "exp-app", "normal", "--json"))).toEqual({ appId: "exp-app", mode: "normal" });
+  }, 30_000);
 
   test("AI references survive activation release and stay pinned until a new channel is issued", async () => {
     // issueCapability releases the preparation record, as the real UI open does.
@@ -546,7 +615,8 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     }
   });
 
-  test("a Service-only App starts from saved enabled policy, keeps its bound identity, and obeys persisted App enablement", async () => {
+  test.each(["normal", "exp"] as const)("a Service-only App preserves supervision, identity, and enablement in %s mode", async mode => {
+    await hostRequest("/api/app-runtime/apps/service-app/mode", { method: "POST", body: JSON.stringify({ mode }) });
     const path = "/api/app-runtime/services/service-app/indexer";
     await hostRequest(path, { method: "POST", body: JSON.stringify({ operation: "enablement", enabled: true }) });
     const broker = new SystemBroker({ coreBaseUrl: coreOrigin, revokeCapability: async channelId => { await hostRequest(`/api/app-runtime/channels/${channelId}`, { method: "DELETE" }); } });
@@ -558,7 +628,9 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
         expect(spec.serviceId).toBe("indexer");
         const system = createSystem((operation, input) => broker.invoke(spec.sdkSenderId, operation, input));
         await expect(system.jobInput()).rejects.toThrow();
-        await system.writeEvent({ type: "service.fixture.result", startedAt: Date.now(), payload: { value: "business output" } });
+        expect(spec.mode).toBe(mode);
+        const write = () => system.writeEvent({ type: "service.fixture.result", startedAt: Date.now(), payload: { value: "business output" } });
+        if (mode === "exp") await expect(write()).rejects.toThrow(/Experiment mode/); else await write();
         launches++; state?.("running"); output?.(Buffer.from("indexer alive\n"));
         await new Promise<void>((_, reject) => {
           if (signal.aborted) reject(signal.reason);
@@ -584,7 +656,8 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
     }
   });
 
-  test("Host CLI and Console share Trigger management, dispatch a bound App job and persist its original event and completion", async () => {
+  test.each(["normal", "exp"] as const)("Host Triggers preserve bound Job input, cancellation, history, and diagnostics in %s mode", async mode => {
+    await hostRequest("/api/app-runtime/apps/trigger-app/mode", { method: "POST", body: JSON.stringify({ mode }) });
     const broker = new SystemBroker({ coreBaseUrl: coreOrigin, revokeCapability: async channelId => { await hostRequest(`/api/app-runtime/channels/${channelId}`, { method: "DELETE" }); } });
     const received: JobInvocation[] = [];
     let holdNext = false, activeJobCapability = ""; const cleanupGate = Promise.withResolvers<void>();
@@ -608,7 +681,9 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
             finally { await cleanupGate.promise; }
           }
           await expect(rpc.invoke("job.input", { runId: "foreign" } as never)).rejects.toThrow();
-          await system.writeEvent({ type: "trigger.result", startedAt: Date.now(), payload: { runId: invocation.runId, input: JSON.parse(JSON.stringify(invocation.input)) } });
+          expect(spec.mode).toBe(mode);
+          const write = () => system.writeEvent({ type: "trigger.result", startedAt: Date.now(), payload: { runId: invocation.runId, input: JSON.parse(JSON.stringify(invocation.input)) } });
+          if (mode === "exp") await expect(write()).rejects.toThrow(/Experiment mode/); else await write();
         } finally { rpc.close(); detach(); pair.client.destroy(); pair.server.destroy(); }
       },
     };
@@ -832,6 +907,7 @@ function seedDataDatabase(): void {
 }
 
 async function issueCapability(appId: string, prepared?: PreparedActivation): Promise<{
+  mode: "normal" | "exp";
   capability: string;
   channelId: string;
   activationId: string;
@@ -846,6 +922,7 @@ async function issueCapability(appId: string, prepared?: PreparedActivation): Pr
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ appId, workload: "ui", activationId: authority.activationId }),
     }) as {
+      mode: "normal" | "exp";
       capability: string;
       channelId: string;
       activationId: string;

@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld("lamarckHost", {
   getAppRuntimeStates: () => ipcRenderer.invoke("app-runtime:states"),
   stopAppJob: (appId, runId) => ipcRenderer.invoke("app-runtime:stop-job", appId, runId),
   closeAppUi: (appId) => ipcRenderer.invoke("app-runtime:close-ui", appId),
+  setAppMode: (appId, mode) => ipcRenderer.invoke("app-runtime:mode", appId, mode),
   setAppEnabled: (appId, enabled) => ipcRenderer.invoke("app-runtime:app-enablement", appId, enabled),
   archiveApp: (appId) => ipcRenderer.invoke("app-runtime:archive", appId),
   createTerminal: () => ipcRenderer.invoke("terminal:create"),

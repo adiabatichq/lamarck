@@ -38,6 +38,7 @@ export const CLI_OPERATIONS = [
   "app.service.enable",
   "app.service.disable",
   "app.activity",
+  "app.mode",
   "app.create",
   "app.save",
   "app.versions",
@@ -48,7 +49,7 @@ export const CLI_OPERATIONS = [
 
 export type CliOperation = typeof CLI_OPERATIONS[number];
 export const HOST_APP_RUNTIME_OPERATIONS: readonly CliOperation[] = Object.freeze([
-  "app.enable", "app.disable", "app.service.enable", "app.service.disable", "app.activity",
+  "app.enable", "app.disable", "app.service.enable", "app.service.disable", "app.activity", "app.mode",
 ]);
 export const HOST_CLI_OPERATIONS: readonly CliOperation[] = Object.freeze(
   CLI_OPERATIONS.filter((operation) => operation !== "app.refresh"),
@@ -165,6 +166,7 @@ export interface AppShape {
     readonly running: boolean;
     /** Host inspection only. Null means the policy has not been observed. */
     readonly enabled?: boolean | null;
+    readonly mode?: "normal" | "exp" | null;
     readonly ui?: AppRuntimeState["ui"];
     readonly stopping?: boolean;
     readonly latestFailure?: string | null;
@@ -197,6 +199,8 @@ export interface AppServiceState {
 export interface AppRuntimeState {
   readonly appId: string;
   readonly enabled?: boolean;
+  readonly mode?: "normal" | "exp";
+  readonly modeChangeAllowed?: boolean;
   readonly runningWorkloads: number;
   readonly latestFailure: string | null;
   readonly ui: "closed" | "starting" | "running" | "stopping";
@@ -261,6 +265,7 @@ export interface CliOperationInputMap {
   "connector.remove": { readonly connectorId: string };
   "app.list": Record<string, never>;
   "app.inspect": { readonly appId: string };
+  "app.mode": { readonly appId: string; readonly mode: "normal" | "exp" };
   "app.enable": { readonly appId: string };
   "app.disable": { readonly appId: string };
   "app.service.enable": { readonly appId: string; readonly serviceId: string };
@@ -333,6 +338,7 @@ export interface CliOperationResultMap {
   "connector.remove": { readonly id: string; readonly removed: true };
   "app.list": readonly AppSummary[];
   "app.inspect": AppShape;
+  "app.mode": { readonly appId: string; readonly mode: "normal" | "exp" };
   "app.enable": { readonly appId: string; readonly enabled: true };
   "app.disable": { readonly appId: string; readonly enabled: false };
   "app.service.enable": { readonly appId: string; readonly serviceId: string; readonly enabled: true };
@@ -366,6 +372,16 @@ export type CliResponse<T extends CliOperation = CliOperation> =
     }
   | { readonly requestId: string; readonly ok: false; readonly error: CliErrorValue };
 
+
+/** Classify the actual fixed operation, including mixed command families. */
+export function isReadOnlyCliRequest(request: Pick<CliRequest, "operation" | "input">): boolean {
+  if (request.operation === "file.command") {
+    const argv = (request.input as CliOperationInput<"file.command">).argv;
+    return ["ls", "cat", "stat"].includes(argv[0] ?? "");
+  }
+  return ["query", "source.list", "source.inspect", "source.run.status", "marketplace.list",
+    "connector.list", "connector.inspect", "app.list", "app.inspect", "app.versions"].includes(request.operation);
+}
 
 export interface CliTransport {
   hello(): Promise<CliHostCapabilities>;

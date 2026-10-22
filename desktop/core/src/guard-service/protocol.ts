@@ -17,6 +17,8 @@ import type {
  * boundary) and never infers app permissions from an app-controlled source.
  */
 export interface GuardPrincipal {
+  /** Host-owned App execution restriction; never accepted from SDK input. */
+  readOnly?: boolean;
   /** Injected into D0. Examples: system:server, app:focus, connector:oura. */
   source: string;
   /** Host-bound logical reference to the immutable Producer Descriptor. */

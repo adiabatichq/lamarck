@@ -24,15 +24,16 @@ describe("AppActivationCoordinator", () => {
     const repository = new AppRepositoryService({ eventWriter: events });
     const coordinator = new AppActivationCoordinator(repository, cacheDir);
 
-    const ui = await coordinator.prepare({ appId: "example", appDir, workload: "ui" });
-    const service = await coordinator.prepare({
+    const ui = await coordinator.prepare({ mode: "normal", appId: "example", appDir, workload: "ui" });
+    const service = await coordinator.prepare({ mode: "normal",
       appId: "example",
       appDir,
       workload: "service:sync",
     });
-    const job = await coordinator.prepare({ appId: "example", appDir, workload: "job:daily" });
+    const job = await coordinator.prepare({ mode: "normal", appId: "example", appDir, workload: "job:daily" });
 
-    expect(ui).toMatchObject({ schemaVersion: 1, workload: "ui" });
+    expect(ui).toMatchObject({ schemaVersion: 1, workload: "ui", mode: "normal" });
+    expect(coordinator.hasAuthority("example")).toBe(true);
     expect(service.version).toBe(ui.version);
     expect(job.version).toBe(ui.version);
     expect(service.packageDigest).toBe(ui.packageDigest);
@@ -46,6 +47,7 @@ describe("AppActivationCoordinator", () => {
     expect((await lstat(ui.immutablePackagePath)).isDirectory()).toBe(true);
     expect(await coordinator.release(service.activationId)).toBe(true);
     expect(await coordinator.release(job.activationId)).toBe(true);
+    expect(coordinator.hasAuthority("example")).toBe(false);
     await expect(lstat(ui.immutablePackagePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -53,7 +55,7 @@ describe("AppActivationCoordinator", () => {
     const { appDir, cacheDir } = await fixture();
     const repository = new AppRepositoryService({ eventWriter: new Events() });
     const coordinator = new AppActivationCoordinator(repository, cacheDir);
-    const activation = await coordinator.prepare({ appId: "example", appDir, workload: "ui" });
+    const activation = await coordinator.prepare({ mode: "normal", appId: "example", appDir, workload: "ui" });
 
     await writeFile(join(appDir, "src", "index.ts"), "export const version = 2;\n");
     const edited = JSON.parse(await readFile(join(appDir, 'manifest.json'), 'utf8'));
@@ -72,7 +74,7 @@ describe("AppActivationCoordinator", () => {
   test("failed activation release retains its exact cleanup obligation for retry", async () => {
     const { appDir, cacheDir } = await fixture();
     const coordinator = new AppActivationCoordinator(new AppRepositoryService({ eventWriter: new Events() }), cacheDir);
-    const activation = await coordinator.prepare({ appId: "example", appDir, workload: "service:sync" });
+    const activation = await coordinator.prepare({ mode: "normal", appId: "example", appDir, workload: "service:sync" });
     const retained = `${activation.immutablePackagePath}.held`;
     await chmod(activation.immutablePackagePath, 0o700);
     await rename(activation.immutablePackagePath, retained);
@@ -92,7 +94,7 @@ describe("AppActivationCoordinator", () => {
       new AppRepositoryService({ eventWriter: events }),
       cacheDir,
     );
-    await expect(coordinator.prepare({
+    await expect(coordinator.prepare({ mode: "normal",
       appId: "example",
       appDir,
       workload: "service:missing",

@@ -13,7 +13,7 @@ import {
 import type { AppRuntimeAggregate } from "../../shared/app-runtime";
 
 export interface AppRuntimeView extends Pick<AppRuntimeAggregate, "appId" | "runningWorkloads" | "latestFailure">,
-  Partial<Pick<AppRuntimeAggregate, "ui" | "stopping" | "jobs" | "services" | "enabled">> {}
+  Partial<Pick<AppRuntimeAggregate, "ui" | "stopping" | "jobs" | "services" | "enabled" | "mode" | "modeChangeAllowed">> {}
 
 export interface AppHistoryView {
   readonly versions: readonly AppVersionRecordV1[];

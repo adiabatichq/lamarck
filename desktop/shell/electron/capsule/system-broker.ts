@@ -26,6 +26,7 @@ const MAX_JSON_DEPTH = 128;
 export type SenderId = string | number;
 
 export interface SystemSenderBinding {
+  mode: "normal" | "exp";
   appId?: string;
   channelId: string;
   capability: string;
@@ -75,6 +76,7 @@ export class SystemBrokerError extends Error {
 }
 
 interface PrivateBinding {
+  mode: "normal" | "exp";
   readonly appId?: string;
   readonly channelId: string;
   readonly capability: string;
@@ -164,6 +166,7 @@ export class SystemBroker {
     viewerResources?: SystemViewerResourceBinding,
   ): void {
     validateSenderId(senderId);
+    if (binding?.mode !== "normal" && binding?.mode !== "exp") throw new Error("App execution policy is unavailable");
     if (!binding || typeof binding.channelId !== "string" || !binding.channelId) {
       throw new Error("System sender binding requires channelId");
     }
@@ -180,6 +183,7 @@ export class SystemBroker {
     // The caller-owned object is never retained. Only this private copy holds
     // the raw capability, and no public inspection API returns the binding.
     const stored: PrivateBinding = Object.freeze({
+      mode: binding.mode,
       channelId: binding.channelId,
       appId: binding.appId,
       capability: binding.capability,
@@ -313,6 +317,7 @@ export class SystemBroker {
 
     const epoch = this.#connectionEpoch.get(senderId) ?? 0;
     const computer = operation.startsWith('computer.');
+    if (computer && binding.mode !== 'normal') throw new SystemBrokerError('operation_denied', 'Computer Use is unavailable in Experiment mode.');
     const coreRequest = computer
       ? { method: 'POST' as const, path: '', body: undefined, sizeValue: expectJson(input, operation) }
       : mapCoreRequest(operation, input);

@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { expect, test } from "vitest";
 import { migrateSystemDatabase, SYSTEM_DATABASE_VERSION } from "../src/db";
@@ -10,7 +13,7 @@ test("the greenfield v1 baseline holds explicit Service policy and fences stale 
     expect(SYSTEM_DATABASE_VERSION).toBe(1);
     expect(db.prepare("PRAGMA user_version").get()?.user_version).toBe(1);
     const store = new AppServiceStore(db);
-    db.exec("INSERT INTO app_runtime_settings VALUES ('notes', 1, 1), ('other', 1, 1)");
+    db.exec("INSERT INTO app_runtime_settings (app_id, enabled, revision) VALUES ('notes', 1, 1), ('other', 1, 1)");
     expect(store.get("notes", "indexer")).toBeNull();
     const enabled = store.setEnabled("notes", "indexer", true);
     expect(enabled).toMatchObject({ enabled: true, revision: 1, restartBaseMs: 1000, restartMaxMs: 60000 });
@@ -52,4 +55,40 @@ test("only admitted Apps receive enabled defaults, and rescans preserve explicit
     expect(store.appEnabled("notes")).toBe(true);
     expect(store.get("notes", "indexer")?.enabled).toBe(true);
   } finally { db.close(); }
+});
+
+
+test("Experiment mode is persistent Host policy independent of versions and enablement", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    migrateSystemDatabase(db);
+    const store = new AppServiceStore(db);
+    const registry = { apps: new Map([["notes", { manifest: { runtime: { jobs: { inbox: { command: ["node", "job.js"] } } } } }]]) } as unknown as import("../src/app-loader").AppRegistry;
+    store.admitInstalled(registry);
+    expect(store.mode("notes")).toBe("normal");
+    store.setAppEnabled("notes", false);
+    store.setMode("notes", "exp");
+    store.admitInstalled(registry);
+    const reopened = new AppServiceStore(db);
+    expect(reopened.appSetting("notes")).toMatchObject({ enabled: false, mode: "exp" });
+    expect(() => reopened.mode("missing")).toThrow("unavailable");
+    const service = reopened.setEnabled("notes", "worker", false);
+    reopened.observe("notes", "worker", service.revision, { crashCount: 0, restartAt: null, lastError: "cleanup failed", cleanupFailed: true });
+    expect(() => reopened.setMode("notes", "normal")).toThrow("cleanup");
+    expect(reopened.mode("notes")).toBe("exp");
+    expect(db.prepare("PRAGMA user_version").get()?.user_version).toBe(1);
+  } finally { db.close(); }
+});
+
+
+test("mode survives a closed system.db and reopened Host", () => {
+  const root = mkdtempSync(join(tmpdir(), "app-mode-persistence-"));
+  let db = new DatabaseSync(join(root, "system.db"));
+  try {
+    migrateSystemDatabase(db);
+    db.prepare("INSERT INTO app_runtime_settings (app_id, enabled, revision) VALUES (?, 1, 1)").run("notes");
+    new AppServiceStore(db).setMode("notes", "exp"); db.close();
+    db = new DatabaseSync(join(root, "system.db")); expect(migrateSystemDatabase(db)).toBe(1);
+    expect(new AppServiceStore(db).appSetting("notes")).toMatchObject({ enabled: true, mode: "exp" });
+  } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
 });

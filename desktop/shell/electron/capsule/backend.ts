@@ -7,6 +7,7 @@ export const CAPSULE_MAX_VIEWER_CONNECTIONS_PER_INSTANCE = 8;
 export class CapsuleViewerCapacityError extends Error {}
 
 export interface CapsuleUiSpec {
+  mode: "normal" | "exp";
   appId: string;
   /** Exact Core activation authority which must match every launch input. */
   activationId: string;

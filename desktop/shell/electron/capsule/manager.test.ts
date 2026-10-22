@@ -144,6 +144,7 @@ class FakeBackend implements CapsuleBackend {
 function createFetch(
   runtimeByApp: Record<string, unknown> = {},
   options: {
+    mode?: "normal" | "exp";
     issuedManifestDigest?: string;
     activationError?: { code: string; message: string };
   } = {},
@@ -161,6 +162,7 @@ function createFetch(
       const appId = decodeURIComponent(activationMatch[1]!);
       return Response.json({
         activation: {
+          mode: options.mode ?? "normal",
           schemaVersion: 1,
           activationId: ACTIVATION_ID,
           activationSequence: ACTIVATION_SEQUENCE,
@@ -192,7 +194,7 @@ function createFetch(
       const { appId } = request;
       issued += 1;
       return Response.json({
-        capability: `secret-capability-${appId}-${issued}`,
+        mode: options.mode ?? "normal", capability: `secret-capability-${appId}-${issued}`,
         channelId: `channel-${appId}-${issued}`,
         activationId: request.activationId,
         appCommit: APP_VERSION,
@@ -289,7 +291,7 @@ describe("CapsuleManager", () => {
     const opened = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     expect(manager.appRuntimeStates()).toEqual([{
       appId: "app-a",
-      runningWorkloads: 1,
+      modeChangeAllowed: false, runningWorkloads: 1,
       ui: "running", stopping: false, jobs: [],
       latestFailure: null,
     }]);
@@ -299,7 +301,7 @@ describe("CapsuleManager", () => {
     }, publishReloadedViewer)).rejects.toThrow("replacement viewer failed");
     expect(manager.appRuntimeStates()).toEqual([{
       appId: "app-a",
-      runningWorkloads: 0,
+      modeChangeAllowed: true, runningWorkloads: 0,
       ui: "closed", stopping: false, jobs: [],
       latestFailure: "replacement viewer failed",
     }]);
@@ -310,14 +312,14 @@ describe("CapsuleManager", () => {
     expect(saveResponse.ok).toBe(true);
     expect(manager.appRuntimeStates()).toEqual([{
       appId: "app-a",
-      runningWorkloads: 0,
+      modeChangeAllowed: true, runningWorkloads: 0,
       ui: "closed", stopping: false, jobs: [],
       latestFailure: "replacement viewer failed",
     }]);
 
     const recovered = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     expect(manager.appRuntimeStates()[0]).toMatchObject({
-      runningWorkloads: 1,
+      modeChangeAllowed: false, runningWorkloads: 1,
       ui: "running", stopping: false, jobs: [],
       latestFailure: null,
     });
@@ -351,7 +353,7 @@ describe("CapsuleManager", () => {
     await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
     expect(manager.appRuntimeStates()).toEqual([{
       appId: "app-a",
-      runningWorkloads: 1,
+      modeChangeAllowed: false, runningWorkloads: 1,
       ui: "running", stopping: false, jobs: [],
       latestFailure: null,
     }]);
@@ -376,7 +378,7 @@ describe("CapsuleManager", () => {
       capability: "secret-capability-app-a-2",
     });
     expect(backend.starts).toEqual([{
-      appId: "app-a",
+      appId: "app-a", mode: "normal",
       activationId: ACTIVATION_ID,
       activationSequence: ACTIVATION_SEQUENCE,
       version: APP_VERSION,
@@ -728,7 +730,7 @@ describe("CapsuleManager", () => {
     const fetch: typeof globalThis.fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith("/enablement")) return Response.json({ enabled: JSON.parse(String(init?.body)).enabled });
-      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "app-a", enabled: false }], services: [] });
+      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "app-a", mode: "normal", enabled: false }], services: [] });
       return base.fetch(input, init);
     };
     const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "secret", fetch, ...systemBindings() });
@@ -1757,7 +1759,7 @@ describe("CapsuleManager", () => {
     expect(backend.replacements).toEqual([{
       instanceId: "instance-app-a",
       spec: {
-        appId: "app-a",
+        appId: "app-a", mode: "normal",
         activationId: ACTIVATION_ID,
         activationSequence: ACTIVATION_SEQUENCE,
         version: APP_VERSION,
@@ -2138,7 +2140,7 @@ describe("persisted App disablement", () => {
     const fetch: typeof globalThis.fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith("/enablement")) return Response.json({ enabled: false });
-      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "app-a", enabled: false }], services: [] });
+      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "app-a", mode: "normal", enabled: false }], services: [] });
       if (url.endsWith("/apps/app-b/activation/prepare")) { entered = true; await gate.promise; }
       return base.fetch(input, init);
     };
@@ -2157,7 +2159,7 @@ describe("persisted App disablement", () => {
     const fetch: typeof globalThis.fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith("/enablement")) return Response.json({ enabled: JSON.parse(String(init?.body)).enabled });
-      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "app-a", enabled: false }], services: [] });
+      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "app-a", mode: "normal", enabled: false }], services: [] });
       if ((phase === "activation" && url.endsWith("/activation/prepare")) || (phase === "channel" && url.endsWith("/channels") && init?.method === "POST")) { entered = true; await gate.promise; }
       return base.fetch(input, init);
     };
@@ -2185,7 +2187,7 @@ describe("persisted App disablement", () => {
     const fetch: typeof globalThis.fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith("/enablement")) return Response.json({ enabled: JSON.parse(String(init?.body)).enabled });
-      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "notes", enabled: false }], services: [] });
+      if (url.endsWith("/services")) return Response.json({ apps: [{ appId: "notes", mode: "normal", enabled: false }], services: [] });
       if (phase === "activation" && url.endsWith("/activation/prepare")) { entered = true; await gate.promise; }
       return base.fetch(input, init);
     };
@@ -2200,4 +2202,109 @@ describe("persisted App disablement", () => {
       expect(manager.appRuntimeStates()[0].jobs).toEqual([]);
     } finally { gate.resolve(); await done; await manager.stopAll(); }
   });
+});
+
+
+describe("Experiment mode admission", () => {
+  test("switching fences UI and Jobs, preserves lifecycle settings, and does not start or stop work", async () => {
+    const backend = new FakeBackend(); const gate = Promise.withResolvers<void>(); const base = createFetch();
+    let entered = false;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      if (String(input).endsWith("/mode")) { entered = true; await gate.promise; return Response.json({ appId: "notes", mode: "exp" }); }
+      return base.fetch(input, init);
+    };
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "host", fetch, ...systemBindings() });
+    const switched = manager.setAppMode("notes", "exp");
+    await vi.waitFor(() => expect(entered).toBe(true));
+    await expect(manager.openViewer("notes", viewerOwner(1), async () => {})).rejects.toThrow();
+    await expect(manager.runJob("run", "notes", "inbox", new AbortController().signal)).rejects.toThrow("mode is changing");
+    await expect(manager.setAppMode("notes", "normal")).rejects.toThrow("Stop the App");
+    gate.resolve(); expect(await switched).toEqual({ appId: "notes", mode: "exp" });
+    expect(backend.starts).toEqual([]); expect(backend.appStops).toEqual([]); expect(backend.stopAllCalls).toBe(0);
+    expect(base.calls).toEqual([]);
+  });
+
+  test.each(["ui", "job", "service"] as const)("%s admission wins against switching even while policy is loading", async kind => {
+    const backend = new FakeBackend(); const gate = Promise.withResolvers<void>(); const base = createFetch({ notes: { ui: { command: ["node", "ui.js"], port: 3000 }, jobs: { inbox: { command: ["node", "job.js"] } }, services: { indexer: { command: ["node", "service.js"] } } } });
+    let entered = false;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      if (String(input).endsWith("/activation/prepare")) { entered = true; await gate.promise; }
+      if (String(input).endsWith("/api/app-runtime/services")) return Response.json({ apps: [{ appId: "notes", enabled: true, mode: "normal" }], services: [{ appId: "notes", serviceId: "indexer", version: APP_VERSION, appEnabled: true, policy: { enabled: true, revision: 1, restartBaseMs: 1000, restartMaxMs: 60000, crashCount: 0, restartAt: null, lastError: null, cleanupFailed: false } }] });
+      return base.fetch(input, init);
+    };
+    Object.assign(backend, { runJob: async () => {}, runService: async () => {} });
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "host", fetch, ...systemBindings() });
+    const work = kind === "ui" ? manager.openViewer("notes", viewerOwner(1), async () => {}) : kind === "job" ? manager.runJob("run", "notes", "inbox", new AbortController().signal) : manager.reconcileServices();
+    void work.catch(() => {});
+    await vi.waitFor(() => expect(entered).toBe(true));
+    await expect(manager.setAppMode("notes", "exp")).rejects.toThrow("Stop the App");
+    const stopping = manager.stopAll(); gate.resolve(); await work.catch(() => {}); await stopping;
+  });
+
+  test("failed UI cleanup blocks switching even after the viewer closes", async () => {
+    const backend = new FakeBackend(); const base = createFetch();
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "host", fetch: base.fetch, ...systemBindings() });
+    await manager.openViewer("notes", viewerOwner(1), async () => {});
+    backend.failStopUi = true;
+    const failure = vi.spyOn(backend, "stopAll").mockRejectedValue(new Error("VM cleanup unconfirmed"));
+    await manager.closeAppUi("notes").catch(() => {});
+    await expect(manager.setAppMode("notes", "exp")).rejects.toThrow("Stop the App");
+    vi.spyOn(backend, "status").mockResolvedValue({ available: false, backend: "failed" });
+    await manager.openViewer("notes", viewerOwner(1), async () => {}).catch(() => {});
+    await expect(manager.setAppMode("notes", "exp")).rejects.toThrow("Stop the App");
+    backend.failStopUi = false; failure.mockRestore(); await manager.stopAll().catch(() => {});
+  });
+});
+
+
+test("closing UI keeps its admission fence until process and authority cleanup settle", async () => {
+  const backend = new FakeBackend(); const base = createFetch(); const cleanup = Promise.withResolvers<void>();
+  const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "host", fetch: base.fetch, ...systemBindings() });
+  await manager.openViewer("notes", viewerOwner(1), async () => {});
+  vi.spyOn(backend, "stopUi").mockImplementation(async () => cleanup.promise);
+  const closing = manager.closeAppUi("notes");
+  expect(manager.appRuntimeStates()[0]).toMatchObject({ ui: "stopping", modeChangeAllowed: false });
+  await expect(manager.setAppMode("notes", "exp")).rejects.toThrow("Stop the App");
+  cleanup.resolve(); await closing; await manager.stopAll();
+});
+
+test("missing authoritative mode never launches a writable workload", async () => {
+  const backend = new FakeBackend(); const base = createFetch();
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const response = await base.fetch(input, init);
+    if (String(input).endsWith("/activation/prepare")) { const body = await response.json(); delete body.activation.mode; return Response.json(body); }
+    return response;
+  };
+  const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "host", fetch, ...systemBindings() });
+  await expect(manager.openViewer("notes", viewerOwner(1), async () => {})).rejects.toThrow("invalid App activation");
+  expect(backend.starts).toHaveLength(0);
+  expect(base.calls.some(call => call.url.endsWith("/api/app-runtime/channels"))).toBe(false);
+  await manager.stopAll();
+});
+
+
+test("exp UI carries identical trusted mode to runtime and browser bindings", async () => {
+  const backend = new FakeBackend(); const base = createFetch({}, { mode: "exp" }); const bindings = systemBindings();
+  const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "host", fetch: base.fetch, ...bindings });
+  const opened = await manager.openViewer("notes", viewerOwner(1), async binding => { expect(binding.mode).toBe("exp"); });
+  expect(opened.mode).toBe("exp"); expect(backend.starts[0].mode).toBe("exp");
+  expect(bindings.bindSystemSender.mock.calls[0][1]).toMatchObject({ mode: "exp", appId: "notes" });
+  await manager.stopAll();
+});
+
+
+test("Host viewer cleanup gates mode changes after workload exit and retains failed obligations", async () => {
+  const backend = new FakeBackend(); const base = createFetch(); const gate = Promise.withResolvers<void>();
+  const fetch: typeof globalThis.fetch = async (input, init) => String(input).endsWith("/mode")
+    ? Response.json({ appId: String(input).split("/").at(-2), mode: JSON.parse(String(init?.body)).mode }) : base.fetch(input, init);
+  const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "host", fetch, ...systemBindings() });
+  const cleanup = manager.trackViewerCleanup("notes", gate.promise);
+  await expect(manager.setAppMode("notes", "exp")).rejects.toThrow("Stop the App");
+  await expect(manager.setAppMode("other", "exp")).resolves.toEqual({ appId: "other", mode: "exp" });
+  gate.resolve(); await cleanup;
+  await expect(manager.setAppMode("notes", "exp")).resolves.toEqual({ appId: "notes", mode: "exp" });
+  await manager.trackViewerCleanup("notes", Promise.reject(new Error("Browser storage cleanup unconfirmed"))).catch(() => {});
+  await manager.stopApp("notes");
+  await expect(manager.setAppMode("notes", "normal")).rejects.toThrow("Stop the App");
+  await manager.stopAll();
 });

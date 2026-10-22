@@ -171,7 +171,7 @@ describe("AppLifecycleService inventory", () => {
     const fixture = await setup();
     const lowers: string[] = [];
     lowers.push((await fixture.lifecycle.prepareEditBase("example")).lowerPath);
-    const activation = await fixture.lifecycle.prepareActivation("example", "ui");
+    const activation = await fixture.lifecycle.prepareActivation("example", "ui", "normal");
     lowers.push((await fixture.lifecycle.prepareEditBase("example")).lowerPath);
 
     for (let revision = 1; revision <= 4; revision += 1) {

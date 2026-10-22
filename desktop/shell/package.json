@@ -24,7 +24,7 @@
   },
   "dependencies": {
     "@lamarck/capsule": "0.1.0",
-    "@lamarck/cli": "0.1.4",
+    "@lamarck/cli": "0.1.5",
     "@lamarck/system": "0.1.6",
     "@modelcontextprotocol/sdk": "1.29.0",
     "electron-updater": "6.8.9",

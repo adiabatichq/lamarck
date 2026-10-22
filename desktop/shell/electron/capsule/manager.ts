@@ -23,6 +23,7 @@ import { PACKAGE_ID_PATTERN } from "../package-id";
 const STOP_ALL_QUIESCENCE_TIMEOUT_MS = 20_000;
 
 interface PreparedActivation {
+  mode: "normal" | "exp";
   schemaVersion: 1;
   activationId: string;
   activationSequence: number;
@@ -48,6 +49,7 @@ interface PreparedActivation {
 }
 
 interface IssuedCapability {
+  mode: "normal" | "exp";
   capability: string;
   channelId: string;
   activationId: string;
@@ -57,6 +59,7 @@ interface IssuedCapability {
 }
 
 export interface OpenedAppViewer {
+  readonly mode: "normal" | "exp";
   viewerId: string;
   appId: string;
   instanceId: string;
@@ -80,6 +83,7 @@ export class AppViewerBusyError extends Error {
 }
 
 export interface ReloadedBrowserBinding {
+  readonly mode: "normal" | "exp";
   readonly viewerId: string;
   readonly instanceId: string;
   readonly channelId: string;
@@ -94,6 +98,7 @@ export interface ReloadedBrowserBinding {
  * the backend's atomic commit both succeed.
  */
 export interface PreparedViewerBinding {
+  readonly mode: "normal" | "exp";
   readonly startupDeadlineMs?: number;
   readonly viewerId: string;
   readonly appId: string;
@@ -263,6 +268,8 @@ export class CapsuleManager {
   readonly #serviceObservations = new Map<string, Promise<void>>();
   readonly #appEnablement = new Map<string, boolean>();
   readonly #appBlocked = new Set<string>();
+  readonly #appModes = new Map<string, "normal" | "exp">();
+  readonly #modeChanges = new Set<string>();
   readonly #appSettingOperations = new Map<string, Promise<void>>();
   readonly #appSettingEpochs = new Map<string, number>();
   readonly #serviceChanges = new Map<string, number>();
@@ -278,7 +285,7 @@ export class CapsuleManager {
   readonly #pendingUiOperations = new Map<string, PendingUiOperation>();
   readonly #stopOperations = new Map<string, Promise<void>>();
   readonly #retireOperations = new Map<string, Promise<void>>();
-  readonly #unexpectedUiLossOperations = new Set<Promise<void>>();
+  readonly #uiCleanupOperations = new Map<Promise<void>, string>();
   readonly #latestFailureByApp = new Map<string, AppRuntimeFailure>();
   readonly #stoppingApps = new Set<string>();
   #stoppingAll = false;
@@ -329,15 +336,19 @@ export class CapsuleManager {
     for (const job of this.#workloads.values()) appIds.add(job.appId);
     for (const id of this.#openingOperations.keys()) appIds.add(id);
     for (const id of this.#stoppingApps) appIds.add(id);
+    for (const id of this.#uiCleanupOperations.values()) appIds.add(id);
     for (const policy of this.#servicePolicies.values()) appIds.add(policy.appId);
     for (const appId of this.#appEnablement.keys()) appIds.add(appId);
+    for (const appId of this.#appModes.keys()) appIds.add(appId);
     return Object.freeze([...appIds].sort().map((appId) => Object.freeze({
       appId,
       ...(this.#appEnablement.has(appId) ? { enabled: this.#appEnablement.get(appId)! } : {}),
+      ...(this.#appModes.has(appId) ? { mode: this.#appModes.get(appId)! } : {}),
+      modeChangeAllowed: this.#canChangeMode(appId),
       runningWorkloads: [...this.#viewers.values()]
         .filter((viewer) => viewer.appId === appId).length + [...this.#workloads.values()].filter(job => job.appId === appId).length,
       latestFailure: this.#latestFailureByApp.get(appId)?.message ?? null,
-      ui: this.#stoppingApps.has(appId) ? "stopping" as const
+      ui: this.#stoppingApps.has(appId) || [...this.#uiCleanupOperations.values()].includes(appId) ? "stopping" as const
         : [...this.#viewers.values()].some(viewer => viewer.appId === appId) ? "running" as const
         : this.#openingOperations.has(appId) ? "starting" as const : "closed" as const,
       stopping: this.#stoppingApps.has(appId) || this.#stoppingAll,
@@ -372,6 +383,7 @@ export class CapsuleManager {
 
   #runBackground(kind: "job" | "service", runId: string, appId: string, jobId: string, requestSignal: AbortSignal, triggerId?: string, predecessor?: BackgroundOperation): Promise<void> {
     if (!PACKAGE_ID_PATTERN.test(appId) || !/^[a-z0-9][a-z0-9-]*$/.test(jobId) || !runId || this.#workloads.has(runId)) return Promise.reject(new Error("Invalid or duplicate job dispatch"));
+    if (this.#modeChanges.has(appId)) return Promise.reject(new Error("App execution mode is changing"));
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, requestSignal]);
     const entry: BackgroundOperation = {
@@ -384,7 +396,7 @@ export class CapsuleManager {
     const stopping = () => { if (!entry.cleanupError) entry.state = "stopping"; };
     signal.addEventListener("abort", stopping, { once: true });
     if (signal.aborted) stopping();
-    const current = () => { signal.throwIfAborted(); if (this.#terminalFailure) throw this.#terminalFailure; if (this.#stoppingAll || this.#stoppingApps.has(appId) || this.#appBlocked.has(appId) || this.#appEnablement.get(appId) === false) throw new Error("App Capsule is stopping or disabled"); };
+    const current = () => { signal.throwIfAborted(); if (this.#terminalFailure) throw this.#terminalFailure; if (this.#stoppingAll || this.#stoppingApps.has(appId) || this.#appBlocked.has(appId) || this.#modeChanges.has(appId) || this.#appEnablement.get(appId) === false) throw new Error("App Capsule is stopping or disabled"); };
     const task = Promise.resolve().then(async () => {
       let activation: PreparedActivation | undefined, issued: IssuedCapability | undefined;
       const sender = `capsule_${kind}_${randomBytes(24).toString("base64url")}`;
@@ -403,7 +415,7 @@ export class CapsuleManager {
         entry.cleanupChannelId = issued.channelId; current();
         this.#bindSystemSender(sender, { ...issued, appId }); current();
         const spec: CapsuleJobSpec | CapsuleServiceSpec = {
-          appId, ...(kind === "job" ? { jobId } : { serviceId: jobId }), activationId: activation.activationId, activationSequence: activation.activationSequence,
+          mode: issued.mode, appId, ...(kind === "job" ? { jobId } : { serviceId: jobId }), activationId: activation.activationId, activationSequence: activation.activationSequence,
           version: activation.version, manifestDigest: activation.manifestDigest, packageDigest: activation.packageDigest,
           packageDir: activation.immutablePackagePath, command: [...job.command],
           writeTables: [...activation.manifest.permissions.writes.tables],
@@ -472,8 +484,56 @@ export class CapsuleManager {
     this.#serviceLoop = { controller, task };
   }
 
+  /** Host viewer resources share the workload cleanup gate, including failed retirement. */
+  trackViewerCleanup(appId: string, operation: Promise<unknown>): Promise<void> {
+    const task = operation.then(() => {
+      this.#uiCleanupOperations.delete(task);
+    }, error => {
+      // Keep failed Host cleanup owned until the Host is restarted. A process
+      // stop alone cannot prove that a renderer/gateway/storage cleanup finished.
+      this.#recordFailure(appId, error, true, "ui");
+      throw error;
+    });
+    this.#uiCleanupOperations.set(task, appId);
+    void task.catch(() => {});
+    return task;
+  }
+
+  #canChangeMode(appId: string): boolean {
+    let failure = this.#latestFailureByApp.get(appId);
+    while (failure) { if (failure.recoverableCleanup) return false; failure = failure.previous; }
+    return !this.#stoppingAll && !this.#terminalFailure && !this.#controlPlaneLost
+      && !this.#modeChanges.has(appId) && !this.#appSettingOperations.has(appId)
+      && !this.#openingOperations.has(appId) && !this.#openingApps.has(appId)
+      && ![...this.#uiCleanupOperations.values()].includes(appId)
+      && ![...this.#serviceManagement.values()].includes(appId)
+      && !this.#rebuildOperations.has(appId) && !this.#stopOperations.has(appId)
+      && !this.#retireOperations.has(appId) && !this.#stoppingApps.has(appId)
+      && ![...this.#viewers.values(), ...this.#pendingUiOperations.values(), ...this.#workloads.values()].some(value => value.appId === appId)
+      && ![...this.#servicePolicies.values()].some(value => value.appId === appId && (value.policy?.cleanupFailed || value.observationPending))
+      && ![...this.#serviceChanges.keys()].some(key => key.startsWith(`${appId}:`));
+  }
+
+  async setAppMode(appId: string, mode: "normal" | "exp"): Promise<{ appId: string; mode: "normal" | "exp" }> {
+    if (!PACKAGE_ID_PATTERN.test(appId) || (mode !== "normal" && mode !== "exp")) throw new Error("Invalid App execution mode");
+    if (!this.#canChangeMode(appId)) throw new AppControlPlaneError("APP_MODE_REQUIRES_STOP", "Stop the App and resolve workload cleanup before changing Experiment mode.");
+    // Synchronous fence before the first await; admission checks this same set.
+    this.#modeChanges.add(appId);
+    this.#serviceGeneration++;
+    try {
+      const response = await this.#hostRequest(`/api/app-runtime/apps/${encodeURIComponent(appId)}/mode`, {
+        method: "POST", body: JSON.stringify({ mode }), signal: AbortSignal.timeout(5000),
+      });
+      const result = await response.json() as { appId: string; mode: "normal" | "exp" };
+      if (result.appId !== appId || result.mode !== mode) throw new Error("App execution mode was not acknowledged");
+      this.#appModes.set(appId, mode);
+      return result;
+    } finally { this.#modeChanges.delete(appId); }
+  }
+
   /** Persisted Host admission, with a synchronous fence for every launch path. */
   setAppEnabled(appId: string, enabled: boolean): Promise<void> {
+    if (this.#modeChanges.has(appId)) return Promise.reject(new Error("App execution mode is changing"));
     if (typeof appId !== "string" || !PACKAGE_ID_PATTERN.test(appId) || typeof enabled !== "boolean") return Promise.reject(new Error("Invalid App setting"));
     const epoch = (this.#appSettingEpochs.get(appId) ?? 0) + 1;
     this.#appSettingEpochs.set(appId, epoch);
@@ -488,7 +548,7 @@ export class CapsuleManager {
     };
     const task = Promise.resolve(previous).catch(() => {}).then(async () => {
       current();
-      if (enabled && (this.#appBlocked.has(appId) || this.#appEnablement.get(appId) === false)) await this.stopApp(appId);
+      if (enabled && (this.#appBlocked.has(appId) || this.#modeChanges.has(appId) || this.#appEnablement.get(appId) === false)) await this.stopApp(appId);
       current();
       const setting = this.#hostRequest(`/api/app-runtime/apps/${encodeURIComponent(appId)}/enablement`, {
         method: "POST", signal: AbortSignal.timeout(5000), body: JSON.stringify({ enabled }),
@@ -526,13 +586,15 @@ export class CapsuleManager {
 
   async #reconcileServices(generation: number): Promise<void> {
     const response = await this.#hostRequest("/api/app-runtime/services", { signal: AbortSignal.timeout(5000) });
-    const body = await response.json() as { apps?: { appId: string; enabled: boolean }[]; services: ServiceDesired[] };
+    const body = await response.json() as { apps?: { appId: string; enabled: boolean; mode: "normal" | "exp" }[]; services: ServiceDesired[] };
     if (!Array.isArray(body.services)) throw new Error("Invalid Service policy response");
     if (generation !== this.#serviceGeneration || this.#stoppingAll) return;
     for (const app of body.apps ?? []) {
       if (!PACKAGE_ID_PATTERN.test(app.appId) || typeof app.enabled !== "boolean") throw new Error("Invalid App enablement response");
       if (this.#appSettingOperations.has(app.appId)) continue;
       const previous = this.#appEnablement.get(app.appId);
+      if (app.mode !== "normal" && app.mode !== "exp") throw new Error("App execution policy is unavailable");
+      this.#appModes.set(app.appId, app.mode);
       this.#appEnablement.set(app.appId, app.enabled);
       if (!app.enabled && (previous !== false || [...this.#workloads.values()].some(value => value.appId === app.appId) || [...this.#viewers.values()].some(value => value.appId === app.appId) || this.#openingOperations.has(app.appId))) {
         void this.stopApp(app.appId).catch(() => {});
@@ -562,7 +624,7 @@ export class CapsuleManager {
         if (generation !== this.#serviceGeneration) return;
       }
       if (this.#serviceChanges.has(id)) continue;
-      if (!service.policy?.enabled || service.appEnabled === false || this.#appEnablement.get(service.appId) === false || this.#appBlocked.has(service.appId) || this.#stoppingApps.has(service.appId)) {
+      if (!service.policy?.enabled || service.appEnabled === false || this.#appEnablement.get(service.appId) === false || this.#appBlocked.has(service.appId) || this.#modeChanges.has(service.appId) || this.#stoppingApps.has(service.appId)) {
         for (const operation of this.#workloads.values()) if (operation.kind === "service" && operation.appId === service.appId && operation.workloadId === service.serviceId) operation.controller.abort(new Error("Service disabled"));
         continue;
       }
@@ -737,7 +799,7 @@ export class CapsuleManager {
       const owned = this.#serviceOperation(service);
       const policy = service.policy;
       return Object.freeze({ serviceId: service.serviceId, enabled: policy?.enabled ?? null,
-        state: owned ? owned[1].state : policy?.cleanupFailed ? "cleanup-failed" : policy?.enabled ? service.appEnabled === false || this.#appEnablement.get(appId) === false || this.#appBlocked.has(appId) ? "stopped" : "backoff" : policy ? "disabled" : "unconfigured",
+        state: owned ? owned[1].state : policy?.cleanupFailed ? "cleanup-failed" : policy?.enabled ? service.appEnabled === false || this.#appEnablement.get(appId) === false || this.#appBlocked.has(appId) || this.#modeChanges.has(appId) ? "stopped" : "backoff" : policy ? "disabled" : "unconfigured",
         executionId: owned?.[0] ?? null, restartAt: policy?.restartAt ?? null, failure: owned?.[1].cleanupError ?? policy?.lastError ?? null,
       });
     });
@@ -848,7 +910,7 @@ export class CapsuleManager {
     const owner = validatedViewerOwner(ownerValue);
     if (
       this.#stoppingAll
-      || this.#appBlocked.has(appId) || this.#appEnablement.get(appId) === false
+      || this.#appBlocked.has(appId) || this.#modeChanges.has(appId) || this.#appEnablement.get(appId) === false
       || this.#openingApps.has(appId)
       || this.#rebuildOperations.has(appId)
       || this.#stoppingApps.has(appId)
@@ -990,6 +1052,7 @@ export class CapsuleManager {
         instanceId: instance.instanceId,
         channelId: browserIssued.channelId,
         capability: browserIssued.capability,
+        mode: browserIssued.mode,
         owner: opening.owner,
         runtimeChannelId: runtimeIssued.channelId,
         runtimeSenderId,
@@ -1020,29 +1083,39 @@ export class CapsuleManager {
     const viewer = this.#viewers.get(viewerId) ?? [...this.#pendingUiOperations.values()]
       .find(pending => pending.previousViewer?.viewerId === viewerId)?.previousViewer;
     if (!viewer || !sameViewerOwner(viewer.owner, owner)) return false;
-    this.#viewers.delete(viewerId);
-    const pending = this.#pendingUiOperations.get(viewer.appId);
-    if (pending?.previousViewer === viewer || pending?.committedViewer === viewer) {
-      this.#cancelPendingUiOperation(
-        pending,
-        new Error("App Capsule reload was cancelled because its viewer closed"),
-      );
+    const cleanup = Promise.withResolvers<void>();
+    this.#uiCleanupOperations.set(cleanup.promise, viewer.appId);
+    try {
+      this.#viewers.delete(viewerId);
+      const pending = this.#pendingUiOperations.get(viewer.appId);
+      if (pending?.previousViewer === viewer || pending?.committedViewer === viewer) {
+        this.#cancelPendingUiOperation(
+          pending,
+          new Error("App Capsule reload was cancelled because its viewer closed"),
+        );
+      }
+      this.#unbindSystemSender(viewer.runtimeSenderId);
+      const [stopResult, revokeResult] = await Promise.allSettled([
+        pending?.previousDetached ? this.#backend.stopAppUi(viewer.appId) : this.#backend.stopUi(viewer.instanceId),
+        Promise.all([
+          this.#revokeCapability(viewer.channelId),
+          this.#revokeCapability(viewer.runtimeChannelId),
+        ]),
+      ]);
+      if (stopResult.status === "rejected") {
+        this.#recordFailure(viewer.appId, stopResult.reason, true, "ui");
+        const causes = [stopResult.reason];
+        if (revokeResult.status === "rejected") causes.push(revokeResult.reason);
+        await this.#collapseBackendBoundary(causes);
+      }
+      if (revokeResult.status === "rejected") {
+        this.#recordFailure(viewer.appId, revokeResult.reason, true, "ui");
+        throw revokeResult.reason;
+      }
+      return true;
+    } finally {
+      cleanup.resolve(); this.#uiCleanupOperations.delete(cleanup.promise);
     }
-    this.#unbindSystemSender(viewer.runtimeSenderId);
-    const [stopResult, revokeResult] = await Promise.allSettled([
-      pending?.previousDetached ? this.#backend.stopAppUi(viewer.appId) : this.#backend.stopUi(viewer.instanceId),
-      Promise.all([
-        this.#revokeCapability(viewer.channelId),
-        this.#revokeCapability(viewer.runtimeChannelId),
-      ]),
-    ]);
-    if (stopResult.status === "rejected") {
-      const causes = [stopResult.reason];
-      if (revokeResult.status === "rejected") causes.push(revokeResult.reason);
-      await this.#collapseBackendBoundary(causes);
-    }
-    if (revokeResult.status === "rejected") throw revokeResult.reason;
-    return true;
   }
 
   async closeOwner(ownerValue: AppViewerOwner): Promise<void> {
@@ -1131,7 +1204,7 @@ export class CapsuleManager {
   ): Promise<ReloadedApp> {
     if (this.#terminalFailure) throw this.#terminalFailure;
     if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
-    if (this.#stoppingAll || this.#stoppingApps.has(appId) || this.#appBlocked.has(appId) || this.#appEnablement.get(appId) === false) {
+    if (this.#stoppingAll || this.#stoppingApps.has(appId) || this.#appBlocked.has(appId) || this.#modeChanges.has(appId) || this.#appEnablement.get(appId) === false) {
       throw new Error(`App "${appId}" is stopping`);
     }
     const existing = this.#rebuildOperations.get(appId);
@@ -1268,6 +1341,7 @@ export class CapsuleManager {
         instanceId: replacement.instanceId,
         channelId: browserIssued.channelId,
         capability: browserIssued.capability,
+        mode: browserIssued.mode,
         runtimeChannelId: runtimeIssued.channelId,
         runtimeSenderId,
       });
@@ -1276,6 +1350,7 @@ export class CapsuleManager {
         instanceId: replacement.instanceId,
         channelId: browserIssued.channelId,
         capability: browserIssued.capability,
+        mode: browserIssued.mode,
       });
       pending.committedViewer = updated;
       this.#viewers.set(viewer.viewerId, updated);
@@ -1357,6 +1432,7 @@ export class CapsuleManager {
     const pending = [
       this.#openingOperations.get(appId)?.operation,
       this.#rebuildOperations.get(appId),
+      ...[...this.#uiCleanupOperations].filter(([, owner]) => owner === appId).map(([task]) => task),
       ...[...this.#serviceManagement].filter(([, owner]) => owner === appId).map(([task]) => task),
       ...[...this.#workloads.values()].filter(job => job.appId === appId).map(job => job.task),
     ].filter((operation): operation is Promise<unknown> => operation !== undefined);
@@ -1433,6 +1509,7 @@ export class CapsuleManager {
       ...[...this.#serviceManagement].filter(([, owner]) => owner === appId).map(([task]) => task),
       this.#openingOperations.get(appId)?.operation,
       this.#rebuildOperations.get(appId),
+      ...[...this.#uiCleanupOperations].filter(([, owner]) => owner === appId).map(([task]) => task),
       this.#stopOperations.get(appId),
     ].filter((operation): operation is Promise<unknown> => operation !== undefined);
     const viewers = [...this.#viewers.values()].filter((viewer) => viewer.appId === appId);
@@ -1459,7 +1536,7 @@ export class CapsuleManager {
       throw new AggregateError(failures, `Could not retire App "${appId}"`);
     }
     this.#clearCleanupFailure(appId);
-    this.#appEnablement.delete(appId); this.#appBlocked.delete(appId);
+    this.#appEnablement.delete(appId); this.#appBlocked.delete(appId); this.#appModes.delete(appId);
     for (const [key, service] of this.#servicePolicies) if (service.appId === appId) {
       this.#servicePolicies.delete(key);
     }
@@ -1498,7 +1575,7 @@ export class CapsuleManager {
         ...this.#rebuildOperations.values(),
         ...this.#stopOperations.values(),
         ...this.#retireOperations.values(),
-        ...this.#unexpectedUiLossOperations,
+        ...this.#uiCleanupOperations.keys(),
       ];
       const pendingUi = [...this.#pendingUiOperations.values()];
       const viewers = [...this.#viewers.values()];
@@ -1580,7 +1657,7 @@ export class CapsuleManager {
           this.#serviceLoop = null;
           this.#cleanBoundaryConfirmed = true;
           this.#servicePolicies.clear();
-          this.#appEnablement.clear(); this.#appBlocked.clear();
+          this.#appEnablement.clear(); this.#appBlocked.clear(); this.#appModes.clear();
           this.#diagnostics.clear();
           this.#controlPlaneRequests = new AbortController();
           this.#controlPlaneLost = false;
@@ -1683,9 +1760,9 @@ export class CapsuleManager {
     let settlement: Promise<void>;
     settlement = this.#settleUnexpectedUiLoss(viewer, event.error, hostCleanup)
       .finally(() => {
-        this.#unexpectedUiLossOperations.delete(settlement);
+        this.#uiCleanupOperations.delete(settlement);
       });
-    this.#unexpectedUiLossOperations.add(settlement);
+    this.#uiCleanupOperations.set(settlement, viewer.appId);
     void settlement.catch(() => {});
   }
 
@@ -1701,13 +1778,19 @@ export class CapsuleManager {
       if (value.recoverableCleanup === recoverableCleanup && value.workloadKey === workloadKey) return previous;
       return { ...value, previous };
     };
+    let unresolved = latest;
+    let retainsCleanup = false;
+    while (unresolved) {
+      if (unresolved.recoverableCleanup) { retainsCleanup = true; break; }
+      unresolved = unresolved.previous;
+    }
     this.#latestFailureByApp.set(appId, {
       message: error instanceof Error ? error.message : String(error),
       recoverableCleanup,
       workloadKey,
       // Replace only this workload's matching failure type. Cleanup retries
       // preserve execution errors and other workloads' unresolved cleanup.
-      ...(recoverableCleanup || workloadKey ? { previous: preserve(latest) } : {}),
+      ...(recoverableCleanup || workloadKey || retainsCleanup ? { previous: preserve(latest) } : {}),
     });
   }
 
@@ -1887,6 +1970,7 @@ export class CapsuleManager {
       instanceId,
       channelId: browserIssued.channelId,
       capability: browserIssued.capability,
+      mode: browserIssued.mode,
       signal: pending.abortController.signal,
       openUiStream: async (): Promise<Duplex> => {
         assertStreamAuthority();
@@ -1920,7 +2004,7 @@ export class CapsuleManager {
     if (
       opening.abortController.signal.aborted
       || this.#stoppingApps.has(opening.appId)
-      || this.#appBlocked.has(opening.appId) || this.#appEnablement.get(opening.appId) === false
+      || this.#appBlocked.has(opening.appId) || this.#modeChanges.has(opening.appId) || this.#appEnablement.get(opening.appId) === false
       || this.#openingOperations.get(opening.appId)?.abortController
         !== opening.abortController
     ) {
@@ -1934,7 +2018,7 @@ export class CapsuleManager {
     operation: "reload",
   ): void {
     this.#assertGenerationCurrent(generation, operation);
-    if (this.#viewers.get(viewer.viewerId) !== viewer || this.#appBlocked.has(viewer.appId) || this.#appEnablement.get(viewer.appId) === false) {
+    if (this.#viewers.get(viewer.viewerId) !== viewer || this.#appBlocked.has(viewer.appId) || this.#modeChanges.has(viewer.appId) || this.#appEnablement.get(viewer.appId) === false) {
       throw new Error(`App Capsule ${operation} was cancelled`);
     }
   }
@@ -1952,7 +2036,7 @@ export class CapsuleManager {
       this.#pendingUiOperations.get(pending.appId) !== pending
       || pending.abortController.signal.aborted
       || this.#stoppingApps.has(pending.appId)
-      || this.#appBlocked.has(pending.appId) || this.#appEnablement.get(pending.appId) === false
+      || this.#appBlocked.has(pending.appId) || this.#modeChanges.has(pending.appId) || this.#appEnablement.get(pending.appId) === false
     ) {
       throw new Error(`App Capsule ${operation} was cancelled`);
     }
@@ -2030,6 +2114,7 @@ export class CapsuleManager {
       .filter((failure) => !failure.controlPlane || !this.#controlPlaneLost)
       .map((failure) => failure.error);
     if (cleanupFailures.length > 0 || pending.commitContractViolated) {
+      this.#recordFailure(pending.appId, failure, true, "ui");
       if (!this.#controlPlaneLost) {
         const appWide = await Promise.allSettled([
           this.#revokeAppCapabilities(pending.appId),
@@ -2068,6 +2153,7 @@ export class CapsuleManager {
         .map((result) => result.reason);
     const failures = [...hostFailures, ...controlPlaneFailures];
     if (failures.length === 0) return;
+    this.#recordFailure(viewer.appId, cause, true, "ui");
 
     if (!this.#controlPlaneLost) {
       const appWideRevoke = await Promise.allSettled([
@@ -2091,7 +2177,8 @@ export class CapsuleManager {
     const activation = body.activation;
     if (/^activation_[A-Za-z0-9_-]{32}$/.test(activation?.activationId ?? "")) onAllocated?.(activation!.activationId!);
     if (
-      activation?.schemaVersion !== 1
+      (activation?.mode !== "normal" && activation?.mode !== "exp")
+      || activation?.schemaVersion !== 1
       || activation.appId !== appId
       || activation.workload !== workload
       || !/^activation_[A-Za-z0-9_-]{32}$/.test(activation.activationId ?? "")
@@ -2122,7 +2209,8 @@ export class CapsuleManager {
     const issued = await response.json() as Partial<IssuedCapability>;
     if (typeof issued.channelId === "string" && issued.channelId.length > 0 && issued.channelId.length <= 256) onAllocated?.(issued.channelId);
     if (
-      typeof issued.capability !== "string"
+      issued.mode !== activation.mode
+      || typeof issued.capability !== "string"
       || typeof issued.channelId !== "string"
       || issued.activationId !== activation.activationId
       || issued.appCommit !== activation.version
@@ -2208,6 +2296,7 @@ function createUiSpec(
 ): CapsuleUiSpec {
   return {
     appId,
+    mode: activation.mode,
     activationId: activation.activationId,
     activationSequence: activation.activationSequence,
     version: activation.version,

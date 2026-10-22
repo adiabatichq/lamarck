@@ -147,7 +147,8 @@ test("streams a complete App save upload with the bound principal", async () => 
     archiveBytes: archive.byteLength,
     message: "Save from Capsule",
   });
-  expect(principal).toEqual(identity());
+  const { mode, ...expectedPrincipal } = identity();
+  expect(principal).toEqual(expectedPrincipal);
   await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
   expect(fetchImpl.mock.calls.map(([input]) => String(input))).toEqual([
     "http://127.0.0.1:3000/api/apps/edit-bases",
@@ -501,7 +502,7 @@ async function invoke(client: Duplex, request: CliRequest) {
 
 function identity(): ManagedCliIdentity {
   return {
-    kind: "app",
+    kind: "app", mode: "normal",
     appId: "initiator",
     workload: "ui",
     appCommit: "d".repeat(40),
@@ -683,4 +684,23 @@ const managedCliArtifact = async () => ({
   descriptor: { type: "cli.artifact" as const, schemaVersion: 1 as const,
     digest: `sha256:${createHash("sha256").update(cliFixtureBytes).digest("hex")}`, bytes: cliFixtureBytes.length },
   bytes: cliFixtureBytes,
+});
+
+
+test("exp streamed save is rejected without staging or writeback and keeps subsequent reads framed", async () => {
+  const dispatch = vi.fn(async (request: CliRequest) => success(request, [{ value: 1 }]));
+  const dispatcher = fakeDispatcher(dispatch); const pair = duplexPair();
+  const detach = new AppCliStreamServer({ managedCliArtifact, dispatcher: () => dispatcher }).attach({ ...identity(), mode: "exp" }, pair.server);
+  const reader = new CliStreamReader(pair.client);
+  const artifact = parseManagedCliArtifact(parseCliFrame(await reader.readFrame())); await reader.readExact(artifact.bytes);
+  await reader.readFrame(); await reader.readFrame();
+  try {
+    await writeCliBytes(pair.client, encodeCliFrame({ requestId: "denied-save", operation: "app.save", input: { appId: "example" }, upload: { kind: "app-package", archiveDigest: ARCHIVE, archiveBytes: 4, baseVersion: null, basePackageDigest: DIGEST } }));
+    await writeCliBytes(pair.client, Buffer.from("data"));
+    expect(parseCliResponse(parseCliFrame(await reader.readFrame()), "denied-save")).toMatchObject({ ok: false, error: { code: "APP_EXPERIMENT_READ_ONLY" } });
+    expect(dispatch).not.toHaveBeenCalled();
+    await writeCliBytes(pair.client, encodeCliFrame({ requestId: "read", operation: "query", input: { sql: "SELECT 1" } }));
+    expect(parseCliResponse(parseCliFrame(await reader.readFrame()), "read")).toMatchObject({ ok: true, result: [{ value: 1 }] });
+    expect(dispatch).toHaveBeenCalledOnce();
+  } finally { detach(); }
 });

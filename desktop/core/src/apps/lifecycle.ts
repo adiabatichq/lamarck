@@ -180,11 +180,12 @@ export class AppLifecycleService {
     });
   }
 
-  async prepareActivation(appId: string, workload: AppWorkload) {
+  async prepareActivation(appId: string, workload: AppWorkload, mode: "normal" | "exp") {
     return this.activations.prepare({
       appId,
       appDir: await this.resolveAppDir(appId),
       workload,
+      mode,
     });
   }
 

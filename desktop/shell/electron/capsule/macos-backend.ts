@@ -2158,6 +2158,7 @@ export class MacOsCapsuleBackend implements CapsuleBackend {
         kind: "app",
         appId: spec.appId,
         workload: "jobId" in spec ? `job:${spec.jobId}` : "serviceId" in spec ? `service:${spec.serviceId}` : "ui",
+        mode: spec.mode,
         appCommit: spec.version,
         writeTables: [...spec.writeTables],
         fileGrants: [...spec.fileGrants],

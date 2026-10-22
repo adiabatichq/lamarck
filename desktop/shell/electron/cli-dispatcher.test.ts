@@ -18,7 +18,8 @@ describe("Shell CLI operation dispatcher", () => {
     const request = { requestId: "apps-1", operation: "app.list", input: {} } as const;
     const result = await dispatcher.dispatch(request, { environment: "managed", principal: identity() });
 
-    expect(forwarded).toEqual({ request, principal: identity() });
+    const { mode, ...principal } = identity();
+    expect(forwarded).toEqual({ request, principal });
     expect(result.response).toMatchObject({
       ok: true,
       result: [
@@ -100,7 +101,7 @@ function create(fetchImpl: typeof fetch, states: readonly { appId: string; runni
 
 function identity(): ManagedCliIdentity {
   return {
-    kind: "app",
+    kind: "app", mode: "normal",
     appId: "initiator",
     workload: "ui",
     appCommit: "a".repeat(40),
@@ -227,4 +228,27 @@ describe("Host App runtime CLI", () => {
     expect(JSON.stringify(response)).not.toContain("other App output");
     expect(response).toMatchObject({ ok: true, result: expect.arrayContaining([expect.objectContaining({ droppedBytes: expect.any(Number), output: expect.stringContaining("[redacted]最後") })]) });
   });
+});
+
+
+test("exp CLI rejects management before archive coordination, upload, or Core effects", async () => {
+  const fetchImpl = vi.fn<typeof fetch>(); const archive = vi.fn();
+  const dispatcher = new CliOperationDispatcher({ coreBaseUrl: "http://localhost", coreToken: "host", fetch: fetchImpl, runtimeStates: () => [], archive });
+  const principal = { ...identity(), mode: "exp" as const };
+  const requests = [
+    ["source.run", { sourceId: "source" }], ["source.pause", { sourceId: "source" }], ["source.resume", { sourceId: "source" }],
+    ["connector.install", { packageId: "package" }], ["connector.update", { connectorId: "connector" }], ["connector.remove", { connectorId: "connector" }],
+    ["app.create", { appId: "new-app", name: "New", description: "New app" }], ["app.save", { appId: "other" }],
+    ["app.restore", { appId: "other", version: "a".repeat(40) }], ["app.archive", { appId: "other" }], ["app.refresh", { appId: "other" }],
+    ["schema.change", { ddl: "CREATE TABLE exp_denied (id TEXT PRIMARY KEY NOT NULL)" }],
+    ...["tee", "cp", "mv", "rm", "mkdir"].map(verb => ["file.command", { argv: [verb, "apps/initiator/data"] }]),
+  ];
+  for (const [operation, input] of requests) {
+    const result = await dispatcher.dispatch({ requestId: "exp", operation, input }, { environment: "managed", principal });
+    expect(result.response).toMatchObject({ ok: false, error: { code: "APP_EXPERIMENT_READ_ONLY" } });
+  }
+  const { Readable } = await import("node:stream");
+  expect((await dispatcher.dispatchManagedAppSave({ requestId: "save", operation: "app.save", input: { appId: "other" } }, principal, Readable.from([]))).response)
+    .toMatchObject({ ok: false, error: { code: "APP_EXPERIMENT_READ_ONLY" } });
+  expect(archive).not.toHaveBeenCalled(); expect(fetchImpl).not.toHaveBeenCalled();
 });

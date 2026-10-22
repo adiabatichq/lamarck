@@ -40,6 +40,7 @@ export const COMMAND_REGISTRY: readonly CommandDefinition[] = Object.freeze([
   command(["connector", "remove"], "connector.remove", "connector remove <connector-id> [--yes] [--json]", "Retire an installed Connector package.", both),
   command(["app", "list"], "app.list", "app list [--json]", "List current Apps.", both),
   command(["app", "inspect"], "app.inspect", "app inspect <app-id> [--json]", "Inspect one App.", both),
+  command(["app", "mode"], "app.mode", "app mode <app-id> <normal|exp> [--json]", "Change Experiment mode while the App is fully stopped.", ["host"]),
   command(["app", "enable"], "app.enable", "app enable <app-id> [--json]", "Enable an App; preserve individual Service settings.", ["host"]),
   command(["app", "disable"], "app.disable", "app disable <app-id> [--json]", "Disable an App and stop its workloads.", ["host"]),
   command(["app", "service", "enable"], "app.service.enable", "app service enable <app-id> <service-id> [--json]", "Enable one declared Service.", ["host"]),

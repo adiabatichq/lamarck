@@ -138,6 +138,11 @@ export function closeAppUi(appId: string): Promise<{ ok: true }> {
   return window.lamarckHost.closeAppUi(appId);
 }
 
+export function setAppMode(appId: string, mode: "normal" | "exp"): Promise<{ appId: string; mode: "normal" | "exp" }> {
+  if (!window.lamarckHost) return Promise.reject(new Error("App execution management requires the Desktop Host"));
+  return window.lamarckHost.setAppMode(appId, mode);
+}
+
 export function setAppEnabled(appId: string, enabled: boolean): Promise<{ ok: true }> {
   if (!window.lamarckHost) return Promise.reject(new Error("App execution management requires the Desktop Host"));
   return window.lamarckHost.setAppEnabled(appId, enabled);

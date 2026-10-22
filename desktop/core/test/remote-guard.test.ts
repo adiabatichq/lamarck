@@ -78,7 +78,7 @@ describe("RemoteGuard capability binding", () => {
     try {
       const registry = new AppCapabilityRegistry();
       const issued = registry.issue("focus", "ui", {
-        activationId: `activation_${"d".repeat(32)}`,
+        mode: "normal", activationId: `activation_${"d".repeat(32)}`,
         manifestDigest: `sha256:${"a".repeat(64)}`,
         packageDigest: `sha256:${"c".repeat(64)}`,
         appCommit: "a".repeat(40),

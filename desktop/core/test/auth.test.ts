@@ -31,7 +31,7 @@ function authorization(
   fileGrants: string[] = [],
 ): AppAuthorizationSnapshot {
   return {
-    activationId: ACTIVATION_ID,
+    mode: "normal", activationId: ACTIVATION_ID,
     manifestDigest: MANIFEST_DIGEST,
     packageDigest: PACKAGE_DIGEST,
     appCommit: APP_COMMIT,
@@ -77,7 +77,7 @@ describe("auth", () => {
       workload: "service:indexer",
       channelId: appA.channelId,
       authorization: {
-        activationId: ACTIVATION_ID,
+        mode: "normal", activationId: ACTIVATION_ID,
         manifestDigest: MANIFEST_DIGEST,
         packageDigest: PACKAGE_DIGEST,
         appCommit: APP_COMMIT,

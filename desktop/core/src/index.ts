@@ -100,6 +100,7 @@ import { ConnectorMarketplaceError, MarketplaceService } from "./marketplace/ser
 import {
   MANAGED_APP_EDIT_ROOT,
   HOST_APP_RUNTIME_OPERATIONS,
+  isReadOnlyCliRequest,
   parseCliRequest,
   type CliRequest,
   type CliResponse,
@@ -464,6 +465,7 @@ function guardForRequest(auth: AuthContext, opts?: {
     prepareProducer: appProducer.prepareProducer,
     // Authority is the immutable activation snapshot bound when the Host
     // issued this channel. Later draft edits cannot change a running workload.
+    readOnly: auth.authorization.mode === "exp",
     writeTables: [...auth.authorization.writeTables],
     schemaGrant: false,
     signal: opts?.signal,
@@ -477,6 +479,7 @@ function vfsCallerForRequest(auth: AuthContext, req: Request, signal: AbortSigna
       guard: guardForRequest(auth, { signal }),
       fileGrants: [...auth.authorization.fileGrants],
       trustedHost: false,
+      readOnly: auth.authorization.mode === "exp",
       workloadId: auth.channelId,
     };
   }
@@ -778,6 +781,7 @@ function cliGuardForPrincipal(principal: CliCorePrincipal, signal: AbortSignal):
   return guard.withSource(sourceForAppWorkload(principal.appId, parseAppWorkload(principal.workload)), {
     producerRef: producer.producerRef,
     prepareProducer: producer.prepareProducer,
+    readOnly: appServices.mode(principal.appId) === "exp",
     writeTables: [...principal.writeTables],
     schemaGrant: false,
     signal,
@@ -829,6 +833,7 @@ function cliVfsCaller(
         fileGrants: [...principal.fileGrants],
         trustedHost: false,
         workloadId: principal.workloadHandle,
+        readOnly: appServices.mode(principal.appId) === "exp",
       };
 }
 
@@ -912,7 +917,7 @@ async function cliAppShapes(principal: CliCorePrincipal, signal: AbortSignal) {
     false,
     principal.kind === "system" ? item.path : `${MANAGED_APP_EDIT_ROOT}/${item.id}`,
     principal.kind === "system" ? appServices.appEnabled(item.id) : undefined,
-  ));
+  )).map(app => principal.kind === "system" ? { ...app, runtime: { ...app.runtime, mode: appServices.appSetting(app.id)?.mode ?? null } } : app);
 }
 
 async function executeCoreCliOperation(
@@ -921,6 +926,9 @@ async function executeCoreCliOperation(
   signal: AbortSignal,
 ): Promise<unknown> {
   const input = request.input as Record<string, unknown>;
+  if (principal.kind === "app" && appServices.mode(principal.appId) === "exp" && !isReadOnlyCliRequest(request)) {
+    throw cliCoded("APP_EXPERIMENT_READ_ONLY", "Experiment mode permits only managed CLI read operations.");
+  }
   if (HOST_APP_RUNTIME_OPERATIONS.includes(request.operation)) {
     throw cliCoded("CLI_UNSUPPORTED_COMMAND", "App runtime management requires the Desktop Host.");
   }
@@ -1938,12 +1946,28 @@ const server = await serve<{ cwd: string }>({
       if (path === "/api/app-runtime/services" && method === "GET") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const inventory = await appLifecycle.inventory(req.signal);
-        return json({ apps: inventory.map(app => ({ appId: app.id, enabled: appServices.appEnabled(app.id) })), services: inventory.flatMap(app => app.manifestHealth.status === "valid"
+        return json({ apps: inventory.filter(app => appServices.appSetting(app.id) !== null).map(app => ({ appId: app.id, enabled: appServices.appEnabled(app.id), mode: appServices.mode(app.id) })), services: inventory.flatMap(app => app.manifestHealth.status === "valid"
           ? Object.keys(app.runtime?.services ?? {}).map(serviceId => ({
               appId: app.id, serviceId, version: app.version, appEnabled: appServices.appEnabled(app.id),
               policy: appServices.get(app.id, serviceId),
             })) : []) });
       }
+      const appModeMatch = path.match(/^\/api\/app-runtime\/apps\/([^/]+)\/mode$/);
+      if (appModeMatch && method === "POST") {
+        if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
+        const appId = decodeURIComponent(appModeMatch[1]);
+        const body = await readBody<{ mode?: unknown }>(req);
+        if (body.mode !== "normal" && body.mode !== "exp") return json({ error: "Invalid App execution mode" }, 400);
+        // No await between authority checks and policy publication. Preparation
+        // registers ownership synchronously before doing any asynchronous work.
+        if (appActivationCoordinator.hasAuthority(appId) || appCapabilities.hasAuthority(appId)) {
+          return json({ error: { code: "APP_MODE_REQUIRES_STOP", message: "Stop the App and resolve workload cleanup before changing Experiment mode." } }, 409);
+        }
+        try { appServices.setMode(appId, body.mode); }
+        catch (error) { return json({ error: coreErrorMessage(error) }, 409); }
+        return json({ appId, mode: body.mode });
+      }
+
       const appEnablementMatch = path.match(/^\/api\/app-runtime\/apps\/([^/]+)\/enablement$/);
       if (appEnablementMatch && method === "POST") {
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
@@ -2018,10 +2042,6 @@ const server = await serve<{ cwd: string }>({
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const appId = decodeURIComponent(editSaveMatch[1]);
         try {
-          const upload = await readAppPackageArchive(
-            req,
-            join(lamarckDir, "staging", "app-edits"),
-          );
           const encodedPrincipal = req.headers.get("x-lamarck-cli-principal");
           const managedPrincipal = encodedPrincipal === null
             ? undefined
@@ -2029,6 +2049,13 @@ const server = await serve<{ cwd: string }>({
           if (managedPrincipal?.kind !== "app") {
             if (encodedPrincipal !== null) throw new Error("Managed App CLI principal is required");
           }
+          if (managedPrincipal?.kind === "app" && appServices.mode(managedPrincipal.appId) === "exp") {
+            return json({ error: { code: "APP_EXPERIMENT_READ_ONLY", message: "Experiment mode permits only managed CLI read operations." } }, 403);
+          }
+          const upload = await readAppPackageArchive(
+            req,
+            join(lamarckDir, "staging", "app-edits"),
+          );
           const result = await appLifecycle.savePackage(appId, upload.entries, {
             baseVersion: upload.metadata.baseVersion,
             basePackageDigest: upload.metadata.basePackageDigest,
@@ -2061,7 +2088,7 @@ const server = await serve<{ cwd: string }>({
         try {
           await appLifecycle.refreshRegistry(req.signal);
           const revision = workloadAdmission(appId, workload);
-          const activation = await appLifecycle.prepareActivation(appId, workload);
+          const activation = await appLifecycle.prepareActivation(appId, workload, appServices.mode(appId));
           try { if (workloadAdmission(appId, workload) !== revision) throw new Error("App enablement changed during activation"); }
           catch (error) { await appActivationCoordinator.release(activation.activationId); throw error; }
           return json({ activation });
@@ -2109,6 +2136,7 @@ const server = await serve<{ cwd: string }>({
           ));
           producerDescriptorStore.resolve(descriptor.ref);
           const issued = appCapabilities.issue(body.appId, workload, {
+            mode: activation.mode,
             activationId: activation.activationId,
             manifestDigest: activation.manifestDigest,
             packageDigest: activation.packageDigest,

@@ -69,6 +69,10 @@ function validateInput(
       exactKeys(input, ["runId", "sourceId"], `CLI ${operation} input`); text(input.sourceId, "sourceId"); text(input.runId, "runId"); break;
     case "connector.install": id("packageId"); break;
     case "connector.inspect": case "connector.update": case "connector.remove": id("connectorId"); break;
+    case "app.mode":
+      exactKeys(input, ["appId", "mode"], `CLI ${operation} input`); appIdentity(input.appId);
+      if (input.mode !== "normal" && input.mode !== "exp") throw new Error("Invalid App mode");
+      break;
     case "app.enable": case "app.disable": case "app.activity":
       id("appId"); appIdentity(input.appId); break;
     case "app.service.enable": case "app.service.disable":

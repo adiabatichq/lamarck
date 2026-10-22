@@ -235,3 +235,18 @@ The tools cover app/window inspection, screenshots, clicks, typing, keyboard act
 Calls keep Vercel usage, finish information, warnings, and sanitized errors. `providerMetadata.lamarck.invocationId` identifies the Host invocation. Tool writes retain the existing Guard evidence; AI call status is not added to the permanent D0 ledger. Custom HTTP headers and raw provider chunks are not exposed. Provider request/debug bodies, credentials, and CLI diagnostics do not cross the App channel. Calls are limited to eight per channel and 64 globally, with bounded event queues, a 60-second idle timeout, and a ten-minute deadline. Cancellation, disconnect, permission withdrawal, or source reconfiguration ends the corresponding work.
 
 Model calls do not automatically record prompts, responses, or tools in Timeline. Apps own recording submitted user content and actual delivery through the existing `system.writeEvent` API; File and Table writes retain their usual change events. SDK initialization does not register Vercel telemetry or require an `ai` peer. Apps can independently configure official Vercel telemetry. Native CLI incidental transcript persistence remains disabled, and existing retained content remains readable through `system.resolveContentRef`.
+
+## App Experiment mode
+
+The Host can place a fully stopped App in persistent `exp` execution mode.
+This is not a manifest field or SDK option. Every admitted UI, Service, Job,
+descendant and tool callback retains its Host-bound policy. Existing reads,
+subscriptions and ordinary `system.ai`/Vercel AI SDK calls work under existing
+grants; AI calls may incur costs. `writeEvent`, D2 writes and Workspace File
+writes (including the App's implicit namespace) are rejected explicitly.
+Mixed transactions fail atomically; read-only transactions remain available.
+Computer Use fails before opening a session or asking for control permission.
+Memory, UI output, stdout and disposable Capsule scratch files remain usable.
+The workload's private CLI is also restricted to its existing read operations.
+Host editing/versioning, schema management and incoming event/cron Jobs keep
+their existing contracts. All manifest and protocol versions remain unchanged.

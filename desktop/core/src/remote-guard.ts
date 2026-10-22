@@ -12,6 +12,7 @@ import type {
 } from "./guard-service/protocol";
 
 export interface GuardBinding {
+  readOnly?: boolean;
   source: string;
   /** Host-established Producer Descriptor ref; callers cannot override it per event. */
   producerRef: string;
@@ -175,6 +176,7 @@ export class RemoteGuard {
   }
 
   withSource(source: string, opts: {
+    readOnly?: boolean;
     producerRef: string;
     prepareProducer?: () => void | Promise<void>;
     writeTables?: string[] | null;
@@ -183,6 +185,7 @@ export class RemoteGuard {
     deadlineMs?: number;
   }): RemoteGuard {
     const guard = new RemoteGuard(this.rpc, {
+      readOnly: this.binding.readOnly || opts.readOnly,
       source,
       producerRef: opts.producerRef,
       // Publication belongs to the new producer context and is never inherited
@@ -290,6 +293,7 @@ export class RemoteGuard {
 
   private principal(): GuardPrincipal {
     return {
+      readOnly: this.binding.readOnly,
       source: this.binding.source,
       producerRef: this.binding.producerRef,
       tableGrants: this.binding.writeTables ?? "*",
@@ -302,6 +306,7 @@ export class RemoteGuard {
   }
 
   private async prepareProducer(): Promise<void> {
+    if (this.binding.readOnly) return;
     await this.binding.prepareProducer?.();
   }
 

@@ -203,6 +203,12 @@ export class AppCliStreamServer {
     if (upload.kind !== "app-package" || upload.archiveBytes > MAX_UPLOAD_BYTES) {
       return failure(request, "APP_INVALID", "App package upload is outside the V1 bound");
     }
+    if (identity.mode !== "normal") {
+      // Retire the declared framing without staging any package or granting
+      // writeback. The next read command may use this same private stream.
+      for await (const _chunk of readUpload(reader, upload.archiveBytes)) { /* drain */ }
+      return failure(request, "APP_EXPERIMENT_READ_ONLY", "Experiment mode permits only managed CLI read operations.");
+    }
     try {
       const body = Readable.from(readUpload(reader, upload.archiveBytes));
       return (await this.options.dispatcher().dispatchManagedAppSave(saveRequest, identity, body)).response;
@@ -410,7 +416,8 @@ function failure(request: CliRequest, code: string, message: string): CliRespons
 
 function validateIdentity(value: AppCliWorkloadIdentityV1): void {
   if (
-    value.kind !== "app"
+    (value.mode !== "normal" && value.mode !== "exp")
+    || value.kind !== "app"
     || !PACKAGE_ID_PATTERN.test(value.appId)
     || !value.workloadHandle
     || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(value.appCommit)

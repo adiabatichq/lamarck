@@ -46,6 +46,7 @@ export interface VfsCaller {
   guard: RemoteGuard;
   fileGrants: readonly string[] | null;
   trustedHost: boolean;
+  readOnly?: boolean;
   workloadId?: string;
 }
 
@@ -140,6 +141,7 @@ export class VfsService {
       }
 
       if (isMutating(parsed.name)) {
+        if (caller.readOnly) return result(1, Buffer.alloc(0), Buffer.from("Experiment mode permits read-only access to Workspace Files.\n"));
         return await this.sequencer.run(() => this.executeMutation(
           caller,
           parsed,

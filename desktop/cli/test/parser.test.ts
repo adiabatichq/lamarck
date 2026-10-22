@@ -32,6 +32,7 @@ describe("shared CLI parser", () => {
     [["connector", "remove", "lamarck.oura", "--yes"], "connector.remove", { connectorId: "lamarck.oura" }],
     [["app", "list"], "app.list", {}],
     [["app", "inspect", "focus"], "app.inspect", { appId: "focus" }],
+    [["app", "mode", "focus", "exp", "--json"], "app.mode", { appId: "focus", mode: "exp" }],
     [["app", "enable", "focus"], "app.enable", { appId: "focus" }],
     [["app", "disable", "focus"], "app.disable", { appId: "focus" }],
     [["app", "service", "enable", "focus", "sync"], "app.service.enable", { appId: "focus", serviceId: "sync" }],
@@ -142,4 +143,12 @@ test("App runtime commands are explicit and Host-only", () => {
   expect(helpText("managed")).not.toContain("app service");
   expect(helpText("managed")).not.toContain("app activity");
   expect(parseCliArgs(["app", "service", "--help"], "host")).toMatchObject({ kind: "help", text: expect.stringContaining("[write]") });
+});
+
+
+test("Experiment mode is a validated Host-only v1 management command", () => {
+  expect(parseCliArgs(["app", "mode", "notes", "exp", "--json"], "host")).toMatchObject({ operation: "app.mode", input: { appId: "notes", mode: "exp" }, json: true });
+  expect(() => parseCliArgs(["app", "mode", "notes", "wrong"], "host")).toThrow();
+  expect(() => parseCliArgs(["app", "mode", "notes", "exp"], "managed")).toThrow(/not available/);
+  expect(helpText("managed")).not.toContain("app mode");
 });

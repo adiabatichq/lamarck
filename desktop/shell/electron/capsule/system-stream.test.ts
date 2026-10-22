@@ -14,7 +14,7 @@ describe("Node System SDK stream termination", () => {
       return Response.json({ ok: true });
     });
     const broker = new SystemBroker({ coreBaseUrl: 'http://127.0.0.1:32100', fetch: fetchMock, revokeCapability: () => {} });
-    broker.bindSender('node-control', { channelId: 'channel-control', capability: 'secret-control' });
+    broker.bindSender('node-control', { mode: "normal" as const, channelId: 'channel-control', capability: 'secret-control' });
     const { client, server } = duplexPair();
     const onClose = vi.fn();
     new SystemStreamServer(broker).attach('node-control', server, { onClose });
@@ -40,7 +40,7 @@ describe("Node System SDK stream termination", () => {
       coreBaseUrl: 'http://127.0.0.1:32100', revokeCapability: () => {},
       fetch: async (_url, init) => new Promise<Response>((_resolve, reject) => { init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true }); }),
     });
-    broker.bindSender('node-overflow', { channelId: 'channel-overflow', capability: 'secret-overflow' });
+    broker.bindSender('node-overflow', { mode: "normal" as const, channelId: 'channel-overflow', capability: 'secret-overflow' });
     const { client, server } = duplexPair();
     const onClose = vi.fn();
     new SystemStreamServer(broker).attach('node-overflow', server, { onClose });
@@ -54,7 +54,7 @@ describe("Node System SDK stream termination", () => {
   test('bounds the control reserve to four extra requests', async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => { init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true }); }));
     const broker = new SystemBroker({ coreBaseUrl: 'http://127.0.0.1:32100', fetch: fetchMock, revokeCapability: () => {} });
-    broker.bindSender('node-reserve', { channelId: 'channel-reserve', capability: 'secret-reserve' });
+    broker.bindSender('node-reserve', { mode: "normal" as const, channelId: 'channel-reserve', capability: 'secret-reserve' });
     const { client, server } = duplexPair();
     const onClose = vi.fn();
     new SystemStreamServer(broker).attach('node-reserve', server, { onClose });
@@ -78,7 +78,7 @@ describe("Node System SDK stream termination", () => {
       fetch: fetchMock as typeof globalThis.fetch,
       revokeCapability: () => {},
     });
-    broker.bindSender("node-1", { channelId: "channel-1", capability: "secret-1" });
+    broker.bindSender("node-1", { mode: "normal" as const, channelId: "channel-1", capability: "secret-1" });
     const { client, server } = duplexPair();
     new SystemStreamServer(broker).attach("node-1", server);
 
@@ -112,7 +112,7 @@ describe("Node System SDK stream termination", () => {
       fetch: vi.fn(),
       revokeCapability: () => {},
     });
-    broker.bindSender("node-bad", { channelId: "channel-bad", capability: "secret-bad" });
+    broker.bindSender("node-bad", { mode: "normal" as const, channelId: "channel-bad", capability: "secret-bad" });
     const { client, server } = duplexPair();
     new SystemStreamServer(broker, { maxFrameBytes: 64 }).attach("node-bad", server);
     const oversized = Buffer.alloc(4);
@@ -130,7 +130,7 @@ describe("Node System SDK stream termination", () => {
       fetch: vi.fn(),
       revokeCapability: () => {},
     });
-    broker.bindSender("node-prefix", { channelId: "channel-prefix", capability: "secret-prefix" });
+    broker.bindSender("node-prefix", { mode: "normal" as const, channelId: "channel-prefix", capability: "secret-prefix" });
     const { client, server } = duplexPair();
     new SystemStreamServer(broker, { maxFrameBytes: 512 }).attach("node-prefix", server);
     client.write(Buffer.from([0, 0]));
@@ -159,7 +159,7 @@ describe("Node System SDK stream termination", () => {
       fetch: vi.fn(),
       revokeCapability: () => {},
     });
-    broker.bindSender("node-bad", { channelId: "channel-bad", capability: "secret-bad" });
+    broker.bindSender("node-bad", { mode: "normal" as const, channelId: "channel-bad", capability: "secret-bad" });
     const { client, server } = duplexPair();
     new SystemStreamServer(broker).attach("node-bad", server);
     client.write(bytes);
@@ -175,7 +175,7 @@ describe("Node System SDK stream termination", () => {
       fetch: vi.fn(),
       revokeCapability: () => {},
     });
-    broker.bindSender("node-reload", { channelId: "channel-reload", capability: "secret-reload" });
+    broker.bindSender("node-reload", { mode: "normal" as const, channelId: "channel-reload", capability: "secret-reload" });
     const { client, server } = duplexPair();
     const onClose = vi.fn();
     new SystemStreamServer(broker, { unbindOnClose: false }).attach(
@@ -197,7 +197,7 @@ describe("Node System SDK stream termination", () => {
       fetch: fetchMock as typeof globalThis.fetch,
       revokeCapability: () => {},
     });
-    broker.bindSender("node-slow", { channelId: "channel-slow", capability: "secret-slow" });
+    broker.bindSender("node-slow", { mode: "normal" as const, channelId: "channel-slow", capability: "secret-slow" });
     const stream = new BlockedWriteDuplex();
     const onClose = vi.fn();
     new SystemStreamServer(broker, {

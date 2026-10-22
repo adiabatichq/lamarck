@@ -421,6 +421,7 @@ cliDispatcher = new CliOperationDispatcher({
   coreToken: CORE_TOKEN,
   runtimeStates: () => capsuleManager.appRuntimeStates(),
   setAppEnabled: setAppEnabledFromHost,
+  setAppMode: (appId, mode) => capsuleManager.setAppMode(appId, mode),
   setServiceEnabled: (appId, serviceId, enabled) => capsuleManager.setServiceEnabled(appId, serviceId, enabled),
   workloadDiagnostics: appId => capsuleManager.workloadDiagnostics(appId),
   archive: coordinateCliArchive,
@@ -2091,10 +2092,10 @@ async function prepareAppViewerSurface(
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => result.reason);
     if (cleanupFailures.length > 0) {
-      throw new AggregateError(
+      await capsuleManager.trackViewerCleanup(appId, Promise.reject(new AggregateError(
         [error, ...cleanupFailures],
         "Prepared App viewer and its Host resources both failed",
-      );
+      )));
     }
     throw error;
   }
@@ -2187,7 +2188,7 @@ async function openAppViewer(
     const surface = preparedSurface as PreparedAppViewerSurface | null;
     if (surface) {
       try {
-        await disposePreparedAppViewerSurface(surface, owner);
+        await capsuleManager.trackViewerCleanup(appId, disposePreparedAppViewerSurface(surface, owner));
       } catch (cleanupError) {
         cleanupFailures.push(cleanupError);
       }
@@ -2294,10 +2295,10 @@ function commitReloadedAppViewer(
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => result.reason);
     if (failures.length > 0) {
-      console.error("[electron] Previous App viewer cleanup failed", ...failures);
+      throw new AggregateError(failures, "Previous App viewer cleanup failed");
     }
   });
-  return { cleanup };
+  return { cleanup: capsuleManager.trackViewerCleanup(record.appId, cleanup) };
 }
 
 function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
@@ -2353,7 +2354,7 @@ function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
           initialRecord.handoffPresentation = presentation;
           // Keep the reload record until publication or failure; its retired
           // browser has no authority and no longer occupies the visible pane.
-          void initialRecord.gateway.close().catch(error => console.error("[electron] Retired viewer gateway cleanup failed", error));
+          void capsuleManager.trackViewerCleanup(appId, initialRecord.gateway.close()).catch(error => console.error("[electron] Retired viewer gateway cleanup failed", error));
         },
       );
       if (!backendCommitted) return { active: result.active };
@@ -2366,7 +2367,7 @@ function reloadAppRuntime(appId: string): Promise<{ active: boolean }> {
           initialRecord.pendingReplacement = null;
         }
         try {
-          await disposePreparedAppViewerSurface(surface, initialRecord.owner);
+          await capsuleManager.trackViewerCleanup(appId, disposePreparedAppViewerSurface(surface, initialRecord.owner));
         } catch (cleanupError) {
           cleanupFailures.push(cleanupError);
         }
@@ -2516,7 +2517,10 @@ function detachAppViewerRecord(
   for (const viewerSession of sessions) {
     captureCleanup(() => clearDisposableAppViewerStorage(viewerSession));
   }
-  return cleanup;
+  return [capsuleManager.trackViewerCleanup(record.appId, Promise.allSettled(cleanup).then(results => {
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) throw new AggregateError(failures, "App viewer resource cleanup failed");
+  }))];
 }
 
 function setAppViewerBounds(
@@ -3106,6 +3110,10 @@ app.whenReady().then(async () => {
     const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
     if (failures.length) throw new AggregateError(failures, "UI cleanup failed");
     return { ok: true };
+  });
+  ipcMain.handle("app-runtime:mode", async (event, appId: string, mode: "normal" | "exp") => {
+    requireShellIpc(event);
+    return capsuleManager.setAppMode(appId, mode);
   });
   ipcMain.handle("app-runtime:app-enablement", async (event, appId: string, enabled: boolean) => {
     requireShellIpc(event);

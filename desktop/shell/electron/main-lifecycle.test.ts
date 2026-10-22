@@ -59,10 +59,10 @@ describe("Shell window lifecycle", () => {
 });
 
 describe("App viewer IPC contract", () => {
-  test.each(["stop-job", "close-ui", "app-enablement", "service-enablement", "diagnostics"])("App execution %s is fenced behind trusted Shell IPC", operation => {
+  test.each(["stop-job", "close-ui", "app-enablement", "service-enablement", "diagnostics", "mode"])("App execution %s is fenced behind trusted Shell IPC", operation => {
     const handler = mainSource.slice(mainSource.indexOf(`  ipcMain.handle("app-runtime:${operation}"`)).split("\n  });")[0];
     expect(handler).toContain("requireShellIpc(event)");
-    const action = operation === "stop-job" ? "capsuleManager.stopJob" : operation === "close-ui" ? "capsuleManager.closeAppUi" : operation === "service-enablement" ? "capsuleManager.setServiceEnabled" : operation === "diagnostics" ? "capsuleManager.workloadDiagnostics" : "setAppEnabledFromHost";
+    const action = operation === "stop-job" ? "capsuleManager.stopJob" : operation === "close-ui" ? "capsuleManager.closeAppUi" : operation === "service-enablement" ? "capsuleManager.setServiceEnabled" : operation === "diagnostics" ? "capsuleManager.workloadDiagnostics" : operation === "mode" ? "capsuleManager.setAppMode" : "setAppEnabledFromHost";
     expect(handler.indexOf("requireShellIpc(event)")).toBeLessThan(handler.indexOf(action));
     expect(handler).toContain(action);
   });
@@ -597,7 +597,7 @@ describe("Shell Host configuration", () => {
       /loadAppViewerDocument\([\s\S]*?markUnhealthy/,
     );
     expect(lifecycle).toMatch(
-      /const cleanupFailures = cleanup[\s\S]*?throw new AggregateError\(/,
+      /const cleanupFailures = cleanup[\s\S]*?trackViewerCleanup[\s\S]*?new AggregateError\(/,
     );
 
     const loader = mainSource.match(

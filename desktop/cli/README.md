@@ -48,11 +48,44 @@ proof that no execution occurred. Persistent Job history belongs to
 There is no additional Job launch/retry/replay command.
 
 These controls and diagnostics are Host-only. Managed workloads retain their
-existing App editing commands and aggregate running read. CLI help labels
+existing App editing commands and aggregate running read in normal mode. Experiment mode restricts that surface to existing reads. CLI help labels
 commands `[read]`, `[write]`, or `[read/write]`; the last applies to the mixed
 file command family. Labels describe effects and do not grant permissions.
 Both the CLI package and running Desktop must support a new command; upgrading
 only the npm package cannot add Host behavior. Protocol and schema remain v1.
+
+## Experiment mode
+
+Experiment mode is one persistent Host setting, `normal` (default) or `exp`,
+independent of App/Service enablement and App versions. Host inspection exposes
+`runtime.mode`; the existing Console App settings show an **Experiment mode**
+toggle: “Read-only access to Workspace data. AI calls may incur costs.”
+
+```sh
+lamarck app mode <app-id> <normal|exp> --json
+```
+
+The setter returns `{ appId, mode }`. Stop the App first using existing controls
+(for example `app disable`) and wait for all UI, Service, Job, descendant and
+authority cleanup to finish. Changing mode never stops, starts, restarts,
+retries or replays work, or changes enablement, Service settings or Triggers.
+The setting survives Host restarts and App source/version changes. A failed
+Host viewer resource cleanup keeps switching blocked until a Host restart.
+
+Exp workloads retain existing live reads, subscriptions and AI access, including
+Vercel AI SDK tools. Memory, disposable Capsule files, UI output and stdout
+remain available. `writeEvent`, Table mutations and Workspace File mutations
+(including `apps/<app-id>/`) fail explicitly. Mutating transactions fail
+atomically; read-only transactions remain available. Managed CLI reads retain
+their existing availability; Source operations, Connector changes, App
+create/save/restore/archive/refresh and schema submissions are rejected.
+Computer Use is rejected before permission or session creation. Existing grants
+and Capsule network restrictions still apply.
+
+Host App editing/versioning and Workspace schema approval/application remain
+independent and retain normal D0 evidence. Incoming event/cron Jobs still run
+with their ordinary input, cancellation, diagnostics and history. There is no
+experimental database or outgoing event from a denied write.
 
 ## Triggers
 

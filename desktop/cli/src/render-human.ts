@@ -15,6 +15,7 @@ export function renderHuman(operation: CliOperation, value: unknown): string {
     case "connector.install": case "connector.update":
       return `${result.changed ? (operation === "connector.update" ? "Updated" : "Installed") : "Already current"} ${result.id} (${result.releaseId}).\n`;
     case "connector.remove": return `Removed Connector ${result.id}.\n`;
+    case "app.mode": return `App ${result.appId} mode: ${result.mode}.\n`;
     case "app.enable": return `Enabled App ${result.appId}.\n`;
     case "app.disable": return `Disabled App ${result.appId}.\n`;
     case "app.service.enable": return `Enabled Service ${result.appId}/${result.serviceId}.\n`;

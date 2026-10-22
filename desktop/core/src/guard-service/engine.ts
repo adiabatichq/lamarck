@@ -118,6 +118,7 @@ interface DenyPolicy {
 type AuthorizerPolicy = QueryPolicy | D0Policy | MutatePolicy | SchemaPolicy | InternalPolicy | DenyPolicy;
 
 interface NormalizedPrincipal {
+  readOnly: boolean;
   source: string;
   producerRef: string;
   tableGrants: "*" | Set<string>;
@@ -402,6 +403,7 @@ export class GuardEngine {
   ): GuardMutationResult {
     this.assertOpen();
     const principal = normalizePrincipal(principalInput);
+    assertWritable(principal);
     const statementSql = this.validateSql(sql, "system.mutate");
     const bound = normalizeParams(params);
 
@@ -448,6 +450,13 @@ export class GuardEngine {
       };
     });
 
+    if (principal.readOnly) {
+      try {
+        for (const item of normalized) this.withPolicy({ mode: "query" }, () => this.db.prepare(item.sql).columns());
+      } catch {
+        throw new GuardServiceError("APP_EXPERIMENT_READ_ONLY", "Experiment mode permits only read-only transactions.");
+      }
+    }
     const transactionId = ulid();
     const results: GuardTransactionStatementResult[] = [];
     const auditBudget = { bytes: 0 };
@@ -526,6 +535,7 @@ export class GuardEngine {
   writeEvent(principalInput: GuardPrincipal, event: GuardEventInput): string {
     this.assertOpen();
     const principal = normalizePrincipal(principalInput);
+    assertWritable(principal);
     validateEventInput(event);
     assertEventTypeAllowed(principal.source, event.type);
 
@@ -535,6 +545,7 @@ export class GuardEngine {
   writeLifecycleEvent(principalInput: GuardPrincipal, event: GuardEventInput): string {
     this.assertOpen();
     const principal = normalizePrincipal(principalInput);
+    assertWritable(principal);
     validateEventInput(event);
     if (!LIFECYCLE_EVENT_TYPES.has(event.type)) {
       throw new GuardServiceError(
@@ -548,6 +559,7 @@ export class GuardEngine {
   writeWorkspaceEvent(principalInput: GuardPrincipal, event: GuardEventInput): string {
     this.assertOpen();
     const principal = normalizePrincipal(principalInput);
+    assertWritable(principal);
     validateEventInput(event);
     if (event.type !== "workspace.files.changed" || event.externalId !== undefined) {
       throw new GuardServiceError(
@@ -1558,10 +1570,16 @@ function normalizePrincipal(input: GuardPrincipal): NormalizedPrincipal {
       "Guard: schema capability requires a system source",
     );
   }
-  return { source, producerRef, tableGrants, schemaGrant };
+  if (input.readOnly !== undefined && typeof input.readOnly !== "boolean") throw new GuardServiceError("GUARD_INVALID_PRINCIPAL", "Guard: invalid read-only policy");
+  return { source, producerRef, tableGrants, schemaGrant, readOnly: input.readOnly === true };
+}
+
+function assertWritable(principal: NormalizedPrincipal): void {
+  if (principal.readOnly) throw new GuardServiceError("APP_EXPERIMENT_READ_ONLY", "Experiment mode permits read-only access to Workspace data.");
 }
 
 function assertSchemaGrant(principal: NormalizedPrincipal): void {
+  assertWritable(principal);
   if (!principal.schemaGrant) {
     throw new GuardServiceError(
       "GUARD_SCHEMA_DENIED",
@@ -1571,6 +1589,7 @@ function assertSchemaGrant(principal: NormalizedPrincipal): void {
 }
 
 function hasTableGrant(principal: NormalizedPrincipal, table: string): boolean {
+  assertWritable(principal);
   return principal.tableGrants === "*" || principal.tableGrants.has(normalizeName(table));
 }
 

@@ -1,5 +1,6 @@
 import {
   HOST_CLI_OPERATIONS,
+  isReadOnlyCliRequest,
   HOST_APP_RUNTIME_OPERATIONS,
   MANAGED_CLI_OPERATIONS,
   parseCliRequest,
@@ -17,6 +18,7 @@ import {
 import type { Readable } from "node:stream";
 
 export interface ManagedCliIdentity {
+  readonly mode: "normal" | "exp";
   readonly kind: "app";
   readonly appId: string;
   readonly workload: "ui" | `service:${string}` | `job:${string}`;
@@ -48,6 +50,7 @@ export class CliOperationDispatcher {
     readonly coreToken: string;
     readonly fetch?: typeof fetch;
     readonly runtimeStates: () => readonly AppRuntimeState[];
+    readonly setAppMode?: (appId: string, mode: "normal" | "exp") => Promise<{ appId: string; mode: "normal" | "exp" }>;
     readonly setAppEnabled?: (appId: string, enabled: boolean) => Promise<unknown>;
     readonly setServiceEnabled?: (appId: string, serviceId: string, enabled: boolean) => Promise<unknown>;
     readonly workloadDiagnostics?: (appId: string) => readonly AppWorkloadDiagnostic[];
@@ -83,6 +86,9 @@ export class CliOperationDispatcher {
     const supported = context.environment === "host" ? HOST_CLI_OPERATIONS : MANAGED_CLI_OPERATIONS;
     if (!supported.includes(request.operation)) {
       return failure(request.requestId, "CLI_UNSUPPORTED_COMMAND", `${request.operation} is not available in the ${context.environment} CLI.`);
+    }
+    if (context.environment === "managed" && (context.principal.mode !== "normal") && !isReadOnlyCliRequest(request)) {
+      return failure(request.requestId, "APP_EXPERIMENT_READ_ONLY", "Experiment mode permits only managed CLI read operations.");
     }
     if (HOST_APP_RUNTIME_OPERATIONS.includes(request.operation)) {
       return this.#dispatchAppRuntime(request, context);
@@ -121,6 +127,11 @@ export class CliOperationDispatcher {
         const result = this.options.workloadDiagnostics(appId).map(boundActivityOutput);
         return { response: { requestId: request.requestId, ok: true, result } };
       }
+      if (request.operation === "app.mode") {
+        if (!this.options.setAppMode) throw new Error("App management is unavailable.");
+        const result = await this.options.setAppMode(appId, (request as CliRequest<"app.mode">).input.mode);
+        return { response: { requestId: request.requestId, ok: true, result } };
+      }
       const enabled = request.operation === "app.enable" || request.operation === "app.service.enable";
       if (serviceId) {
         if (!this.options.setServiceEnabled) throw new Error("Service management is unavailable.");
@@ -130,7 +141,8 @@ export class CliOperationDispatcher {
         await this.options.setAppEnabled(appId, enabled);
       }
       return { response: { requestId: request.requestId, ok: true, result: { appId, ...(serviceId ? { serviceId } : {}), enabled } } as CliResponse };
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "APP_MODE_REQUIRES_STOP") return failure(request.requestId, error.code, error.message);
       return failure(request.requestId, "APP_RUNTIME_FAILED", "Lamarck could not confirm the App runtime operation. Inspect the App and its activity before retrying.");
     }
   }
@@ -140,6 +152,7 @@ export class CliOperationDispatcher {
     identity: ManagedCliIdentity,
     body: Readable,
   ): Promise<CliDispatchResult> {
+    if (identity.mode !== "normal") return failure(request.requestId, "APP_EXPERIMENT_READ_ONLY", "Experiment mode permits only managed CLI read operations.");
     const upload = request.upload;
     if (!upload || upload.kind !== "app-package") {
       return failure(request.requestId, "APP_INVALID", "The App package upload is invalid.");
@@ -165,7 +178,7 @@ export class CliOperationDispatcher {
             "Content-Type": "application/octet-stream",
             "Content-Length": String(upload.archiveBytes),
             "X-Lamarck-App-Edit-V1": Buffer.from(JSON.stringify(metadata), "utf8").toString("base64url"),
-            "X-Lamarck-CLI-Principal": Buffer.from(JSON.stringify(identity), "utf8").toString("base64url"),
+            "X-Lamarck-CLI-Principal": Buffer.from(JSON.stringify(corePrincipal(identity)), "utf8").toString("base64url"),
           },
           body,
           duplex: "half",
@@ -259,7 +272,7 @@ export class CliOperationDispatcher {
           Authorization: `Bearer ${this.options.coreToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ request, principal: context.principal }),
+        body: JSON.stringify({ request, principal: corePrincipal(context.principal) }),
       });
       const value = await response.json();
       try {
@@ -302,6 +315,7 @@ function joinRuntime(
   const runtime: AppShape["runtime"] = environment === "managed" ? { running: running.has(app.id) } : {
     running: running.has(app.id),
     enabled: app.runtime.enabled ?? state?.enabled ?? null,
+    mode: app.runtime.mode,
     ui: state?.ui ?? "closed",
     stopping: state?.stopping ?? false,
     latestFailure: state?.latestFailure ?? null,
@@ -311,6 +325,12 @@ function joinRuntime(
     }),
   };
   return { ...response, result: { ...app, runtime } } as CliResponse;
+}
+
+function corePrincipal(principal: CliDispatchContext["principal"]) {
+  if (principal.kind === "system") return principal;
+  const { mode, ...identity } = principal;
+  return identity;
 }
 
 function boundActivityOutput(value: AppWorkloadDiagnostic): AppWorkloadDiagnostic {

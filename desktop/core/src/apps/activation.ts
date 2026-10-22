@@ -23,6 +23,7 @@ export interface PreparedAppActivationV1 {
   readonly activationSequence: number;
   readonly appId: string;
   readonly workload: AppWorkload;
+  readonly mode: "normal" | "exp";
   readonly version: string;
   readonly manifest: AppManifest;
   readonly manifestDigest: AppManifestDigest;
@@ -35,6 +36,13 @@ export class AppActivationCoordinator {
   private sequence = 0;
   private readonly materializations = new Map<string, Promise<unknown>>();
 
+  private readonly preparing = new Map<string, number>();
+
+  hasAuthority(appId: string): boolean {
+    return this.preparing.has(appId) || this.materializations.has(appId)
+      || [...this.activations.values()].some(activation => activation.appId === appId);
+  }
+
   constructor(
     private readonly repository: AppRepositoryService,
     private readonly cacheRoot: string,
@@ -44,46 +52,55 @@ export class AppActivationCoordinator {
     readonly appId: string;
     readonly appDir: string;
     readonly workload: AppWorkload;
+    readonly mode: "normal" | "exp";
   }): Promise<PreparedAppActivationV1> {
-    const admitted = await this.repository.activate({
-      appId: options.appId,
-      appDir: options.appDir,
-      validateCandidate(candidate) {
-        if (!isDeclaredWorkload(candidate.manifest, options.workload)) {
-          throw new Error(`App ${options.appId} does not declare workload ${options.workload}`);
-        }
-      },
-    });
-    const packageValue = await this.repository.readVersionPackage(
-      options.appId,
-      options.appDir,
-      admitted.version,
-    );
-    if (!isDeclaredWorkload(packageValue.manifest, options.workload)) {
-      throw new Error("Retained App version workload authority does not match activation admission");
-    }
-    return this.withMaterialization(options.appId, async () => {
-      const immutablePackagePath = await this.materialize({
+    if (options.mode !== "normal" && options.mode !== "exp") throw new Error("App execution policy is unavailable");
+    this.preparing.set(options.appId, (this.preparing.get(options.appId) ?? 0) + 1);
+    try {
+      const admitted = await this.repository.activate({
         appId: options.appId,
         appDir: options.appDir,
-        version: admitted.version,
-        expectedDigest: packageValue.digest,
+        validateCandidate(candidate) {
+          if (!isDeclaredWorkload(candidate.manifest, options.workload)) {
+            throw new Error(`App ${options.appId} does not declare workload ${options.workload}`);
+          }
+        },
       });
-      const activation = Object.freeze({
-        schemaVersion: 1 as const,
-        activationId: allocateActivationId(this.activations),
-        activationSequence: ++this.sequence,
-        appId: options.appId,
-        workload: options.workload,
-        version: admitted.version,
-        manifest: packageValue.manifest,
-        manifestDigest: digestNormalizedAppManifest(packageValue.manifest),
-        packageDigest: packageValue.digest,
-        immutablePackagePath,
+      const packageValue = await this.repository.readVersionPackage(
+        options.appId,
+        options.appDir,
+        admitted.version,
+      );
+      if (!isDeclaredWorkload(packageValue.manifest, options.workload)) {
+        throw new Error("Retained App version workload authority does not match activation admission");
+      }
+      return await this.withMaterialization(options.appId, async () => {
+        const immutablePackagePath = await this.materialize({
+          appId: options.appId,
+          appDir: options.appDir,
+          version: admitted.version,
+          expectedDigest: packageValue.digest,
+        });
+        const activation = Object.freeze({
+          schemaVersion: 1 as const,
+          activationId: allocateActivationId(this.activations),
+          activationSequence: ++this.sequence,
+          appId: options.appId,
+          workload: options.workload,
+          mode: options.mode,
+          version: admitted.version,
+          manifest: packageValue.manifest,
+          manifestDigest: digestNormalizedAppManifest(packageValue.manifest),
+          packageDigest: packageValue.digest,
+          immutablePackagePath,
+        });
+        this.activations.set(activation.activationId, activation);
+        return activation;
       });
-      this.activations.set(activation.activationId, activation);
-      return activation;
-    });
+    } finally {
+      const remaining = this.preparing.get(options.appId)! - 1;
+      if (remaining) this.preparing.set(options.appId, remaining); else this.preparing.delete(options.appId);
+    }
   }
 
   require(

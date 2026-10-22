@@ -4,7 +4,7 @@ import { describe, expect, test, vi } from "vitest";
 import type { AppHistoryView, AppRuntimeView } from "../hooks/useAppsManager";
 import type { AppInfo, AppVersionRecordV1, TriggerSummary } from "../lib/api";
 import { AppActivityView, AppEnablementSwitch, AppServices } from "./AppWorkloadManagement";
-import { AppVersions } from "./AppManagementDetails";
+import { AppManagementDetails, AppVersions } from "./AppManagementDetails";
 import { AppExecutionView, AppsManagerView, deriveAppPrimaryStatus } from "./AppsManager";
 
 const latest: AppVersionRecordV1 = {
@@ -309,3 +309,12 @@ function runtime(
 ): AppRuntimeView {
   return { appId, enabled: true, runningWorkloads, latestFailure };
 }
+
+
+test.each([true, false])("Experiment mode shows saved policy while disabled, with stopped-only controls (%s)", allowed => {
+  const html = renderToStaticMarkup(<AppManagementDetails app={app("notes")} runtime={{ ...runtime("notes"), enabled: false, mode: "exp", modeChangeAllowed: allowed }}
+    history={history} loading={false} busy={null} error={null} onOpenApp={vi.fn()} onLoadMore={vi.fn()} onRequestRestore={vi.fn()} onRequestRebuild={vi.fn()} />);
+  expect(html).toContain('aria-label="Experiment mode" aria-checked="true"');
+  expect(html).toContain("Read-only access to Workspace data. AI calls may incur costs.");
+  expect(html.includes("Stop the App and resolve workload cleanup before changing Experiment mode.")).toBe(!allowed);
+});

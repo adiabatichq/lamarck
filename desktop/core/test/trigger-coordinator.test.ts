@@ -203,10 +203,11 @@ test('a due schedule invokes a concrete Source through real supervisor state and
   } finally { await coordinator.close(); data.close(); }
 });
 
-test('App enablement uses the existing unavailable-target queue policy and preserves Trigger and child Service settings', async () => {
+test.each(['normal', 'exp'] as const)('App enablement and cron preserve queues, history, and child settings in %s mode', async mode => {
   await coordinator.close();
   const apps = { inventory: async () => [{ id: 'notes', name: 'Notes', manifestHealth: { status: 'valid' }, versionHealth: { status: 'healthy' }, runtime: { jobs: { inbox: { command: ['node', 'job.js'] } } } }] };
-  const services = new AppServiceStore(db); db.prepare('INSERT INTO app_runtime_settings VALUES (?, 1, 1)').run('notes'); services.setEnabled('notes', 'indexer', false);
+  const services = new AppServiceStore(db); db.prepare('INSERT INTO app_runtime_settings (app_id, enabled, revision) VALUES (?, 1, 1)').run('notes'); services.setEnabled('notes', 'indexer', false);
+  services.setMode('notes', mode);
   const jobs = new AppJobDispatch(() => now); jobs.heartbeat(true, []);
   const sourceFixture = { listAdmitted: async () => [], listInstalledConnectors: () => [] };
   const appTargets = new HostTriggerTargets(apps as unknown as AppLifecycleService, sourceFixture as unknown as ConnectorSupervisor, jobs, id => services.appEnabled(id));

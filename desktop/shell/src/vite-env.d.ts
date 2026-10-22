@@ -103,6 +103,7 @@ interface Window {
     getAppRuntimeStates(): Promise<Array<import("../shared/app-runtime").AppRuntimeAggregate>>;
     stopAppJob(appId: string, runId: string): Promise<{ active: boolean }>;
     closeAppUi(appId: string): Promise<{ ok: true }>;
+    setAppMode(appId: string, mode: "normal" | "exp"): Promise<{ appId: string; mode: "normal" | "exp" }>;
     setAppEnabled(appId: string, enabled: boolean): Promise<{ ok: true }>;
     archiveApp(appId: string): Promise<{ ok: true; id: string }>;
     createTerminal(): Promise<{ id: string }>;

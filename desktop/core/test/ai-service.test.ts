@@ -14,10 +14,12 @@ import { SYSTEM_SCHEMA_V1 } from '../src/db';
 import { CredentialStore } from '../src/credentials/credential-store';
 import { SqliteEncryptedSecretStore } from '../src/credentials/secret-store';
 import { AiService, type AiAdapter } from '../src/ai/service';
+import { GuardEngine } from '../src/guard-service/engine';
+import { TEST_PRODUCER_REF } from './support/test-guard';
 import { AI_CATALOG } from '../src/ai/catalog';
 let db: DatabaseSync, root: string, service: AiService;
 const caller = { kind: 'app', appId: 'fixture', channelId: 'fixture', workload: 'ui', authorization: {} } as any;
-beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'ai-service-')); db = new DatabaseSync(join(root, 'system.db')); db.exec(SYSTEM_SCHEMA_V1); service = createService(); });
+beforeEach(async () => { caller.authorization = { mode: 'normal' }; root = await mkdtemp(join(tmpdir(), 'ai-service-')); db = new DatabaseSync(join(root, 'system.db')); db.exec(SYSTEM_SCHEMA_V1); service = createService(); });
 afterEach(async () => { vi.unstubAllGlobals(); await service.close(); db.close(); await rm(root, { recursive: true, force: true }); });
 function createService(adapter?: AiAdapter) { return new AiService(db, new CredentialStore(db), new SqliteEncryptedSecretStore(db, new Uint8Array(32).fill(1)), root, adapter); }
 async function restartService() { await service.close(); db.close(); db = new DatabaseSync(join(root, 'system.db')); service = createService(); }
@@ -32,7 +34,8 @@ function system() {
     throw new Error('Unexpected operation');
   });
 }
-test('official API providers bind independent keys, preserve usage and embedding vectors, sanitize failures', async () => {
+test.each(['normal', 'exp'])('official API providers preserve keys, usage, embeddings, and errors in %s mode', async mode => {
+  caller.authorization = { mode };
   const credentials: string[] = [];
   vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
     const headers = new Headers(init.headers); credentials.push(headers.get('authorization') ?? headers.get('x-api-key')!);
@@ -359,4 +362,43 @@ test('subscription eligibility follows discovery and capabilities independently 
   await service.sources.save({ name: source.name, provider: source.provider, kind: source.kind, allow: { mode: 'apps', appIds: [] } }, source.id);
   await expect(generateText({ model, prompt: 'hello', maxRetries: 0 })).rejects.toMatchObject({ code: 'source_denied' });
   expect(generate).toHaveBeenCalledTimes(ids.length);
+});
+
+
+test('exp nested AI tool callbacks retain read-only data authority', async () => {
+  caller.authorization = { mode: 'exp' };
+  const engine = new GuardEngine({ workspacePath: root });
+  const principal = { source: 'app:fixture:ui', producerRef: TEST_PRODUCER_REF, tableGrants: [], readOnly: true };
+  const callbacks: string[] = [];
+  await service.close();
+  service = createService({
+    async describe(source) { return { models: [], view: { ...source, status: 'ready', discovery: 'known', support: [{ model: 'openai:gpt-5.6-luna', streaming: true, structuredOutput: true, tools: true }] } }; },
+    async open(_source, _options, context) {
+      const model: LanguageModelV4 = {
+        specificationVersion: 'v4', modelId: 'gpt-5.6-luna', provider: 'fixture', supportedUrls: {},
+        async doGenerate() { throw new Error('unused'); },
+        async doStream() {
+          await context.tool('nested', {}, 'outer');
+          return { stream: new ReadableStream({ start(controller) {
+            controller.enqueue({ type: 'stream-start', warnings: [] });
+            controller.enqueue({ type: 'finish', finishReason: { unified: 'stop', raw: 'stop' }, usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } } } as any);
+            controller.close();
+          } }) };
+        },
+      };
+      return { provider: { specificationVersion: 'v4', languageModel: () => model, embeddingModel() { throw new Error('unused'); }, imageModel() { throw new Error('unused'); } }, async dispose() {} };
+    },
+  });
+  const source = await service.sources.save({ provider: 'openai', kind: 'subscription', name: 'Fixture' });
+  try {
+    await system().ai.withTools({ model: 'openai:gpt-5.6-luna', accessSource: source.id, tools: { nested: tool({ inputSchema: z.object({}), execute: async () => {
+      callbacks.push('outer');
+      const inner = async () => { callbacks.push('inner'); return engine.writeEvent(principal, { type: 'exp.denied', startedAt: 1, payload: { mode: 'normal' } }); };
+      await expect(inner()).rejects.toThrow('Experiment mode');
+      expect(engine.query(principal, 'SELECT 3 AS value')).toEqual([{ value: 3 }]);
+      return 'read-only result';
+    } }) } }, async ({ model, tools }) => { await streamText({ model, tools, prompt: 'nested', maxRetries: 0 }).consumeStream(); });
+    expect(callbacks).toEqual(['outer', 'inner']);
+    expect(engine.query(principal, 'SELECT count(*) AS n FROM events')).toEqual([{ n: 0 }]);
+  } finally { engine.close(); }
 });

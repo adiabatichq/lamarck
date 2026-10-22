@@ -97,6 +97,10 @@ export function parseCliArgs(argv: readonly string[], environment: CliEnvironmen
       requireNoOptions(args, `app service ${action}`);
       if (args.length !== 2 || args.some(value => !value)) usage(`app service ${action} requires an App id and Service id`);
       operation = `app.service.${action}`; input = { appId: args[0], serviceId: args[1] };
+    } else if (verb === "mode") {
+      requireNoOptions(args, "app mode");
+      if (args.length !== 2 || !args[0] || !["normal", "exp"].includes(args[1]!)) usage("app mode requires an App id and normal or exp");
+      operation = "app.mode"; input = { appId: args[0], mode: args[1] };
     } else if (verb === "create" && args.includes("--from")) {
       const fromPackageId = removeValueFlag(args, "--from")!;
       const localId = removeValueFlag(args, "--as");
@@ -121,7 +125,7 @@ export function parseCliArgs(argv: readonly string[], environment: CliEnvironmen
     } else if (verb === "refresh" || verb === "archive") {
       confirmed = removeBooleanFlag(args, "--yes");
       operation = `app.${verb}` as CliOperation; input = { appId: oneArg(args, `app ${verb}`) };
-    } else usage("app requires list, inspect, enable, disable, service, activity, create, save, versions, restore, refresh, or archive");
+    } else usage("app requires list, inspect, enable, disable, service, activity, mode, create, save, versions, restore, refresh, or archive");
   } else usage(`unknown command: ${top}`);
 
   if (HOST_APP_RUNTIME_OPERATIONS.includes(operation)) {

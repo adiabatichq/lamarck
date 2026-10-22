@@ -47,7 +47,7 @@ describe("SystemBroker", () => {
   test('cancels subscription handles on connection teardown under the original capability', async () => {
     const fetchImpl = vi.fn<typeof fetch>(async (url) => jsonResponse(String(url).endsWith('/start') ? { subscriptionId: 'owned-listener' } : { ok: true }));
     const { broker } = createBroker(fetchImpl);
-    broker.bindSender(1, { channelId: 'runtime', capability: 'host-bound' });
+    broker.bindSender(1, { mode: "normal" as const, channelId: 'runtime', capability: 'host-bound' });
     await broker.invoke(1, 'subscription.start', { sql: 'SELECT id FROM events' });
     broker.unbindSender(1);
     await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
@@ -61,7 +61,7 @@ describe("SystemBroker", () => {
     let finish!: (response: Response) => void;
     const fetchImpl = vi.fn<typeof fetch>(async url => String(url).endsWith('/start') ? new Promise(resolve => { finish = resolve; }) : jsonResponse({ ok: true }));
     const { broker } = createBroker(fetchImpl);
-    broker.bindSender(1, { channelId: 'runtime', capability: 'host-bound' });
+    broker.bindSender(1, { mode: "normal" as const, channelId: 'runtime', capability: 'host-bound' });
     const registration = broker.invoke(1, 'subscription.start', { sql: 'SELECT id FROM events' });
     await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
     broker.cancelAi(1);
@@ -79,13 +79,13 @@ describe("SystemBroker", () => {
       return jsonResponse(String(url).endsWith('/start') ? { subscriptionId: 'new-listener' } : { ok: true });
     });
     const { broker } = createBroker(fetchImpl);
-    broker.bindSender(1, { channelId: 'old-runtime', capability: 'old-cap' });
+    broker.bindSender(1, { mode: "normal" as const, channelId: 'old-runtime', capability: 'old-cap' });
     const registration = broker.invoke(1, 'subscription.start', { sql: 'SELECT id FROM events' });
     const rejected = expect(registration).rejects.toMatchObject({ code: 'request_aborted' });
     await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
     const signal = fetchImpl.mock.calls[0][1]?.signal;
     broker.unbindSender(1); await rejected; expect(signal?.aborted).toBe(true);
-    broker.bindSender(1, { channelId: 'new-runtime', capability: 'new-cap' });
+    broker.bindSender(1, { mode: "normal" as const, channelId: 'new-runtime', capability: 'new-cap' });
     await broker.invoke(1, 'subscription.start', { sql: 'SELECT id FROM events' });
     finish(jsonResponse({ subscriptionId: 'late-listener' }));
     await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(3));
@@ -100,7 +100,7 @@ describe("SystemBroker", () => {
   test('failed start transport aborts its initialization request and releases broker capacity', async () => {
     const fetchImpl = vi.fn<typeof fetch>(async () => { throw new Error('response lost'); });
     const { broker } = createBroker(fetchImpl, { maxInFlightPerSender: 1 });
-    broker.bindSender(1, { channelId: 'runtime', capability: 'cap' });
+    broker.bindSender(1, { mode: "normal" as const, channelId: 'runtime', capability: 'cap' });
     for (let attempt = 0; attempt < 24; attempt++) {
       await expect(broker.invoke(1, 'subscription.start', { sql: 'SELECT id FROM events' })).rejects.toMatchObject({ code: 'transport_error' });
       expect(fetchImpl.mock.calls[attempt][1]?.signal?.aborted).toBe(true);
@@ -110,7 +110,7 @@ describe("SystemBroker", () => {
     const response = { subscriptionId: 'orphan' };
     const fetchImpl = vi.fn<typeof fetch>(async url => jsonResponse(String(url).endsWith('/start') ? response : { ok: true }));
     const { broker } = createBroker(fetchImpl, { maxResponseBytes: Buffer.byteLength(JSON.stringify(response)) });
-    broker.bindSender(1, { channelId: 'runtime', capability: 'cap' });
+    broker.bindSender(1, { mode: "normal" as const, channelId: 'runtime', capability: 'cap' });
     const result = browserEnvelope(await broker.invokeSerialized(1, browserRequest('subscription.start', { sql: 'SELECT id FROM events' })));
     expect(result.error?.code).toBe('response_too_large');
     await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
@@ -124,20 +124,20 @@ describe("SystemBroker", () => {
     const fetchImpl = vi.fn<typeof fetch>();
     const computer = { invoke: vi.fn(async () => ({ sessionId: 's', tools: [], instructions: '' })), closeOwner: vi.fn(async () => {}) };
     const { broker } = createBroker(fetchImpl, { computer });
-    broker.bindSender(1, { channelId: 'channel', capability: 'secret', appId: 'real-app' });
+    broker.bindSender(1, { mode: "normal" as const, channelId: 'channel', capability: 'secret', appId: 'real-app' });
     await broker.invoke(1, 'computer.open', { sessionId: 'test-scope' });
     expect(computer.invoke).toHaveBeenCalledWith('channel', 'real-app', 'computer.open', { sessionId: 'test-scope' }, expect.any(AbortSignal));
     expect(fetchImpl).not.toHaveBeenCalled();
     broker.cancelAi(1);
     expect(computer.closeOwner).toHaveBeenCalledWith('channel');
-    broker.bindSender(2, { channelId: 'missing-app', capability: 'secret' });
+    broker.bindSender(2, { mode: "normal" as const, channelId: 'missing-app', capability: 'secret' });
     await expect(broker.invoke(2, 'computer.open', { sessionId: 'test-scope' })).rejects.toMatchObject({ code: 'operation_denied' });
     expect(computer.invoke).toHaveBeenCalledTimes(1);
   });
   test('Computer Use shares Host bounds and revokes late opening scopes', async () => {
     const computer = { invoke: vi.fn(async () => { broker.cancelAi(1); return { sessionId: 'late', tools: [], instructions: '' }; }), closeOwner: vi.fn(async () => {}) };
     const { broker } = createBroker(vi.fn<typeof fetch>(), { computer });
-    broker.bindSender(1, { channelId: 'channel', capability: 'secret', appId: 'app' });
+    broker.bindSender(1, { mode: "normal" as const, channelId: 'channel', capability: 'secret', appId: 'app' });
     await expect(broker.invoke(1, 'computer.open', { sessionId: 'test-scope' })).rejects.toMatchObject({ code: 'request_aborted' });
     expect(computer.closeOwner).toHaveBeenCalledWith('channel');
   });
@@ -161,7 +161,7 @@ describe("SystemBroker", () => {
     ]);
     const fetchImpl = vi.fn<typeof fetch>();
     const { broker } = createBroker(fetchImpl);
-    broker.bindSender(1, { channelId: "channel-a", capability: "cap-a" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel-a", capability: "cap-a" });
 
     await expect(
       broker.invoke(1, "attach" as never, {} as never),
@@ -176,8 +176,8 @@ describe("SystemBroker", () => {
       return jsonResponse({ ok: true, id: "event-1" });
     });
     const { broker } = createBroker(fetchImpl);
-    broker.bindSender("sender-a", { channelId: "channel-a", capability: "capability-a" });
-    broker.bindSender("sender-b", { channelId: "channel-b", capability: "capability-b" });
+    broker.bindSender("sender-a", { mode: "normal" as const, channelId: "channel-a", capability: "capability-a" });
+    broker.bindSender("sender-b", { mode: "normal" as const, channelId: "channel-b", capability: "capability-b" });
 
     await broker.invoke("sender-a", "writeEvent", {
       type: "test.event",
@@ -207,7 +207,7 @@ describe("SystemBroker", () => {
       return jsonResponse({ ok: true });
     });
     const { broker } = createBroker(fetchImpl);
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
 
     await broker.invoke(1, "query", { sql: "SELECT 1", params: undefined });
     await broker.invoke(1, "vfs.command", {
@@ -248,7 +248,7 @@ describe("SystemBroker", () => {
     const { broker } = createBroker(fetchImpl, { maxRequestBytes: 1024 });
     broker.bindSender(
       1,
-      { channelId: "channel", capability: "capability" },
+      { mode: "normal" as const, channelId: "channel", capability: "capability" },
       { registerVfsResource: () => "http://0123456789abcdef.localhost/.lamarck/vfs/token" },
     );
 
@@ -307,7 +307,7 @@ describe("SystemBroker", () => {
     const { broker } = createBroker(fetchImpl);
     broker.bindSender(
       1,
-      { channelId: "channel", capability: "capability" },
+      { mode: "normal" as const, channelId: "channel", capability: "capability" },
       { registerVfsResource },
     );
 
@@ -325,7 +325,7 @@ describe("SystemBroker", () => {
   test("rejects VFS open before Core when no Viewer resource binding exists", async () => {
     const fetchImpl = vi.fn<typeof fetch>();
     const { broker } = createBroker(fetchImpl);
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
 
     await expect(broker.invoke(1, "vfs.open", { path: "image.png" })).rejects.toMatchObject({
       code: "operation_denied",
@@ -337,6 +337,7 @@ describe("SystemBroker", () => {
   test("does not expose a bound raw capability through its API or serialization", () => {
     const { broker } = createBroker(vi.fn<typeof fetch>());
     const result = broker.bindSender(1, {
+      mode: "normal" as const,
       channelId: "channel-secret",
       capability: "raw-secret-capability",
     });
@@ -410,7 +411,7 @@ describe("SystemBroker", () => {
     const { broker } = createBroker(fetchImpl);
     broker.bindSender(
       7,
-      { channelId: "channel", capability: "capability" },
+      { mode: "normal" as const, channelId: "channel", capability: "capability" },
       { registerVfsResource: () => "http://0123456789abcdef.localhost/.lamarck/vfs/token" },
     );
 
@@ -424,8 +425,8 @@ describe("SystemBroker", () => {
   test("unbinds and revokes bindings fail closed", async () => {
     const revokeCapability = vi.fn(async () => {});
     const { broker } = createBroker(vi.fn<typeof fetch>(), { revokeCapability });
-    broker.bindSender(1, { channelId: "channel-a", capability: "cap-a" });
-    broker.bindSender(2, { channelId: "channel-b", capability: "cap-b" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel-a", capability: "cap-a" });
+    broker.bindSender(2, { mode: "normal" as const, channelId: "channel-b", capability: "cap-b" });
 
     expect(broker.unbindSender(1)).toBe(true);
     expect(broker.unbindSender(1)).toBe(false);
@@ -444,8 +445,8 @@ describe("SystemBroker", () => {
   test("synchronously drops every authority and aborts in-flight calls when Core is lost", async () => {
     const fetchImpl = vi.fn<typeof fetch>(() => new Promise<Response>(() => {}));
     const { broker } = createBroker(fetchImpl, { timeoutMs: 10_000 });
-    broker.bindSender("browser-a", { channelId: "channel-a", capability: "cap-a" });
-    broker.bindSender("runtime-b", { channelId: "channel-b", capability: "cap-b" });
+    broker.bindSender("browser-a", { mode: "normal" as const, channelId: "channel-a", capability: "cap-a" });
+    broker.bindSender("runtime-b", { mode: "normal" as const, channelId: "channel-b", capability: "cap-b" });
 
     const browser = broker.invokeSerialized(
       "browser-a",
@@ -466,7 +467,7 @@ describe("SystemBroker", () => {
   test("rejects oversized requests before fetch", async () => {
     const fetchImpl = vi.fn<typeof fetch>();
     const { broker } = createBroker(fetchImpl, { maxRequestBytes: 64 });
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
 
     await expect(broker.invoke(1, "vfs.command", {
       command: "tee -- apps/a/result.md",
@@ -478,7 +479,7 @@ describe("SystemBroker", () => {
   test("accepts only a bounded serialized browser request and returns a serialized envelope", async () => {
     const fetchImpl = vi.fn<typeof fetch>(async () => jsonResponse({ rows: [{ answer: 42 }] }));
     const { broker } = createBroker(fetchImpl, { maxRequestBytes: 128 });
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
 
     const success = browserEnvelope(await broker.invokeSerialized(
       1,
@@ -504,7 +505,7 @@ describe("SystemBroker", () => {
   test("rejects malformed and deeply nested JSON at the Host boundary without recursion", async () => {
     const fetchImpl = vi.fn<typeof fetch>();
     const { broker } = createBroker(fetchImpl);
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
     let deep: Record<string, unknown> = { leaf: true };
     for (let depth = 0; depth < 140; depth++) deep = { next: deep };
 
@@ -532,7 +533,7 @@ describe("SystemBroker", () => {
   test("allows 16 browser calls per WebContents and fails the 17th fast", async () => {
     const fetchImpl = vi.fn<typeof fetch>(() => new Promise<Response>(() => {}));
     const { broker } = createBroker(fetchImpl, { timeoutMs: 10_000 });
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
     const serialized = browserRequest("query", { sql: "SELECT 1" });
 
     const pending = Array.from({ length: 16 }, () => broker.invokeSerialized(1, serialized));
@@ -561,7 +562,7 @@ describe("SystemBroker", () => {
       maxAggregateBytesPerSender: leaseBytes * 2 - 1,
       maxAggregateBytesGlobal: leaseBytes * 4,
     });
-    senderBroker.bindSender(1, { channelId: "sender-channel", capability: "capability" });
+    senderBroker.bindSender(1, { mode: "normal" as const, channelId: "sender-channel", capability: "capability" });
     const first = senderBroker.invokeSerialized(1, serialized);
     const senderRejected = browserEnvelope(await senderBroker.invokeSerialized(1, serialized));
     expect(senderRejected.error?.code).toBe("resource_exhausted");
@@ -575,8 +576,8 @@ describe("SystemBroker", () => {
       maxAggregateBytesPerSender: leaseBytes * 2,
       maxAggregateBytesGlobal: leaseBytes * 2 - 1,
     });
-    globalBroker.bindSender(1, { channelId: "global-a", capability: "capability-a" });
-    globalBroker.bindSender(2, { channelId: "global-b", capability: "capability-b" });
+    globalBroker.bindSender(1, { mode: "normal" as const, channelId: "global-a", capability: "capability-a" });
+    globalBroker.bindSender(2, { mode: "normal" as const, channelId: "global-b", capability: "capability-b" });
     const globalFirst = globalBroker.invokeSerialized(1, serialized);
     const globalRejected = browserEnvelope(await globalBroker.invokeSerialized(2, serialized));
     expect(globalRejected.error?.code).toBe("resource_exhausted");
@@ -599,7 +600,7 @@ describe("SystemBroker", () => {
       maxAggregateBytesPerSender: requestBytes + largeResponseBytes - 1,
       maxAggregateBytesGlobal: requestBytes + largeResponseBytes - 1,
     });
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
 
     const responseRejected = browserEnvelope(await broker.invokeSerialized(1, serialized));
     expect(responseRejected.error?.code).toBe("resource_exhausted");
@@ -616,12 +617,12 @@ describe("SystemBroker", () => {
       maxAggregateBytesPerSender: requestBytes * 2 - 1,
       maxAggregateBytesGlobal: requestBytes * 2 - 1,
     });
-    abortBroker.bindSender(7, { channelId: "old-channel", capability: "old-capability" });
+    abortBroker.bindSender(7, { mode: "normal" as const, channelId: "old-channel", capability: "old-capability" });
     const pending = abortBroker.invokeSerialized(7, serialized);
     abortBroker.unbindSender(7);
     expect(browserEnvelope(await pending).error?.code).toBe("request_aborted");
 
-    abortBroker.bindSender(7, { channelId: "new-channel", capability: "new-capability" });
+    abortBroker.bindSender(7, { mode: "normal" as const, channelId: "new-channel", capability: "new-capability" });
     const afterReload = browserEnvelope(await abortBroker.invokeSerialized(7, serialized));
     expect(afterReload).toEqual({ ok: true, result: { rows: [] } });
   });
@@ -637,7 +638,7 @@ describe("SystemBroker", () => {
       },
       maxInFlightPerSender: 1,
     });
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
     const serialized = browserRequest("query", { sql: "SELECT 1" });
 
     const failed = browserEnvelope(await broker.invokeSerialized(1, serialized));
@@ -654,7 +655,7 @@ describe("SystemBroker", () => {
       vi.fn<typeof fetch>(async () => jsonResponse({ rows: ["x".repeat(100)] })),
       { maxResponseBytes: 32 },
     );
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
 
     await expect(broker.invoke(1, "query", { sql: "SELECT 1" }))
       .rejects.toMatchObject({ code: "response_too_large" });
@@ -667,7 +668,7 @@ describe("SystemBroker", () => {
       return new Promise<Response>(() => {});
     });
     const { broker } = createBroker(fetchImpl, { timeoutMs: 10 });
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
 
     await expect(broker.invoke(1, "query", { sql: "SELECT 1" }))
       .rejects.toMatchObject({ code: "request_timeout" });
@@ -677,7 +678,7 @@ describe("SystemBroker", () => {
   test("aborts an in-flight request when its sender is unbound", async () => {
     const fetchImpl = vi.fn<typeof fetch>(() => new Promise<Response>(() => {}));
     const { broker } = createBroker(fetchImpl, { timeoutMs: 10_000 });
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
 
     const request = broker.invoke(1, "query", { sql: "SELECT 1" });
     await Promise.resolve();
@@ -690,7 +691,7 @@ describe("SystemBroker", () => {
     const baseUrl = new Promise<string>((resolve) => { resolveBaseUrl = resolve; });
     const fetchImpl = vi.fn<typeof fetch>();
     const { broker } = createBroker(fetchImpl, { coreBaseUrl: () => baseUrl });
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
 
     const request = broker.invoke(1, "query", { sql: "SELECT 1" });
     await Promise.resolve();
@@ -705,7 +706,7 @@ describe("SystemBroker", () => {
     const { broker } = createBroker(vi.fn<typeof fetch>(), {
       revokeCapability: async () => { throw new Error("Core unavailable"); },
     });
-    broker.bindSender(1, { channelId: "channel", capability: "capability" });
+    broker.bindSender(1, { mode: "normal" as const, channelId: "channel", capability: "capability" });
 
     await expect(broker.revokeSender(1)).rejects.toMatchObject({
       code: "revoke_failed",
@@ -717,8 +718,24 @@ describe("SystemBroker", () => {
 });
 
 test("job input has one closed route and no caller-supplied invocation identity", async () => {
-  const fetchImpl = vi.fn<typeof fetch>(async () => jsonResponse({ version: 1, runId: "bound-run" })); const { broker } = createBroker(fetchImpl); broker.bindSender("job", { channelId: "job-channel", capability: "job-secret" });
+  const fetchImpl = vi.fn<typeof fetch>(async () => jsonResponse({ version: 1, runId: "bound-run" })); const { broker } = createBroker(fetchImpl); broker.bindSender("job", { mode: "normal" as const, channelId: "job-channel", capability: "job-secret" });
   await expect(broker.invoke("job", "job.input", {})).resolves.toMatchObject({ runId: "bound-run" });
   expect(fetchImpl.mock.calls[0][0]).toBe("http://127.0.0.1:32100/api/app-runtime/job-input"); expect(JSON.parse(String(fetchImpl.mock.calls[0][1]!.body))).toEqual({});
   await expect(broker.invoke("job", "job.input", { runId: "other-run" } as never)).rejects.toThrow();
+});
+
+
+test("exp Computer Use rejects before opening sessions or requesting control", async () => {
+  const computer = { invoke: vi.fn(), closeOwner: vi.fn(async () => {}) };
+  const fetchImpl = vi.fn<typeof fetch>();
+  const { broker } = createBroker(fetchImpl, { computer });
+  const binding = { mode: "exp" as "normal" | "exp", appId: "experiment", channelId: "exp", capability: "host-bound" };
+  broker.bindSender(1, binding);
+  binding.mode = "normal";
+  for (const operation of ["computer.open", "computer.call", "computer.close"] as const) {
+    await expect(broker.invoke(1, operation, { mode: "normal", appId: "other" } as never)).rejects.toMatchObject({ code: "operation_denied" });
+  }
+  expect(computer.invoke).not.toHaveBeenCalled();
+  expect(fetchImpl).not.toHaveBeenCalled();
+  expect(() => broker.bindSender(2, { appId: "missing-policy", channelId: "unknown", capability: "x" } as never)).toThrow("policy is unavailable");
 });

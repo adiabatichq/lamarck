@@ -14,7 +14,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@lamarck/cli": "0.1.4",
+    "@lamarck/cli": "0.1.5",
     "@lamarck/capsule": "0.1.0"
   },
   "devDependencies": {
