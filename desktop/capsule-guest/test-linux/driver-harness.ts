@@ -373,7 +373,7 @@ async function runCapsuleCoreGuard(): Promise<void> {
           activationId: appAuthority.activationId,
         }),
       },
-    ) as { capability: string; channelId: string };
+    ) as { mode: "normal" | "exp"; capability: string; channelId: string };
     broker = new SystemBroker({
       coreBaseUrl: coreOrigin,
       revokeCapability: async (channelId) => {

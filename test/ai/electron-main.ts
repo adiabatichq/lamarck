@@ -80,7 +80,7 @@ service.invocations.next = async (...args) => {
 const cancel = service.invocations.cancel.bind(service.invocations);
 service.invocations.cancel = (caller, id) => { if (id === retryInvocation) cancelledDuringPull ||= retryPulling; cancel(caller, id); };
 const source = await service.sources.save({ provider: 'openai', kind: 'subscription', name: 'Fixture' });
-const caller = { kind: 'app', appId: 'browser-fixture', channelId: 'browser', workload: 'ui', authorization: { aiAccessSources: structuredClone(manifest.manifest.ai!.accessSources) } } as any;
+const caller = { kind: 'app', appId: 'browser-fixture', channelId: 'browser', workload: 'ui', authorization: { mode: 'normal', aiAccessSources: structuredClone(manifest.manifest.ai!.accessSources) } } as any;
 const signal = new AbortController();
 let loginState = 'pending', loginStarts = 0, loginCancels = 0;
 let failNextLogin = false;
@@ -156,7 +156,7 @@ const broker = new SystemBroker({ coreBaseUrl: async () => `http://127.0.0.1:${s
   async closeOwner() { computerScope = undefined; },
 } });
 const window = new BrowserWindow({ show: false, webPreferences: { preload: join(import.meta.dirname, 'preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false } });
-broker.bindSender(window.webContents.id, { capability: 'fixture', channelId: 'browser', appId: 'browser-fixture' });
+broker.bindSender(window.webContents.id, { mode: 'normal', capability: 'fixture', channelId: 'browser', appId: 'browser-fixture' });
 ipcMain.handle('app-system:invoke', (event, request) => broker.invokeSerialized(event.sender.id, request));
 let code = 0;
 try {
