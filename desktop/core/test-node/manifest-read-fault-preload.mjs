@@ -2,7 +2,6 @@ import {
   fstatSync,
   readFileSync,
   statSync,
-  unlinkSync,
 } from "node:fs";
 import { open } from "node:fs/promises";
 
@@ -30,7 +29,8 @@ fileHandlePrototype.readFile = async function (...args) {
     const opened = fstatSync(this.fd, { bigint: true });
     const target = statSync(targetPath, { bigint: true });
     if (opened.dev === target.dev && opened.ino === target.ino) {
-      unlinkSync(controlPath);
+      // Keep the fault armed until test cleanup; background registry reads
+      // must not consume the failure intended for an explicit request.
       throw Object.assign(new Error(`injected manifest ${code}`), { code });
     }
   }

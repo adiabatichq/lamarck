@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { chmod, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -51,7 +51,7 @@ try {
   if (first.integrity !== integrity || second.integrity !== integrity) {
     throw new Error("npm pack integrity does not match the independently computed SHA-512");
   }
-  await rename(join(firstStage, first.filename), outputPath);
+  await writeFile(outputPath, firstTarball);
   await verifyConsumer(outputPath);
   process.stdout.write(`${outputPath}\n${integrity}\n`);
 } finally {

@@ -12,7 +12,7 @@ function harness() {
   const attempts: { signal: AbortSignal; exit: ReturnType<typeof Promise.withResolvers<void>>; spec: CapsuleServiceSpec }[] = [];
   const fetch: typeof globalThis.fetch = async (input, init) => {
     const url = String(input), body = JSON.parse(String(init?.body ?? "{}")); calls.push({ url, body });
-    if (url.endsWith("/services")) return Response.json({ apps: present ? [{ appId: "notes", enabled: appEnabled }] : [], services: present ? [{ appId: "notes", serviceId: "indexer", version, policy, appEnabled }] : [] });
+    if (url.endsWith("/services")) return Response.json({ apps: present ? [{ appId: "notes", enabled: appEnabled, mode: "normal" }] : [], services: present ? [{ appId: "notes", serviceId: "indexer", version, policy, appEnabled }] : [] });
     if (url.endsWith("/apps/notes/enablement")) { appEnabled = body.enabled; await settingReply; return Response.json({ enabled: appEnabled }); }
     if (url.endsWith("/services/notes/indexer")) {
       if (body.operation === "observe") {
@@ -24,11 +24,11 @@ function harness() {
       policy = { ...policy, enabled: body.enabled, revision: policy.revision + 1, restartAt: body.enabled ? null : policy.restartAt }; await settingReply; return Response.json({ policy });
     }
     if (url.endsWith("/activation/prepare")) return Response.json({ activation: {
-      schemaVersion: 1, activationId: ACTIVATION, activationSequence: 1, appId: "notes", workload: body.workload,
+      schemaVersion: 1, activationId: ACTIVATION, activationSequence: 1, appId: "notes", workload: body.workload, mode: "normal",
       version, manifestDigest: DIGEST, packageDigest: DIGEST, immutablePackagePath: "/immutable/notes",
       manifest: { runtime: { services: { indexer: { command: ["node", "indexer.js"] } }, jobs: { inbox: { command: ["node", "inbox.js"] } } }, permissions: { writes: { files: [], tables: [] } } },
     } });
-    if (url.endsWith("/channels") && init?.method === "POST") return Response.json({ capability: "private-channel-secret", channelId: "channel-a", activationId: ACTIVATION, appCommit: version, manifestDigest: DIGEST, packageDigest: DIGEST });
+    if (url.endsWith("/channels") && init?.method === "POST") return Response.json({ mode: "normal", capability: "private-channel-secret", channelId: "channel-a", activationId: ACTIVATION, appCommit: version, manifestDigest: DIGEST, packageDigest: DIGEST });
     if (failAuthority && url.endsWith("/channels/channel-a")) return Response.json({ error: "retirement failed" }, { status: 500 });
     return Response.json({ ok: true });
   };

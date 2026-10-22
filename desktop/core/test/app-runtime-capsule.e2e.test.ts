@@ -346,7 +346,6 @@ describe.sequential("Capsule System SDK to Core and Guard", () => {
         await expect(failedRefresh.json()).resolves.toEqual({
           error: `injected manifest ${code}`,
         });
-        await writeFile(manifestFaultControl, code, "utf8"); // Re-arm the one-shot fault for CLI.
         expect(await runCliFailure("app", "list", "--json")).toEqual({
           error: { code: "CLI_INTERNAL", message: "Lamarck could not complete the command." },
         });
