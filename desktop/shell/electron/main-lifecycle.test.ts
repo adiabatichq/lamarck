@@ -207,7 +207,7 @@ describe("Shell Host configuration", () => {
     const firstQuitFence = startup.indexOf("if (isQuitting)", loadSettings);
     const startGuard = startup.indexOf("await startGuard(generation)");
     const secondQuitFence = startup.indexOf("if (isQuitting)", startGuard);
-    const startCore = startup.indexOf("startCore(generation)");
+    const startCore = startup.indexOf("startCore(generation, opts)");
     expect(loadSettings).toBeGreaterThan(-1);
     expect(firstQuitFence).toBeGreaterThan(loadSettings);
     expect(startGuard).toBeGreaterThan(firstQuitFence);
@@ -464,7 +464,7 @@ describe("Shell Host configuration", () => {
     expect(restartGate).toBeGreaterThan(restoreVault);
     expect(restartPrevious).toBeGreaterThan(restartGate);
     expect(mainSource).toMatch(
-      /async function startRuntimeProcesses\([\s\S]*?startCore\(generation\);[\s\S]*?await waitForCore\(generation\)/,
+      /async function startRuntimeProcesses\([\s\S]*?startCore\(generation, opts\);[\s\S]*?await waitForCore\(generation\)/,
     );
   });
 

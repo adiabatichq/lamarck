@@ -6,6 +6,7 @@ import { describe, expect, test, vi } from "vitest";
 const PRELOAD_SOURCE = readFileSync(new URL("./preload.cjs", import.meta.url), "utf8");
 
 interface WorkspacePreloadHost {
+  resetSystemSettings(workspace: { path: string; vaultId: string }): Promise<{ reset: boolean }>;
   setAppServiceEnabled(appId: string, serviceId: string, enabled: boolean): Promise<unknown>;
   getAppWorkloadDiagnostics(appId: string, executionId?: string): Promise<unknown>;
   stopAppJob(appId: string, runId: string): Promise<unknown>;
@@ -47,6 +48,15 @@ function loadPreload(ipcInvoke: ReturnType<typeof vi.fn>, events = new EventEmit
 }
 
 describe("Shell Workspace preload contract", () => {
+  test("resets only the explicitly identified Workspace through Shell IPC", async () => {
+    const invoke = vi.fn(async () => ({ reset: false }));
+    const host = loadPreload(invoke);
+    const workspace = { path: "/workspace", vaultId: "vault-a" };
+    expect(await host.resetSystemSettings(workspace)).toEqual({ reset: false });
+    expect(invoke.mock.calls).toEqual([["workspace:resetSystemSettings", workspace]]);
+    const appPreload = readFileSync(new URL("./app-preload.ts", import.meta.url), "utf8");
+    expect(appPreload).not.toContain("workspace:resetSystemSettings");
+  });
   test("exposes Service enablement and exact diagnostic reads only through Shell IPC", async () => {
     const invoke = vi.fn(async () => ({})); const host = loadPreload(invoke);
     await host.setAppServiceEnabled("notes", "indexer", false);

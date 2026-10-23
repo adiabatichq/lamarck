@@ -22,6 +22,7 @@ if (import.meta.env.DEV && !window.lamarckHost) {
     getCoreRuntimeState: async () => ({ generation: 0, phase: "ready", error: null }),
     onCoreRuntimeState: () => () => {},
     retryCore: async () => ({ coreBaseUrl: base }),
+    resetSystemSettings: async () => { throw new Error("Resetting system settings requires the Desktop Host."); },
     rotateCorePort: async () => ({ coreBaseUrl: base }),
     openExternal: async (url: string) => {
       window.open(url, "_blank", "noopener");

@@ -58,6 +58,7 @@ interface Window {
       error: string | null;
     }) => void): () => void;
     retryCore(): Promise<{ coreBaseUrl: string }>;
+    resetSystemSettings(workspace: HostWorkspaceDescriptor): Promise<{ reset: boolean }>;
     rotateCorePort(): Promise<{ coreBaseUrl: string }>;
     openExternal(url: string): Promise<void>;
     marketplaceReady(): Promise<{ ok: true }>;

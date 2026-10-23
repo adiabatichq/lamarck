@@ -49,6 +49,15 @@ export function WorkspaceRuntimeGate({ workspace, children }: {
     setFailure(null);
   }
 
+  async function resetSystemSettings() {
+    const host = window.lamarckHost;
+    if (!host) throw new Error("The Lamarck Host is unavailable.");
+    if ((await host.resetSystemSettings(workspace)).reset) {
+      clearCoreBaseUrlCache();
+      window.location.reload();
+    }
+  }
+
   if (failure !== null) {
     return <WorkspaceSetup state={{
       status: "setup",
@@ -56,7 +65,7 @@ export function WorkspaceRuntimeGate({ workspace, children }: {
       suggestedPath: "",
       previousWorkspace: { lastKnownPath: workspace.path, vaultId: workspace.vaultId },
       detail: failure,
-    }} onRetry={retry} onReady={() => {
+    }} onRetry={retry} onResetSystemSettings={resetSystemSettings} onReady={() => {
       clearCoreBaseUrlCache();
       window.location.reload();
     }} />;

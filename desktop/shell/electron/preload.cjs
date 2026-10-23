@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld("lamarckHost", {
     return () => ipcRenderer.removeListener("core:runtimeState", listener);
   },
   retryCore: () => ipcRenderer.invoke("core:retry"),
+  resetSystemSettings: (workspace) => ipcRenderer.invoke("workspace:resetSystemSettings", workspace),
   rotateCorePort: () => ipcRenderer.invoke("core:rotatePort"),
   openExternal: (url) => ipcRenderer.invoke("shell:openExternal", url),
   marketplaceReady: () => ipcRenderer.invoke("marketplace:rendererReady"),

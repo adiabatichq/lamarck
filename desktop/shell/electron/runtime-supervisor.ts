@@ -9,6 +9,7 @@ export interface RuntimeState {
 export interface RuntimeStartOptions {
   expectedVaultId?: string;
   rotatePort?: boolean;
+  resetSystemSettings?: boolean;
 }
 
 interface RuntimeOperations<CoreProcess, GuardProcess> {
@@ -42,6 +43,21 @@ export class DesktopRuntimeSupervisor<CoreProcess extends object, GuardProcess e
     const result = this.#queue.then(operation);
     this.#queue = result.then(() => undefined, () => undefined);
     return result;
+  }
+
+  async resetSystemSettings(expectedVaultId: string, confirm: () => Promise<boolean>): Promise<boolean> {
+    if (this.#state.phase !== "failed") throw new Error("System settings can only be reset after Workspace startup fails");
+    if (!await confirm()) return false;
+    try {
+      // Core may already be gone. Require confirmed Capsule/process cleanup
+      // before granting the replacement Core permission to reset its database.
+      await this.stop("lost");
+      await this.start({ expectedVaultId, resetSystemSettings: true });
+      return true;
+    } catch (error) {
+      this.fail(this.#state.generation, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   }
 
   expectCoreStop(child: CoreProcess): void { this.#expectedCoreStops.add(child); }

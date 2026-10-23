@@ -170,6 +170,12 @@
   margin-top: 12px;
 }
 
+.startupActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .previousNotice {
   display: flex;
   min-width: 0;

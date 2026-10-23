@@ -1211,7 +1211,7 @@ async function startGuard(generation: number): Promise<void> {
   }
 }
 
-function startCore(generation: number): void {
+function startCore(generation: number, options?: RuntimeStartOptions): void {
   const guard = runtimeSupervisor.guard;
   const guardOrigin = runtimeSupervisor.guardOrigin;
   if (!guard || !guardOrigin) {
@@ -1230,6 +1230,7 @@ function startCore(generation: number): void {
       LAMARCK_VAULT_KEY: workspaceVault.requireKey(workspace),
       LAMARCK_GUARD_ORIGIN: guardOrigin,
       LAMARCK_GUARD_TOKEN: GUARD_TOKEN,
+      LAMARCK_RESET_SYSTEM_SETTINGS: options?.resetSystemSettings ? "1" : "0",
     },
   });
   runtimeSupervisor.attachCore(generation, child);
@@ -1340,7 +1341,7 @@ async function startRuntimeProcesses(
   if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
   await startGuard(generation);
   if (isQuitting) throw new Error("Runtime startup was cancelled because Lamarck is quitting");
-  startCore(generation);
+  startCore(generation, opts);
   await waitForCore(generation);
   await cliGateway.start();
   capsuleJobWorker.start(coreBaseUrl());
@@ -2924,6 +2925,34 @@ app.whenReady().then(async () => {
   ipcMain.handle("core:retry", (event) => {
     requireShellIpc(event);
     return runtimeSupervisor.enqueue(retryCore);
+  });
+  ipcMain.handle("workspace:resetSystemSettings", (event, expected: WorkspaceDescriptor) => {
+    const owner = requireShellIpc(event);
+    return runtimeSupervisor.enqueue(async () => {
+      const target = inspectWorkspaceForOpen(workspace);
+      if (expected?.path !== target.path || expected?.vaultId !== target.vaultId) {
+        throw new Error("Workspace changed before system settings could be reset");
+      }
+      const reset = await runtimeSupervisor.resetSystemSettings(target.vaultId, async () => {
+        const { response } = await dialog.showMessageBox(owner, {
+          type: "warning",
+          message: "Reset system settings?",
+          detail: "Your files, data, app and connector packages, and app versions will be kept. Connected accounts, schedules, system settings, and execution history will be removed. Existing apps will be disabled until you enable them again. This does not repair damaged Workspace data.",
+          buttons: ["Cancel", "Reset system settings"],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        });
+        if (response !== 1) return false;
+        const current = inspectWorkspaceForOpen(workspace);
+        if (current.path !== target.path || current.vaultId !== target.vaultId) {
+          throw new Error("Workspace changed before system settings could be reset");
+        }
+        disposeAllTerminals();
+        return true;
+      });
+      return { reset };
+    });
   });
   ipcMain.handle("core:rotatePort", (event) => {
     requireShellIpc(event);

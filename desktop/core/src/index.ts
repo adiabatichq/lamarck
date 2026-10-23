@@ -14,6 +14,7 @@ import { mkdir, readFile, rm, stat } from "fs/promises";
 import { randomBytes } from "crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { openSystemDatabase } from "./db";
+import { resetSystemSettings } from "./reset-system-settings";
 import { sendStartupFailure } from "./startup-failure";
 import { ContentBlobStore } from "./blob-store";
 import {
@@ -141,7 +142,12 @@ const lamarckApiOrigin = process.env.LAMARCK_API_ORIGIN ?? "https://api.lamarck.
 await mkdir(lamarckDir, { recursive: true });
 
 // Boot
-const systemDb = await Promise.resolve().then(() => openSystemDatabase(workspacePath)).catch(async (error) => {
+const systemDb = await Promise.resolve().then(() => {
+  const resetRequested = process.env.LAMARCK_RESET_SYSTEM_SETTINGS === "1";
+  delete process.env.LAMARCK_RESET_SYSTEM_SETTINGS;
+  if (resetRequested) resetSystemSettings(workspacePath);
+  return openSystemDatabase(workspacePath);
+}).catch(async (error) => {
   await sendStartupFailure(error);
   throw error;
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import { DesktopRuntimeSupervisor } from "./runtime-supervisor";
+import { DesktopRuntimeSupervisor, type RuntimeStartOptions } from "./runtime-supervisor";
 
 function startReadyRuntime(
   supervisor: DesktopRuntimeSupervisor<object, object>,
@@ -31,6 +31,51 @@ describe("Desktop runtime supervisor", () => {
     await failure;
     await next;
     expect(events).toEqual(["first", "next"]);
+  });
+
+  test("refuses settings reset outside a failed Workspace", async () => {
+    const { supervisor, operations } = harness();
+    await supervisor.start();
+    const confirm = vi.fn(async () => true);
+    await expect(supervisor.resetSystemSettings("vault-a", confirm)).rejects.toThrow("after Workspace startup fails");
+    expect(confirm).not.toHaveBeenCalled();
+    expect(operations.stopGateway).not.toHaveBeenCalled();
+  });
+
+  test("cancel leaves settings and the failed runtime untouched", async () => {
+    const { supervisor, operations, events } = harness();
+    supervisor.fail(0, "incompatible system DB");
+    const state = supervisor.snapshot();
+    expect(await supervisor.resetSystemSettings("vault-a", async () => false)).toBe(false);
+    expect(supervisor.snapshot()).toBe(state);
+    expect(events).toEqual([]);
+    expect(operations.start).not.toHaveBeenCalled();
+  });
+
+  test("settings reset waits for all failed-runtime cleanup before one reset startup", async () => {
+    const { supervisor, operations, events } = harness();
+    await supervisor.start();
+    supervisor.fail(1, "incompatible system DB");
+    operations.stopApps.mockImplementationOnce(async lost => {
+      expect(lost).toBe(true);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      events.push("apps-stopped");
+    });
+    expect(await supervisor.resetSystemSettings("vault-a", async () => true)).toBe(true);
+    expect(events).toEqual(["start", "gateway", "core", "guard", "apps-stopped", "start"]);
+    expect(operations.start.mock.calls[1]?.[1]).toEqual({ expectedVaultId: "vault-a", resetSystemSettings: true });
+    await supervisor.stop();
+    await supervisor.start();
+    expect(operations.start.mock.calls[2]?.[1]).toBeUndefined();
+  });
+
+  test("cleanup failure prevents settings reset and remains visible", async () => {
+    const { supervisor, operations } = harness();
+    supervisor.fail(0, "incompatible system DB");
+    operations.stopApps.mockRejectedValueOnce(new Error("App cleanup incomplete"));
+    await expect(supervisor.resetSystemSettings("vault-a", async () => true)).rejects.toThrow("App cleanup incomplete");
+    expect(operations.start).not.toHaveBeenCalled();
+    expect(supervisor.snapshot()).toMatchObject({ phase: "failed", error: "App cleanup incomplete" });
   });
 
   test("revokes Apps while Core is alive, then releases Core before Guard", async () => {
@@ -169,7 +214,7 @@ describe("Desktop runtime supervisor", () => {
 function harness() {
   const events: string[] = [];
   const operations = {
-    start: vi.fn(async (generation: number) => {
+    start: vi.fn(async (generation: number, _options?: RuntimeStartOptions) => {
       events.push("start");
       const guard = {};
       supervisor.attachGuard(generation, guard);

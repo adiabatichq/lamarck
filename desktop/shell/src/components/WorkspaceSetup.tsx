@@ -22,9 +22,10 @@ export interface WorkspaceSetupProps {
   state: WorkspaceSetupState;
   onReady: (workspace: WorkspaceDescriptor) => void | Promise<void>;
   onRetry?: () => Promise<void>;
+  onResetSystemSettings?: () => Promise<void>;
 }
 
-type PendingAction = "browse-create" | "create" | "open" | "recover" | "retry" | null;
+type PendingAction = "browse-create" | "create" | "open" | "recover" | "retry" | "reset" | null;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -66,7 +67,7 @@ function setupCopy(reason: WorkspaceSetupState["reason"]): {
   };
 }
 
-export function WorkspaceSetup({ state, onReady, onRetry }: WorkspaceSetupProps) {
+export function WorkspaceSetup({ state, onReady, onRetry, onResetSystemSettings }: WorkspaceSetupProps) {
   const [createPath, setCreatePath] = useState(state.suggestedPath);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
   const [error, setError] = useState<string | null>(null);
@@ -97,6 +98,19 @@ export function WorkspaceSetup({ state, onReady, onRetry }: WorkspaceSetupProps)
     setRecoveryCode("");
     try {
       await onRetry();
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  async function resetSystemSettings() {
+    if (!onResetSystemSettings) return;
+    setPendingAction("reset");
+    setError(null);
+    try {
+      await onResetSystemSettings();
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -210,12 +224,20 @@ export function WorkspaceSetup({ state, onReady, onRetry }: WorkspaceSetupProps)
             <div className={styles.startupNotice}>
               <code>{state.previousWorkspace?.lastKnownPath}</code>
               <p role="alert">{state.detail}</p>
-              {onRetry && (
-                <button type="button" className={styles.secondaryButton}
-                  disabled={busy} onClick={() => void retryWorkspace()}>
-                  {pendingAction === "retry" ? "Opening…" : "Try again"}
-                </button>
-              )}
+              <div className={styles.startupActions}>
+                {onRetry && (
+                  <button type="button" className={styles.secondaryButton}
+                    disabled={busy} onClick={() => void retryWorkspace()}>
+                    {pendingAction === "retry" ? "Opening…" : "Try again"}
+                  </button>
+                )}
+                {onResetSystemSettings && (
+                  <button type="button" className={styles.secondaryButton}
+                    disabled={busy} onClick={() => void resetSystemSettings()}>
+                    {pendingAction === "reset" ? "Resetting…" : "Reset system settings…"}
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
