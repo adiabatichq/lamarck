@@ -967,6 +967,7 @@ export interface HostCoreRuntimeState {
   generation: number;
   phase: "starting" | "ready" | "restarting" | "failed";
   error: string | null;
+  canResetSystemSettings?: true;
 }
 
 export function coreResponseDisposition(

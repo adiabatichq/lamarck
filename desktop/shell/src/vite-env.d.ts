@@ -51,11 +51,13 @@ interface Window {
       generation: number;
       phase: "starting" | "ready" | "restarting" | "failed";
       error: string | null;
+      canResetSystemSettings?: true;
     }>;
     onCoreRuntimeState(callback: (state: {
       generation: number;
       phase: "starting" | "ready" | "restarting" | "failed";
       error: string | null;
+      canResetSystemSettings?: true;
     }) => void): () => void;
     retryCore(): Promise<{ coreBaseUrl: string }>;
     resetSystemSettings(workspace: HostWorkspaceDescriptor): Promise<{ reset: boolean }>;

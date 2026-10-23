@@ -4,6 +4,7 @@ export interface RuntimeState {
   generation: number;
   phase: RuntimePhase;
   error: string | null;
+  canResetSystemSettings?: true;
 }
 
 export interface RuntimeStartOptions {
@@ -30,6 +31,7 @@ export class DesktopRuntimeSupervisor<CoreProcess extends object, GuardProcess e
   #core: CoreProcess | null = null;
   #guard: GuardProcess | null = null;
   #guardOrigin = "";
+  #resettableSystemDatabaseGeneration: number | null = null;
   #queue: Promise<void> = Promise.resolve();
   #expectedCoreStops = new WeakSet<CoreProcess>();
   #expectedGuardStops = new WeakSet<GuardProcess>();
@@ -46,8 +48,11 @@ export class DesktopRuntimeSupervisor<CoreProcess extends object, GuardProcess e
   }
 
   async resetSystemSettings(expectedVaultId: string, confirm: () => Promise<boolean>): Promise<boolean> {
-    if (this.#state.phase !== "failed") throw new Error("System settings can only be reset after Workspace startup fails");
+    const generation = this.#state.generation;
+    this.#requireResettableSystemDatabase();
     if (!await confirm()) return false;
+    this.#requireResettableSystemDatabase();
+    if (this.#state.generation !== generation) throw new Error("Workspace changed before system settings could be reset");
     try {
       // Core may already be gone. Require confirmed Capsule/process cleanup
       // before granting the replacement Core permission to reset its database.
@@ -57,6 +62,18 @@ export class DesktopRuntimeSupervisor<CoreProcess extends object, GuardProcess e
     } catch (error) {
       this.fail(this.#state.generation, error instanceof Error ? error.message : String(error));
       throw error;
+    }
+  }
+
+  #requireResettableSystemDatabase(): void {
+    if (this.#state.phase !== "failed" || this.#state.canResetSystemSettings !== true) {
+      throw new Error("System settings can only be reset after a confirmed system database failure");
+    }
+  }
+
+  noteSystemDatabaseFailure(generation: number): void {
+    if (generation === this.#state.generation && this.#state.phase === "starting") {
+      this.#resettableSystemDatabaseGeneration = generation;
     }
   }
 
@@ -153,6 +170,7 @@ export class DesktopRuntimeSupervisor<CoreProcess extends object, GuardProcess e
       throw new Error("Cannot start a runtime generation while its predecessor is still attached");
     }
     this.#guardOrigin = "";
+    this.#resettableSystemDatabaseGeneration = null;
     this.#publish({
       generation: this.#state.generation + 1,
       phase: "starting",
@@ -212,6 +230,7 @@ export class DesktopRuntimeSupervisor<CoreProcess extends object, GuardProcess e
       || !this.#guard
       || !this.#guardOrigin
     ) return false;
+    this.#resettableSystemDatabaseGeneration = null;
     this.#publish({ generation, phase: "ready", error: null });
     return true;
   }
@@ -228,7 +247,9 @@ export class DesktopRuntimeSupervisor<CoreProcess extends object, GuardProcess e
 
   fail(generation: number, error: string): boolean {
     if (generation !== this.#state.generation) return false;
-    this.#publish({ generation, phase: "failed", error });
+    this.#publish({ generation, phase: "failed", error,
+      ...(this.#resettableSystemDatabaseGeneration === generation ? { canResetSystemSettings: true as const } : {}),
+    });
     return true;
   }
 

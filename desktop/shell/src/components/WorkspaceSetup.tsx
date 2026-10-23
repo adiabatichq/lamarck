@@ -16,6 +16,7 @@ export interface WorkspaceSetupState {
     vaultId?: string;
   };
   detail?: string;
+  canResetSystemSettings?: boolean;
 }
 
 export interface WorkspaceSetupProps {
@@ -106,7 +107,7 @@ export function WorkspaceSetup({ state, onReady, onRetry, onResetSystemSettings 
   }
 
   async function resetSystemSettings() {
-    if (!onResetSystemSettings) return;
+    if (!onResetSystemSettings || state.canResetSystemSettings !== true) return;
     setPendingAction("reset");
     setError(null);
     try {
@@ -231,7 +232,7 @@ export function WorkspaceSetup({ state, onReady, onRetry, onResetSystemSettings 
                     {pendingAction === "retry" ? "Opening…" : "Try again"}
                   </button>
                 )}
-                {onResetSystemSettings && (
+                {state.canResetSystemSettings === true && onResetSystemSettings && (
                   <button type="button" className={styles.secondaryButton}
                     disabled={busy} onClick={() => void resetSystemSettings()}>
                     {pendingAction === "reset" ? "Resetting…" : "Reset system settings…"}

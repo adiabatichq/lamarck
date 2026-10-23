@@ -65,6 +65,7 @@ export function WorkspaceRuntimeGate({ workspace, children }: {
       suggestedPath: "",
       previousWorkspace: { lastKnownPath: workspace.path, vaultId: workspace.vaultId },
       detail: failure,
+      canResetSystemSettings: runtime?.phase === "failed" && runtime.canResetSystemSettings === true,
     }} onRetry={retry} onResetSystemSettings={resetSystemSettings} onReady={() => {
       clearCoreBaseUrlCache();
       window.location.reload();

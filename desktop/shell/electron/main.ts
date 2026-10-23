@@ -1238,7 +1238,10 @@ function startCore(generation: number, options?: RuntimeStartOptions): void {
   child.on("message", (message: unknown) => {
     const state = runtimeSupervisor.snapshot();
     if (state.generation === generation && state.phase === "starting"
-      && runtimeSupervisor.core === child && isStartupFailure(message)) startupFailure = message;
+      && runtimeSupervisor.core === child && isStartupFailure(message)) {
+      startupFailure = message;
+      if (message.canResetSystemSettings === true) runtimeSupervisor.noteSystemDatabaseFailure(generation);
+    }
   });
   child.on("error", (error) => {
     if (child.pid === undefined) unspawnedCoreFailures.add(child);

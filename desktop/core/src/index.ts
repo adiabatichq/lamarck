@@ -148,7 +148,7 @@ const systemDb = await Promise.resolve().then(() => {
   if (resetRequested) resetSystemSettings(workspacePath);
   return openSystemDatabase(workspacePath);
 }).catch(async (error) => {
-  await sendStartupFailure(error);
+  await sendStartupFailure(error, "system.db");
   throw error;
 });
 const systemIdentity = systemIdentityFromBuild();

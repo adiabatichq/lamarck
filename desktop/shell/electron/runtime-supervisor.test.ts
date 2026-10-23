@@ -37,13 +37,14 @@ describe("Desktop runtime supervisor", () => {
     const { supervisor, operations } = harness();
     await supervisor.start();
     const confirm = vi.fn(async () => true);
-    await expect(supervisor.resetSystemSettings("vault-a", confirm)).rejects.toThrow("after Workspace startup fails");
+    await expect(supervisor.resetSystemSettings("vault-a", confirm)).rejects.toThrow("confirmed system database failure");
     expect(confirm).not.toHaveBeenCalled();
     expect(operations.stopGateway).not.toHaveBeenCalled();
   });
 
   test("cancel leaves settings and the failed runtime untouched", async () => {
     const { supervisor, operations, events } = harness();
+    supervisor.noteSystemDatabaseFailure(0);
     supervisor.fail(0, "incompatible system DB");
     const state = supervisor.snapshot();
     expect(await supervisor.resetSystemSettings("vault-a", async () => false)).toBe(false);
@@ -54,28 +55,67 @@ describe("Desktop runtime supervisor", () => {
 
   test("settings reset waits for all failed-runtime cleanup before one reset startup", async () => {
     const { supervisor, operations, events } = harness();
-    await supervisor.start();
-    supervisor.fail(1, "incompatible system DB");
+    const generation = supervisor.begin();
+    const guard = {};
+    supervisor.attachGuard(generation, guard);
+    supervisor.publishGuardOrigin(generation, guard, "http://127.0.0.1:1");
+    supervisor.attachCore(generation, {});
+    supervisor.noteSystemDatabaseFailure(generation);
+    supervisor.fail(generation, "incompatible system DB");
     operations.stopApps.mockImplementationOnce(async lost => {
       expect(lost).toBe(true);
       await new Promise(resolve => setTimeout(resolve, 10));
       events.push("apps-stopped");
     });
     expect(await supervisor.resetSystemSettings("vault-a", async () => true)).toBe(true);
-    expect(events).toEqual(["start", "gateway", "core", "guard", "apps-stopped", "start"]);
-    expect(operations.start.mock.calls[1]?.[1]).toEqual({ expectedVaultId: "vault-a", resetSystemSettings: true });
+    expect(events).toEqual(["gateway", "core", "guard", "apps-stopped", "start"]);
+    expect(operations.start.mock.calls[0]?.[1]).toEqual({ expectedVaultId: "vault-a", resetSystemSettings: true });
     await supervisor.stop();
     await supervisor.start();
-    expect(operations.start.mock.calls[2]?.[1]).toBeUndefined();
+    expect(operations.start.mock.calls[1]?.[1]).toBeUndefined();
   });
 
   test("cleanup failure prevents settings reset and remains visible", async () => {
     const { supervisor, operations } = harness();
+    supervisor.noteSystemDatabaseFailure(0);
     supervisor.fail(0, "incompatible system DB");
     operations.stopApps.mockRejectedValueOnce(new Error("App cleanup incomplete"));
     await expect(supervisor.resetSystemSettings("vault-a", async () => true)).rejects.toThrow("App cleanup incomplete");
     expect(operations.start).not.toHaveBeenCalled();
     expect(supervisor.snapshot()).toMatchObject({ phase: "failed", error: "App cleanup incomplete" });
+  });
+
+  test("generic startup failures never show or execute reset, even through direct invocation", async () => {
+    const { supervisor, operations } = harness();
+    supervisor.fail(0, "Core port is in use");
+    expect(supervisor.snapshot().canResetSystemSettings).toBeUndefined();
+    const confirm = vi.fn(async () => true);
+    await expect(supervisor.resetSystemSettings("vault-a", confirm)).rejects.toThrow("confirmed system database failure");
+    expect(confirm).not.toHaveBeenCalled();
+    expect(operations.start).not.toHaveBeenCalled();
+  });
+
+  test("a retry clears the old diagnosis even when the next startup also fails", async () => {
+    const { supervisor, operations } = harness();
+    supervisor.noteSystemDatabaseFailure(0);
+    supervisor.fail(0, "system database mismatch");
+    expect(supervisor.snapshot().canResetSystemSettings).toBe(true);
+    operations.start.mockRejectedValueOnce(new Error("Core port is in use"));
+    await expect(supervisor.start()).rejects.toThrow("Core port is in use");
+    expect(supervisor.snapshot().canResetSystemSettings).toBeUndefined();
+    supervisor.noteSystemDatabaseFailure(0); // stale IPC cannot restore it
+    expect(supervisor.snapshot().canResetSystemSettings).toBeUndefined();
+  });
+
+  test("rechecks the diagnosis after confirmation rather than resetting a recovered runtime", async () => {
+    const { supervisor, operations } = harness();
+    supervisor.noteSystemDatabaseFailure(0);
+    supervisor.fail(0, "system database mismatch");
+    await expect(supervisor.resetSystemSettings("vault-a", async () => {
+      await supervisor.start();
+      return true;
+    })).rejects.toThrow("confirmed system database failure");
+    expect(operations.stopGateway).not.toHaveBeenCalled();
   });
 
   test("revokes Apps while Core is alive, then releases Core before Guard", async () => {
