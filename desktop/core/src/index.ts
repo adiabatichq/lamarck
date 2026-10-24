@@ -381,7 +381,12 @@ const d1Observer = new D1Observer(
   contentBlobStore,
   d1Sequencer,
 );
-await d1Observer.start();
+// Rebuilding this cache may read large or cloud-backed files. It must not keep
+// the entire Workspace offline; Files operations still wait for its baseline.
+const d1ObserverReady = d1Observer.start();
+// Attach immediately, including when initialization fails before HTTP listens.
+// The failure is handled through normal shutdown once the server exists below.
+void d1ObserverReady.catch(() => {});
 
 interface SchemaRequest {
   id: string;
@@ -974,6 +979,8 @@ async function executeCoreCliOperation(
       if ((expected && argv[0] !== expected) || (!expected && (argv[0] === "import" || argv[0] === "export"))) {
         throw cliCoded("CLI_UNSUPPORTED_COMMAND", "The file operation does not match its typed command.");
       }
+      await d1ObserverReady;
+      signal.throwIfAborted();
       const result = await vfs.command(
         cliVfsCaller(principal, requestGuard),
         argv.map(quoteCliWord).join(" "),
@@ -1470,6 +1477,8 @@ const server = await serve<{ cwd: string }>({
           options?: import("@lamarck/system/protocol").VfsCommandWireOptions;
         }>(req);
         if (typeof body.command !== "string") throw new HttpStatusError(400, "VFS command is required");
+        await d1ObserverReady;
+        requestGuardSignal.throwIfAborted();
         return json(await vfs.command(
           vfsCallerForRequest(auth!, req, requestGuardSignal),
           body.command,
@@ -1500,6 +1509,8 @@ const server = await serve<{ cwd: string }>({
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const body = await readBody<{ path: string }>(req);
         if (typeof body.path !== "string") throw new HttpStatusError(400, "exclusion path is required");
+        await d1ObserverReady;
+        requestGuardSignal.throwIfAborted();
         const exclusion = d1ObserverState.addExclusion(body.path);
         d1Observer.schedule();
         return json({ ok: true, exclusion });
@@ -1509,6 +1520,8 @@ const server = await serve<{ cwd: string }>({
         if (auth!.kind !== "host") return json({ error: "host auth required" }, 403);
         const body = await readBody<{ path: string }>(req);
         if (typeof body.path !== "string") throw new HttpStatusError(400, "exclusion path is required");
+        await d1ObserverReady;
+        requestGuardSignal.throwIfAborted();
         const removed = d1ObserverState.removeExclusion(body.path);
         d1Observer.schedule();
         return json({ ok: true, removed });
@@ -2442,6 +2455,16 @@ const server = await serve<{ cwd: string }>({
   },
 });
 
+void d1ObserverReady.catch(async (error) => {
+  console.error("[lamarck:d1] Initial observation failed:", error);
+  try {
+    await shutdown(1);
+  } catch (shutdownError) {
+    console.error("[lamarck] Shutdown failed:", shutdownError);
+    process.exit(1);
+  }
+});
+
 triggerCoordinator.start();
 connectorScheduler.start().catch((err) => {
   console.error("[lamarck] Connector scheduler failed:", err);
@@ -2485,7 +2508,7 @@ function assertDisplayNameField(
 }
 
 // Graceful shutdown
-async function shutdown(): Promise<void> {
+async function shutdown(exitCode = 0): Promise<void> {
   runtimeListeners.close();
   if (shuttingDown) return;
   shuttingDown = true;
@@ -2512,7 +2535,7 @@ async function shutdown(): Promise<void> {
   const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
   if (failures.length) throw new AggregateError(failures, "Core cleanup was incomplete");
   systemDb.close();
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 process.on("SIGINT", () => {
