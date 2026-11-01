@@ -383,7 +383,9 @@ const capsuleManager = new CapsuleManager({
   unbindSystemSender: (senderId) => { systemBroker.unbindSender(senderId); },
   onBackendBoundaryLost(error) {
     console.error(`[electron] App Capsule boundary lost: ${errorMessage(error)}`);
-    scheduleRuntimeRestart(`App Capsule boundary lost: ${errorMessage(error)}`);
+    // Manager contains the Capsule; keep Core alive for revocation and Host use.
+    systemBroker.unbindAll();
+    detachAllAppWebContents();
   },
   onUiLost(event) {
     console.error(

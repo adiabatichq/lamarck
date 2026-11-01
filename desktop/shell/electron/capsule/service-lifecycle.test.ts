@@ -3,10 +3,11 @@ import { CapsuleManager } from "./manager";
 import { CapsuleRestartRequiredError, UnavailableCapsuleBackend, type CapsuleServiceSpec } from "./backend";
 
 const VERSION = "a".repeat(40), DIGEST = `sha256:${"b".repeat(64)}`, ACTIVATION = `activation_${"c".repeat(32)}`;
-function harness() {
+function harness({ ui = false }: { ui?: boolean } = {}) {
   let policy = { enabled: true, revision: 1, restartBaseMs: 1000, restartMaxMs: 60000, crashCount: 0, restartAt: null as number | null, lastError: null as string | null, cleanupFailed: false };
   let present = true, version = VERSION, failAuthority = false, failObserve = false, appEnabled = true, cleanBoundary = false;
   let settingReply: Promise<void> | null = null;
+  let boundaryLost: ((error: unknown) => void) | undefined;
   const calls: { url: string; body: Record<string, unknown> }[] = [];
   const cleanup = new Map<number, Promise<void>>();
   const attempts: { signal: AbortSignal; exit: ReturnType<typeof Promise.withResolvers<void>>; spec: CapsuleServiceSpec }[] = [];
@@ -26,7 +27,7 @@ function harness() {
     if (url.endsWith("/activation/prepare")) return Response.json({ activation: {
       schemaVersion: 1, activationId: ACTIVATION, activationSequence: 1, appId: "notes", workload: body.workload, mode: "normal",
       version, manifestDigest: DIGEST, packageDigest: DIGEST, immutablePackagePath: "/immutable/notes",
-      manifest: { runtime: { services: { indexer: { command: ["node", "indexer.js"] } }, jobs: { inbox: { command: ["node", "inbox.js"] } } }, permissions: { writes: { files: [], tables: [] } } },
+      manifest: { runtime: { ...(ui ? { ui: { command: ["node", "ui.js"], port: 3000 } } : {}), services: { indexer: { command: ["node", "indexer.js"] } }, jobs: { inbox: { command: ["node", "inbox.js"] } } }, permissions: { writes: { files: [], tables: [] } } },
     } });
     if (url.endsWith("/channels") && init?.method === "POST") return Response.json({ mode: "normal", capability: "private-channel-secret", channelId: "channel-a", activationId: ACTIVATION, appCommit: version, manifestDigest: DIGEST, packageDigest: DIGEST });
     if (failAuthority && url.endsWith("/channels/channel-a")) return Response.json({ error: "retirement failed" }, { status: 500 });
@@ -41,10 +42,12 @@ function harness() {
     finally { signal.removeEventListener("abort", abort); onState?.("stopping"); await cleanup.get(index); }
   });
   const confirmCleanBoundary = vi.fn(async () => { if (!cleanBoundary) throw new Error("VM cleanup is unconfirmed"); });
-  const backend = Object.assign(new UnavailableCapsuleBackend(), { confirmCleanBoundary, status: async () => ({ available: true, backend: "fixture" }), runService });
+  const backend = Object.assign(new UnavailableCapsuleBackend(), { confirmCleanBoundary, status: async () => ({ available: true, backend: "fixture" }), runService,
+    setBoundaryLostHandler(handler: (error: unknown) => void) { boundaryLost = handler; } });
   const freshManager = () => new CapsuleManager({ backend, workspacePath: () => "/isolated", coreBaseUrl: () => "http://core", coreToken: "host-secret", fetch, bindSystemSender() {}, unbindSystemSender() {} });
   const manager = freshManager();
   return { manager, freshManager, backend, attempts, runService, cleanup, calls, fetch, confirmCleanBoundary,
+    loseBoundary() { boundaryLost!(new Error("injected Capsule boundary loss")); },
     cleanBoundary(value: boolean) { cleanBoundary = value; },
     get appEnabled() { return appEnabled; },
     appEnabledExternally(value: boolean) { appEnabled = value; },
@@ -70,6 +73,38 @@ test("enabled Services reconcile once, need no UI port, and survive Close UI", a
     expect(h.manager.appRuntimeStates()[0].services?.[0].state).toBe("stopped");
     await h.manager.reconcileServices(); expect(h.attempts).toHaveLength(1);
   } finally { await h.manager.stopAll(); }
+});
+
+test("closing a live UI preserves its running Service through pending and failed viewer cleanup", async () => {
+  const h = harness({ ui: true }), stopped = Promise.withResolvers<void>();
+  Object.assign(h.backend, {
+    async prepareUi() { return { preparationId: "prepared-ui", instanceId: "instance-ui" }; },
+    async commitPreparedUi() { return { instanceId: "instance-ui" }; },
+  });
+  const stopUi = vi.spyOn(h.backend, "stopUi").mockReturnValue(stopped.promise);
+  let closing: Promise<void> | undefined;
+  try {
+    await h.manager.reconcileServices(); await vi.waitFor(() => expect(h.attempts).toHaveLength(1));
+    await h.manager.openViewer("notes", { webContentsId: 7, rendererGeneration: 1 }, async () => {});
+    const executionId = h.manager.appRuntimeStates()[0].services![0].executionId;
+    closing = h.manager.closeAppUi("notes");
+    expect(stopUi).toHaveBeenCalledWith("instance-ui");
+    expect(h.manager.appRuntimeStates()[0].ui).toBe("stopping");
+    for (let i = 0; i < 3; i++) await h.manager.reconcileServices();
+    expect(h.attempts[0].signal.aborted).toBe(false);
+    expect(h.manager.appRuntimeStates()[0].services?.[0]).toMatchObject({ state: "running", executionId });
+    expect(h.runService).toHaveBeenCalledOnce();
+    await expect(h.manager.openViewer("notes", { webContentsId: 7, rendererGeneration: 1 }, async () => {})).rejects.toThrow();
+    stopped.resolve(); await closing;
+    await h.manager.reconcileServices();
+    expect(h.attempts[0].signal.aborted).toBe(false);
+    expect(h.runService).toHaveBeenCalledOnce();
+    await h.manager.trackViewerCleanup("notes", Promise.reject(new Error("retired viewer cleanup failed"))).catch(() => {});
+    await h.manager.reconcileServices();
+    expect(h.attempts[0].signal.aborted).toBe(false);
+    expect(h.manager.appRuntimeStates()[0]).toMatchObject({ latestFailure: "retired viewer cleanup failed", services: [{ state: "running", executionId }] });
+    expect(h.runService).toHaveBeenCalledOnce();
+  } finally { stopped.resolve(); await closing; await h.manager.stopAll().catch(() => {}); }
 });
 
 test("crash restart waits for confirmed cleanup and saved backoff", async () => {
@@ -390,4 +425,159 @@ test("successful exact authority cleanup and startup clear only the recovered Se
     expect(h.manager.appRuntimeStates()[0]).toMatchObject({ latestFailure: null, services: [{ state: "running", failure: null }] });
     expect(h.manager.workloadDiagnostics("notes", execution)[0].failure).toContain("Service authority cleanup failed");
   } finally { h.failAuthority(false); await h.manager.stopAll(); }
+});
+
+test("Capsule containment retains the Service loop and requires saved backoff before another attempt", async () => {
+  const h = harness(), stop = Promise.withResolvers<void>();
+  const stopAll = vi.spyOn(h.backend, "stopAll").mockReturnValueOnce(stop.promise);
+  h.policy.restartBaseMs = 60_000;
+  try {
+    h.manager.startServices();
+    await vi.waitFor(() => expect(h.attempts).toHaveLength(1));
+    h.loseBoundary();
+    expect(h.attempts[0].signal.aborted).toBe(true);
+    await h.manager.reconcileServices(); expect(h.attempts).toHaveLength(1);
+    stop.resolve();
+    await vi.waitFor(async () => expect(await h.manager.status()).toMatchObject({ available: true }));
+    h.failObserve(true);
+    await expect(h.manager.reconcileServices()).rejects.toThrow("acknowledged");
+    expect(h.attempts).toHaveLength(1);
+    h.failObserve(false);
+    await h.manager.reconcileServices();
+    expect(h.policy).toMatchObject({ enabled: true, crashCount: 1, cleanupFailed: false, lastError: "Capsule boundary lost" });
+    expect(h.policy.restartAt).toBeGreaterThan(Date.now());
+    for (let i = 0; i < 5; i++) await h.manager.reconcileServices();
+    expect(h.attempts).toHaveLength(1);
+    h.due();
+    // The existing timer, rather than a newly created recovery loop, notices
+    // the due policy. This also catches accidentally abandoning that timer.
+    await vi.waitFor(() => expect(h.attempts).toHaveLength(2), { timeout: 2500 });
+    expect(stopAll).toHaveBeenCalledOnce();
+    expect(h.manager.workloadDiagnostics("notes")).toHaveLength(2);
+  } finally { stop.resolve(); h.failObserve(false); await h.manager.stopAll(); }
+});
+
+test("an unconfirmed Capsule stop keeps enabled Services unavailable without restarting them", async () => {
+  const h = harness();
+  const stopAll = vi.spyOn(h.backend, "stopAll").mockRejectedValue(new CapsuleRestartRequiredError("VM stop unconfirmed; restart Lamarck before using Apps"));
+  try {
+    h.manager.startServices(); await vi.waitFor(() => expect(h.attempts).toHaveLength(1));
+    h.loseBoundary();
+    await vi.waitFor(async () => expect(await h.manager.status()).toMatchObject({ available: false, restartRequired: true }));
+    h.due();
+    for (let i = 0; i < 5; i++) await h.manager.reconcileServices();
+    await expect(h.manager.setServiceEnabled("notes", "indexer", true)).rejects.toThrow();
+    expect(h.attempts).toHaveLength(1);
+    expect(stopAll).toHaveBeenCalledOnce();
+    expect(h.calls.some(call => call.url.endsWith("/apps/notes/channels"))).toBe(true);
+    expect(h.calls.some(call => call.url.includes("/api/apps/activation/"))).toBe(true);
+  } finally { await h.manager.stopAll().catch(() => {}); }
+});
+
+test("containment cancels both Service replacement generations and waits for their existing cleanup", async () => {
+  const h = harness(), cleanup = Promise.withResolvers<void>();
+  h.cleanup.set(0, cleanup.promise);
+  try {
+    await h.manager.reconcileServices(); await vi.waitFor(() => expect(h.attempts).toHaveLength(1));
+    h.replace(); await h.manager.reconcileServices(); await vi.waitFor(() => expect(h.attempts).toHaveLength(2));
+    h.loseBoundary();
+    expect(h.attempts.every(value => value.signal.aborted)).toBe(true);
+    await expect(h.manager.status()).resolves.toMatchObject({ available: false });
+    await h.manager.reconcileServices(); expect(h.attempts).toHaveLength(2);
+    cleanup.resolve();
+    await vi.waitFor(async () => expect(await h.manager.status()).toMatchObject({ available: true }));
+    await h.manager.reconcileServices();
+    expect(h.attempts).toHaveLength(2);
+    expect(h.policy.restartAt).toBeGreaterThan(Date.now());
+  } finally { cleanup.resolve(); await h.manager.stopAll(); }
+});
+
+test("intentional Host teardown can join Capsule containment and later start Services normally", async () => {
+  const h = harness(), cleanup = Promise.withResolvers<void>();
+  h.cleanup.set(0, cleanup.promise);
+  try {
+    h.manager.startServices(); await vi.waitFor(() => expect(h.attempts).toHaveLength(1));
+    h.loseBoundary();
+    const stopped = h.manager.stopAll();
+    cleanup.resolve(); await stopped;
+    h.manager.startServices();
+    h.due(); await h.manager.reconcileServices();
+    await vi.waitFor(() => expect(h.attempts).toHaveLength(2));
+  } finally { cleanup.resolve(); await h.manager.stopAll(); }
+});
+
+test("an enable acknowledged during Capsule containment releases only its own temporary admission block", async () => {
+  const h = harness(), reply = Promise.withResolvers<void>();
+  try {
+    h.manager.startServices(); await vi.waitFor(() => expect(h.attempts).toHaveLength(1));
+    await h.manager.setAppEnabled("notes", false);
+    h.holdSettingReply(reply.promise);
+    const enabled = h.manager.setAppEnabled("notes", true);
+    const cancelled = expect(enabled).rejects.toThrow("cancelled");
+    await vi.waitFor(() => expect(h.appEnabled).toBe(true));
+    h.loseBoundary();
+    reply.resolve(); await cancelled;
+    await vi.waitFor(async () => expect(await h.manager.status()).toMatchObject({ available: true }));
+    await h.manager.reconcileServices();
+    await vi.waitFor(() => expect(h.attempts).toHaveLength(2));
+    expect(h.manager.appRuntimeStates()[0]).toMatchObject({ enabled: true, latestFailure: null, services: [{ state: "running" }] });
+  } finally { reply.resolve(); await h.manager.stopAll(); }
+});
+
+test("a genuinely disabled App remains disabled after Capsule containment", async () => {
+  const h = harness();
+  try {
+    await h.manager.reconcileServices(); await vi.waitFor(() => expect(h.attempts).toHaveLength(1));
+    await h.manager.setAppEnabled("notes", false);
+    h.loseBoundary();
+    await vi.waitFor(async () => expect(await h.manager.status()).toMatchObject({ available: true }));
+    for (let i = 0; i < 3; i++) await h.manager.reconcileServices();
+    expect(h.attempts).toHaveLength(1);
+    expect(h.appEnabled).toBe(false);
+    expect(h.manager.appRuntimeStates()[0]).toMatchObject({ enabled: false, services: [{ state: "stopped" }] });
+  } finally { await h.manager.stopAll(); }
+});
+
+test.each(["before", "after"] as const)("a newer disable intent %s boundary loss survives an older enable acknowledgement", async when => {
+  const h = harness(), reply = Promise.withResolvers<void>();
+  try {
+    await h.manager.reconcileServices(); await vi.waitFor(() => expect(h.attempts).toHaveLength(1));
+    await h.manager.setAppEnabled("notes", false);
+    h.holdSettingReply(reply.promise);
+    const enabled = h.manager.setAppEnabled("notes", true);
+    const cancelledEnable = expect(enabled).rejects.toThrow("cancelled");
+    await vi.waitFor(() => expect(h.appEnabled).toBe(true));
+    if (when === "after") h.loseBoundary();
+    const disabled = h.manager.setAppEnabled("notes", false);
+    const cancelledDisable = expect(disabled).rejects.toThrow("cancelled");
+    if (when === "before") h.loseBoundary();
+    reply.resolve(); await Promise.all([cancelledEnable, cancelledDisable]);
+    await vi.waitFor(async () => expect(await h.manager.status()).toMatchObject({ available: true }));
+    for (let i = 0; i < 3; i++) await h.manager.reconcileServices();
+    expect(h.attempts).toHaveLength(1);
+    expect(h.manager.appRuntimeStates()[0].services?.[0].state).toBe("stopped");
+    // Retrying the latest intent can still persist it after containment.
+    await h.manager.setAppEnabled("notes", false);
+    expect(h.appEnabled).toBe(false);
+  } finally { reply.resolve(); await h.manager.stopAll(); }
+});
+
+test("an interrupted enable resumes independent Services while retaining viewer cleanup diagnostics", async () => {
+  const h = harness(), reply = Promise.withResolvers<void>();
+  try {
+    await h.manager.reconcileServices(); await vi.waitFor(() => expect(h.attempts).toHaveLength(1));
+    await h.manager.setAppEnabled("notes", false);
+    h.holdSettingReply(reply.promise);
+    const enabled = h.manager.setAppEnabled("notes", true);
+    const cancelled = expect(enabled).rejects.toThrow("cancelled");
+    await vi.waitFor(() => expect(h.appEnabled).toBe(true));
+    h.loseBoundary();
+    await h.manager.trackViewerCleanup("notes", Promise.reject(new Error("viewer cleanup failed"))).catch(() => {});
+    reply.resolve(); await cancelled;
+    await vi.waitFor(async () => expect(await h.manager.status()).toMatchObject({ available: true }));
+    for (let i = 0; i < 3; i++) await h.manager.reconcileServices();
+    await vi.waitFor(() => expect(h.attempts).toHaveLength(2));
+    expect(h.manager.appRuntimeStates()[0]).toMatchObject({ enabled: true, ui: "stopping", latestFailure: "viewer cleanup failed", services: [{ state: "running" }] });
+    await expect(h.manager.setAppMode("notes", "exp")).rejects.toThrow("Stop the App");
+  } finally { reply.resolve(); await h.manager.stopAll().catch(() => {}); }
 });

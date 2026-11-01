@@ -7,6 +7,7 @@ import type {
   CapsuleUiSpec,
 } from "./backend";
 import { CapsuleRestartRequiredError } from "./backend";
+import { CapsuleJobWorker } from "./job-worker";
 import {
   AppViewerBusyError,
   CapsuleManager,
@@ -918,8 +919,8 @@ describe("CapsuleManager", () => {
     expect(onBackendBoundaryLost).toHaveBeenCalledOnce();
     expect(backend.stopAllCalls).toBe(1);
     expect(manager.getViewer(viewerB.viewerId, viewerOwner(8))).toBeNull();
-    expect(calls.some((call) => call.url.endsWith("/channels/channel-app-b-3"))).toBe(true);
-    expect(calls.some((call) => call.url.endsWith("/channels/channel-app-b-4"))).toBe(true);
+    await manager.stopAll();
+    expect(calls.filter((call) => call.url.endsWith("/api/app-runtime/apps/app-b/channels"))).toHaveLength(2);
   });
 
   test("revokes every live channel when the backend loses its boundary asynchronously", async () => {
@@ -948,8 +949,8 @@ describe("CapsuleManager", () => {
     expect(bindings.unbindSystemSender).toHaveBeenCalledWith(
       backend.starts[0]!.sdkSenderId,
     );
-    expect(calls.some((call) => call.url.endsWith("/channels/channel-app-a-1"))).toBe(true);
-    expect(calls.some((call) => call.url.endsWith("/channels/channel-app-a-2"))).toBe(true);
+    await manager.stopAll();
+    expect(calls.filter((call) => call.url.endsWith("/api/app-runtime/apps/app-a/channels"))).toHaveLength(2);
   });
 
   test("synchronously detaches one unexpectedly exited UI before revoking its channels", async () => {
@@ -1281,6 +1282,49 @@ describe("CapsuleManager", () => {
         instanceId: "instance-app-a-replacement",
       }],
     });
+  });
+
+  test("successful reload preserves retired gateway cleanup diagnostics without fencing Jobs", async () => {
+    const backend = new FakeBackend(), bindings = systemBindings();
+    const retired = Promise.withResolvers<void>(), verifying = Promise.withResolvers<void>(), publish = Promise.withResolvers<void>();
+    const finishJob = Promise.withResolvers<void>();
+    const runJob = vi.fn(async (_spec: unknown, signal: AbortSignal) => { await finishJob.promise; signal.throwIfAborted(); });
+    Object.assign(backend, { runJob });
+    const { fetch, calls } = createFetch({ "app-a": { ui: { command: ["node", "ui.js"], port: 3000 }, jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "host", fetch, ...bindings });
+    const original = await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
+    const originalSender = backend.starts[0]!.sdkSenderId;
+    const job = manager.runJob("running-job", "app-a", "inbox", new AbortController().signal);
+    const jobResult = job.then(() => null, error => error);
+    await vi.waitFor(() => expect(runJob).toHaveBeenCalledOnce());
+    let cleanup: Promise<void> | undefined;
+    const reloading = manager.reloadApp("app-a", async () => { verifying.resolve(); await publish.promise; }, publishReloadedViewer, () => {
+      cleanup = manager.trackViewerCleanup("app-a", retired.promise);
+    });
+    try {
+      await verifying.promise;
+      retired.reject(new Error("retired gateway cleanup failed")); await cleanup?.catch(() => {});
+      expect(manager.appRuntimeStates()[0].latestFailure).toBe("retired gateway cleanup failed");
+      expect(bindings.unbindSystemSender).toHaveBeenCalledWith(originalSender);
+      for (const channel of [1, 2]) expect(calls.some(call => call.url.endsWith(`/channels/channel-app-a-${channel}`) && call.init?.method === "DELETE")).toBe(true);
+      publish.resolve();
+      await expect(reloading).resolves.toMatchObject({ active: true });
+      expect(manager.getViewer(original.viewerId, viewerOwner(7))?.instanceId).toBe("instance-app-a-replacement");
+      expect(manager.appRuntimeStates()[0].latestFailure).toBe("retired gateway cleanup failed");
+      finishJob.resolve();
+      expect(await jobResult).toBeNull();
+      await expect(manager.runJob("next-job", "app-a", "inbox", new AbortController().signal)).resolves.toBeUndefined();
+      expect(runJob).toHaveBeenCalledTimes(2);
+      await expect(manager.reloadApp("app-a", verifyPreparedViewer, publishReloadedViewer)).rejects.toThrow();
+      await manager.closeAppUi("app-a");
+      await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)).rejects.toThrow();
+      await expect(manager.setAppMode("app-a", "exp")).rejects.toThrow("Stop the App");
+      expect(manager.appRuntimeStates()[0].latestFailure).toBe("retired gateway cleanup failed");
+      expect(backend.stopAllCalls).toBe(0);
+    } finally {
+      retired.resolve(); publish.resolve(); finishJob.resolve();
+      await jobResult; await reloading.catch(() => {}); await manager.stopAll().catch(() => {});
+    }
   });
 
   test("launches a declared UI without rejecting sibling Service or Job declarations", async () => {
@@ -2306,5 +2350,204 @@ test("Host viewer cleanup gates mode changes after workload exit and retains fai
   await manager.trackViewerCleanup("notes", Promise.reject(new Error("Browser storage cleanup unconfirmed"))).catch(() => {});
   await manager.stopApp("notes");
   await expect(manager.setAppMode("notes", "normal")).rejects.toThrow("Stop the App");
-  await manager.stopAll();
+  expect(manager.appRuntimeStates().find(app => app.appId === "notes")?.latestFailure).toBe("Browser storage cleanup unconfirmed");
+  await expect(manager.stopAll()).rejects.toThrow("App viewer cleanup was not confirmed");
+});
+
+test.each(["before", "during"] as const)("a Job admitted %s normal UI cleanup can complete successfully while that cleanup is pending", async when => {
+  const backend = new FakeBackend(), stopped = Promise.withResolvers<void>(), completed = Promise.withResolvers<void>();
+  const runJob = vi.fn(async (_spec: unknown, signal: AbortSignal) => { await completed.promise; signal.throwIfAborted(); });
+  Object.assign(backend, { runJob });
+  vi.spyOn(backend, "stopUi").mockReturnValue(stopped.promise);
+  const { fetch } = createFetch({ notes: { ui: { command: ["node", "ui.js"], port: 3000 }, jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+  const manager = new CapsuleManager({ backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "host", fetch, ...systemBindings() });
+  let closing: Promise<void> | undefined, outcome: Promise<unknown> | undefined;
+  const startJob = () => manager.runJob("job-a", "notes", "inbox", new AbortController().signal).then(() => null, error => error);
+  try {
+    await manager.openViewer("notes", viewerOwner(7), verifyPreparedViewer);
+    if (when === "before") { outcome = startJob(); await vi.waitFor(() => expect(runJob).toHaveBeenCalledOnce()); }
+    closing = manager.closeAppUi("notes");
+    let uiClosed = false; void closing.then(() => { uiClosed = true; });
+    if (when === "during") { outcome = startJob(); await vi.waitFor(() => expect(runJob).toHaveBeenCalledOnce()); }
+    completed.resolve();
+    expect(await outcome).toBeNull();
+    expect(uiClosed).toBe(false);
+    expect(manager.workloadDiagnostics("notes", "job-a")[0]).toMatchObject({ failure: null, endedAt: expect.any(Number) });
+    expect(manager.appRuntimeStates()[0]).toMatchObject({ ui: "stopping", latestFailure: null, jobs: [] });
+  } finally { completed.resolve(); stopped.resolve(); await outcome; await closing; await manager.stopAll(); }
+});
+
+describe("Capsule-only containment", () => {
+  test.each(["success", "failure"] as const)("viewer cleanup %s is accounted for separately from VM containment", async outcome => {
+    const backend = new FakeBackend(), base = createFetch({ "app-a": { ui: { command: ["node", "ui.js"], port: 3000 }, jobs: { inbox: { command: ["node", "inbox.js"] } } } });
+    const cleanup = Promise.withResolvers<void>();
+    const runJob = vi.fn(async () => {}); Object.assign(backend, { runJob });
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/isolated", coreBaseUrl: () => "http://core", coreToken: "host", fetch: base.fetch, ...systemBindings(),
+      onBackendBoundaryLost() { manager.trackViewerCleanup("app-a", cleanup.promise); },
+    });
+    await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
+    backend.boundaryLostHandler!(new Error("injected boundary loss"));
+    const stopping = manager.stopAll();
+    const result = stopping.then(() => null, error => error);
+    let settled = false; void result.then(() => { settled = true; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(await manager.status()).toMatchObject({ available: false });
+      await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)).rejects.toThrow();
+      if (outcome === "success") cleanup.resolve();
+      else cleanup.reject(new Error("gateway cleanup failed"));
+      const error = await result;
+      if (outcome === "success") {
+        expect(error).toBeNull();
+        expect(manager.appRuntimeStates().find(app => app.appId === "app-a")?.ui).toBe("closed");
+        await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer);
+      } else {
+        expect(error).toBeInstanceOf(AggregateError);
+        expect(error.errors).toContainEqual(expect.objectContaining({ message: "gateway cleanup failed" }));
+        expect(manager.appRuntimeStates().find(app => app.appId === "app-a")).toMatchObject({ ui: "stopping", latestFailure: "gateway cleanup failed" });
+        await expect(manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)).rejects.toThrow();
+        await expect(manager.runJob("independent-job", "app-a", "inbox", new AbortController().signal)).resolves.toBeUndefined();
+        expect(runJob).toHaveBeenCalledOnce();
+        expect(manager.appRuntimeStates().find(app => app.appId === "app-a")?.latestFailure).toBe("gateway cleanup failed");
+      }
+      // A confirmed VM stop and revoked capabilities allow unrelated Apps.
+      expect(await manager.status()).toMatchObject({ available: true });
+      await manager.openViewer("app-b", viewerOwner(8), verifyPreparedViewer);
+    } finally { cleanup.resolve(); await result; await manager.stopAll().catch(() => {}); }
+  });
+
+  test.each(["launch", "replacement"] as const)("a %s cannot publish authority returned after boundary loss", async kind => {
+    for (const phase of ["activation", "runtime-channel", "browser-channel", "preparation", "commit"] as const) {
+      const backend = new FakeBackend(), base = createFetch(), bindings = systemBindings();
+      const entered = Promise.withResolvers<void>(), late = Promise.withResolvers<void>();
+      const vmStop = Promise.withResolvers<void>(), hostCleanup = Promise.withResolvers<void>();
+      let armed = false, channel = 0;
+      const hold = async () => { entered.resolve(); await late.promise; };
+      const fetch: typeof globalThis.fetch = async (input, init) => {
+        const url = String(input);
+        if (armed && phase === "activation" && url.endsWith("/activation/prepare")) await hold();
+        if (armed && url.endsWith("/channels") && init?.method === "POST") {
+          if (++channel === (phase === "runtime-channel" ? 1 : phase === "browser-channel" ? 2 : -1)) await hold();
+        }
+        return base.fetch(input, init);
+      };
+      const prepare = backend.prepareUi.bind(backend), commit = backend.commitPreparedUi.bind(backend);
+      backend.prepareUi = async (...args) => { if (armed && phase === "preparation") await hold(); return prepare(...args); };
+      backend.commitPreparedUi = async id => { if (armed && phase === "commit") await hold(); return commit(id); };
+      const backendStop = vi.spyOn(backend, "stopAll").mockImplementation(() => vmStop.promise);
+      const onBackendBoundaryLost = vi.fn(() => { manager.trackViewerCleanup("app-a", hostCleanup.promise); });
+      const manager = new CapsuleManager({ backend, workspacePath: () => "/isolated", coreBaseUrl: () => "http://core", coreToken: "host", fetch, ...bindings, onBackendBoundaryLost });
+      const original = kind === "replacement" ? await manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer) : null;
+      const publish = vi.fn();
+      armed = true;
+      const operation = rejectionOf(kind === "launch"
+        ? manager.openViewer("app-a", viewerOwner(7), verifyPreparedViewer)
+        : manager.reloadApp("app-a", verifyPreparedViewer, publish));
+      try {
+        await entered.promise;
+        backend.boundaryLostHandler!(new Error("injected boundary loss"));
+        backend.boundaryLostHandler!(new Error("duplicate boundary signal"));
+        expect(onBackendBoundaryLost).toHaveBeenCalledOnce();
+        expect(backendStop).toHaveBeenCalledOnce();
+        expect(await manager.jobAvailability()).toBe(false);
+        await expect(manager.openViewer("other", viewerOwner(8), verifyPreparedViewer)).rejects.toBeInstanceOf(AppViewerBusyError);
+        late.resolve();
+        expect((await operation).message).toMatch(/cancelled|aborted/i);
+        expect(publish).not.toHaveBeenCalled();
+        if (original) expect(manager.getViewer(original.viewerId, viewerOwner(7))).toBeNull();
+        vmStop.resolve();
+        await Promise.resolve();
+        await expect(manager.openViewer("other", viewerOwner(8), verifyPreparedViewer)).rejects.toBeInstanceOf(AppViewerBusyError);
+        hostCleanup.resolve();
+        await vi.waitFor(async () => expect(await manager.status()).toMatchObject({ available: true }));
+        const revokes = base.calls.filter(call => call.url.endsWith("/api/app-runtime/apps/app-a/channels"));
+        expect(revokes).toHaveLength(2);
+        const lastIssue = base.calls.findLastIndex(call => call.url.endsWith("/channels") && call.init?.method === "POST");
+        expect(base.calls.indexOf(revokes[1])).toBeGreaterThan(lastIssue);
+        expect(manager.appRuntimeStates().every(app => app.ui === "closed")).toBe(true);
+        armed = false;
+        await manager.openViewer("other", viewerOwner(8), verifyPreparedViewer);
+      } finally {
+        late.resolve(); vmStop.resolve(); hostCleanup.resolve(); await operation;
+        backendStop.mockRestore(); await manager.stopAll();
+      }
+    }
+  });
+
+  test("Job dispatch keeps heartbeating unavailable and retries completion without replay after containment", async () => {
+    const backend = new FakeBackend(), vmStop = Promise.withResolvers<void>();
+    const signals: AbortSignal[] = [];
+    const runJob = vi.fn(async (_spec, signal: AbortSignal) => {
+      signals.push(signal);
+      if (signals.length === 1) await new Promise<void>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    });
+    Object.assign(backend, { runJob });
+    vi.spyOn(backend, "stopAll").mockImplementation(() => vmStop.promise);
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox"] } } } });
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/isolated", coreBaseUrl: () => "http://core", coreToken: "host", fetch: base.fetch, ...systemBindings() });
+    let claims = 0, recovered = false;
+    const heartbeats: { available: boolean; active: string[] }[] = [], completed: string[] = [];
+    const fetch: typeof globalThis.fetch = async (url, init) => {
+      if (String(url).endsWith("heartbeat")) { heartbeats.push(JSON.parse(String(init?.body))); return Response.json({ cancel: [] }); }
+      if (String(url).endsWith("claim")) {
+        const runId = claims === 0 ? "run-a" : recovered && claims === 1 ? "run-b" : null;
+        if (runId) claims++;
+        return Response.json({ job: runId ? { runId, appId: "notes", jobId: "inbox" } : null });
+      }
+      const { runId } = JSON.parse(String(init?.body)); completed.push(runId);
+      if (completed.length === 1) throw new Error("completion reply lost");
+      return Response.json({ ok: true });
+    };
+    const worker = new CapsuleJobWorker(manager, "host", fetch);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    worker.start("http://core");
+    try {
+      await vi.waitFor(() => expect(runJob).toHaveBeenCalledOnce());
+      backend.boundaryLostHandler!(new Error("injected CONTROL failure"));
+      expect(signals[0].aborted).toBe(true);
+      await vi.waitFor(() => expect(completed).toEqual(["run-a", "run-a"]), { timeout: 3000 });
+      expect(heartbeats.some(value => !value.available)).toBe(true);
+      expect(claims).toBe(1);
+      vmStop.resolve();
+      await vi.waitFor(async () => expect(await manager.jobAvailability()).toBe(true));
+      recovered = true;
+      await vi.waitFor(() => expect(completed.at(-1)).toBe("run-b"), { timeout: 3000 });
+      expect(runJob).toHaveBeenCalledTimes(2);
+      expect(completed).toEqual(["run-a", "run-a", "run-b"]);
+    } finally {
+      vmStop.resolve(); await worker.stop(); await manager.stopAll(); warning.mockRestore();
+    }
+  });
+
+  test("a Job claim already in flight cannot cross the Capsule cleanup fence", async () => {
+    const backend = new FakeBackend(), stop = Promise.withResolvers<void>();
+    const claimed = Promise.withResolvers<void>(), reply = Promise.withResolvers<void>();
+    const runJob = vi.fn(); Object.assign(backend, { runJob });
+    vi.spyOn(backend, "stopAll").mockReturnValue(stop.promise);
+    const base = createFetch({ notes: { jobs: { inbox: { command: ["node", "inbox"] } } } });
+    const manager = new CapsuleManager({ backend, workspacePath: () => "/isolated", coreBaseUrl: () => "http://core", coreToken: "host", fetch: base.fetch, ...systemBindings() });
+    let claims = 0;
+    const completed: { runId: string; error: string }[] = [];
+    const fetch: typeof globalThis.fetch = async (url, init) => {
+      if (String(url).endsWith("heartbeat")) return Response.json({ cancel: [] });
+      if (String(url).endsWith("claim")) {
+        claims++; claimed.resolve(); await reply.promise;
+        return Response.json({ job: { runId: "late-claim", appId: "notes", jobId: "inbox" } });
+      }
+      completed.push(JSON.parse(String(init?.body))); return Response.json({ ok: true });
+    };
+    const worker = new CapsuleJobWorker(manager, "host", fetch);
+    worker.start("http://core");
+    try {
+      await claimed.promise;
+      backend.boundaryLostHandler!(new Error("injected failure while claiming"));
+      reply.resolve();
+      await vi.waitFor(() => expect(completed).toHaveLength(1));
+      expect(completed[0]).toMatchObject({ runId: "late-claim", error: expect.stringContaining("stopping") });
+      expect(runJob).not.toHaveBeenCalled();
+      expect(base.calls).toEqual([]);
+      expect(claims).toBe(1);
+    } finally { reply.resolve(); await worker.stop(); stop.resolve(); await manager.stopAll(); }
+  });
 });

@@ -22,6 +22,8 @@ import { PACKAGE_ID_PATTERN } from "../package-id";
 
 const STOP_ALL_QUIESCENCE_TIMEOUT_MS = 20_000;
 
+class CapsuleBoundaryLostError extends Error {}
+
 interface PreparedActivation {
   mode: "normal" | "exp";
   schemaVersion: 1;
@@ -327,6 +329,9 @@ export class CapsuleManager {
         restartRequired: true,
       });
     }
+    if (this.#stoppingAll) {
+      return Promise.resolve({ available: false, backend: "stopping", reason: "App Capsule cleanup is in progress" });
+    }
     return this.#backend.status();
   }
 
@@ -348,7 +353,7 @@ export class CapsuleManager {
       runningWorkloads: [...this.#viewers.values()]
         .filter((viewer) => viewer.appId === appId).length + [...this.#workloads.values()].filter(job => job.appId === appId).length,
       latestFailure: this.#latestFailureByApp.get(appId)?.message ?? null,
-      ui: this.#stoppingApps.has(appId) || [...this.#uiCleanupOperations.values()].includes(appId) ? "stopping" as const
+      ui: this.#stoppingApps.has(appId) || this.#hasViewerCleanup(appId) ? "stopping" as const
         : [...this.#viewers.values()].some(viewer => viewer.appId === appId) ? "running" as const
         : this.#openingOperations.has(appId) ? "starting" as const : "closed" as const,
       stopping: this.#stoppingApps.has(appId) || this.#stoppingAll,
@@ -484,7 +489,7 @@ export class CapsuleManager {
     this.#serviceLoop = { controller, task };
   }
 
-  /** Host viewer resources share the workload cleanup gate, including failed retirement. */
+  /** Host viewer resources fence UI reuse and mode changes, not independent workloads. */
   trackViewerCleanup(appId: string, operation: Promise<unknown>): Promise<void> {
     const task = operation.then(() => {
       this.#uiCleanupOperations.delete(task);
@@ -499,13 +504,17 @@ export class CapsuleManager {
     return task;
   }
 
+  #hasViewerCleanup(appId: string): boolean {
+    return [...this.#uiCleanupOperations.values()].includes(appId);
+  }
+
   #canChangeMode(appId: string): boolean {
     let failure = this.#latestFailureByApp.get(appId);
     while (failure) { if (failure.recoverableCleanup) return false; failure = failure.previous; }
     return !this.#stoppingAll && !this.#terminalFailure && !this.#controlPlaneLost
       && !this.#modeChanges.has(appId) && !this.#appSettingOperations.has(appId)
       && !this.#openingOperations.has(appId) && !this.#openingApps.has(appId)
-      && ![...this.#uiCleanupOperations.values()].includes(appId)
+      && !this.#hasViewerCleanup(appId)
       && ![...this.#serviceManagement.values()].includes(appId)
       && !this.#rebuildOperations.has(appId) && !this.#stopOperations.has(appId)
       && !this.#retireOperations.has(appId) && !this.#stoppingApps.has(appId)
@@ -560,8 +569,11 @@ export class CapsuleManager {
       const results = await Promise.allSettled([setting, stop]);
       const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
       if (failures.length) throw new AggregateError(failures, "App enablement or workload cleanup was not confirmed");
+      // A validated Core acknowledgement can release this intent's temporary
+      // block even if Capsule containment cancelled its Host epoch. Global and
+      // owned-cleanup fences still apply; a newer disable owns a newer epoch.
+      if (enabled && epoch === this.#appSettingEpochs.get(appId)) this.#appBlocked.delete(appId);
       current();
-      if (enabled) this.#appBlocked.delete(appId);
     }).catch(error => { this.#recordFailure(appId, error, true); throw error; }).finally(() => {
       if (this.#appSettingOperations.get(appId) === task) this.#appSettingOperations.delete(appId);
     });
@@ -666,7 +678,9 @@ export class CapsuleManager {
     const settled = task.catch(() => {}).then(async () => {
       const current = this.#servicePolicies.get(serviceKey(service.appId, service.serviceId));
       if (current?.policy?.revision !== service.policy?.revision || !service.policy) return;
-      if (!operation.controller.signal.aborted || operation.cleanupError) {
+      // Boundary containment is a failed Service attempt, not an intentional
+      // stop. Keep the normal saved backoff before reconciliation admits more.
+      if (!operation.controller.signal.aborted || operation.cleanupError || operation.controller.signal.reason instanceof CapsuleBoundaryLostError) {
         const diagnostic = this.#diagnostics.read(service.appId).find(value => value.executionId === executionId);
         const count = operation.runningAt !== null && Date.now() - operation.runningAt >= 60_000 ? 1 : service.policy.crashCount + 1;
         service.policy = { ...service.policy, crashCount: count,
@@ -914,6 +928,7 @@ export class CapsuleManager {
       || this.#openingApps.has(appId)
       || this.#rebuildOperations.has(appId)
       || this.#stoppingApps.has(appId)
+      || this.#hasViewerCleanup(appId)
       || [...this.#viewers.values()].some((viewer) => viewer.appId === appId)
     ) {
       throw new AppViewerBusyError(appId);
@@ -950,7 +965,7 @@ export class CapsuleManager {
     ).then(resolveOpening, rejectOpening);
     try {
       const viewer = await operation;
-      this.#latestFailureByApp.delete(appId);
+      this.#clearUiExecutionFailure(appId);
       return viewer;
     } catch (error) {
       if (!isExpectedCancellation(error)) this.#recordFailure(appId, error);
@@ -1204,7 +1219,7 @@ export class CapsuleManager {
   ): Promise<ReloadedApp> {
     if (this.#terminalFailure) throw this.#terminalFailure;
     if (!PACKAGE_ID_PATTERN.test(appId)) throw new Error("Invalid App id");
-    if (this.#stoppingAll || this.#stoppingApps.has(appId) || this.#appBlocked.has(appId) || this.#modeChanges.has(appId) || this.#appEnablement.get(appId) === false) {
+    if (this.#stoppingAll || this.#stoppingApps.has(appId) || this.#hasViewerCleanup(appId) || this.#appBlocked.has(appId) || this.#modeChanges.has(appId) || this.#appEnablement.get(appId) === false) {
       throw new Error(`App "${appId}" is stopping`);
     }
     const existing = this.#rebuildOperations.get(appId);
@@ -1221,7 +1236,7 @@ export class CapsuleManager {
     this.#rebuildOperations.set(appId, operation);
     try {
       const result = await operation;
-      if (result.active) this.#latestFailureByApp.delete(appId);
+      if (result.active) this.#clearUiExecutionFailure(appId);
       return result;
     } catch (error) {
       if (!isExpectedCancellation(error)) this.#recordFailure(appId, error);
@@ -1543,9 +1558,13 @@ export class CapsuleManager {
   }
 
   stopAll(options: StopAllOptions = {}): Promise<void> {
+    return this.#stopAll(options);
+  }
+
+  #stopAll(options: StopAllOptions, boundaryFailure?: CapsuleBoundaryLostError): Promise<void> {
     this.#serviceGeneration++;
     this.#serviceHostEpoch++;
-    this.#serviceLoop?.controller.abort(new Error("Host stopped"));
+    if (!boundaryFailure) this.#serviceLoop?.controller.abort(new Error("Host stopped"));
     if (options.controlPlaneLost && !this.#controlPlaneLost) {
       this.#controlPlaneLost = true;
       this.#controlPlaneRequests.abort(new ControlPlaneLostError());
@@ -1561,13 +1580,21 @@ export class CapsuleManager {
     // a synchronous reentrant stop must join this teardown, not start another.
     this.#stopAllOperation = shared;
     this.#stoppingAll = true;
-    for (const job of this.#workloads.values()) job.controller.abort(new Error("Host stopped"));
+    this.#cleanBoundaryConfirmed = false;
+    for (const job of this.#workloads.values()) job.controller.abort(boundaryFailure ?? new Error("Host stopped"));
     this.#generation += 1;
 
     try {
+      // Fence admission before Main invalidates published and hidden viewers.
+      // Their cleanup is registered below, alongside Manager-owned operations.
+      const notificationFailures: unknown[] = [];
+      if (boundaryFailure) {
+        try { this.#onBackendBoundaryLost?.(boundaryFailure.cause); }
+        catch (error) { notificationFailures.push(error); }
+      }
       const pending = [
         ...[...this.#workloads.values()].map(job => job.task),
-        ...(this.#serviceLoop ? [this.#serviceLoop.task] : []),
+        ...(!boundaryFailure && this.#serviceLoop ? [this.#serviceLoop.task] : []),
         ...(this.#serviceReconciliation ? [this.#serviceReconciliation] : []),
         ...this.#serviceManagement.keys(),
         ...this.#appSettingOperations.values(),
@@ -1587,6 +1614,7 @@ export class CapsuleManager {
         ...this.#rebuildOperations.keys(),
         ...this.#stopOperations.keys(),
         ...this.#retireOperations.keys(),
+        ...this.#uiCleanupOperations.values(),
         ...this.#stoppingApps,
         ...pendingUi.map((operation) => operation.appId),
         ...viewers.map((viewer) => viewer.appId),
@@ -1596,7 +1624,7 @@ export class CapsuleManager {
       for (const operation of pendingUi) {
         this.#cancelPendingUiOperation(
           operation,
-          new Error("App Capsule operation was cancelled during Host shutdown"),
+          new Error("App Capsule operation was cancelled during Capsule cleanup"),
         );
         if (!operation.runtimeUnbound) {
           operation.runtimeUnbound = true;
@@ -1623,6 +1651,10 @@ export class CapsuleManager {
         // Keep the global fence until every operation cancelled by the backend
         // has observed that cancellation and completed its own Host cleanup.
         await Promise.allSettled(pending);
+        // Viewer cleanup has its own ownership: unlike cancelled launches,
+        // rejected tasks stay registered. Include cleanup registered while
+        // those launches were settling, without treating cancellation as loss.
+        const viewerCleanup = await Promise.allSettled(this.#uiCleanupOperations.keys());
         // Capability issuance already in flight at the first revoke can commit
         // afterward. Revoke each affected App again only after issuance and
         // launch cleanup have quiesced.
@@ -1637,6 +1669,7 @@ export class CapsuleManager {
         ]
           .filter((result): result is PromiseRejectedResult => result.status === "rejected")
           .map((result) => result.reason);
+        failures.push(...notificationFailures);
         const jobCleanup = await Promise.all([...affectedApps].map((appId, index) => this.#cleanupRetainedWorkloads(
           appId, this.#controlPlaneLost || finalRevocations[index]?.status === "fulfilled",
         )));
@@ -1645,23 +1678,30 @@ export class CapsuleManager {
           throw new AggregateError(failures, "Could not fully stop App Capsules");
         }
         for (const appId of affectedApps) this.#clearCleanupFailure(appId);
+        return viewerCleanup.flatMap(result => result.status === "rejected" ? [result.reason] : []);
       })();
       void withDeadline(
         teardown,
         STOP_ALL_QUIESCENCE_TIMEOUT_MS,
         "App Capsule shutdown did not quiesce before its deadline",
       ).then(
-        () => {
+        (viewerFailures) => {
           if (this.#stopAllOperation === shared) this.#stopAllOperation = null;
           this.#stoppingAll = false;
-          this.#serviceLoop = null;
           this.#cleanBoundaryConfirmed = true;
-          this.#servicePolicies.clear();
-          this.#appEnablement.clear(); this.#appBlocked.clear(); this.#appModes.clear();
-          this.#diagnostics.clear();
+          if (!boundaryFailure || this.#serviceLoop?.controller.signal.aborted || this.#controlPlaneLost) {
+            this.#serviceLoop = null;
+            this.#servicePolicies.clear();
+            this.#appEnablement.clear(); this.#appBlocked.clear(); this.#appModes.clear();
+            this.#diagnostics.clear();
+          }
           this.#controlPlaneRequests = new AbortController();
           this.#controlPlaneLost = false;
-          resolveStop();
+          // VM/authority containment succeeded. Retained viewer ownership
+          // fences UI reuse, not independent workloads or the live Host.
+          if (viewerFailures.length) rejectStop(new AggregateError(viewerFailures,
+            "App viewer cleanup was not confirmed; affected App viewers remain unavailable until cleanup completes or Lamarck restarts"));
+          else resolveStop();
         },
         (error) => {
           const terminal = error instanceof CapsuleRestartRequiredError
@@ -1691,33 +1731,13 @@ export class CapsuleManager {
   }
 
   async #collapseBackendBoundary(causes: unknown[]): Promise<never> {
-    for (const job of this.#workloads.values()) job.controller.abort(new Error("Capsule boundary lost"));
-    this.#generation += 1;
-    for (const pending of this.#pendingUiOperations.values()) {
-      this.#cancelPendingUiOperation(
-        pending,
-        new Error("App Capsule backend boundary was lost"),
-      );
+    if (!this.#stopAllOperation) {
+      for (const viewer of this.#viewers.values()) this.#recordFailure(viewer.appId, causes[0]);
+      // Reuse global ownership, cancellation, two-pass revocation and the
+      // quiescence deadline. Never join here: the reporting operation can be
+      // one of the operations stopAll must itself wait for.
+      void this.#stopAll({}, new CapsuleBoundaryLostError("Capsule boundary lost", { cause: causes[0] })).catch(() => {});
     }
-    const remaining = [...this.#viewers.values()];
-    for (const viewer of remaining) this.#recordFailure(viewer.appId, causes[0]);
-    this.#viewers.clear();
-    for (const viewer of remaining) this.#unbindSystemSender(viewer.runtimeSenderId);
-    try {
-      this.#onBackendBoundaryLost?.(causes[0]);
-    } catch (error) {
-      causes.push(error);
-    }
-    const results = await Promise.allSettled([
-      this.#backend.stopAll(),
-      ...remaining.flatMap((viewer) => [
-        this.#revokeCapability(viewer.channelId),
-        this.#revokeCapability(viewer.runtimeChannelId),
-      ]),
-    ]);
-    causes.push(...results
-      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-      .map((result) => result.reason));
     const primary = errorMessage(causes[0]);
     throw new AggregateError(
       causes,
@@ -1794,13 +1814,26 @@ export class CapsuleManager {
     });
   }
 
-  #clearCleanupFailure(appId: string): void {
-    // Called only after confirmed App-wide cleanup; every retained cleanup
-    // failure for this App is now resolved, while execution failures remain.
+  #clearUiExecutionFailure(appId: string): void {
+    // Starting a UI resolves UI execution errors, not retained cleanup or
+    // independent Service/Job failures. Diagnostics never gate those lifetimes.
     const prune = (failure?: AppRuntimeFailure): AppRuntimeFailure | undefined => {
       if (!failure) return;
       const previous = prune(failure.previous);
-      return failure.recoverableCleanup ? previous : { ...failure, previous };
+      return !failure.recoverableCleanup && (!failure.workloadKey || failure.workloadKey === "ui") ? previous : { ...failure, previous };
+    };
+    const latest = prune(this.#latestFailureByApp.get(appId));
+    if (latest) this.#latestFailureByApp.set(appId, latest);
+    else this.#latestFailureByApp.delete(appId);
+  }
+
+  #clearCleanupFailure(appId: string): void {
+    // Backend/authority cleanup cannot discharge retained Host viewer cleanup.
+    const viewerCleanupPending = this.#hasViewerCleanup(appId);
+    const prune = (failure?: AppRuntimeFailure): AppRuntimeFailure | undefined => {
+      if (!failure) return;
+      const previous = prune(failure.previous);
+      return failure.recoverableCleanup && !(viewerCleanupPending && failure.workloadKey === "ui") ? previous : { ...failure, previous };
     };
     const latest = prune(this.#latestFailureByApp.get(appId));
     if (latest) this.#latestFailureByApp.set(appId, latest);

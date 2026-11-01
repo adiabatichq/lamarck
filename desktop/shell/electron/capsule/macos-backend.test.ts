@@ -36,6 +36,10 @@ import {
 } from "./backend";
 import { MacOsCapsuleBackend, type MacOsCapsuleBackendOptions } from "./macos-backend";
 import { CapsuleStorageBudget, type CapsuleStorageBudgetLike } from "./storage-budget";
+import { CapsuleManager } from "./manager";
+import { SystemBroker } from "./system-broker";
+import { DesktopRuntimeSupervisor } from "../runtime-supervisor";
+import { loadMainRuntimeLifecycle } from "../test-support/main-runtime";
 
 const IMAGE = `sha256:${"1".repeat(64)}`;
 const PACKAGE_A = `sha256:${"2".repeat(64)}`;
@@ -1630,6 +1634,87 @@ describe("MacOsCapsuleBackend orchestration", () => {
     expect(harness.vm.stopCalls).toBeGreaterThan(0);
   });
 
+  test.each(["asynchronous", "App stop", "VM stop timeout"] as const)("%s failure contains Apps while Main keeps its Host ready", async fault => {
+    const h = createHarness(), host = hostHarness(h);
+    const viewer = await host.open();
+    if (fault === "VM stop timeout") {
+      h.vm.blockStop();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    }
+    try {
+      if (fault === "App stop") {
+        h.session.failAppStop = true;
+        await expect(host.manager.stopApp("weather")).rejects.toThrow();
+      } else {
+        h.session.emit("fatal", new Error("injected CONTROL failure"));
+      }
+      expect(host.manager.getViewer(viewer.viewerId, host.owner)).toBeNull();
+      expect(host.appViewers.size).toBe(0);
+      expect(host.preparedSenders.size).toBe(0);
+      expect(host.broker.size).toBe(0);
+      const denied = JSON.parse(await host.broker.invokeSerialized(77, JSON.stringify({ operation: "files.list", input: {} })));
+      expect(denied).toMatchObject({ ok: false, error: { code: "sender_unbound" } });
+      host.assertHostReady();
+      if (fault === "VM stop timeout") {
+        await vi.advanceTimersByTimeAsync(15_000);
+        await expect(host.manager.stopAll()).rejects.toMatchObject({ restartRequired: true });
+        expect(host.channels.size).toBe(0);
+        await expect(host.manager.status()).resolves.toMatchObject({ available: false, restartRequired: true, reason: expect.stringContaining("restart") });
+        await expect(host.open()).rejects.toMatchObject({ restartRequired: true });
+        expect(h.vm.startCalls).toBe(1);
+      } else {
+        await vi.waitFor(async () => expect(await host.manager.status()).toMatchObject({ available: true }));
+        expect(host.channels.size).toBe(0);
+        // Confirmed cleanup releases admission without a Host restart or any
+        // new VM reconstruction/recovery mechanism.
+        h.session.failAppStop = false;
+        expect(h.lifecycleEvents).toContain("helper.stop.confirmed");
+        h.session.executingWorkloads.clear(); // The transport fake is reused across VM boots.
+        await host.open();
+        expect(h.vm.startCalls).toBe(2);
+      }
+      host.assertHostReady();
+      expect(h.vm.stopCalls).toBe(1);
+    } finally {
+      h.vm.releaseStop();
+      vi.useRealTimers();
+      await host.manager.stopAll().catch(() => {});
+    }
+  });
+
+  test.each(["Core", "Guard"] as const)("genuine %s loss still follows Main's existing runtime recovery", async kind => {
+    const h = createHarness(), host = hostHarness(h);
+    await host.open();
+    const generation = host.supervisor.snapshot().generation;
+    if (kind === "Core") host.main.beginUnexpectedCoreTeardown(host.supervisor.core!, generation, "injected Core loss");
+    else host.main.beginUnexpectedGuardTeardown(host.supervisor.guard!, generation, "injected Guard loss");
+    await host.supervisor.enqueue(async () => {});
+    expect(host.stopCore).toHaveBeenCalledOnce();
+    expect(host.stopGuard).toHaveBeenCalledOnce();
+    expect(host.stopGateway).toHaveBeenCalledOnce();
+    expect(host.start).toHaveBeenCalledOnce();
+    expect(host.supervisor.snapshot()).toMatchObject({ phase: "ready", generation: generation + 1 });
+    expect(host.app.relaunch).not.toHaveBeenCalled();
+    await host.manager.stopAll();
+  });
+
+  test("Main keeps the Host running when asynchronous viewer cleanup fails during Capsule containment", async () => {
+    const h = createHarness(), cleanup = Promise.withResolvers<void>();
+    const host = hostHarness(h, cleanup.promise);
+    await host.open();
+    h.session.emit("fatal", new Error("injected CONTROL failure"));
+    const rejected = expect(host.manager.stopAll()).rejects.toThrow("App viewer cleanup was not confirmed");
+    cleanup.reject(new Error("gateway cleanup failed"));
+    await rejected;
+    host.assertHostReady();
+    expect(host.channels.size).toBe(0);
+    expect(host.broker.size).toBe(0);
+    expect(host.manager.appRuntimeStates().find(app => app.appId === "weather"))
+      .toMatchObject({ ui: "stopping", latestFailure: "gateway cleanup failed" });
+    await expect(host.open()).rejects.toThrow();
+    await host.manager.stopAll().catch(() => {});
+  });
+
   test("rejects viewer fan-out locally before it can exhaust the Guest DATA budget", async () => {
     const harness = createHarness();
     const instance = await harness.backend.startUi(spec("sender-a"));
@@ -2431,6 +2516,86 @@ describe("declared Capsule jobs", () => {
     expect((await done).message).toMatch(/provenance/); expect(lost).toHaveBeenCalledOnce(); await h.backend.stopAll();
   });
 });
+
+function hostHarness(h: ReturnType<typeof createHarness>, viewerCleanup: Promise<void> = Promise.resolve()) {
+  let manager!: CapsuleManager;
+  const channels = new Set<string>();
+  let sequence = 0;
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const url = String(input), launch = spec("host", PACKAGE_A, sequence);
+    if (url.endsWith("/activation/prepare")) return Response.json({ activation: {
+      ...launch, schemaVersion: 1, activationSequence: ++sequence, workload: "ui", immutablePackagePath: launch.packageDir,
+      manifest: { runtime: { ui: { command: launch.command, port: launch.port } }, permissions: { writes: { files: [], tables: [] } } },
+    } });
+    if (url.endsWith("/channels") && init?.method === "POST") {
+      const channelId = `host-channel-${channels.size}-${sequence}`;
+      channels.add(channelId);
+      return Response.json({ ...launch, appCommit: launch.version, channelId, capability: `secret-${channelId}` });
+    }
+    if (init?.method === "DELETE") {
+      if (url.endsWith("/apps/weather/channels")) channels.clear();
+      else channels.delete(url.split("/").at(-1)!);
+    }
+    return Response.json({ ok: true });
+  };
+  const broker = new SystemBroker({ coreBaseUrl: "http://core", fetch, revokeCapability() {} });
+  const stopCore = vi.fn(async (child: object) => { supervisor.expectCoreStop(child); supervisor.detachCore(child); });
+  const stopGuard = vi.fn(async (child: object) => { supervisor.expectGuardStop(child); supervisor.detachGuard(child); });
+  const stopGateway = vi.fn(async () => {});
+  const start = vi.fn(async (generation: number) => {
+    const guard = {};
+    supervisor.attachGuard(generation, guard);
+    supervisor.publishGuardOrigin(generation, guard, "http://guard");
+    supervisor.attachCore(generation, {});
+    supervisor.ready(generation);
+  });
+  const supervisor = new DesktopRuntimeSupervisor(() => {}, {
+    start, stopGateway, stopCore, stopGuard,
+    stopApps: controlPlaneLost => manager.stopAll({ controlPlaneLost }),
+  });
+  const core = {}, guard = {}, generation = supervisor.begin();
+  supervisor.attachGuard(generation, guard);
+  supervisor.publishGuardOrigin(generation, guard, "http://guard");
+  supervisor.attachCore(generation, core);
+  supervisor.ready(generation);
+  const initialState = supervisor.snapshot();
+  const app = { relaunch: vi.fn(), exit: vi.fn(), quit: vi.fn() };
+  const appViewers = new Map<string, { appId: string }>();
+  const preparedSenders = new Set<number>();
+  const main = loadMainRuntimeLifecycle({
+    runtimeSupervisor: supervisor, systemBroker: broker, appViewers, preparedAppViewerSenderIds: preparedSenders,
+    app, console: { error() {}, log() {} }, isQuitting: false, runtimeRelaunchRequested: false,
+    startedFromRuntimeRelaunch: false, activeWorkspace: { vaultId: "isolated-vault" },
+    process: { argv: [] }, RUNTIME_RELAUNCH_ARG: "--test", shutdownComplete: false, disposeAllTerminals: vi.fn(),
+    detachAppViewerRecord(viewerId: string, record: { appId: string }) {
+      appViewers.delete(viewerId);
+      return [manager.trackViewerCleanup(record.appId, viewerCleanup)];
+    },
+  });
+  manager = new CapsuleManager({
+    backend: h.backend, workspacePath: () => "/workspace", coreBaseUrl: () => "http://core", coreToken: "host-secret", fetch,
+    bindSystemSender: (sender, binding) => broker.bindSender(sender, binding),
+    unbindSystemSender: sender => { broker.unbindSender(sender); },
+    onBackendBoundaryLost: main.onBackendBoundaryLost,
+  });
+  const owner = { webContentsId: 7, rendererGeneration: 1 };
+  return { manager, supervisor, main, broker, channels, app, appViewers, preparedSenders, owner, stopCore, stopGuard, stopGateway, start,
+    async open() {
+      const viewer = await manager.openViewer("weather", owner, async () => {});
+      appViewers.set(viewer.viewerId, { appId: "weather" });
+      broker.bindSender(77, viewer);
+      preparedSenders.add(88);
+      broker.bindSender(88, { ...viewer, channelId: "hidden-browser-channel" });
+      return viewer;
+    },
+    assertHostReady() {
+      expect(supervisor.snapshot()).toEqual(initialState);
+      expect(supervisor.core).toBe(core);
+      expect(supervisor.guard).toBe(guard);
+      for (const operation of [stopCore, stopGuard, stopGateway, start, app.relaunch, app.exit, app.quit]) expect(operation).not.toHaveBeenCalled();
+    },
+  };
+}
 
 function spec(sender: string, packageDigest: string = PACKAGE_A, activationSequence = 1) {
   return {
