@@ -305,8 +305,6 @@ function assertSameFile(
     || actual.dev !== expected.dev
     || actual.ino !== expected.ino
     || actual.size !== expected.size
-    || actual.mtimeNs !== expected.mtimeNs
-    || actual.ctimeNs !== expected.ctimeNs
   ) {
     throw new Error(`Package file changed while reading: ${path}`);
   }
@@ -318,8 +316,6 @@ function assertSameDirectory(expected: BigIntStats, actual: BigIntStats, path: s
     || actual.isSymbolicLink()
     || actual.dev !== expected.dev
     || actual.ino !== expected.ino
-    || actual.mtimeNs !== expected.mtimeNs
-    || actual.ctimeNs !== expected.ctimeNs
   ) {
     throw new Error(`Package directory changed while reading: ${path || "."}`);
   }

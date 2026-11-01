@@ -1,15 +1,20 @@
+import { execFileSync } from "node:child_process";
 import {
   chmod,
+  link,
+  lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   collectAppPackageTree,
   hashAppPackageTree,
@@ -21,6 +26,7 @@ import {
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -88,6 +94,58 @@ describe("canonical App package projection", () => {
       "é.txt",
     ]);
   });
+
+  test.each([
+    ["file", "src/index.ts"],
+    ["root directory", "."],
+    ["nested directory", "src"],
+  ])("accepts timestamp-only changes to a %s during the first read", async (_kind, path) => {
+    const app = await fixture();
+    const target = join(app, path);
+    const baseline = await collectAppPackageTree(app);
+    const before = await lstat(target, { bigint: true });
+    const probe = await open(join(app, "src", "index.ts"), "r");
+    const prototype = Object.getPrototypeOf(probe) as { readFile: typeof probe.readFile };
+    const originalReadFile = prototype.readFile;
+    await probe.close();
+    const read = vi.spyOn(prototype, "readFile").mockImplementation(async function (
+      this: typeof probe,
+      options,
+    ) {
+      const bytes = await originalReadFile.call(this, options);
+      // The second file is src/index.ts: both directories and the file have
+      // already been statted, and their post-read checks are still pending.
+      if (read.mock.calls.length === 2) {
+        await utimes(target, new Date(1_700_000_000_000), new Date(1_700_000_000_000));
+      }
+      return bytes;
+    });
+
+    const entries = await collectAppPackageTree(app);
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(entries).toEqual(baseline);
+    expect(hashAppPackageTree(entries)).toBe(hashAppPackageTree(baseline));
+    const after = await lstat(target, { bigint: true });
+    expect(after.mtimeNs).not.toBe(before.mtimeNs);
+    expect(after.ctimeNs).not.toBe(before.ctimeNs);
+  });
+
+  test("rejects hard links and unsupported file types", async () => {
+    const app = await fixture();
+    const hardlink = join(app, "linked.ts");
+    await link(join(app, "src", "index.ts"), hardlink);
+    await expect(collectAppPackageTree(app)).rejects.toThrow("hard links are not supported");
+    await rm(hardlink);
+    execFileSync("mkfifo", [join(app, "pipe")]);
+    await expect(collectAppPackageTree(app)).rejects.toThrow("Unsupported package file type");
+  });
+
+  test.each(["../escape", "/absolute", "nested/../../escape", "nested\\escape"])(
+    "rejects unsafe package path %s",
+    (path) => {
+      expect(() => hashAppPackageTree([file(path, Buffer.from("unsafe"))])).toThrow("Invalid package path");
+    },
+  );
 
   test("rejects symlinks, excluded upload paths, portable collisions, and wrong manifest identity", async () => {
     const app = await fixture();

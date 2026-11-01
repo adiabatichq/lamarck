@@ -71,6 +71,22 @@ describe("AppActivationCoordinator", () => {
     ).digest).toBe(activation.packageDigest);
   });
 
+  test("rejects same-size content changes in a known-version cache without losing the running activation", async () => {
+    const { appDir, cacheDir } = await fixture();
+    const events = new Events();
+    const coordinator = new AppActivationCoordinator(new AppRepositoryService({ eventWriter: events }), cacheDir);
+    const activation = await coordinator.prepare({ mode: "normal", appId: "example", appDir, workload: "ui" });
+    const cachedFile = join(activation.immutablePackagePath, "src", "index.ts");
+    await chmod(cachedFile, 0o644);
+    await writeFile(cachedFile, "export const version = 2;\n");
+
+    await expect(coordinator.prepare({ mode: "normal", appId: "example", appDir, workload: "ui" }))
+      .rejects.toThrow("Immutable App version cache does not match its retained commit");
+    expect(coordinator.require(activation.activationId, "example", "ui")).toBe(activation);
+    expect(coordinator.hasAuthority("example")).toBe(true);
+    expect(events.values).toHaveLength(1);
+  });
+
   test("failed activation release retains its exact cleanup obligation for retry", async () => {
     const { appDir, cacheDir } = await fixture();
     const coordinator = new AppActivationCoordinator(new AppRepositoryService({ eventWriter: new Events() }), cacheDir);
